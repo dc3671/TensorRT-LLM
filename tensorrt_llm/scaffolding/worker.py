@@ -154,6 +154,8 @@ class TRTLLMWorker(Worker):
                   tokenizer=tokenizer,
                   mixed_sampler=True,
                   disable_overlap_scheduler=disable_overlap_scheduler,
+                  use_cuda_graph=True,
+                  cuda_graph_batch_sizes=[1, 2, 4, 8, 16, 24, 32],
                   kv_cache_config=kv_cache_config,
                   max_batch_size=max_batch_size,
                   max_num_tokens=max_num_tokens)
