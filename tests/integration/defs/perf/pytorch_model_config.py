@@ -29,8 +29,9 @@ def get_model_yaml_config(model_label: str,
         """
     base_config = {
         'print_iter_log': True,
-        'use_cuda_graph': True,
-        'cuda_graph_padding_enabled': True,
+        'cuda_graph_config': {
+            'padding_enabled': True,
+        },
     }
     if 'kv_cache_dtype' in model_label:
         base_config.update({
@@ -49,7 +50,7 @@ def get_model_yaml_config(model_label: str,
             ],
             'config': {
                 'enable_attention_dp': True,
-                'use_cuda_graph': True,
+                'cuda_graph_config': {},
                 'speculative_config': {
                     'decoding_type': 'MTP',
                     'num_nextn_predict_layers': 3
@@ -84,9 +85,17 @@ def get_model_yaml_config(model_label: str,
             'deepseek_v3_lite_nvfp4-bench-pytorch-streaming-float4-maxbs:2048-maxnt:8192-input_output_len:256,256-reqs:200',
             'config': {
                 'print_iter_log': True,
-                'use_cuda_graph': True,
-                'cuda_graph_padding_enabled': True,
-                'cuda_graph_batch_sizes': [1, 512, 1024, 2048]
+                'cuda_graph_config': {
+                    'padding_enabled': True,
+                    'batch_sizes': [1, 512, 1024, 2048]
+                }
+            }
+        },
+        # Deepseek default cases
+        {
+            'patterns': 'deepseek_r1',
+            'config': {
+                'enable_attention_dp': True,
             }
         },
         # Llama Nemotron models with attention_dp disabled to prevent hangs
@@ -101,6 +110,26 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': False,
             }
         },
+        # Qwen3 models with fp4 quantization on B200 and fp8 quantization on H200/H20
+        {
+            'patterns': [
+                'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:512-ep:4-gpus:4',
+                'qwen3_235b_a22b_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:256-ep:8-gpus:8'
+            ],
+            'config': {
+                'enable_attention_dp': True,
+            }
+        },
+        # Qwen3 models with fp4 quantization on B200 with moe backend equal to TRTLLM
+        {
+            'patterns': [
+                'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:8-ep:8-gpus:8',
+            ],
+            'config': {
+                'enable_attention_dp': False,
+                'moe_backend': 'TRTLLM'
+            }
+        }
     ]
 
     # Apply pattern-based configurations on top of base config

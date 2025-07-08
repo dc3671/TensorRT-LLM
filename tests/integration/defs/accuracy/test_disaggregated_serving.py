@@ -83,7 +83,6 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
         yaml.dump(gen_server_config, f)
 
     args = LlmArgs.from_kwargs(model=model_name,
-                               backend="pytorch",
                                tensor_parallel_size=tensor_parallel_size)
 
     trtllm_serve_path = "trtllm-serve"
@@ -134,11 +133,12 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
         client = openai.OpenAI(api_key="1234567890",
                                base_url=f"http://localhost:8000/v1")
 
-        def send_request(prompt: str, sampling_params: SamplingParams):
+        def send_request(prompt: str, sampling_params: SamplingParams,
+                         streaming: bool):
             response = client.completions.create(
                 model=model_name,
                 prompt=prompt,
-                stream=False,
+                stream=streaming,
                 **({
                     "max_tokens": sampling_params.max_tokens,
                     "temperature": sampling_params.temperature,
@@ -158,8 +158,10 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
             return requested_output
 
         def generate_async(prompt: str,
-                           sampling_params: Optional[SamplingParams] = None):
-            future = thread_pool.submit(send_request, prompt, sampling_params)
+                           sampling_params: Optional[SamplingParams] = None,
+                           streaming: bool = False):
+            future = thread_pool.submit(send_request, prompt, sampling_params,
+                                        streaming)
             thread_pool.futures.append(future)
             return future
 
@@ -284,5 +286,42 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       tensor_parallel_size=4) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@pytest.mark.timeout(3600)
+class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-3-1b-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
+
+    @pytest.mark.parametrize("overlap_scheduler", [False, True])
+    def test_auto_dtype(self, overlap_scheduler):
+        ctx_server_config = {"disable_overlap_scheduler": True}
+        gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
+        ctx_server_config["kv_cache_config"] = {
+            "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": False
+        }
+        gen_server_config["kv_cache_config"] = {
+            "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": False
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)

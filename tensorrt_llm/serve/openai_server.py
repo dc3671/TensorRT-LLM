@@ -14,12 +14,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoConfig, AutoProcessor
 
+from tensorrt_llm._tensorrt_engine import LLM
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
-from tensorrt_llm.llmapi import LLM
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -294,6 +294,7 @@ class OpenAIServer:
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
+                lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
@@ -309,9 +310,11 @@ class OpenAIServer:
                 response = await create_chat_response(promise, postproc_params, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
+            logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
+            logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
 
     async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
@@ -414,6 +417,7 @@ class OpenAIServer:
                     sampling_params=sampling_params,
                     _postproc_params=postproc_params,
                     streaming=request.stream,
+                    lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params
                 )
                 asyncio.create_task(self.await_disconnected(raw_request, promise))
@@ -434,10 +438,11 @@ class OpenAIServer:
                     generator, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
+            logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
         except Exception as e:
-            traceback.print_exc()
+            logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
 
     async def __call__(self, host, port):

@@ -39,9 +39,14 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
 {
     auto const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 100, "Only SM100 is supported by FP4 block scale MOE");
-    TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float
-            || routing_logits.scalar_type() == at::ScalarType::BFloat16,
-        "routing_logits must be float or bfloat16.");
+    if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3)
+    {
+        TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::Float, "routing_logits must be float");
+    }
+    else
+    {
+        TORCH_CHECK(routing_logits.scalar_type() == at::ScalarType::BFloat16, "routing_logits must be bfloat16");
+    }
     TORCH_CHECK(routing_logits.dim() == 2, "routing_logits must be 2D.");
     TORCH_CHECK(routing_logits.sizes()[1] == num_experts, "routing_logits has incorrect shape.");
     if (routing_bias.has_value())
@@ -123,7 +128,8 @@ std::vector<torch::Tensor> fp4_block_scale_moe_runner(torch::Tensor const& routi
         {args.num_tokens, args.top_k}, routing_bias_dtype, routing_logits.device(), std::nullopt);
     at::Tensor expert_indexes = at::detail::empty_cuda(
         {args.num_tokens, args.top_k}, at::ScalarType::Int, routing_logits.device(), std::nullopt);
-    at::Tensor expert_count_histogram = at::detail::empty_cuda({((num_experts * 2 + 255) / 256) * 256},
+    int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
+    at::Tensor expert_count_histogram = at::detail::empty_cuda({size_of_expert_count_histogram},
         at::ScalarType::Int, // 256 is the max number of threads per block and max number of experts
         routing_logits.device(), std::nullopt);
 
