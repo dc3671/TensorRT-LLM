@@ -51,14 +51,29 @@ def _load_minimax_m2_moe_layer(model_name_or_path):
         model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
         model.eval()
 
-        # Access the MoE layer
-        layer_name = "model.layers.0.block_sparse_moe"
-        module = dict(model.named_modules()).get(layer_name)
-        if module is None:
-            print(f"Layer '{layer_name}' not found in the model.")
-        else:
-            print(f"Successfully extracted layer '{layer_name}'.")
-        return module
+        # Access the MoE layer — try known paths (name changed across HF versions)
+        candidate_names = [
+            "model.layers.0.block_sparse_moe",
+            "model.layers.0.feed_forward",
+        ]
+        all_modules = dict(model.named_modules())
+        for layer_name in candidate_names:
+            module = all_modules.get(layer_name)
+            if module is not None:
+                print(f"Successfully extracted layer '{layer_name}'.")
+                return module
+
+        # Fallback: search by class name
+        for name, mod in all_modules.items():
+            if "SparseMoeBlock" in type(mod).__name__:
+                print(f"Found MoE layer by class name at '{name}'.")
+                return mod
+
+        print(
+            f"MoE layer not found. Tried: {candidate_names}. "
+            f"Available: {[n for n in all_modules if 'layers.0' in n]}"
+        )
+        return None
     except Exception as e:
         print(f"Error extracting layer: {e}")
         return None
