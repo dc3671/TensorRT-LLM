@@ -35,6 +35,11 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     ]
 
     llm_config = {}
+    # Transformers 5.x moved rope_theta into rope_parameters; extract if needed.
+    if "rope_theta" not in config_dict:
+        rope_params = config_dict.get("rope_parameters", {})
+        if isinstance(rope_params, dict) and "rope_theta" in rope_params:
+            config_dict["rope_theta"] = rope_params["rope_theta"]
     for field in required_fields:
         if field not in config_dict:
             raise KeyError(f"Required field '{field}' not found in config")
