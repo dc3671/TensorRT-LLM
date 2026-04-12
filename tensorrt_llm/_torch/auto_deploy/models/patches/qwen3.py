@@ -53,9 +53,14 @@ def _forward_moe(self: Qwen3MoeSparseMoeBlock, hidden_states: torch.Tensor):
     if isinstance(router_logits, tuple):
         router_logits = router_logits[0]
 
+    top_k = (
+        getattr(self, "top_k", None)
+        or getattr(self, "num_experts_per_tok", None)
+        or getattr(self.config, "num_experts_per_tok", 2)
+    )
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-    if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    if getattr(self, "norm_topk_prob", getattr(self, "normalize_expert_weights", True)):
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
     # we cast back to the input dtype
     routing_weights = routing_weights.to(hidden_states.dtype)
