@@ -3339,22 +3339,75 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         The partition attends through the FP8 MLA context kernel. Returns the
         attention output of the partition.
         """
-        for fmha in self._fmha_manager.fmha_libs:
-            if isinstance(fmha, Fp4MlaFmha):
-                output = fmha.forward_context_partition(
-                    q,
-                    k,
-                    v,
-                    metadata,
-                    forward_args,
-                    kv_lens_cuda=kv_lens_cuda,
-                    kv_lens_cpu=kv_lens_cpu,
-                )
-                if isinstance(output, tuple):
-                    output = output[0]
-                return output
-        raise RuntimeError(
-            "Dense FP4 MLA FMHA is unavailable for chunked prefill.")
+        fp4_mla_fmha = self._get_fp4_mla_fmha()
+        if fp4_mla_fmha is None:
+            raise RuntimeError(
+                "Dense FP4 MLA FMHA is unavailable for chunked prefill.")
+        output = fp4_mla_fmha.forward_context_partition(
+            q,
+            k,
+            v,
+            metadata,
+            forward_args,
+            kv_lens_cuda=kv_lens_cuda,
+            kv_lens_cpu=kv_lens_cpu,
+        )
+        if isinstance(output, tuple):
+            output = output[0]
+        return output
+
+    def _get_fp4_mla_fmha(self):
+        """Return this layer's dense FP4 MLA FMHA library, if enabled."""
+        fp4_mla_fmha = getattr(self, "_fp4_mla_fmha_cache", False)
+        if fp4_mla_fmha is False:
+            fp4_mla_fmha = next(
+                (fmha for fmha in self._fmha_manager.fmha_libs
+                 if isinstance(fmha, Fp4MlaFmha)),
+                None,
+            )
+            self._fp4_mla_fmha_cache = fp4_mla_fmha
+        return fp4_mla_fmha
+
+    def supports_k3_fp8_split_k_context(self) -> bool:
+        fp4_mla_fmha = self._get_fp4_mla_fmha()
+        return (fp4_mla_fmha is not None
+                and fp4_mla_fmha.supports_k3_fp8_split_k_context())
+
+    def forward_k3_fp8_split_k_context_partition(
+        self,
+        q: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+        output: torch.Tensor,
+        softmax_stats: torch.Tensor,
+        merge_op: torch.Tensor,
+        cu_q_seqlens: torch.Tensor,
+        cu_kv_seqlens: torch.Tensor,
+        *,
+        max_q_len: int,
+        max_kv_len: int,
+        is_causal: bool,
+    ) -> None:
+        fp4_mla_fmha = self._get_fp4_mla_fmha()
+        if fp4_mla_fmha is None:
+            raise RuntimeError(
+                "Rubin K3 FP8 split-K context FMHA is unavailable for chunked prefill."
+            )
+        fp4_mla_fmha.forward_k3_fp8_split_k_context_partition(
+            q,
+            k_nope,
+            k_pe,
+            v,
+            output,
+            softmax_stats,
+            merge_op,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            is_causal=is_causal,
+        )
 
     def mla_rope_append_paged_kv_assign_q(
         self,
