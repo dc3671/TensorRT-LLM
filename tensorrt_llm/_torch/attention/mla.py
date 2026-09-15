@@ -1367,6 +1367,12 @@ class MLA(nn.Module):
         trtllm_attention = cast(TrtllmAttention, self.mha)
         if latent_cache is None:
             raise RuntimeError("FP4 MLA chunked prefill requires latent_cache.")
+        use_fused_split_k_merge = (
+            q.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and self.out_scale is None
+            and trtllm_attention.supports_k3_fp8_split_k_context()
+        )
 
         # Match the FP8 KV path: fuse Q/K RoPE with the cache append, then
         # consume the rotated current K directly from latent_cache.
@@ -1375,23 +1381,47 @@ class MLA(nn.Module):
             -1,
             self.kv_lora_rank + self.qk_rope_head_dim,
         )[:, self.kv_lora_rank :]
+        q_for_fmha = q
+        fp8_unit_scale = None
+        context_cu_q_seqlens = None
+        if use_fused_split_k_merge:
+            fp8_unit_scale = trtllm_attention.kv_cache_scaling_factor
+            q_for_fmha, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                q, fp8_unit_scale
+            )
+            context_cu_q_seqlens = attn_metadata.mla_prepare_ctx_cu_seqlens()
+            if context_cu_q_seqlens is None:
+                raise RuntimeError("K3 split-K context FMHA requires context requests.")
 
         self.softmax_stats_tensor = torch.empty(
             (attn_metadata.num_ctx_tokens, self.num_context_heads, 2),
             dtype=torch.float,
             device=q.device,
         )
-        self.temp_softmax_stats_tensor = torch.empty_like(self.softmax_stats_tensor)
         attn_output = output
-        temp_attn_output = q.new_empty(
-            (q.size(0), self.num_context_heads * self.v_head_dim),
-        )
+        if use_fused_split_k_merge:
+            self.temp_softmax_stats_tensor = None
+            temp_attn_output = None
+        else:
+            self.temp_softmax_stats_tensor = torch.empty_like(self.softmax_stats_tensor)
+            temp_attn_output = q.new_empty(
+                (q.size(0), self.num_context_heads * self.v_head_dim),
+            )
 
         def expand_kv(
             partition_compressed_kv: torch.Tensor,
             partition_k_pe: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             partition_kv = self._project_context_kv(partition_compressed_kv)
+            if use_fused_split_k_merge:
+                if fp8_unit_scale is None:
+                    raise RuntimeError("K3 split-K context FMHA requires an FP8 scale.")
+                partition_kv, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    partition_kv, fp8_unit_scale
+                )
+                partition_k_pe, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    partition_k_pe.contiguous(), fp8_unit_scale
+                )
             partition_k_nope, partition_v = partition_kv.split(
                 [
                     self.num_context_heads * self.qk_nope_head_dim,
@@ -1405,6 +1435,15 @@ class MLA(nn.Module):
                 self.qk_nope_head_dim,
             )
             partition_k_pe = partition_k_pe.view(-1, 1, self.qk_rope_head_dim)
+            if use_fused_split_k_merge:
+                return (
+                    partition_k_nope.view(
+                        -1,
+                        self.num_context_heads * self.qk_nope_head_dim,
+                    ),
+                    partition_k_pe,
+                    partition_v,
+                )
             partition_k = maybe_compiled_cat(
                 (
                     partition_k_nope,
@@ -1414,23 +1453,71 @@ class MLA(nn.Module):
             )
             return (
                 partition_k.view(-1, self.num_context_heads * self.qk_head_dim),
+                partition_k_pe,
                 partition_v,
             )
 
-        def partition_forward_args(attention_mask) -> AttentionForwardArgs:
-            return AttentionForwardArgs(
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=None,
-                out_scale=self.out_scale,
-                attention_mask=attention_mask,
-                softmax_stats_tensor=self.temp_softmax_stats_tensor,
-                chunked_prefill_buffer_batch_size=(
-                    attn_metadata.runtime_features.chunked_prefill_buffer_batch_size
+        def run_partition(
+            partition_k: torch.Tensor,
+            partition_k_pe: torch.Tensor,
+            partition_v: torch.Tensor,
+            attention_mask: PredefinedAttentionMask,
+            kv_lens_cuda: torch.Tensor,
+            kv_lens_cpu: torch.Tensor,
+            max_kv_len: int,
+            cu_kv_seqlens: Optional[torch.Tensor],
+            merge_op: torch.Tensor,
+        ) -> None:
+            if use_fused_split_k_merge:
+                if context_cu_q_seqlens is None or cu_kv_seqlens is None:
+                    raise RuntimeError("K3 split-K context FMHA requires cumulative lengths.")
+                trtllm_attention.forward_k3_fp8_split_k_context_partition(
+                    q_for_fmha,
+                    partition_k,
+                    partition_k_pe,
+                    partition_v,
+                    attn_output,
+                    self.softmax_stats_tensor,
+                    merge_op,
+                    context_cu_q_seqlens,
+                    cu_kv_seqlens,
+                    max_q_len=attn_metadata.max_ctx_seq_len,
+                    max_kv_len=max_kv_len,
+                    is_causal=attention_mask == PredefinedAttentionMask.CAUSAL,
+                )
+                return
+            if self.temp_softmax_stats_tensor is None or temp_attn_output is None:
+                raise RuntimeError("FP8 MLA context partition buffers are unavailable.")
+            trtllm_attention.forward_fp4_mla_context_partition(
+                q,
+                partition_k,
+                partition_v,
+                attn_metadata,
+                AttentionForwardArgs(
+                    attention_input_type=AttentionInputType.context_only,
+                    latent_cache=None,
+                    out_scale=self.out_scale,
+                    attention_mask=attention_mask,
+                    softmax_stats_tensor=self.temp_softmax_stats_tensor,
+                    chunked_prefill_buffer_batch_size=(
+                        attn_metadata.runtime_features.chunked_prefill_buffer_batch_size
+                    ),
+                    output=temp_attn_output,
                 ),
-                output=temp_attn_output,
+                kv_lens_cuda=kv_lens_cuda,
+                kv_lens_cpu=kv_lens_cpu,
+            )
+            trtllm_attention.merge_attention_for_mla(
+                attn_output,
+                temp_attn_output,
+                self.softmax_stats_tensor,
+                self.temp_softmax_stats_tensor,
+                merge_op,
+                attn_metadata,
             )
 
         for loop_idx in range(attn_metadata.chunked_loop_num):
+            cu_chunked_seq_len = attn_metadata.cu_chunked_seq_len[loop_idx]
             total_chunked_tokens = int(
                 attn_metadata.host_cu_chunked_seq_len[
                     loop_idx,
@@ -1440,47 +1527,38 @@ class MLA(nn.Module):
             chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
                 metadata=attn_metadata,
                 num_ctx_cached_tokens=total_chunked_tokens,
-                cu_chunked_seq_len=attn_metadata.cu_chunked_seq_len[loop_idx],
+                cu_chunked_seq_len=cu_chunked_seq_len,
                 chunked_global_offset=attn_metadata.chunked_global_offset[loop_idx],
                 chunked_max_seq_len=int(attn_metadata.max_chunk_len_per_loop[loop_idx]),
                 out_dtype=q.dtype,
             )
-            chunked_k, chunked_v = expand_kv(chunked_compressed_kv, chunked_k_pe)
-            temp_attn_output = trtllm_attention.forward_fp4_mla_context_partition(
-                q,
-                chunked_k,
-                chunked_v,
-                attn_metadata,
-                partition_forward_args(PredefinedAttentionMask.FULL),
-                kv_lens_cuda=attn_metadata.chunked_seq_len[loop_idx],
-                kv_lens_cpu=attn_metadata.host_chunked_seq_len[loop_idx],
+            chunked_k, chunked_k_pe, chunked_v = expand_kv(
+                chunked_compressed_kv,
+                chunked_k_pe,
             )
-            trtllm_attention.merge_attention_for_mla(
-                attn_output,
-                temp_attn_output,
-                self.softmax_stats_tensor,
-                self.temp_softmax_stats_tensor,
+            run_partition(
+                chunked_k,
+                chunked_k_pe,
+                chunked_v,
+                PredefinedAttentionMask.FULL,
+                attn_metadata.chunked_seq_len[loop_idx],
+                attn_metadata.host_chunked_seq_len[loop_idx],
+                attn_metadata.max_chunk_len_per_loop[loop_idx],
+                cu_chunked_seq_len if use_fused_split_k_merge else None,
                 attn_metadata.merge_op_tensor[loop_idx],
-                attn_metadata,
             )
 
-        current_k, current_v = expand_kv(compressed_kv, current_k_pe)
-        temp_attn_output = trtllm_attention.forward_fp4_mla_context_partition(
-            q,
+        current_k, current_k_pe, current_v = expand_kv(compressed_kv, current_k_pe)
+        run_partition(
             current_k,
+            current_k_pe,
             current_v,
-            attn_metadata,
-            partition_forward_args(PredefinedAttentionMask.CAUSAL),
-            kv_lens_cuda=attn_metadata.prompt_lens_cuda_runtime,
-            kv_lens_cpu=attn_metadata.prompt_lens_cpu_runtime,
-        )
-        trtllm_attention.merge_attention_for_mla(
-            attn_output,
-            temp_attn_output,
-            self.softmax_stats_tensor,
-            self.temp_softmax_stats_tensor,
+            PredefinedAttentionMask.CAUSAL,
+            attn_metadata.prompt_lens_cuda_runtime,
+            attn_metadata.prompt_lens_cpu_runtime,
+            attn_metadata.max_ctx_seq_len,
+            context_cu_q_seqlens,
             attn_metadata.merge_op_tensor[attn_metadata.chunked_loop_num],
-            attn_metadata,
         )
         return attn_output
 
