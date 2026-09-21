@@ -639,6 +639,8 @@ def launch_server(
         enable_runtime_control_endpoints: bool = False,
         runtime_control_api_key: Optional[str] = None):
 
+    if isinstance(server_role, str):
+        server_role = ServerRole[server_role.upper()]
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
     if server_role is not None:
@@ -647,6 +649,17 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
+
+    # MPI workers may predate this launcher process. Send the role through
+    # worker_main's explicit overrides instead of relying on env inheritance.
+    # Clear an inherited CTX role for unspecified-role servers.
+    if (server_role is not None or os.environ.get(
+            DisaggLauncherEnvs.TLLM_DISAGG_ROLE) == "context"):
+        llm_args["env_overrides"] = {
+            **(llm_args.get("env_overrides") or {}),
+            DisaggLauncherEnvs.TLLM_DISAGG_ROLE:
+            (server_role.name.lower() if server_role is not None else ""),
+        }
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
     # An attached frontend gets the launcher's socket from its spawn env; the
@@ -2864,6 +2877,10 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     role_map = {"ctx": "context", "gen": "generation"}
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role_map.get(
         server_cfg.type, "")
+    server_role = {
+        "ctx": ServerRole.CONTEXT,
+        "gen": ServerRole.GENERATION
+    }[server_cfg.type]
 
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
@@ -2882,6 +2899,7 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     launch_server(host=server_cfg.hostname,
                   port=server_cfg.port,
                   llm_args=llm_args,
+                  server_role=server_role,
                   **launch_kwargs)
 
 
