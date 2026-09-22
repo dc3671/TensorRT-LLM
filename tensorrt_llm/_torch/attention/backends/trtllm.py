@@ -3107,7 +3107,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         chunked_global_offset: torch.Tensor,
         chunked_max_seq_len: int,
         out_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        output_format: str = "dense",
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
@@ -3121,9 +3122,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 chunked_global_offset=chunked_global_offset,
                 chunked_max_seq_len=chunked_max_seq_len,
                 out_dtype=out_dtype,
+                output_format=output_format,
                 kv_lora_rank=self.mla_params.kv_lora_rank,
                 qk_rope_head_dim=self.mla_params.qk_rope_head_dim,
             )
+
+        if output_format != "dense":
+            raise ValueError(
+                "MXFP8 chunk gathering requires NVFP4 MLA storage.")
 
         if metadata.max_ctx_cached_token_len == 0:
             empty_kv = torch.empty((0, self.mla_params.kv_lora_rank),
