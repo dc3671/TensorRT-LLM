@@ -347,9 +347,9 @@ class Fp4MlaFmha(PhasedFmha):
         sm_version = get_sm_version()
         if sm_version != 107:
             reason = f"requires SM107, got SM{sm_version}"
-        elif attn.num_heads != 96 or attn.num_kv_heads != 96:
+        elif attn.num_heads <= 0 or attn.num_heads != attn.num_kv_heads:
             reason = (
-                "requires 96 Q/KV heads per rank (attention TP=1 for K3), "
+                "requires matching positive Q/KV head counts per rank, "
                 f"got {attn.num_heads}/{attn.num_kv_heads}"
             )
         elif attn.qk_nope_head_dim != 128 or attn.qk_rope_head_dim != 64 or attn.v_head_dim != 128:
@@ -397,12 +397,13 @@ class Fp4MlaFmha(PhasedFmha):
             self.attn.q_scaling
             * ((self.attn.qk_nope_head_dim or 0) + (self.attn.qk_rope_head_dim or 0)) ** 0.5
         )
+        num_heads = self.attn.num_heads
         torch.ops.trtllm.cute_dsl_k3_context_fmha_rubin(
-            q.view(q.shape[0], 96, 192),
-            k_nope.view(k_nope.shape[0], 96, 128),
+            q.view(q.shape[0], num_heads, 192),
+            k_nope.view(k_nope.shape[0], num_heads, 128),
             k_pe.view(k_pe.shape[0], 1, 64),
-            v.view(v.shape[0], 96, 128),
-            output.view(q.shape[0], 96, 128),
+            v.view(v.shape[0], num_heads, 128),
+            output.view(q.shape[0], num_heads, 128),
             cu_q_seqlens,
             cu_kv_seqlens,
             softmax_stats,
