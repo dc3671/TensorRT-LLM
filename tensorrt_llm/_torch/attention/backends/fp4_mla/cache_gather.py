@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Gather cached FP4 MLA prefix partitions for explicit-KV context attention."""
 
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import triton
@@ -28,8 +28,19 @@ def load_fp4_mla_chunked_kv_cache(
     out_dtype: torch.dtype,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather one cached-prefix partition from dense FP4 MLA V2 storage."""
+    output_format: Literal["dense", "mxfp8"] = "dense",
+) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Gather one cached-prefix partition from dense FP4 MLA V2 storage.
+
+    ``mxfp8`` preserves BF16 reconstruction, returning ((E4M3 [M,512],
+    UE8M0 [pad_up(M,128)*16]), E4M3 [M,64]). Scales use R128c4 K32
+    storage with K128 quantization; RoPE output uses unit FMHA scale.
+    """
+    if output_format not in ("dense", "mxfp8"):
+        raise ValueError(f"Unsupported FP4 MLA gather output format: {output_format}.")
+    quantize_mxfp8 = output_format == "mxfp8"
+    if quantize_mxfp8 and (out_dtype != torch.bfloat16 or kv_lora_rank != 512):
+        raise ValueError("MXFP8 gather requires BF16 reconstruction and kv_lora_rank=512.")
     if out_dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError(f"FP4 MLA chunk gather does not support output dtype {out_dtype}.")
     if num_ctx_cached_tokens < 0:
@@ -74,18 +85,25 @@ def load_fp4_mla_chunked_kv_cache(
     if cu_chunked_seq_len.device != chunked_global_offset.device:
         raise ValueError("FP4 MLA chunk gather metadata tensors must share one device.")
 
+    storage_dtype = torch.float8_e4m3fn if quantize_mxfp8 else out_dtype
     compressed_kv = torch.empty(
         (num_ctx_cached_tokens, kv_lora_rank),
-        dtype=out_dtype,
+        dtype=storage_dtype,
         device=cu_chunked_seq_len.device,
     )
     k_pe = torch.empty(
         (num_ctx_cached_tokens, qk_rope_head_dim),
-        dtype=out_dtype,
+        dtype=storage_dtype,
         device=cu_chunked_seq_len.device,
     )
+    if quantize_mxfp8:
+        compressed_sf = torch.empty(
+            (triton.cdiv(num_ctx_cached_tokens, 128) * 128 * (kv_lora_rank // 32),),
+            dtype=torch.uint8,
+            device=cu_chunked_seq_len.device,
+        )
     if num_ctx_cached_tokens == 0:
-        return compressed_kv, k_pe
+        return ((compressed_kv, compressed_sf), k_pe) if quantize_mxfp8 else (compressed_kv, k_pe)
 
     if not bool(getattr(metadata.fp4_mla_state, "device_page_table", False)):
         raise RuntimeError("FP4 MLA chunk gather requires fixed-stride device page metadata.")
@@ -116,6 +134,25 @@ def load_fp4_mla_chunked_kv_cache(
         )
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
     global_scale = _get_fp4_mla_global_scale(metadata, kv_cache.device)
+    if quantize_mxfp8:
+        from tensorrt_llm._torch.attention.kernels.rubin.fp4_mla_context_gather import gather_mxfp8
+
+        gather_mxfp8(
+            compressed_kv,
+            compressed_sf,
+            k_pe,
+            kv_cache,
+            sf_cache,
+            page_ids,
+            cu_chunked_seq_len,
+            chunked_global_offset,
+            global_scale,
+            chunked_max_seq_len,
+            metadata.page_size,
+            page_table_stride=page_table_stride,
+            num_contexts=num_contexts,
+        )
+        return (compressed_kv, compressed_sf), k_pe
     token_block = 16
     grid = (
         triton.cdiv(chunked_max_seq_len, token_block),

@@ -188,19 +188,22 @@ if IS_K3_CONTEXT_FMHA_AVAILABLE:
             raise ValueError("K3 context FMHA requires FP8 E4M3 Q/K/V inputs.")
         if output.dtype != torch.bfloat16:
             raise ValueError("K3 context FMHA requires BF16 output.")
-        if q.dim() != 3 or q.shape[1:] != (96, 192):
-            raise ValueError(f"Expected q [T, 96, 192], got {tuple(q.shape)}.")
-        if k_nope.dim() != 3 or k_nope.shape[1:] != (96, 128):
-            raise ValueError(f"Expected k_nope [T, 96, 128], got {tuple(k_nope.shape)}.")
+        if q.dim() != 3 or q.shape[1] <= 0 or q.shape[2] != 192:
+            raise ValueError(f"Expected q [T, H, 192] with H > 0, got {tuple(q.shape)}.")
+        num_heads = q.shape[1]
+        if k_nope.dim() != 3 or k_nope.shape[1:] != (num_heads, 128):
+            raise ValueError(f"Expected k_nope [T, {num_heads}, 128], got {tuple(k_nope.shape)}.")
         if k_pe.dim() != 3 or k_pe.shape[1:] != (1, 64):
             raise ValueError(f"Expected k_pe [T, 1, 64], got {tuple(k_pe.shape)}.")
-        if v.dim() != 3 or v.shape[1:] != (96, 128):
-            raise ValueError(f"Expected v [T, 96, 128], got {tuple(v.shape)}.")
-        if output.shape != (q.shape[0], 96, 128):
-            raise ValueError(f"Expected output {(q.shape[0], 96, 128)}, got {tuple(output.shape)}.")
-        if merge_stats.shape != (q.shape[0], 96, 2):
+        if v.dim() != 3 or v.shape[1:] != (num_heads, 128):
+            raise ValueError(f"Expected v [T, {num_heads}, 128], got {tuple(v.shape)}.")
+        if output.shape != (q.shape[0], num_heads, 128):
             raise ValueError(
-                f"Expected merge_stats {(q.shape[0], 96, 2)}, got {tuple(merge_stats.shape)}."
+                f"Expected output {(q.shape[0], num_heads, 128)}, got {tuple(output.shape)}."
+            )
+        if merge_stats.shape != (q.shape[0], num_heads, 2):
+            raise ValueError(
+                f"Expected merge_stats {(q.shape[0], num_heads, 2)}, got {tuple(merge_stats.shape)}."
             )
         if merge_stats.dtype != torch.float32:
             raise ValueError("merge_stats must be float32.")
