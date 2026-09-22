@@ -1223,7 +1223,7 @@ class MLA(nn.Module):
             and w.dtype == torch.bfloat16
             and tuple(w.shape) == expected_shape
             and w.numel() == expected_numel
-            and self.kv_b_proj.bias is None
+            and getattr(self.kv_b_proj, "bias", None) is None
         )
 
     def _get_kvbproj_head_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1436,6 +1436,30 @@ class MLA(nn.Module):
             and trtllm_attention.supports_k3_fp8_split_k_context()
         )
 
+        use_fp8_kv_b = (
+            use_fused_split_k_merge
+            and get_sm_version() == 107
+            and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+            and getattr(self.kv_b_proj, "bias", None) is None
+            and (
+                getattr(self.kv_b_proj, "supports_prequantized_input", False)
+                or (
+                    getattr(self.kv_b_proj, "quant_config", None) is not None
+                    and self.kv_b_proj.quant_config.quant_mode.has_fp8_block_scales()
+                    and (
+                        getattr(self.kv_b_proj, "use_cute_dsl_blockscaling_mm", False)
+                        or getattr(self.kv_b_proj, "disable_deep_gemm", False)
+                    )
+                )
+            )
+            and getattr(self.kv_b_proj, "weight", None) is not None
+            and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn
+            and getattr(self.kv_b_proj, "weight_scale", None) is not None
+            and self.kv_b_proj.weight_scale.dtype == torch.uint8
+        )
+
         # Match the FP8 KV path: fuse Q/K RoPE with the cache append, then
         # consume the rotated current K directly from latent_cache.
         trtllm_attention.append_fp4_mla_context_cache(q, latent_cache, attn_metadata)
@@ -1471,19 +1495,38 @@ class MLA(nn.Module):
             )
 
         def expand_kv(
-            partition_compressed_kv: torch.Tensor,
+            partition_compressed_kv: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
             partition_k_pe: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            partition_kv = self._project_context_kv(partition_compressed_kv)
+            if use_fp8_kv_b:
+                if isinstance(partition_compressed_kv, tuple):
+                    activation, activation_scale = partition_compressed_kv
+                else:
+                    activation, activation_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+                        partition_compressed_kv
+                    )
+                # NVFP4 MLA uses a fixed unit scale for the FP8 FMHA scratch.
+                # Keep the BF16 intermediate rounding inside the GEMM epilogue.
+                partition_kv = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                    activation,
+                    self.kv_b_proj.weight,
+                    activation_scale,
+                    self.kv_b_proj.weight_scale,
+                    output_dtype=torch.float8_e4m3fn,
+                )
+            else:
+                partition_kv = self._project_context_kv(partition_compressed_kv)
             if use_fused_split_k_merge:
                 if fp8_unit_scale is None:
                     raise RuntimeError("K3 split-K context FMHA requires an FP8 scale.")
-                partition_kv, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    partition_kv, fp8_unit_scale
-                )
-                partition_k_pe, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    partition_k_pe.contiguous(), fp8_unit_scale
-                )
+                if not use_fp8_kv_b:
+                    partition_kv, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                        partition_kv, fp8_unit_scale
+                    )
+                if partition_k_pe.dtype != torch.float8_e4m3fn:
+                    partition_k_pe, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                        partition_k_pe.contiguous(), fp8_unit_scale
+                    )
             partition_k_nope, partition_v = partition_kv.split(
                 [
                     self.num_context_heads * self.qk_nope_head_dim,
@@ -1593,6 +1636,7 @@ class MLA(nn.Module):
                 chunked_global_offset=attn_metadata.chunked_global_offset[loop_idx],
                 chunked_max_seq_len=int(attn_metadata.max_chunk_len_per_loop[loop_idx]),
                 out_dtype=q.dtype,
+                output_format="mxfp8" if use_fp8_kv_b else "dense",
             )
             chunked_k, chunked_k_pe, chunked_v = expand_kv(
                 chunked_compressed_kv,

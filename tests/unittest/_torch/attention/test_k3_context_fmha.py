@@ -187,7 +187,9 @@ def test_k3_context_old_o_barrier(run_fmha, q_len: int) -> None:
 @pytest.mark.parametrize(
     "q_len,is_causal", [(256, False), (257, False), (512, False), (8192, False), (257, True)]
 )
-def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool) -> None:
+@pytest.mark.parametrize("heads", [96, 48, 24, 12, 6, 3])
+def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool, heads: int) -> None:
+    from tensorrt_llm._torch.attention.backends.fmha.fp4_mla import Fp4MlaFmha
     from tensorrt_llm._torch.custom_ops.cute_dsl_k3_context_custom_ops import (
         CuteDSLK3ContextFmhaRunner,
     )
@@ -195,12 +197,29 @@ def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool) -> None:
     torch.manual_seed(q_len)
     q_lens = [q_len, 17]
     kv_lens = [384, 128]
-    nq, nk, heads = sum(q_lens), sum(kv_lens), 96
+    nq, nk = sum(q_lens), sum(kv_lens)
+
+    class Attention:
+        is_mla_enable = True
+        kv_lora_rank = 512
+        num_heads = heads
+        num_kv_heads = heads
+        qk_nope_head_dim = 128
+        qk_rope_head_dim = 64
+        v_head_dim = 128
+        q_scaling = 1.0
+
+    attn = Attention()
+    fmha = Fp4MlaFmha(attn)
+    assert fmha.supports_k3_fp8_split_k_context()
 
     def fp8(*shape):
         return (torch.randn(*shape, device="cuda") * 0.125).to(torch.float8_e4m3fn)
 
-    q, k, k_pe, v = fp8(nq, heads, 192), fp8(nk, heads, 128), fp8(nk, 1, 64), fp8(nk, heads, 128)
+    q, k_pe = fp8(nq, heads, 192), fp8(nk, 1, 64)
+    # Match the noncompact K/V views produced by the combined KV-B projection.
+    kv = fp8(nk, 2 * heads * 128)
+    k, v = (part.view(nk, heads, 128) for part in kv.chunk(2, dim=-1))
     cu_q = torch.tensor([0, q_len, nq], dtype=torch.int32, device="cuda")
     cu_k = torch.tensor([0, kv_lens[0], nk], dtype=torch.int64, device="cuda")
     output = torch.empty((nq, heads, 128), dtype=torch.bfloat16, device="cuda")
@@ -209,6 +228,7 @@ def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool) -> None:
     old_max = torch.zeros_like(stats[..., 0])
     old_sum = torch.full_like(old_max, 256)
     expected, expected_lse = [], []
+    expected_current, expected_current_lse = [], []
     q_start = k_start = 0
     for q_size, k_size in zip(q_lens, kv_lens):
         full_k = torch.cat(
@@ -241,6 +261,24 @@ def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool) -> None:
         ) / merged_sum[..., None]
         expected.append(merged)
         expected_lse.append(merged_max + merged_sum.log())
+        current_sum = weights.sum(-1).T
+        current_output = (
+            torch.einsum("hqk,khd->qhd", weights, v[k_start : k_start + k_size].float())
+            / current_sum[..., None]
+        )
+        if is_causal:
+            # Short causal prefixes fit in one 128-key tile. Model the kernel's
+            # E4M3 P rounding (prescale=256, unrounded denominator) explicitly:
+            # the FP32-only reference misses this error even with 96 heads.
+            prefix = min(q_size, 128)
+            p = (scores[:, :prefix] - cur_max[:prefix].T[..., None]).exp()
+            p_quantized = (p * 256).to(torch.float8_e4m3fn).float() / 256
+            current_output[:prefix] = (
+                torch.einsum("hqk,khd->qhd", p_quantized, v[k_start : k_start + k_size].float())
+                / p.sum(-1).T[..., None]
+            )
+        expected_current.append(current_output)
+        expected_current_lse.append(merged_max + current_sum.log())
         q_start += q_size
         k_start += k_size
     expected, expected_lse = torch.cat(expected), torch.cat(expected_lse)
@@ -250,20 +288,19 @@ def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool) -> None:
         output.copy_(old_output)
         stats[..., 0].copy_(old_max)
         stats[..., 1].copy_(old_sum)
-        torch.ops.trtllm.cute_dsl_k3_context_fmha_rubin(
-            q,
-            k,
+        fmha.forward_k3_fp8_split_k_context_partition(
+            q.flatten(1),
+            k.flatten(1),
             k_pe,
-            v,
-            output,
-            cu_q,
-            cu_k.to(dtype),
+            v.flatten(1),
+            output.flatten(1),
             stats,
             op,
-            max(q_lens),
-            max(kv_lens),
-            1.0 / math.sqrt(192),
-            is_causal,
+            cu_q,
+            cu_k.to(dtype),
+            max_q_len=max(q_lens),
+            max_kv_len=max(kv_lens),
+            is_causal=is_causal,
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(output.float(), expected, atol=2e-3, rtol=2e-2)
@@ -276,3 +313,73 @@ def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool) -> None:
             assert compiled is cache_entries[dtype]
         cache_entries[dtype] = compiled
     assert cache_entries[torch.int32] is not cache_entries[torch.int64]
+
+    # Exercise initialization and skip as well as the merge path above.
+    output.fill_(torch.nan)
+    stats.fill_(torch.nan)
+    op.fill_(2)
+    fmha.forward_k3_fp8_split_k_context_partition(
+        q.flatten(1),
+        k.flatten(1),
+        k_pe,
+        v.flatten(1),
+        output.flatten(1),
+        stats,
+        op,
+        cu_q,
+        cu_k,
+        max_q_len=max(q_lens),
+        max_kv_len=max(kv_lens),
+        is_causal=is_causal,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), torch.cat(expected_current), atol=2e-3, rtol=2e-2)
+    torch.testing.assert_close(
+        stats[..., 0] + stats[..., 1].log(),
+        torch.cat(expected_current_lse),
+        atol=3e-4,
+        rtol=1e-5,
+    )
+    if is_causal:
+        # Same logical heads through the original 96-head specialization must
+        # agree exactly, independently of the FP8-vs-FP32 reference tolerance.
+        repeats = 96 // heads
+        baseline_output = torch.empty((nq, 96, 128), dtype=output.dtype, device="cuda")
+        baseline_stats = torch.empty((nq, 96, 2), device="cuda")
+        torch.ops.trtllm.cute_dsl_k3_context_fmha_rubin(
+            torch.cat([q] * repeats, dim=1),
+            torch.cat([k] * repeats, dim=1),
+            k_pe,
+            torch.cat([v] * repeats, dim=1),
+            baseline_output,
+            cu_q,
+            cu_k,
+            baseline_stats,
+            op,
+            max(q_lens),
+            max(kv_lens),
+            1.0 / math.sqrt(192),
+            True,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, baseline_output[:, :heads], atol=0, rtol=0)
+        torch.testing.assert_close(stats, baseline_stats[:, :heads], atol=0, rtol=0)
+    saved_output, saved_stats = output.clone(), stats.clone()
+    op.zero_()
+    fmha.forward_k3_fp8_split_k_context_partition(
+        q.flatten(1),
+        k.flatten(1),
+        k_pe,
+        v.flatten(1),
+        output.flatten(1),
+        stats,
+        op,
+        cu_q,
+        cu_k,
+        max_q_len=max(q_lens),
+        max_kv_len=max(kv_lens),
+        is_causal=is_causal,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, saved_output, atol=0, rtol=0)
+    torch.testing.assert_close(stats, saved_stats, atol=0, rtol=0)
