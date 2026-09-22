@@ -14488,11 +14488,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          use_tvm_ffi: bool = True):
                 super().__init__()
 
-                if output_dtype != torch.bfloat16:
+                if output_dtype != torch.bfloat16 and not (
+                        self.gemm_name == "MXFP8"
+                        and output_dtype == torch.float8_e4m3fn):
                     raise ValueError(
-                        f"CuteDSL {self.gemm_name} only supports bfloat16 output, "
+                        f"CuteDSL {self.gemm_name} does not support output dtype "
                         f"got {output_dtype}")
                 self.output_dtype = output_dtype
+                self.c_dtype = (cutlass.Float8E4M3FN if output_dtype
+                                == torch.float8_e4m3fn else cutlass.BFloat16)
                 self.to_userbuffers = to_userbuffers
                 self.use_tvm_ffi = use_tvm_ffi
 
@@ -14558,12 +14562,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     return []
 
                 # Both swap orientations use the original N as C's physical
-                # contiguous dimension and require 16-byte BF16 alignment.
-                output_aligned = (n % 8 == 0)
+                # contiguous dimension and require 16-byte output alignment.
+                output_alignment = 16 if self.output_dtype == torch.float8_e4m3fn else 8
+                output_aligned = n % output_alignment == 0
                 if not output_aligned:
                     logger.debug(
                         f"CuteDSL: Output N={n} does not meet the 16-byte "
-                        f"alignment requirement (N%8={n%8}). Skipping all tactics."
+                        f"alignment requirement (N%{output_alignment}={n % output_alignment}). Skipping all tactics."
                     )
                     return []
 
@@ -14644,7 +14649,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 self.a_dtype,
                                 self.b_dtype,
                                 self.sf_dtype,
-                                cutlass.BFloat16,
+                                self.c_dtype,
                                 a_major,
                                 b_major,
                                 c_major,
@@ -14702,7 +14707,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             self.a_dtype,
                             self.b_dtype,
                             self.sf_dtype,
-                            cutlass.BFloat16,
+                            self.c_dtype,
                             a_major,
                             b_major,
                             c_major,
@@ -14976,7 +14981,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 b_sf_ptr = self.make_cute_dsl_global_pointer(
                     b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                 c_ptr = self.make_cute_dsl_global_pointer(
-                    c_tensor, cutlass.BFloat16, 16)
+                    c_tensor, self.c_dtype, 16)
 
                 # get stream
                 torch_stream = torch.cuda.current_stream()
@@ -15056,7 +15061,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_preferred_clusters = get_max_activate_clusters(
                         preferred_cluster_shape_mn[0] *
                         preferred_cluster_shape_mn[1])
-                cache_key = (kernel_variant, sf_vec_size, mma_tiler_mnk,
+                cache_key = (self.output_dtype, kernel_variant, sf_vec_size, mma_tiler_mnk,
                              mma_inst_shape, preferred_cluster_shape_mn,
                              cluster_shape_mn, swap_ab, use_prefetch,
                              raster_order, scheduler_mode, split_k,
@@ -15079,7 +15084,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         b_sf_ptr = self.make_cute_dsl_global_pointer(
                             b_sf_tensor, self.sf_dtype, self.sf_assumed_align)
                         c_ptr = self.make_cute_dsl_global_pointer(
-                            c_tensor, cutlass.BFloat16, 16)
+                            c_tensor, self.c_dtype, 16)
                         alpha_cute_tensor = cute.runtime.from_dlpack(
                             alpha_tensor)
                         # make faked stream
@@ -15341,10 +15346,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """Run the SM107 dense MXFP8 GEMM with K32 R128c4 UE8M0 scales.
 
             ``fine_grained_m`` enables Kimi K3's 16-token low-M tuning buckets.
+            FP8 output preserves BF16 intermediate rounding and uses unit
+            output scale, for the NVFP4 MLA context FMHA scratch.
             """
-            if output_dtype != torch.bfloat16:
+            if output_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
                 raise ValueError(
-                    f"CuteDSL MXFP8 only supports bfloat16 output, got "
+                    f"CuteDSL MXFP8 supports bfloat16 or float8_e4m3fn output, got "
                     f"{output_dtype}")
             if (sm_version := get_sm_version()) != 107:
                 raise ValueError(
@@ -15382,7 +15389,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ) -> torch.Tensor:
             shape = list(mat_a.shape)
             shape[-1] = mat_b.shape[-2]
-            return mat_a.new_empty(shape, dtype=torch.bfloat16)
+            return mat_a.new_empty(shape, dtype=output_dtype)
 
         @torch.library.custom_op(
             "trtllm::cute_dsl_mxfp8_gemm_inplace_rubin",

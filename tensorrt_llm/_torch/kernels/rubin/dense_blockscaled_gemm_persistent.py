@@ -50,6 +50,8 @@ from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from .fp8_output_epilogue import epilogue_tma_store_fp8
+
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, ".."))
@@ -859,6 +861,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         self.b_dtype: Type[cutlass.Numeric] = b_ptr.value_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa_ptr.value_type
         self.c_dtype: Type[cutlass.Numeric] = c_ptr.value_type
+        if cutlass.const_expr(self.c_dtype == cutlass.Float8E4M3FN):
+            assert self.sf_dtype == cutlass.Float8E8M0FNU
+            assert self.a_dtype == cutlass.Float8E4M3FN
+            assert self.b_dtype == cutlass.Float8E4M3FN
 
         m, n, k, l = problem_mnkl
         self.a_major_mode, self.b_major_mode, self.c_layout = layouts
@@ -1200,7 +1206,10 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         """
         GPU device kernel implementation performing the Persistent batched GEMM computation.
         """
-        alpha_value = alpha[0].to(self.c_dtype)
+        alpha_dtype = self.c_dtype
+        if cutlass.const_expr(self.c_dtype == cutlass.Float8E4M3FN):
+            alpha_dtype = cutlass.BFloat16
+        alpha_value = alpha[0].to(alpha_dtype)
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1942,7 +1951,11 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     work_tile = tile_sched.get_current_work()
                 epi_tiles_executed += 1
 
-                acc_consumer_state = utils.gemm.sm100.epilogue_tma_store(
+                epilogue_store = utils.gemm.sm100.epilogue_tma_store
+                store_op = lambda x: epilogue_op(alpha_value * x)
+                if cutlass.const_expr(self.c_dtype == cutlass.Float8E4M3FN):
+                    epilogue_store = epilogue_tma_store_fp8
+                acc_consumer_state = epilogue_store(
                     self,
                     tidx,
                     warp_idx,
@@ -1952,7 +1965,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
                     tCgC,
                     epi_tile,
                     epi_tiles_executed,
-                    lambda x: epilogue_op(alpha_value * x),
+                    store_op,
                     mma_tile_coord_mnl,
                     acc_consumer_state,
                     acc_pipeline,
@@ -2119,6 +2132,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             cutlass.Float32,
             cutlass.Float16,
             cutlass.BFloat16,
+            cutlass.Float8E4M3FN,
         }:
             raise testing.CantImplementError(f"Unsupported output data type: {c_dtype}")
 
