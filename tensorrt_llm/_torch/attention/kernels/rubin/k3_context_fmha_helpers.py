@@ -1124,11 +1124,9 @@ def ex2_emulation_packed_f32x2(
     # is at the rightest place
     # We want to round down here, so that the fractional part is in [0, 1)
     xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
-    cute.nvgpu.warp_switch()  # {$nv-internal-release}
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
     xy_rounded_back = cute.arch.sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
-    cute.nvgpu.warp_switch()  # {$nv-internal-release}
     xy_frac = cute.arch.sub_packed_f32x2(xy_clamped, xy_rounded_back)
 
     @dsl_user_op
@@ -1147,7 +1145,6 @@ def ex2_emulation_packed_f32x2(
         out = (coeff[deg], coeff[deg])
         for i in cutlass.range_constexpr(deg - 1, -1, -1):
             out = cute.arch.fma_packed_f32x2(out, (x, y), (coeff[i], coeff[i]), loc=loc, ip=ip)
-            cute.nvgpu.warp_switch()  # {$nv-internal-release}
         return out
 
     xy_frac_ex2 = polynomial_deg3_packed_f32x2(*xy_frac, loc=loc, ip=ip)
@@ -1156,7 +1153,6 @@ def ex2_emulation_packed_f32x2(
     def combine_int_frac_ex2(
         x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=None
     ) -> Float32:
-        # {$nv-internal-release begin}
         # x_rounded, S is the sign bit, N is a bit we don't care about
         # X are bits of the integer
         # |  S   | 10010110 | NSSSSSSSSSSSSSSEEEEEEEE |
@@ -1175,7 +1171,6 @@ def ex2_emulation_packed_f32x2(
         # the frac_ex2 * 2^(integer part) is the final result
         # We can directly add the exponent part
         # as the result is also a normalized FP32 number
-        # {$nv-internal-release end}
         return cutlass.Float32(
             llvm.inline_asm(
                 T.f32(),
@@ -1204,10 +1199,6 @@ def ex2_emulation_packed_f32x2(
     return x_out, y_out
 
 
-# {$nv-internal-release begin}
-# Temporary function for converting float32x4 to float8x4 to eliminate extra PRMTs
-# due to the issue from nvvm. Will be removed once the issue is fixed.
-# {$nv-internal-release end}
 @cute.jit
 def cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8_type, *, loc=None, ip=None):
     fp32x4 = fp32x4.load()
@@ -1246,10 +1237,6 @@ def cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8_type, *, loc=None, ip=None):
     return packed_i32
 
 
-# {$nv-internal-release begin}
-# Temporary function for converting float32x4 to float8x4 to eliminate extra PRMTs
-# due to the issue from nvvm. Will be removed once the issue is fixed.
-# {$nv-internal-release end}
 @cute.jit
 def cvt_f32x4_to_f8x4(fp32x4, fp8x4, *, loc=None, ip=None):
     packed_i32 = cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8x4.element_type)
