@@ -340,6 +340,7 @@ class RubinFusedMultiHeadAttentionForward:
         # But sometimes, compiler will schedule the barrier at an unexpected place
         # if it hurts perf a lot, try to quickly fix it by disabling seq barrier
         self.enable_sequence_barrier = False
+        self.enable_sequence_barrier = True
         # Optional double buffering for correction rescale.
         self.enable_correction_double_buffer = False
 
