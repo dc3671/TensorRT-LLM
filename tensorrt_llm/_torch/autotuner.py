@@ -1218,7 +1218,6 @@ class AutoTuner:
         if self._should_current_rank_tune(
                 tuning_config.distributed_tuning_strategy):
             for p in profiles:
-                tensors = self._prepare_input_tensors(p, inputs)
                 is_cache_hit, *_ = self.profiling_cache.search_cache(
                     custom_op,
                     runners,
@@ -1227,6 +1226,9 @@ class AutoTuner:
                     apply_map_to_tuning_buckets=False,
                 )
                 if not is_cache_hit:
+                    # Random profiling inputs only on a miss: with a warm cache they were built for every
+                    # profile of every op call and dropped (~1 min of K3 CTX warmup).
+                    tensors = self._prepare_input_tensors(p, inputs)
                     # Initialize runner and tactic as None in case of no valid tactic or runners are found
                     with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
                         best_runner_id, best_tactic, min_time, has_tuning_failure_occurred = self._profile_runners(
