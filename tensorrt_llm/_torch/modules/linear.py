@@ -22,7 +22,8 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     BufferKind, mxfp8_quantize_gemm_autotuned)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
-from tensorrt_llm._utils import is_device_integrated, mpi_disabled
+from tensorrt_llm._utils import (is_device_integrated, mpi_disabled,
+                                 prefer_pinned)
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
@@ -207,6 +208,27 @@ def _uses_marlin_nvfp4_backend(module) -> bool:
             and hasattr(torch.ops.trtllm, "gptq_marlin_repack"))
 
 
+def weight_to_device(tensor: torch.Tensor,
+                     device: torch.device) -> torch.Tensor:
+    """Copy a checkpoint tensor to ``device``.
+
+    TRTLLM_PINNED_WEIGHT_LOAD=1 stages a pageable CPU tensor of >= 64 KiB in
+    pinned memory and copies it asynchronously: per-tensor pageable copies of
+    mmapped checkpoint tensors measured ~1 GB/s per rank on GB300. The caching
+    host allocator reuses a staging block only after its copy completes.
+    """
+    if (device.type == "cuda" and tensor.device.type == "cpu"
+            and os.environ.get("TRTLLM_PINNED_WEIGHT_LOAD", "0") == "1"
+            and tensor.numel() * tensor.element_size() >= 65536
+            and not tensor.is_pinned()):
+        staged = torch.empty(tensor.shape,
+                             dtype=tensor.dtype,
+                             pin_memory=prefer_pinned())
+        staged.copy_(tensor)
+        return staged.to(device, non_blocking=True)
+    return tensor.to(device)
+
+
 def load_weight_shard(
     weight,
     tensor_parallel_size: int = 1,
@@ -237,9 +259,10 @@ def load_weight_shard(
                                           indices: list[slice] | None = None):
             if indices is None:
                 # Avoid unnecessary copy
-                result = (tensor.to(device), [slice(d) for d in tensor.shape])
+                result = (weight_to_device(tensor, device),
+                          [slice(d) for d in tensor.shape])
             else:
-                result = (tensor[indices].to(device), indices)
+                result = (weight_to_device(tensor[indices], device), indices)
             return result if return_slice_indices else result[0]
 
     # WAR to check whether it is a safetensor slice since safetensor didn't register the type to the module
@@ -249,7 +272,7 @@ def load_weight_shard(
 
         def maybe_convert_to_torch_tensor(
             tensor, indices: Union[slice, tuple[slice]] = slice(None)):
-            return tensor[indices].to(device)
+            return weight_to_device(tensor[indices], device)
     else:
         raise ValueError(f'unsupported weight type: {type(weight)}')
     if tensor_parallel_mode is None or tensor_parallel_size <= 1:
@@ -4463,9 +4486,9 @@ class Linear(nn.Module):
                                               | None = None):
                 if indices is None:
                     # Avoid unnecessary copy
-                    return tensor.to(device)
+                    return weight_to_device(tensor, device)
                 else:
-                    return tensor[indices].to(device)
+                    return weight_to_device(tensor[indices], device)
 
         # WAR to check whether it is a safetensor slice since safetensor didn't register the type to the module
         # safetensors slice, supports lazy loading, type(weight) is `builtin.PySafeSlice`
@@ -4474,7 +4497,7 @@ class Linear(nn.Module):
 
             def maybe_convert_to_torch_tensor(
                 tensor, indices: Union[slice, tuple[slice]] = slice(None)):
-                return tensor[indices].to(device)
+                return weight_to_device(tensor[indices], device)
         else:
             raise ValueError(f'unsupported weight type: {type(weight)}')
         if self.tp_mode is None or self.tp_size <= 1:
