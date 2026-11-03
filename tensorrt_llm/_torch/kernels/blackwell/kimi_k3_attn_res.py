@@ -49,6 +49,14 @@ boundary. The kernel releases its dependent grid right after its own ``griddepco
 the next kernel (the decode projection GEMM or the router) can become resident and stream its
 weights while this one finishes; that is safe for every dependent that, as PDL requires, writes
 no global memory and reads no output of this kernel before its own ``griddepcontrol.wait``.
+
+``entry_trigger`` releases the dependent at kernel entry instead and prefers the largest
+shared-memory carve-out, so that a projection which holds its whole weight slice on chip before
+its wait (``fp8_block_scale_low_m_gemm.weights_on_chip``) becomes resident and streams its weights
+while this kernel and the grid before it still run, also on the SMs of this kernel's CTAs. The
+dependent, and the grids it releases before its own wait, must then read before their wait only
+memory no grid still running writes (weights, and for the KDA verify kernel the state, conv
+windows and replay rows of the previous step).
 """
 
 from __future__ import annotations
@@ -551,6 +559,7 @@ class KimiK3AttnResKernel:
         hidden: int,
         mxfp8: bool = False,
         in_place_addend: bool = False,
+        entry_trigger: bool = False,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -562,6 +571,7 @@ class KimiK3AttnResKernel:
             raise ValueError("the in-place all-reduce addend is an ADD_PREFIX variant")
         self.mxfp8 = mxfp8
         self.in_place_addend = in_place_addend
+        self.entry_trigger = entry_trigger
         self.n = num_candidates
         self.k = num_candidates - 1
         self.c = cluster
@@ -629,6 +639,7 @@ class KimiK3AttnResKernel:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             use_pdl=True,
+            preferred_smem_carveout=100 if self.entry_trigger else None,
         )
 
     @cute.kernel
@@ -661,6 +672,8 @@ class KimiK3AttnResKernel:
         outsq_smem = storage.outsq.data_ptr().toint()
         mbar_smem = storage.mbar.data_ptr().toint()
 
+        if cutlass.const_expr(self.entry_trigger):
+            _griddepcontrol_launch_dependents()
         token = bidx // c
         rank = bidx - token * c
         if tidx == 0:
@@ -745,7 +758,8 @@ class KimiK3AttnResKernel:
 
         # ---- wait for the previous grid, then release the dependent grid ----
         _griddepcontrol_wait()
-        _griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.entry_trigger):
+            _griddepcontrol_launch_dependents()
 
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
             pre = unpack(load(layer_addr + row + col, False))
@@ -856,8 +870,11 @@ def _compiled(
     hidden: int,
     mxfp8: bool,
     in_place_addend: bool,
+    entry_trigger: bool = False,
 ):
-    kernel = KimiK3AttnResKernel(num_candidates, add_mode, cluster, hidden, mxfp8, in_place_addend)
+    kernel = KimiK3AttnResKernel(
+        num_candidates, add_mode, cluster, hidden, mxfp8, in_place_addend, entry_trigger
+    )
     addr = Int64(1 << 20)
     return cute.compile(
         kernel,
@@ -934,6 +951,7 @@ def run_attn_res(
     *,
     mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
     in_place_addend: tuple[int, int] | None = None,
+    entry_trigger: bool = False,
 ) -> None:
     """Launch on the current stream with PDL (inputs are not re-validated; see :func:`can_run`).
 
@@ -954,6 +972,7 @@ def run_attn_res(
             ``()``): ``bf16(layer + addend)`` with the ``[M, H]`` result of the pushed two-shot
             all-reduce finished in place last on the workspace. The next all-reduce on the
             workspace re-arms that buffer, so it must not start before this kernel completed.
+        entry_trigger: release the dependent at kernel entry (see the module docstring).
     """
     if in_place_addend is not None and addends:
         raise ValueError("pass either addends or in_place_addend")
@@ -967,6 +986,7 @@ def run_attn_res(
         hidden,
         mxfp8_out is not None,
         in_place_addend is not None,
+        entry_trigger,
     )
     if in_place_addend is not None:
         add_addr, add2_addr = in_place_addend

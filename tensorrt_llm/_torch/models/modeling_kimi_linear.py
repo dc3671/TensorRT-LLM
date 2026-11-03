@@ -631,6 +631,7 @@ def _attn_res_decode_kernel(
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
     mxfp8: bool = False,
+    entry_trigger: bool = False,
 ) -> Optional[Tuple[Optional[torch.Tensor], ...]]:
     """``(updated prefix sum or None, normed mix)`` from the decode attention-residual kernel
     (``kimi_k3_attn_res``: PDL prologue, cluster per token) where ``_attn_res_kernel`` picks it,
@@ -639,7 +640,8 @@ def _attn_res_decode_kernel(
     ``addends``: ``()``; ``(addend,)`` for ``layer + addend``, where ``addend`` may be an
     all-reduce result left in its workspace (read in place); ``(routed, shared)`` for the MoE
     residual update ``layer + bf16(routed + shared)``. With ``mxfp8`` (MoE residual update only)
-    the result also holds the MXFP8 form ``(activation, scale)`` of the normed mix.
+    the result also holds the MXFP8 form ``(activation, scale)`` of the normed mix, and
+    ``entry_trigger`` releases its consumer at kernel entry (``kimi_k3_attn_res``).
     """
     num_candidates = int(block_residual.shape[0]) + 1
     if _attn_res_kernel(layer, num_candidates) is not _AttnResKernel.DECODE:
@@ -671,7 +673,7 @@ def _attn_res_decode_kernel(
         )
     if mxfp8:
         return torch.ops.trtllm.kimi_k3_attn_res_moe_add_rmsnorm_mxfp8(
-            layer, *addends, block_residual, *weights, eps, out_eps
+            layer, *addends, block_residual, *weights, eps, out_eps, entry_trigger
         )
     return torch.ops.trtllm.kimi_k3_attn_res_moe_add_rmsnorm(
         layer, *addends, block_residual, *weights, eps, out_eps
@@ -1059,6 +1061,19 @@ class _Fp8BlockScaleWeightReadLinear(
         :meth:`forward` and the GEMM skips the quantization."""
         return 1 <= num_rows <= self._low_m.max_m
 
+    def stages_weights(self, num_rows: int) -> bool:
+        """Whether :meth:`forward_prequantized` with ``stage_weights`` holds each CTA's whole
+        weight slice on chip before its ``griddepcontrol.wait`` for ``num_rows`` rows
+        (``fp8_block_scale_low_m_gemm.weights_on_chip``), so that its producer may release it at
+        the producer's entry."""
+        from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+
+        return self.takes_prequantized_input(num_rows) and (
+            fp8_block_scale_low_m_gemm.weights_on_chip(
+                num_rows, self.out_features, self.in_features
+            )
+        )
+
     @staticmethod
     def quantize_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """BF16 ``[out, in]`` weight -> (FP8 weight, backend-ready scale).
@@ -1313,11 +1328,13 @@ class _Fp8BlockScaleWeightReadLinear(
         self,
         activation: torch.Tensor,
         activation_scale: torch.Tensor,
+        stage_weights: bool = False,
     ) -> torch.Tensor:
         """Project an FP8 activation a fused producer already quantized.
 
         Runs the low-M GEMM where :meth:`takes_prequantized_input`, the CuTe MXFP8 GEMM at any
-        other row count where :attr:`supports_prequantized_input`.
+        other row count where :attr:`supports_prequantized_input`. ``stage_weights``: the low-M
+        GEMM holds its weights on chip before its wait where :meth:`stages_weights` (same bits).
 
         Args:
             activation: ``[..., in_features]`` ``float8_e4m3fn`` activation.
@@ -1333,7 +1350,11 @@ class _Fp8BlockScaleWeightReadLinear(
         num_rows = activation_flat.shape[0]
         if self.takes_prequantized_input(num_rows):
             out = torch.ops.trtllm.fp8_block_scale_low_m_gemm_prequantized(
-                activation_flat, activation_scale, self.weight, self._low_m_weight_scale
+                activation_flat,
+                activation_scale,
+                self.weight,
+                self._low_m_weight_scale,
+                stage_weights,
             )
         elif not self.supports_prequantized_input:
             raise RuntimeError(f"no GEMM for a prequantized Kimi K3 activation of {num_rows} rows")
@@ -2764,6 +2785,10 @@ class KimiLinearDecoderLayer(nn.Module):
             if capture is None and num_snapshots > 0:
                 num_rows = hidden_states.residual.shape[0]
                 attention = self.linear_attn if self.is_kda else self.self_attn
+                # Under row slicing the mixer reads the gathered rows, not this rank's.
+                mxfp8 = sliced is None and attention.takes_prequantized_input(
+                    num_rows, attn_metadata
+                )
                 folded = _attn_res_decode_kernel(
                     hidden_states.residual,
                     (hidden_states.routed, hidden_states.shared),
@@ -2771,9 +2796,9 @@ class KimiLinearDecoderLayer(nn.Module):
                     self.self_attention_res_proj,
                     self.self_attention_res_norm,
                     self.input_layernorm,
-                    # Under row slicing the mixer reads the gathered rows, not this rank's.
-                    mxfp8=sliced is None
-                    and attention.takes_prequantized_input(num_rows, attn_metadata),
+                    mxfp8=mxfp8,
+                    # A KDA QKVG GEMM holding its weights on chip starts beside the mix.
+                    entry_trigger=mxfp8 and self.is_kda and attention.qkvg_stages_weights(num_rows),
                 )
                 if folded is not None:
                     hidden_states, normed, *attn_input_mxfp8 = folded
@@ -4260,7 +4285,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     _swap_linear_to_fp8_weight_read(attention, name, (TrtllmLinear,), *reduction)
             fused = getattr(attention, "qkvg_proj", None)
             if isinstance(fused, _Fp8BlockScaleWeightReadLinear):
-                attention.accept_prequantized_qkvg_input(fused.takes_prequantized_input)
+                attention.accept_prequantized_qkvg_input(
+                    fused.takes_prequantized_input, fused.stages_weights
+                )
                 offset = 0
                 for name in ("q_proj", "k_proj", "v_proj", "g_proj"):
                     projection = getattr(attention, name)
