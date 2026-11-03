@@ -277,10 +277,7 @@ def gather_mxfp8(
     num_contexts=None,
 ):
     """Gather canonical page-128 FP4 storage; prefix lengths and page strides are dynamic."""
-    from ...attention_backend.fp4_mla.fp4_mla_cutedsl_v_repack import (
-        _compile_cutedsl,
-        _current_cu_stream,
-    )
+    from ...backends.fp4_mla.cute_dsl_utils import _compile_cutedsl, _current_cu_stream
 
     if (
         page_size != 128
