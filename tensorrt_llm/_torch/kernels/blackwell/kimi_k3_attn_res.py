@@ -59,7 +59,9 @@ writer and the previous call's readers included, has completed by then. The kern
 its dependent grid right after its own ``griddepcontrol.wait``, so the next kernel (the decode
 projection GEMM or the router) can become resident and stream its weights while this one
 finishes; that is safe for every dependent that, as PDL requires, writes
-no global memory and reads no output of this kernel before its own ``griddepcontrol.wait``.
+no global memory and reads no output of this kernel before its own ``griddepcontrol.wait``. With
+``entry_trigger`` (a finishing mix) it releases the dependent at kernel entry instead, for a
+dependent that before its own wait also reads only weights (the Kimi-K3 MoE front's head).
 """
 
 from __future__ import annotations
@@ -558,6 +560,7 @@ class KimiK3AttnResKernel:
     (one-shot) does so before the grid wait; ``finish_chunk`` / ``finish_sanitize``: the slot
     sums in the order of another C++ transport. ``finish_all_gather`` (``ADD_MOE``): the call
     is an all-gather call, ``routed`` its all-gather row and ``shared`` its slot sum.
+    ``entry_trigger`` (with ``finish_world``): release the dependent grid at kernel entry.
     """
 
     def __init__(
@@ -574,6 +577,7 @@ class KimiK3AttnResKernel:
         finish_chunk: int = 0,
         finish_sanitize: bool = False,
         finish_all_gather: bool = False,
+        entry_trigger: bool = False,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -591,6 +595,9 @@ class KimiK3AttnResKernel:
             raise ValueError("early_poll, sum orders and all-gather calls are one-shot only")
         if finish_all_gather and not finish_world:
             raise ValueError("finish_all_gather needs finish_world")
+        if entry_trigger and not finish_world:
+            raise ValueError("entry_trigger needs finish_world")
+        self.entry_trigger = entry_trigger
         self.mxfp8 = mxfp8
         self.in_place_addend = in_place_addend
         self.finish_world = finish_world
@@ -705,6 +712,8 @@ class KimiK3AttnResKernel:
         last_smem = storage.last.data_ptr().toint()
         outsq_smem = storage.outsq.data_ptr().toint()
         mbar_smem = storage.mbar.data_ptr().toint()
+        if cutlass.const_expr(self.entry_trigger):
+            _griddepcontrol_launch_dependents()
 
         token = bidx // c
         rank = bidx - token * c
@@ -794,7 +803,8 @@ class KimiK3AttnResKernel:
         # the mix, before the first store) ----
         if cutlass.const_expr(not self.early_poll):
             _griddepcontrol_wait()
-            _griddepcontrol_launch_dependents()
+            if cutlass.const_expr(not self.entry_trigger):
+                _griddepcontrol_launch_dependents()
 
         state = None
         finished = []
@@ -920,7 +930,8 @@ class KimiK3AttnResKernel:
         if cutlass.const_expr(self.early_poll):
             # The output buffers may reuse memory the producer, or a grid before it, still reads.
             _griddepcontrol_wait()
-            _griddepcontrol_launch_dependents()
+            if cutlass.const_expr(not self.entry_trigger):
+                _griddepcontrol_launch_dependents()
             _stg_v4_if(valid, upd_addr + row + col, upd_words)
         _stg_v4_if(valid, out_addr + row + col, words)
         if cutlass.const_expr(self.mxfp8):
@@ -967,7 +978,8 @@ class AllReduceFinish(NamedTuple):
     (``two_shot``) and whether the kernel finishes it before its grid wait (``early_poll``).
     One-shot calls may sum ``chunk`` ranks at a time and ``sanitize`` the sum (the order of
     another C++ transport, 0 / False: their own) and be ``all_gather`` calls (``(routed,
-    shared)`` addends: the all-gather rows and the slot sum)."""
+    shared)`` addends: the all-gather rows and the slot sum). ``entry_trigger``: the kernel
+    releases its dependent at entry."""
 
     world: int
     rank: int
@@ -977,6 +989,7 @@ class AllReduceFinish(NamedTuple):
     chunk: int = 0
     sanitize: bool = False
     all_gather: bool = False
+    entry_trigger: bool = False
 
 
 def cluster_size(num_tokens: int, num_candidates: int) -> int:
@@ -999,6 +1012,7 @@ def _compiled(
     finish_chunk: int = 0,
     finish_sanitize: bool = False,
     finish_all_gather: bool = False,
+    entry_trigger: bool = False,
 ):
     kernel = KimiK3AttnResKernel(
         num_candidates,
@@ -1013,6 +1027,7 @@ def _compiled(
         finish_chunk,
         finish_sanitize,
         finish_all_gather,
+        entry_trigger,
     )
     addr = Int64(1 << 20)
     return cute.compile(
@@ -1144,6 +1159,7 @@ def run_attn_res(
                 finish.chunk,
                 finish.sanitize,
                 finish.all_gather,
+                finish.entry_trigger,
             )
             if finish is not None
             else ()

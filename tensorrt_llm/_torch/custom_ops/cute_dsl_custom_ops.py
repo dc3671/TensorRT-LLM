@@ -5829,37 +5829,67 @@ if IS_CUTLASS_DSL_AVAILABLE:
         mutates_args=(),
         device_types="cuda")
     def kimi_k3_attn_res_add_rmsnorm_finish_addend(
-            prefix: torch.Tensor, uc_local: int, mc_base: int,
-            flags: torch.Tensor, world: int, rank: int, two_shot: bool,
-            early_poll: bool, block: torch.Tensor, res_weight: torch.Tensor,
-            rms_weight: torch.Tensor, out_weight: torch.Tensor, rms_eps: float,
-            out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+            prefix: torch.Tensor,
+            uc_local: int,
+            mc_base: int,
+            flags: torch.Tensor,
+            world: int,
+            rank: int,
+            two_shot: bool,
+            early_poll: bool,
+            block: torch.Tensor,
+            res_weight: torch.Tensor,
+            rms_weight: torch.Tensor,
+            out_weight: torch.Tensor,
+            rms_eps: float,
+            out_eps: float,
+            entry_trigger: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """``kimi_k3_attn_res_add_rmsnorm`` whose addend is the pushed MNNVL
         all-reduce over ``world`` ranks on the workspace (``uc_local``,
         ``mc_base``, ``flags``) whose finish was left to this kernel
         (``MnnvlPendingResult``): the kernel finishes it (``two_shot``
-        transport; ``early_poll``: before its grid wait, one-shot only)."""
+        transport; ``early_poll``: before its grid wait, one-shot only).
+        ``entry_trigger``: release the dependent at kernel entry (the caller
+        checked that it is the Kimi-K3 MoE front's head)."""
         output = torch.empty_like(prefix)
         updated = torch.empty_like(prefix)
-        kimi_k3_attn_res.run_attn_res(
-            prefix, (),
-            block,
-            res_weight,
-            rms_weight,
-            out_weight,
-            rms_eps,
-            out_eps,
-            output,
-            updated,
-            in_place_addend=(uc_local, flags.data_ptr()),
-            finish=kimi_k3_attn_res.AllReduceFinish(world, rank, mc_base,
-                                                    two_shot, early_poll))
+        kimi_k3_attn_res.run_attn_res(prefix, (),
+                                      block,
+                                      res_weight,
+                                      rms_weight,
+                                      out_weight,
+                                      rms_eps,
+                                      out_eps,
+                                      output,
+                                      updated,
+                                      in_place_addend=(uc_local,
+                                                       flags.data_ptr()),
+                                      finish=kimi_k3_attn_res.AllReduceFinish(
+                                          world,
+                                          rank,
+                                          mc_base,
+                                          two_shot,
+                                          early_poll,
+                                          entry_trigger=entry_trigger))
         return updated, output
 
     @torch.library.register_fake(
         "trtllm::kimi_k3_attn_res_add_rmsnorm_finish_addend")
-    def _(prefix, uc_local, mc_base, flags, world, rank, two_shot, early_poll,
-          block, res_weight, rms_weight, out_weight, rms_eps, out_eps):
+    def _(prefix,
+          uc_local,
+          mc_base,
+          flags,
+          world,
+          rank,
+          two_shot,
+          early_poll,
+          block,
+          res_weight,
+          rms_weight,
+          out_weight,
+          rms_eps,
+          out_eps,
+          entry_trigger=False):
         return torch.empty_like(prefix), torch.empty_like(prefix)
 
     @torch.library.custom_op("trtllm::kimi_k3_attn_res_moe_add_rmsnorm",
