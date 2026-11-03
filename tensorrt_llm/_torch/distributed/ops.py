@@ -952,6 +952,18 @@ class MnnvlInPlaceResult:
         return mnnvl_pushed_allreduce.run_gather(self.view, output)
 
 
+@dataclasses.dataclass
+class MnnvlNormPushTarget(MnnvlPushTarget):
+    """A pushed MNNVL all-reduce fused with the residual add and the following RMSNorm
+    (``AllReduceFusionOp.RESIDUAL_RMS_NORM``): ``AllReduce.finish_push`` returns
+    ``(norm_out, residual_out)`` into ``output`` / ``residual_output``, bitwise the C++ kernel."""
+
+    residual: Optional[torch.Tensor] = None
+    norm_weight: Optional[torch.Tensor] = None
+    eps: float = 1e-6
+    residual_output: Optional[torch.Tensor] = None
+
+
 class MNNVLAllReduce(nn.Module):
     """A specialized AllReduce implementation for Multi-Node NVLink communication.
 
@@ -1382,6 +1394,7 @@ class MNNVLAllReduce(nn.Module):
                     tactic,
                     scale=params.scale if quant else None,
                     norm_out=norm_out)
+
     def push_target(self, num_tokens: int, hidden_dim: int,
                     in_place: bool) -> Optional[MnnvlPushTarget]:
         """See ``AllReduce.push_target``."""
@@ -1404,10 +1417,57 @@ class MNNVLAllReduce(nn.Module):
         return MnnvlPushTarget(workspace["push_view"], num_tokens, hidden_dim,
                                one_shot, in_place, output)
 
+    def residual_norm_push_target(
+            self, num_tokens: int, hidden_dim: int,
+            params: AllReduceParams) -> Optional[MnnvlNormPushTarget]:
+        """See ``AllReduce.push_target`` with a ``RESIDUAL_RMS_NORM`` fusion."""
+        from ..kernels.blackwell import (mnnvl_pushed_allreduce,
+                                         mnnvl_pushed_allreduce_norm)
+        residual, norm_weight = params.residual, params.norm_weight
+        world = self.mapping.tp_size
+        if (world not in mnnvl_pushed_allreduce.WORLD_SIZES
+                or params.bias is not None or residual is None
+                or norm_weight is None
+                or residual.shape != (num_tokens, hidden_dim)
+                or residual.dtype != torch.bfloat16
+                or norm_weight.dtype != torch.bfloat16
+                or not residual.is_contiguous()
+                or not norm_weight.is_contiguous()):
+            return None
+        device = residual.device
+        if not mnnvl_pushed_allreduce_norm.norm_finish_config(
+                num_tokens, hidden_dim, device)[0]:
+            return None
+        one_shot, need = mnnvl_allreduce_transport(num_tokens, hidden_dim,
+                                                   world, self.dtype)
+        if need >= 2**32 - 1:
+            return None
+        workspace = get_or_scale_allreduce_mnnvl_workspace(
+            self.mapping, self.dtype, buffer_size_bytes=need)
+        return MnnvlNormPushTarget(workspace["push_view"],
+                                   num_tokens,
+                                   hidden_dim,
+                                   one_shot,
+                                   False,
+                                   torch.empty_like(residual),
+                                   residual=residual,
+                                   norm_weight=norm_weight,
+                                   eps=params.eps,
+                                   residual_output=torch.empty_like(residual))
+
     @staticmethod
     def finish_push(
-            target: MnnvlPushTarget) -> Union[torch.Tensor, MnnvlInPlaceResult]:
+        target: MnnvlPushTarget
+    ) -> Union[torch.Tensor, MnnvlInPlaceResult, Tuple[torch.Tensor,
+                                                       torch.Tensor]]:
         from ..kernels.blackwell import mnnvl_pushed_allreduce
+        if isinstance(target, MnnvlNormPushTarget):
+            from ..kernels.blackwell import mnnvl_pushed_allreduce_norm
+            mnnvl_pushed_allreduce_norm.run_finish_residual_rms_norm(
+                target.view, target.one_shot, target.residual,
+                target.norm_weight.detach(), target.eps, target.output,
+                target.residual_output)
+            return target.output, target.residual_output
         if target.in_place:
             mnnvl_pushed_allreduce.run_finish_in_place(target.view,
                                                        target.num_tokens,
@@ -1595,6 +1655,7 @@ class AllReduce(nn.Module):
                                                         input_scale,
                                                         all_reduce_params,
                                                         gemm_tactic)
+
     def push_target(
         self,
         num_tokens: int,
@@ -1605,7 +1666,8 @@ class AllReduce(nn.Module):
         """The MNNVL all-reduce of a BF16 ``[num_tokens, hidden_dim]`` input as a target a
         producer kernel pushes its output into (the FP8 block-scale low-M GEMM's push epilogue),
         where ``forward(input, all_reduce_params)`` runs that all-reduce for the plain sum (no
-        fusion op); else None.
+        fusion op) or with a ``RESIDUAL_RMS_NORM`` fusion (``finish_push`` then returns
+        ``(norm_out, residual_out)``); else None.
 
         A producer that stored its output into the target replaces this all-reduce's input;
         ``finish_push`` then returns what ``forward`` returns, bit for bit. Targets must be
@@ -1613,7 +1675,11 @@ class AllReduce(nn.Module):
         transport; ``in_place`` asks for the result in the workspace (``MnnvlInPlaceResult``),
         which the two-shot transport (above the one-shot size threshold) leaves there.
         """
-        if all_reduce_params is not None and (
+        norm_fusion = (all_reduce_params is not None
+                       and all_reduce_params.enable_allreduce
+                       and all_reduce_params.fusion_op
+                       == AllReduceFusionOp.RESIDUAL_RMS_NORM)
+        if all_reduce_params is not None and not norm_fusion and (
                 not all_reduce_params.enable_allreduce
                 or all_reduce_params.fusion_op != AllReduceFusionOp.NONE):
             return None
@@ -1622,14 +1688,19 @@ class AllReduce(nn.Module):
                 or self.mnnvl_allreduce.dtype != torch.bfloat16
                 or hidden_dim % 8 or torch.compiler.is_compiling()):
             return None
+        if norm_fusion:
+            return self.mnnvl_allreduce.residual_norm_push_target(
+                num_tokens, hidden_dim, all_reduce_params)
         return self.mnnvl_allreduce.push_target(num_tokens, hidden_dim,
                                                 in_place)
 
     def finish_push(
-            self,
-            target: MnnvlPushTarget) -> Union[torch.Tensor, MnnvlInPlaceResult]:
-        """Complete a target the producer pushed into: the reduced tensor, or for an
-        ``in_place`` target the result left in the workspace.
+        self, target: MnnvlPushTarget
+    ) -> Union[torch.Tensor, MnnvlInPlaceResult, Tuple[torch.Tensor,
+                                                       torch.Tensor]]:
+        """Complete a target the producer pushed into: the reduced tensor, for an
+        ``in_place`` target the result left in the workspace, for a ``RESIDUAL_RMS_NORM``
+        target ``(norm_out, residual_out)``.
 
         Must be the next launch on the stream after the producer kernel, which releases its
         dependents (PDL) only after its own ``griddepcontrol.wait``: the finish kernel reads the
