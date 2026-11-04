@@ -83,7 +83,7 @@ import math
 import os
 import re
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, NamedTuple, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -3571,10 +3571,14 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         context_kv_only: bool = False,
         context_kv_dtype: str = "auto",
         helix_mapping: Optional[Mapping] = None,
+        decode_rows: Optional[Sequence[int]] = None,
     ):
         """``helix_mapping``: the target's helix mapping when this drafter runs on
         its repurposed (CP folded into TP) group; the CuTe DSL decode then reads
-        a context sharded like the target's pages."""
+        a context sharded like the target's pages.
+
+        ``decode_rows``: the row counts of the decode steps' projections and
+        context-latent GEMM (the CUDA-graph steps); None when any count can run."""
         if context_kv_dtype not in ("auto", "fp8"):
             raise ValueError(f"context_kv_dtype must be 'auto' or 'fp8', got {context_kv_dtype!r}")
         cfg = draft_config.pretrained_config
@@ -3663,9 +3667,15 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         if context_kv_only:
             self._keep_context_kv_modules()
         # The block decode projections and the context latent GEMM run at a few
-        # rows per request: they race the low-M BF16 kernels against cuBLAS.
+        # rows per request: they race the low-M BF16 kernels against cuBLAS, at
+        # the decode row counts only. The SIMT direct kernel sits out: it builds
+        # one kernel per row count, and split-K or warp-MMA match it at K rows.
         self._low_m_gemm = prepare_low_m_gemm(
-            self.model, force=True, per_rank_tuning=draft_config.mapping.enable_attention_dp
+            self.model,
+            force=True,
+            per_rank_tuning=draft_config.mapping.enable_attention_dp,
+            row_counts=decode_rows,
+            race_direct=False,
         )
         self._ar_push = (
             self._tp_split
@@ -5112,6 +5122,16 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     if draft_arches and draft_arches[0] == MINIMAX_DSPARK_DRAFT_ARCH:
         drafter_cls = MiniMaxDSparkForCausalLM
     elif is_mla(draft_config.pretrained_config):
+        spec_config = model_config.spec_config
+        # Per request, a decode step runs K or K + 1 block rows (by the slot
+        # convention) and K + 1 context-latent rows.
+        decode_rows = sorted(
+            {
+                batch_size * rows
+                for batch_size in model_config.cuda_graph_batch_sizes
+                for rows in (spec_config.max_draft_len, spec_config.tokens_per_gen_step)
+            }
+        )
         return MLADSparkForCausalLM(
             draft_config,
             dflash_attention_backend=model_config.spec_config.attention_backend,
@@ -5119,6 +5139,7 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
             context_kv_dtype=context_kv_dtype,
             # Set by a helix target that repurposed its mapping (Kimi K3).
             helix_mapping=getattr(model_config, "_helix_mapping_with_cp", None),
+            decode_rows=decode_rows or None,
         )
     else:
         drafter_cls = GQADSparkForCausalLM

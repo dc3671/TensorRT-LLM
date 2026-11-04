@@ -3,7 +3,7 @@
 
 import functools
 import os
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -491,7 +491,16 @@ class LowMGemmDispatcher:
        (M-bucket, K, N) shape it encounters and caches the winner.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, row_counts: Optional[Sequence[int]] = None, race_direct: bool = True
+    ) -> None:
+        """
+        Args:
+            row_counts: The row counts the owner's GEMMs run at; the race tunes only their M buckets
+                (others miss the cache and run cuBLAS). None tunes every bucket.
+            race_direct: Race the SIMT direct kernel. Its JIT build is per row count up to
+                ``_MAX_EXACT_DIRECT_M``, the bulk of a race's tuning time.
+        """
         # _prepared: runners + TuningConfig have been created (set by _init_runners).
         self._prepared = False
         # _attached: modules have been labelled (set by attach).
@@ -521,6 +530,17 @@ class LowMGemmDispatcher:
         # Tune on every rank: ranks of the group see different shapes (attention DP), so a rank-local cache
         # hit must not skip a collective a peer enters.
         self.per_rank_tuning: bool = False
+        self._race_direct = race_direct
+        self._m_dim_spec = _M_DIM_SPEC
+        if row_counts is not None:
+            self._m_dim_spec = DynamicTensorSpec(
+                input_idx=0,
+                dim_idx=0,
+                gen_tuning_buckets=tuple(
+                    sorted({_map_m_to_tuning_bucket(m) for m in row_counts if 1 <= m <= _MAX_M})
+                ),
+                map_to_tuning_buckets=_map_m_to_tuning_bucket,
+            )
 
     def attach(
         self,
@@ -571,7 +591,7 @@ class LowMGemmDispatcher:
         self._runner_no_bias = _SplitKGemmRunner(has_bias=False, pdl=pdl)
         self._runner_with_bias = _SplitKGemmRunner(has_bias=True, pdl=pdl)
         # Direct SIMT runner: no-bias only; wins for M=1 with narrow N on K=8192.
-        self._direct = _DirectGemmRunner(pdl=pdl)
+        self._direct = _DirectGemmRunner(pdl=pdl) if self._race_direct else None
         self._warp_mma = _WarpMmaGemmRunner()
         # cuBLAS runners — always included as competitors so the AutoTuner can
         # fall back to cuBLAS for shapes where neither custom kernel is fastest.
@@ -590,7 +610,7 @@ class LowMGemmDispatcher:
             for quantize in (False, True)
         }
         self._tuning_config = TuningConfig(
-            dynamic_tensor_specs=(_M_DIM_SPEC,),
+            dynamic_tensor_specs=(self._m_dim_spec,),
             use_cold_l2_cache=True,
             # Time device work as the decode CUDA graphs replay it, PDL launches
             # included: eager timing adds each runner's host launch cost, which
@@ -636,6 +656,17 @@ class LowMGemmDispatcher:
         """
         self.attach(model, force=force)
         self._init_runners()
+
+    def _bf16_runners(self, has_bias: bool) -> List[TunableRunner]:
+        """The BF16 race, cuBLAS first: the cache-miss fallback (runners[0]) is the stock path."""
+        if has_bias:
+            # The direct and warp-MMA kernels have no bias.
+            return [self._cublas_with_bias, self._runner_with_bias]
+        runners: List[TunableRunner] = [self._cublas_no_bias, self._runner_no_bias]
+        if self._direct is not None:
+            runners.append(self._direct)
+        runners.append(self._warp_mma)
+        return runners
 
     @staticmethod
     def _is_candidate_shape(
@@ -706,19 +737,9 @@ class LowMGemmDispatcher:
         weight_t = weight.detach().t()  # [N, K] → [K, N] col-major view
         bias_d = bias.detach() if bias is not None else None
         has_bias = bias_d is not None
-        # Race cuBLAS, split-K tensor-core, and SIMT direct; the AutoTuner caches
-        # the winner per shape.  cuBLAS is listed first so that the cache-miss
-        # fallback (runners[0]) always lands on the safe baseline rather than
-        # running a custom kernel on an untuned shape.
-        splitk_runner = self._runner_with_bias if has_bias else self._runner_no_bias
-        cublas_runner = self._cublas_with_bias if has_bias else self._cublas_no_bias
-        runners: List = [cublas_runner, splitk_runner]
-        if not has_bias:
-            # Include the direct SIMT and warp-MMA runners for unbiased calls;
-            # they return [] for biased inputs so it is safe to always pass,
-            # but excluding them for biased calls keeps the race concise.
-            runners.append(self._direct)
-            runners.append(self._warp_mma)
+        # The AutoTuner caches the winner per shape.
+        runners = self._bf16_runners(has_bias)
+        cublas_runner = runners[0]
         best_runner, best_tactic = AutoTuner.get().choose_one(
             _AUTOTUNER_OP_NAME,
             runners,
@@ -872,7 +893,7 @@ class LowMGemmDispatcher:
             )
         else:
             op = _AUTOTUNER_OP_NAME
-            runners = [self._cublas_no_bias, self._runner_no_bias, self._direct, self._warp_mma]
+            runners = self._bf16_runners(has_bias=False)
             shapes = (torch.Size((num_rows, k)), torch.Size((k, n)))
         hit, runner_id, tactic, _ = tuner.profiling_cache.search_cache(
             op, runners, shapes, self._tuning_config
@@ -903,6 +924,8 @@ def prepare_low_m_gemm(
     model: torch.nn.Module,
     force: bool = False,
     per_rank_tuning: bool = False,
+    row_counts: Optional[Sequence[int]] = None,
+    race_direct: bool = True,
 ) -> LowMGemmDispatcher:
     """Create a per-engine dispatcher and attach it to every eligible submodule.
 
@@ -923,11 +946,13 @@ def prepare_low_m_gemm(
             LLM arg).
         per_rank_tuning: Tune each rank on its own (attention DP: the ranks'
             projections see different token counts).
+        row_counts: As :class:`LowMGemmDispatcher`.
+        race_direct: As :class:`LowMGemmDispatcher`.
 
     Returns:
         The newly created :class:`LowMGemmDispatcher` for this engine.
     """
-    dispatcher = LowMGemmDispatcher()
+    dispatcher = LowMGemmDispatcher(row_counts=row_counts, race_direct=race_direct)
     dispatcher.per_rank_tuning = per_rank_tuning
     dispatcher.attach(model, force=force)
     return dispatcher

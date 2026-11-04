@@ -1034,7 +1034,9 @@ def _tiny_mla_weights(seed=11):
     return w
 
 
-def _build_mla_drafter(weights, *, dflash_attention_backend="TRTLLM", context_kv_only=False):
+def _build_mla_drafter(
+    weights, *, dflash_attention_backend="TRTLLM", context_kv_only=False, decode_rows=None
+):
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
 
@@ -1043,6 +1045,7 @@ def _build_mla_drafter(weights, *, dflash_attention_backend="TRTLLM", context_kv
         model_config,
         dflash_attention_backend=dflash_attention_backend,
         context_kv_only=context_kv_only,
+        decode_rows=decode_rows,
     ).to("cuda")
     drafter.load_weights(dict(weights))
     return drafter
@@ -2383,10 +2386,15 @@ def test_helix_context_store_writes_only_owned_positions():
 
 @needs_cuda
 def test_mla_drafter_races_its_projections_in_the_low_m_dispatcher():
+    from tensorrt_llm._torch.modules.low_m_gemm import _DirectGemmRunner
+
     weights = _tiny_mla_weights()
-    drafter = _build_mla_drafter(weights)
+    # The decode rows of CUDA-graph batches 1 / 2 / 4 / 8 at K = 5: 5b block, 6b context rows.
+    drafter = _build_mla_drafter(weights, decode_rows=(5, 6, 10, 12, 20, 24, 40, 48))
     dispatcher = drafter._low_m_gemm
     assert dispatcher is not None and dispatcher._force
+    # Rows up to 8 tune exactly, larger ones in their bucket; rows past 32 never race.
+    assert dispatcher._m_dim_spec.gen_tuning_buckets == (5, 6, 16, 32)
     for name, module in drafter.model.named_modules():
         if module.__class__.__name__.endswith("Linear"):
             assert module._low_m_gemm_dispatcher is dispatcher, name
@@ -2399,6 +2407,7 @@ def test_mla_drafter_races_its_projections_in_the_low_m_dispatcher():
     positions = torch.arange(3, 17, device="cuda")
     projected = drafter.project_target_hidden(captured)
     latent, _ = drafter.precompute_context_kv(projected, positions)
+    assert not any(isinstance(r, _DirectGemmRunner) for r in dispatcher._bf16_runners(False))
     drafter._low_m_gemm = None
     reference, _ = drafter.precompute_context_kv(projected, positions)
     torch.testing.assert_close(latent, reference, rtol=2e-2, atol=2e-2)
