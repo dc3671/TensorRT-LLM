@@ -672,6 +672,9 @@ class PyExecutor:
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
+    # Whether the event loop runs under the short thread switch interval of
+    # enable_min_latency (executor_switch_interval); read once at construction.
+    _min_latency_switch_interval = False
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
 
@@ -943,6 +946,8 @@ class PyExecutor:
         self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
+        self._min_latency_switch_interval = bool(
+            getattr(self.llm_args, "enable_min_latency", False))
         self.enable_iter_perf_stats = self.llm_args.enable_iter_perf_stats
         self.enable_iter_req_stats = self.llm_args.enable_iter_req_stats
         self.iter_perf_stats_interval = self.llm_args.iter_perf_stats_interval
@@ -1943,8 +1948,7 @@ class PyExecutor:
                 "TLLM_LINE_PROFILER_PATH")) and not self.is_warmup
             with host_profiler_context(enable=enable_profiler), \
                  customized_gc_thresholds(self.garbage_collection_gen0_threshold), \
-                 executor_switch_interval(
-                     getattr(self.llm_args, "enable_min_latency", False)):
+                 executor_switch_interval(self._min_latency_switch_interval):
                 self.event_loop()
         except Exception as e:
             # A raise AFTER the loop reached its own normal-exit `break` (from
