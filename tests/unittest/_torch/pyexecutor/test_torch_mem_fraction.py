@@ -5,7 +5,7 @@
 import pytest
 
 from tensorrt_llm._torch.pyexecutor import _util
-from tensorrt_llm._torch.pyexecutor.dwdp import DwdpManager
+from tensorrt_llm._torch.pyexecutor.dwdp import DWDP_DRIVER_MEMORY_RESERVE
 
 pytestmark = pytest.mark.cpu_only
 
@@ -15,7 +15,7 @@ MiB = 1024**2
 
 @pytest.mark.parametrize(
     "margin_args, margin",
-    [((), 32 * MiB), ((DwdpManager.DRIVER_MEMORY_RESERVE,), GiB)],
+    [((), 32 * MiB), ((DWDP_DRIVER_MEMORY_RESERVE,), GiB)],
     ids=["default", "dwdp"],
 )
 @pytest.mark.parametrize("mem_reserved", [0, 3 * GiB])
