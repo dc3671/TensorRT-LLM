@@ -190,10 +190,6 @@ class DecoderRunner(ScheduledModelRunner):
             )
         self._model_caller = model_caller
         self._mapping = mapping
-        # Vocabulary-sharded spec-worker logits are the target LM head's TP
-        # shard, gathered over the head's TP group: under helix the repurposed
-        # tp*cp group, not the executor mapping's TP group.
-        self._vocab_shard_mapping = getattr(getattr(model, "lm_head", None), "mapping", mapping)
         self._dist = dist
         self._agreement = WarmupAgreement(dist, mapping)
         self._moe_load_balancer = moe_load_balancer
@@ -395,6 +391,15 @@ class DecoderRunner(ScheduledModelRunner):
     @property
     def cuda_graph_runner(self) -> CUDAGraphRunner:
         return self._graphs.cuda_graph_runner
+
+    @property
+    def _vocab_shard_mapping(self) -> Mapping:
+        """The mapping vocabulary-sharded spec-worker logits are gathered over.
+
+        They are the target LM head's TP shard, gathered over the head's TP group: under helix
+        the repurposed tp*cp group, not the executor mapping's TP group.
+        """
+        return getattr(getattr(self._model, "lm_head", None), "mapping", self._mapping)
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self._model.extra_attrs)
