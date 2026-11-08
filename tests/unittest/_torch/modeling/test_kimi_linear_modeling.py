@@ -22,7 +22,9 @@ def test_kimi_linear_model_builds_shared_aux_stream_registry(
     layer_aux_stream_dicts = []
 
     class _FakeDecoderLayer(nn.Module):
-        def __init__(self, _model_config, _config, _layer_idx, aux_stream_dict) -> None:
+        def __init__(
+            self, _model_config, _config, _layer_idx, aux_stream_dict, helix_tail=None
+        ) -> None:
             super().__init__()
             self.token_sliced = False
             self.is_kda = True
