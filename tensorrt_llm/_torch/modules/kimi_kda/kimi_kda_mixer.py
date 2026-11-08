@@ -697,7 +697,8 @@ class KimiKDALinearAttention(nn.Module):
 
         cores: List[torch.Tensor] = []
         if num_prefills > 0:
-            snapshot = mamba_metadata.kda_inforward_snapshot
+            # Only KimiK3MambaMetadata records in-forward snapshots; Mamba2Metadata has none.
+            snapshot = getattr(mamba_metadata, "kda_inforward_snapshot", None)
             inforward = None
             if snapshot is not None:
                 stage = attn_metadata.kv_cache_manager.inforward_snapshot_stage_views(
