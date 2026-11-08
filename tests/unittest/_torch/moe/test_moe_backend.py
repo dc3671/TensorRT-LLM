@@ -1733,6 +1733,7 @@ def test_cutedsl_finalize_weights_once_with_the_router_weight_on_the_input(leaf_
         x_sf=None,
         x_ready_event=None,
         sort_tables=None,
+        output_push=None,
         token_selected_experts=torch.tensor([[3], [1]], dtype=torch.int32),
         token_final_scales=None,
         comm_plan=SimpleNamespace(
