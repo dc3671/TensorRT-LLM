@@ -1050,6 +1050,8 @@ def test_post_load_weights_selects_dspark_linear_backend(
     model = DSv4DSparkDraftModel.__new__(DSv4DSparkDraftModel)
     torch.nn.Module.__init__(model)
     monkeypatch.delenv("TRTLLM_DSPARK_LINEAR_BACKEND", raising=False)
+    # Rubin, where an unsharded drafter keeps the FP8 projections by default.
+    monkeypatch.setattr(modeling_dspark, "get_sm_version", lambda: 107)
     mapping = types.SimpleNamespace(
         tp_size=tp_size,
         enable_attention_dp=enable_attention_dp,
