@@ -854,6 +854,10 @@ class DFlashWorker(SpecWorkerBase):
     # draft_slot_trail_tokens). Set in _lazy_init_ctx_buffers.
     _ctx_pool_windowed = False
     _ctx_pool_trail = 0
+    # Pages of the drafter's context this helix CP rank holds when a helix
+    # target manager hosts them; None when every rank holds the whole context.
+    # Set in _lazy_init_ctx_buffers.
+    _ctx_helix: Optional[HelixDraftShard] = None
 
     def __init__(
         self,
@@ -864,9 +868,6 @@ class DFlashWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
-        # Pages of the drafter's context this helix CP rank holds when a helix
-        # target manager hosts them; None when every rank holds the whole context.
-        self._ctx_helix: Optional[HelixDraftShard] = None
         # The paged context latent store's side stream, and the operands of its
         # last launch (kept alive until the next step, after the drafter joined it).
         self._ctx_store_stream: Optional[torch.cuda.Stream] = None
