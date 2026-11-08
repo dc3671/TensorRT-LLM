@@ -661,6 +661,11 @@ def test_kimi_k3_latent_all_reduce_own_workspace_before_shared_join(
             return value
 
     class _Shared(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            # Main's per-forward SM reserve reads the shared down projection.
+            self.down_proj = SimpleNamespace()
+
         def forward(self, value: torch.Tensor, final_all_reduce_params=None) -> torch.Tensor:
             calls.append(("shared", current_stream))
             return value
