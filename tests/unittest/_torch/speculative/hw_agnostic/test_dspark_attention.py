@@ -200,9 +200,11 @@ def test_forward_stage_honors_enable_fused_hc(monkeypatch, enable_fused_hc):
 
         return call
 
+    # The single-shot captured-context attention (no ``slots``); ``dspark_attention_forward``
+    # is the paged drafter's attention.
     monkeypatch.setattr(
         modeling_dspark,
-        "dspark_attention_forward",
+        "_dspark_attention_forward_legacy",
         Mock(return_value=attention_output),
     )
 
@@ -247,13 +249,9 @@ def test_forward_stage_honors_enable_fused_hc(monkeypatch, enable_fused_hc):
         stage,
         h,
         torch.randn(num_requests, hidden_size),
-        torch.ones(num_requests, dtype=torch.long),
+        1,
         torch.empty(0),
         torch.zeros(num_requests, block_size, dtype=torch.long),
-        torch.empty(1, 128, 1),
-        torch.zeros(num_requests, 1, dtype=torch.int32),
-        torch.full((num_requests,), 128, dtype=torch.long),
-        torch.ones(num_requests, dtype=torch.long),
     )
 
     assert actual is final_h
