@@ -693,6 +693,9 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     )
     metadata.helix_local_slots = torch.full_like(metadata.helix_position_offsets, untouched)
     metadata.helix_kv_bounds = torch.full_like(metadata.helix_position_offsets, untouched)
+    metadata.helix_zero_kv_tokens = torch.ones_like(
+        metadata.helix_position_offsets, dtype=torch.bool
+    )
     metadata.kv_lens_cuda = torch.full((num_seqs + 3,), untouched, dtype=torch.int32, device="cuda")
 
     metadata.recompute_helix_spec_buffers(num_tokens, tokens_per_seq)
@@ -707,12 +710,14 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     gen = slice(0, num_tokens)
     torch.testing.assert_close(metadata.helix_local_slots[gen], expected_slots)
     torch.testing.assert_close(metadata.helix_kv_bounds[gen], expected_bounds)
+    assert torch.equal(metadata.helix_zero_kv_tokens[gen], expected_bounds == 0)
     torch.testing.assert_close(
         metadata.kv_lens_cuda[1 : 1 + num_seqs],
         expected_bounds.view(num_seqs, tokens_per_seq)[:, -1],
     )
     assert (metadata.helix_local_slots[num_tokens:] == untouched).all()
     assert (metadata.helix_kv_bounds[num_tokens:] == untouched).all()
+    assert metadata.helix_zero_kv_tokens[num_tokens:].all()
     assert metadata.kv_lens_cuda[0].item() == untouched
     assert (metadata.kv_lens_cuda[1 + num_seqs :] == untouched).all()
     # Any group of the sequence that this rank does not own writes no slot.
