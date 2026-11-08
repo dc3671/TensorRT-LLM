@@ -4178,6 +4178,12 @@ class KimiLinearDecoderLayer(nn.Module):
 
 
 class KimiLinearModel(DecoderModel):
+    # With an FP4 KV cache, the stream the FP4 MLA backend writes a generation-only step's
+    # metadata on ahead of the first MLA layer, and the per-rank query heads every MLA layer
+    # has. Set in __init__.
+    _fp4_mla_metadata_stream: Optional[torch.cuda.Stream] = None
+    _mla_num_heads = 0
+
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = _get_text_config(model_config.pretrained_config)
@@ -4238,19 +4244,16 @@ class KimiLinearModel(DecoderModel):
             if any(sliced)
             else None
         )
-        # With an FP4 KV cache the FP4 MLA backend writes a generation-only step's metadata on
-        # this stream ahead of the first MLA layer; every MLA layer has the same per-rank query
-        # heads.
-        self._mla_num_heads = next(
-            (layer.self_attn.mixer.num_heads_tp for layer in self.layers if not layer.is_kda), 0
-        )
-        self._fp4_mla_metadata_stream = (
-            torch.cuda.Stream()
-            if self._mla_num_heads > 0
-            and model_config.quant_config is not None
+        if (
+            model_config.quant_config is not None
             and model_config.quant_config.quant_mode.has_fp4_kv_cache()
-            else None
-        )
+        ):
+            self._mla_num_heads = next(
+                (layer.self_attn.mixer.num_heads_tp for layer in self.layers if not layer.is_kda),
+                0,
+            )
+            if self._mla_num_heads > 0:
+                self._fp4_mla_metadata_stream = torch.cuda.Stream()
         self.norm = RMSNorm(hidden_size=cfg.hidden_size, eps=cfg.rms_norm_eps, dtype=dtype)
 
         # KimiK3RMSNorm (not RMSNorm): consumed field-wise (.weight/.eps)
