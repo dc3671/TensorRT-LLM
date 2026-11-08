@@ -1526,7 +1526,8 @@ class DFlashWorker(SpecWorkerBase):
 
         dtype = dflash_context_dtype(draft_model)
         self._ctx_dtype = dtype
-        pool_dtype = torch.float8_e4m3fn if draft_model.context_kv_fp8 else dtype
+        context_kv_fp8 = getattr(draft_model, "context_kv_fp8", False)
+        pool_dtype = torch.float8_e4m3fn if context_kv_fp8 else dtype
 
         # Reserve slot index max_batch as a scratch slot for padding/unknown
         # dummies; real requests only draw slots 0..max_batch-1, so dummy
@@ -1620,7 +1621,7 @@ class DFlashWorker(SpecWorkerBase):
             if pool is None:
                 if self._ctx_unified_cache:
                     raise ValueError("DFlash could not bind the unified manager's draft KV layers")
-                if draft_model.context_kv_fp8:
+                if context_kv_fp8:
                     raise ValueError(
                         "speculative_config.context_kv_dtype='fp8' needs the drafter's context "
                         "KV in an FP8 draft KV cache manager pool."
@@ -1658,7 +1659,7 @@ class DFlashWorker(SpecWorkerBase):
                 self._ctx_kv_ptrs = torch.tensor(
                     [layer.data_ptr() for layer in pool], dtype=torch.int64, device="cuda"
                 )
-                if draft_model.waits_for_ctx_store:
+                if getattr(draft_model, "waits_for_ctx_store", False):
                     self._ctx_store_stream = torch.cuda.Stream()
                 # The fused preparation stores single-latent context entries
                 # projected from the captured target features through fc and
@@ -2417,7 +2418,7 @@ class DFlashWorker(SpecWorkerBase):
 
         # A context-KV-only drafter (disaggregated context server) stores the
         # prompt's drafter context above and never drafts.
-        drafts = not draft_model.context_kv_only
+        drafts = not getattr(draft_model, "context_kv_only", False)
         inputs = (
             self.prepare_1st_drafter_inputs(
                 input_ids=input_ids,
@@ -2619,7 +2620,7 @@ class DFlashWorker(SpecWorkerBase):
         num_gens = attn_metadata.num_seqs
         if (
             draft_model is None
-            or draft_model.context_kv_only
+            or getattr(draft_model, "context_kv_only", False)
             or attn_metadata.num_contexts != 0
             or num_gens == 0
             or not self._fused_gen_prepare_applies(spec_metadata)
