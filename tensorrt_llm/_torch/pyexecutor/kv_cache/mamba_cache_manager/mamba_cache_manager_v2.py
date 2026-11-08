@@ -528,7 +528,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     "kv_cache_config.pool_ratio was placed for a layer-group order the native "
                     f"manager does not use (layer {layer_id} {role} is not in group {group})"
                 )
-        self._log_pool_group_slots()
 
         self._setup_state_pool()
 
@@ -1197,6 +1196,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             groups,
         )
         return config
+
+    def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
+        super()._log_kv_cache_pool_lifecycle_mapping()
+        self._log_pool_group_slots()
 
     def _log_pool_group_slots(self) -> None:
         """Log the slots each pool group got on every cache level, named by its layer groups."""
