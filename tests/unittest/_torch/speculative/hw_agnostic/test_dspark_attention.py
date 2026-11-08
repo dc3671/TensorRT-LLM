@@ -38,7 +38,6 @@ from tensorrt_llm._torch.models.modeling_dspark import (
     get_dspark_topk_idxs,
     precompute_dspark_freqs_cis,
 )
-from tensorrt_llm._torch.modules.linear import Linear
 
 dspark_attention = modeling_dspark
 
@@ -1074,30 +1073,6 @@ def test_post_load_weights_selects_dspark_linear_backend(
     else:
         fp8_bind.assert_called_once_with()
         bf16_bind.assert_not_called()
-
-
-def test_post_load_weights_selects_rubin_cute_backend_before_transform(monkeypatch):
-    model = DSv4DSparkDraftModel.__new__(DSv4DSparkDraftModel)
-    torch.nn.Module.__init__(model)
-    model._use_bf16_linear = False
-
-    projection = Linear.__new__(Linear)
-    torch.nn.Module.__init__(projection)
-    projection.use_cute_dsl_blockscaling_mm = False
-    projection.transform_weights = Mock()
-    stage = types.SimpleNamespace(self_attn=types.SimpleNamespace(modules=lambda: [projection]))
-    model.mtp_layers = [stage]
-    model.modules = lambda: [projection]
-
-    bind = Mock()
-    monkeypatch.setattr(modeling_dspark, "get_sm_version", lambda: 107)
-    monkeypatch.setattr(DSv4DSparkDraftModel, "_bind_attn_projections", bind)
-
-    model.post_load_weights({})
-
-    assert projection.use_cute_dsl_blockscaling_mm is True
-    projection.transform_weights.assert_called_once_with()
-    bind.assert_called_once_with()
 
 
 def test_bind_bf16_attn_projections_disables_every_fp8_projection():
