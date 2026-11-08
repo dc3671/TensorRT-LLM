@@ -124,6 +124,12 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     _supports_non_divisible_ep: bool = True
     # Set by allow_die_major_weights (a model's opt-in at construction).
     _die_major_allowed: bool = False
+    # Per-layer launch state, set in __init__ (then by post_load_weights and
+    # reserve_sms_for_concurrent_kernels); class defaults for stand-ins built without it.
+    small_batch_max_tokens: int = 0
+    _small_batch_counters: torch.Tensor | None = None
+    weights_die_major: bool = False
+    _concurrent_sm_reserve: int = 0
 
     descriptor = MoEImplDescriptor(
         identity=MoEImplId(PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL, KERNEL_FUSED_FC12, "nvfp4"),
