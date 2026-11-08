@@ -198,6 +198,8 @@ class _PushingRoutedExperts:
     """Stand-in for routed experts that push their output (``output_push``): ``3 x``."""
 
     all_reduce = None
+    # As _RoutedExperts: no persistent grid for the per-launch SM reserve to shrink.
+    backend = _RoutedExperts.backend
 
     def __init__(self, log, main):
         self.log, self.main = log, main
