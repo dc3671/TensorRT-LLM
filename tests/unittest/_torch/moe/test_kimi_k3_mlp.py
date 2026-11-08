@@ -386,6 +386,7 @@ def test_kimi_k3_min_latency_kernels_follow_enable_min_latency(monkeypatch, min_
             self.backend = SimpleNamespace(
                 initial_local_expert_ids=[0, 1, 2, 3],
                 scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
+                sm_reserve_ceiling=lambda: 0,
             )
             self.comm = None
             self.layer_load_balancer = None
@@ -642,6 +643,7 @@ def test_kimi_k3_latent_all_reduce_own_workspace_before_shared_join(
 
     class _Routed:
         all_reduce = _AllReduce("shared_ws_latent_ar")
+        backend = SimpleNamespace(reserve_sms_for_concurrent_kernels=lambda num_sms: None)
 
         def __call__(self, value: torch.Tensor, logits: torch.Tensor, **kwargs) -> torch.Tensor:
             calls.append(("routed_moe", current_stream))
