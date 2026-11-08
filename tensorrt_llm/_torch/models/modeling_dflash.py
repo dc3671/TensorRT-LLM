@@ -26,6 +26,7 @@ from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_att
 from ..speculative.dflash_attention import (
     DFLASH_FOLDED_DECODE_LOWERING,
     DFlashTrtllmGenOps,
+    HelixDraftShard,
     dflash_trtllm_gen_unavailability_reason,
     get_dflash_fa4_fwd,
     get_dflash_flash_attention,
@@ -606,6 +607,36 @@ class DFlashForCausalLM(nn.Module):
     # tests), so the config cap stands.
     _runtime_position_ceiling = None
 
+    # True for a drafter built for a disaggregated context server: it only
+    # stores the context KV and holds no modules for the block decode.
+    context_kv_only = False
+    # True when the drafter's context KV is stored as FP8 E4M3
+    # (speculative_config.context_kv_dtype); the worker binds an FP8 pool.
+    context_kv_fp8 = False
+
+    def reads_managed_ctx_pages(self, tokens_per_block: int) -> bool:
+        """Whether the block decode reads the context KV from a KV cache
+        manager's pages of ``tokens_per_block`` tokens.
+
+        The worker validates the TRTLLM kernels' page sizes when it binds them.
+        """
+        return self.dflash_attention_backend == "TRTLLM"
+
+    # The block decode waits on block_placement.ctx_stored before its first
+    # draft-pool write, so the worker may store the context latents on a side stream.
+    waits_for_ctx_store = False
+
+    def projects_context_beside(self, num_rows: int) -> bool:
+        """Whether ``project_target_hidden_beside`` projects ``num_rows`` captured
+        rows on a stream running beside the main stream's all-reduces."""
+        return False
+
+    @property
+    def reads_helix_sharded_ctx_pages(self) -> bool:
+        """Whether the block decode reads a context whose pages are sharded over
+        helix CP, merging the ranks' partial attention."""
+        return False
+
     @classmethod
     def _resolve_auto_attention_backend(cls) -> str:
         """Turn ``AUTO`` into a concrete backend for this drafter family."""
@@ -711,6 +742,9 @@ class DFlashForCausalLM(nn.Module):
         self.block_size = dflash_config.get(
             "block_size", getattr(pretrained_config, "block_size", None)
         )
+        # The block's draft tokens sit in slots 0..K-1 (the DSpark shift_label
+        # convention, set by DSpark heads) instead of 1..K.
+        self.shift_label = False
         self.logit_multiplier, self.logit_softcap = resolve_draft_logit_transform(dflash_config)
         if dflash_attention_backend == "AUTO":
             dflash_attention_backend = self._resolve_auto_attention_backend()
@@ -1797,6 +1831,7 @@ class DFlashForCausalLM(nn.Module):
         ctx_kv_cache: Optional[torch.Tensor] = None,
         ctx_page_table: Optional[torch.Tensor] = None,
         block_placement: Optional[DraftBlockPlacement] = None,
+        ctx_helix_shard: Optional[HelixDraftShard] = None,
     ) -> torch.Tensor:
         """DFlash draft forward with cross-attention over a pooled K/V buffer.
 
@@ -1812,6 +1847,9 @@ class DFlashForCausalLM(nn.Module):
             block_placement: where the block's own positions sit in the
                 context pages, from the worker's paged single-latent
                 preparation; a drafter that appends the block itself ignores it
+            ctx_helix_shard: the helix shard of a context held in a helix
+                target manager's pages, or None; only a drafter that
+                ``reads_helix_sharded_ctx_pages`` is given one
         Returns:
             [B * block_size, hidden_size]
         """

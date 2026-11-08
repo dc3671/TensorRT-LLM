@@ -114,6 +114,21 @@ class RMSNorm(nn.Module):
         # carries the BF16/FP16 normed output.
         self.fp8_per_token_out = False
 
+    def runs_flashinfer_cute_dsl(self) -> bool:
+        """Whether ``forward`` of BF16 rows without a residual runs FlashInfer's
+        CuTe DSL RMSNorm kernel, whose arithmetic a kernel that fuses this norm
+        must repeat to match it bit for bit."""
+        if not (IS_FLASHINFER_AVAILABLE
+                and not (self.use_cuda_tile or self.use_gemma or self.is_nvfp4)
+                and not self.return_hp_output and self.weight.dtype
+                == torch.bfloat16 and self.weight.is_contiguous()):
+            return False
+        try:
+            from flashinfer.norm import _use_cuda_norm
+        except ImportError:
+            return False
+        return not _use_cuda_norm(self.weight.device)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
