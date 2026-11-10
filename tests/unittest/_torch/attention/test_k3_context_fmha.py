@@ -190,6 +190,7 @@ def test_k3_context_old_o_barrier(run_fmha, q_len: int) -> None:
 @pytest.mark.parametrize("heads", [96, 48, 24, 12, 6, 3])
 def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool, heads: int) -> None:
     from tensorrt_llm._torch.attention.backends.fmha.fp4_mla import Fp4MlaFmha
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
     from tensorrt_llm._torch.custom_ops.cute_dsl_k3_context_custom_ops import (
         CuteDSLK3ContextFmhaRunner,
     )
@@ -208,6 +209,8 @@ def test_k3_context_fmha_cu_kv_dtypes(q_len: int, is_causal: bool, heads: int) -
         qk_rope_head_dim = 64
         v_head_dim = 128
         q_scaling = 1.0
+        rope_append = True
+        out_head_size = TrtllmAttention.out_head_size
 
     attn = Attention()
     fmha = Fp4MlaFmha(attn)
