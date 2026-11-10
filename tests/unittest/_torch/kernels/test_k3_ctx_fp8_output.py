@@ -90,7 +90,7 @@ def test_context_projection_dispatch(
     projection_kind,
     cached_prefix,
 ):
-    from types import SimpleNamespace
+    from types import MethodType, SimpleNamespace
 
     import tensorrt_llm._torch.attention.mla as mla_module
 
@@ -176,10 +176,13 @@ def test_context_projection_dispatch(
         kv_lora_rank=512,
         qk_rope_head_dim=64,
         qk_nope_head_dim=128,
+        qk_head_dim=192,
         num_heads_tp=96,
+        num_context_heads=96,
         v_head_dim=128,
         kv_b_proj=projection,
     )
+    module._project_context_kv = MethodType(mla_module.MLA._project_context_kv, module)
     monkeypatch.setattr(mla_module, "get_sm_version", lambda: 107)
     monkeypatch.setattr(mla_module, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
     monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_mxfp8_gemm_rubin", fused)
