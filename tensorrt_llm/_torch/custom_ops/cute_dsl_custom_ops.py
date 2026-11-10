@@ -15061,12 +15061,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_preferred_clusters = get_max_activate_clusters(
                         preferred_cluster_shape_mn[0] *
                         preferred_cluster_shape_mn[1])
-                cache_key = (self.output_dtype, kernel_variant, sf_vec_size, mma_tiler_mnk,
-                             mma_inst_shape, preferred_cluster_shape_mn,
-                             cluster_shape_mn, swap_ab, use_prefetch,
-                             raster_order, scheduler_mode, split_k,
-                             locality_domain_half_gemm, self.use_tvm_ffi,
-                             max_active_preferred_clusters, max_active_clusters)
+                cache_key = (self.output_dtype, kernel_variant, sf_vec_size,
+                             mma_tiler_mnk, mma_inst_shape,
+                             preferred_cluster_shape_mn, cluster_shape_mn,
+                             swap_ab, use_prefetch, raster_order,
+                             scheduler_mode, split_k, locality_domain_half_gemm,
+                             self.use_tvm_ffi, max_active_preferred_clusters,
+                             max_active_clusters)
                 alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
 
                 # get stream

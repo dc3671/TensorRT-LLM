@@ -3577,7 +3577,9 @@ def test_fp4_mla_context_mxfp8_gather(
             torch.randint(1, 127, sf.shape, dtype=torch.uint8, device="cuda")
         )
         # Native allocation remains active, but use nonidentity physical pages.
-        metadata.fp4_mla_state._paged_kv_indices.copy_(kv.shape[0] - 1 - metadata.fp4_mla_state._paged_kv_indices)
+        metadata.fp4_mla_state._paged_kv_indices.copy_(
+            kv.shape[0] - 1 - metadata.fp4_mla_state._paged_kv_indices
+        )
         if large_page_stride:
             metadata.fp4_mla_state._paged_kv_indices.fill_(1)
             assert kv.stride(0) >= 1 << 31 and sf.stride(0) >= 1 << 31
@@ -3651,7 +3653,10 @@ def test_fp4_mla_context_mxfp8_gather(
             (
                 metadata.fp4_mla_state._paged_kv_indices,
                 torch.full(
-                    (3 * metadata.fp4_mla_state.page_table_stride,), -1, dtype=torch.int32, device="cuda"
+                    (3 * metadata.fp4_mla_state.page_table_stride,),
+                    -1,
+                    dtype=torch.int32,
+                    device="cuda",
                 ),
             )
         )
