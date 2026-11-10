@@ -29,6 +29,7 @@ def run_fmha(request, tmp_path_factory):
         RubinFusedMultiHeadAttentionForward,
     )
     from tensorrt_llm._torch.attention.kernels.rubin.k3_context_fmha_helpers import MaskEnum
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.helpers.ptx_helpers import nanosleep
 
     kernel_type = RubinFusedMultiHeadAttentionForward
     if request.param is not None:
@@ -45,13 +46,15 @@ def run_fmha(request, tmp_path_factory):
             "                        if (row_idx - thread_idx) % self.cta_tiler[0] == 0:\n"
             "                            delay_start = cute.arch.clock64()\n"
             "                            while cute.arch.clock64() - delay_start < 2_000_000:\n"
-            "                                cute.arch.nanosleep(sleep_time=1000)\n"
+            "                                _delay_nanosleep(1000)\n"
         )
         source_path = tmp_path_factory.mktemp("old_o_delay") / "delayed_fmha.py"
         source_path.write_text(source.replace(wait, delay + wait))
         module_name = f"{k3_context_fmha.__package__}._old_o_delay_{request.param}"
         spec = importlib.util.spec_from_file_location(module_name, source_path)
         module = importlib.util.module_from_spec(spec)
+        # The public CuTe DSL has no cute.arch.nanosleep; use the tree's inline-PTX helper.
+        module._delay_nanosleep = nanosleep
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
 
