@@ -218,7 +218,8 @@ class ExpertL2Prefetch:
         """Issue the FC1 prefetch of the experts recorded for ``layer_idx`` at the previous step (on the side
         stream), for a forward of ``rows`` rows."""
         backend = self._backends.get(layer_idx)
-        if backend is None or not self.takes_rows(rows):
+        # NVFP4 experts only: the pieces are FC1 weights and their block scales.
+        if backend is None or not self.takes_rows(rows) or not backend.has_nvfp4:
             return
         w, sf = backend.w3_w1_weight, backend.w3_w1_weight_scale
         if (

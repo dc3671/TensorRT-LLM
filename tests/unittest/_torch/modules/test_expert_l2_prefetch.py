@@ -39,6 +39,7 @@ def _selection(prefetch: ExpertL2Prefetch, layer_idx: int) -> list:
 
 def _backend(num_local: int = NUM_LOCAL) -> SimpleNamespace:
     return SimpleNamespace(
+        has_nvfp4=True,
         w3_w1_weight=torch.randint(0, 255, (num_local, 2, PIECE), dtype=torch.uint8, device="cuda"),
         w3_w1_weight_scale=torch.randint(
             0, 255, (num_local, PIECE), dtype=torch.uint8, device="cuda"
@@ -111,3 +112,13 @@ def test_prefetch_changes_no_tensor_and_joins(budget_ns) -> None:
     torch.cuda.synchronize()
     assert torch.equal(backend.w3_w1_weight, weight)
     assert torch.equal(backend.w3_w1_weight_scale, scale)
+
+
+def test_prefetch_skips_experts_without_nvfp4_scales() -> None:
+    """A layer whose experts are not NVFP4 (no FC1 block scales) issues no prefetch and forks nothing."""
+    prefetch = ExpertL2Prefetch(
+        num_layers=1, min_rows=2, max_rows=64, top_k=TOP_K, stream=torch.cuda.Stream()
+    )
+    prefetch.register(0, SimpleNamespace(has_nvfp4=False))
+    prefetch.prefetch(0, rows=8)
+    assert not prefetch._forked
