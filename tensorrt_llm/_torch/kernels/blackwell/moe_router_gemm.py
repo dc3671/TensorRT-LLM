@@ -47,6 +47,7 @@ from .moe_persistent_engine import _pack_bf16x2_rn
 from .moe_route_front import (
     _bulk_commit,
     _bulk_push,
+    _cluster_arrive_relaxed,
     _cluster_arrive_release,
     _cluster_wait_acquire,
     _keys2,
@@ -547,7 +548,7 @@ class MoeRouterGemmKernel:
                     sB, full_mbar, gs_ptr, xq_ptr, xsf_ptr, s, e_tile, t_tile, tidx, phase
                 )
         cute.arch.mbarrier_wait(recv_mbar, 0)
-        _cluster_arrive_release()  # this CTA's slices have arrived (waited at the end)
+        _cluster_arrive_relaxed()  # this CTA's slices have arrived (waited at the end)
 
         # Reduce this CTA's slice (tokens [s tps, (s + 1) tps) of the tile, all 128 experts) in split order.
         lane = tidx % Int32(32)

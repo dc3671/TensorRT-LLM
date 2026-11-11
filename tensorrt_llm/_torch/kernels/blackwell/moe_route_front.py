@@ -712,7 +712,7 @@ class MoeRouteFrontKernel:
                 _st_b32(ids_ptr + o * Int64(4), my_sel)
                 _st_b16(wts_ptr + o * Int64(2), my_w)
         cute.arch.mbarrier_wait(mbar_ptr, 0)
-        _cluster_arrive_release()  # this CTA's counts have arrived (waited at the end)
+        _cluster_arrive_relaxed()  # this CTA's counts have arrived (waited at the end)
         tot = Int32(0)
         nct = Int32(0)
         e = tidx
