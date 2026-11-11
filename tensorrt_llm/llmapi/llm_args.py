@@ -5312,9 +5312,10 @@ class RemoteCacheConfig(StrictBaseModel):
         default=0,
         status="prototype",
         description=
-        "Bytes of this rank's remote cache level. Pages are byte copies, so the "
-        "level is lossless. It takes the disk level's place, so it cannot be "
-        "combined with `disk_cache_size`.")
+        "Bytes of this rank's remote cache level. Pages are stored as the cold "
+        "tiers store them: byte copies, or encoded by a lossy cold-page codec "
+        "(kv_cache_compression_config) when one is set. It takes the disk "
+        "level's place, so it cannot be combined with `disk_cache_size`.")
 
     lend_size: NonNegativeInt = Field(
         default=0,
@@ -5378,9 +5379,10 @@ class RemoteCacheConfig(StrictBaseModel):
         default=900.0,
         status="prototype",
         description=
-        "Seconds a rank with `cache_size` waits for lenders: for the expected "
-        "lenders to report, and for a free chunk to claim. Lenders publish "
-        "while their own servers start, so this bounds the job's startup skew.")
+        "Seconds a rank with `cache_size` waits for lenders, applied to each "
+        "wait on its own: for the expected lenders to report, and for each "
+        "chunk claim. Lenders publish while their own servers start, so this "
+        "bounds the job's startup skew per wait, not in total.")
 
     transfer_timeout_s: _PositiveFiniteFloat = Field(
         default=30.0,

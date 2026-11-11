@@ -800,7 +800,7 @@ class RemoteLender:
         try:
             self.start()
         except Exception as error:  # noqa: BLE001 - a failed lender only removes capacity
-            _log(f"{self.name} failed to start: {error!r}")
+            logger.warning(f"KVCM2 remote lender: {self.name} failed to start: {error!r}")
             self.close()
             self.publish_failure(error)
 
