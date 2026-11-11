@@ -146,3 +146,29 @@ def test_gdn_verify_tcgen05_replay_is_bitwise(heads, n):
     for k in m0:
         assert torch.equal(m0[k], m1[k]), k
     assert not torch.equal(m0["ssm"], mut["ssm"]), "commit expected (history full)"
+
+
+@skip_no_sm100f
+@pytest.mark.parametrize("t", [2, 4, 7, 8])
+@pytest.mark.parametrize("pnat", ["zero", "offset", "fills", "mixed"])
+@pytest.mark.parametrize("n", [16, 200])
+def test_gdn_verify_tcgen05_matches_gdn_verify_across_draft_lengths(t, pnat, n):
+    """Every admitted draft length, appends at an offset into the history, a history the step fills exactly
+    (16 - T), batches mixing appends and commits, and more requests than one CTA wave of 128."""
+    heads = (2, 8)
+    start = {"zero": 0, "offset": 3, "fills": _HIST - t, "mixed": 0}[pnat]
+    HV, cd, proj, ba, st, mut = _verify_case(heads, n, t, start, seed=2000 + t)
+    if pnat == "mixed":
+        # Every third request commits (its history overflows), the others append at offset 3.
+        st["pnat"].fill_(3)
+        st["pnat"][st["state_indices"][::3].long()] = 12
+    y_ref, m_ref = _verify_op(torch.ops.trtllm.gdn_verify, HV, cd, n, t, proj, ba, st, mut)
+    y, m = _verify_op(gdn_verify_tcgen05, HV, cd, n, t, proj, ba, st, mut)
+    torch.cuda.synchronize()
+    assert y.dtype == torch.float8_e4m3fn and y.shape == y_ref.shape
+    assert _rel(y, y_ref) < 5e-2
+    assert (y.view(torch.uint8) != y_ref.view(torch.uint8)).float().mean().item() < 0.2
+    assert _rel(m["old_u"], m_ref["old_u"]) < 1e-3
+    assert _rel(m["old_k"], m_ref["old_k"]) < 1e-2
+    assert torch.allclose(m["old_g"], m_ref["old_g"], rtol=1e-5, atol=1e-6)
+    assert _rel(m["ssm"], m_ref["ssm"]) < 1e-3
