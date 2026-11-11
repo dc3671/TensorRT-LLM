@@ -139,6 +139,26 @@ class DisaggClusterConfig:
     inactive_timeout_sec: int = 10  # the worker will be considered inactive if it doesn't send heartbeat for inactive_timeout_sec seconds
 
 
+class OutputLengthPredictionConfig(StrictBaseModel):
+    """Generation priority from an online prediction of each request's output length.
+
+    After the context phase the orchestrator predicts the reply's length from the
+    conversation's earlier replies (``conversation_params.conversation_id``) and the
+    prompt length, never from ``max_tokens``, and sets the generation request's
+    ``priority`` (higher for shorter replies). The predictor learns online in the
+    coordinator. Generation servers order by it with
+    ``scheduler_config.waiting_queue_policy: priority``.
+    """
+
+    predictor: Literal["ridge", "ridge_gbm"] = Field(
+        default="ridge_gbm",
+        description=(
+            "'ridge': a ridge regression on the request's history features, "
+            "refit every 120 s. 'ridge_gbm': also a gradient-boosted tree "
+            "ensemble refit every 300 s in a separate process, which needs "
+            "numpy and scikit-learn in the server's Python environment."))
+
+
 @dataclass
 class DisaggServerConfig():
     server_configs: List[CtxGenServerConfig]
@@ -191,6 +211,8 @@ class DisaggServerConfig():
     # servers when they expose per-frontend affinity ports: context requests
     # with a conversation id go to the port of one frontend.
     ctx_frontend_affinity: Optional[Tuple[int, int]] = None
+    # Generation priority from the predicted output length; None: off.
+    output_length_prediction: Optional[OutputLengthPredictionConfig] = None
 
 
 class MetadataServerConfig(StrictBaseModel):
@@ -340,6 +362,7 @@ def extract_disagg_cfg(
         internal_request_auth_key: Optional[str] = None,
         conversation_affinity_header_for_subagents: Optional[str] = None,
         subagent_affinity_scope: Literal['context', 'both'] = 'context',
+        output_length_prediction: Optional[OutputLengthPredictionConfig] = None,
         **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -435,6 +458,10 @@ def extract_disagg_cfg(
             f"{subagent_affinity_scope!r}")
     config.subagent_affinity_scope = subagent_affinity_scope
     config.ctx_frontend_affinity = ctx_frontend_affinity
+    if output_length_prediction is not None:
+        config.output_length_prediction = (
+            OutputLengthPredictionConfig.model_validate(
+                output_length_prediction))
     _warn_if_subagent_affinity_inactive(config)
     return config
 

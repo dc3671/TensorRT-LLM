@@ -45,6 +45,7 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 from tensorrt_llm.serve.openai_service import OpenAIService
+from tensorrt_llm.serve.output_length_predictor import OutputLengthPriority
 from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
@@ -172,6 +173,13 @@ class OpenAIDisaggregatedService(OpenAIService):
         # Opt-in: ask context workers to return prompt_token_ids as base64 int32.
         self._tokids_ctxbytes = config.gen_tokids_ctxbytes
         self._subagent_affinity_scope = config.subagent_affinity_scope
+        # Generation priority from the predicted output length (output_length_prediction).
+        self._output_length_priority: Optional[OutputLengthPriority] = None
+        if config.output_length_prediction is not None:
+            self._output_length_priority = OutputLengthPriority(
+                coordinator, config.output_length_prediction.predictor
+            )
+            logger.info(self._output_length_priority.startup_line())
 
         self._ctx_client = None
         self._gen_client = None
@@ -310,6 +318,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         need_ctx = need_ctx and not benchmark_gen_only
         ctx_response = None
         gen_req = request
+        length_ticket = None
         if need_ctx:
             try:
                 # Mark ctx-dispatch start: arrival->here is the pre-ctx wait in the
@@ -333,6 +342,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                     if hooks:
                         hooks.on_disagg_request_id(disagg_request_id)
                 gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+                if self._output_length_priority is not None:
+                    # Before the generation placement, which orders by the priority it sets.
+                    length_ticket = await self._output_length_priority.assign(gen_req)
             except Exception:
                 if gen_server:
                     await self._gen_router.finish_request(
@@ -356,8 +368,12 @@ class OpenAIDisaggregatedService(OpenAIService):
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
             )
+            if length_ticket is not None:
+                gen_response = self._output_length_priority.track(gen_response, length_ticket)
             return gen_response
         else:
+            if length_ticket is not None:
+                self._output_length_priority.track(ctx_response, length_ticket)
             if gen_server:
                 await self._gen_router.finish_request(request, req_id=gen_reservation_id)
             if hooks:

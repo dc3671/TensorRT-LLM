@@ -83,6 +83,7 @@ class CoordinatorServer:
         self.app.add_api_route("/select", self.select, methods=["POST"])
         self.app.add_api_route("/finish", self.finish, methods=["POST"])
         self.app.add_api_route("/renew", self.renew, methods=["POST"])
+        self.app.add_api_route("/output_length", self.output_length, methods=["POST"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -153,6 +154,36 @@ class CoordinatorServer:
             return self._response({"error": "success must be a boolean"}, status_code=400)
         await self._coordinator.finish(role, req_id, success)
         return self._response({})
+
+    async def output_length(self, raw_req: Request) -> Response:
+        """POST {"op": "predict" | "record", "conv", "isl"[, "out", "key"]}: output-length prediction."""
+        try:
+            body = msgpack.unpackb(await raw_req.body(), raw=False)
+        except Exception as e:
+            return self._response({"error": f"invalid MessagePack body: {e}"}, status_code=400)
+        if not isinstance(body, dict) or body.get("op") not in ("predict", "record"):
+            return self._response({"error": "op must be 'predict' or 'record'"}, status_code=400)
+
+        def is_number(value) -> bool:
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+        conv, isl, out, key = body.get("conv"), body.get("isl"), body.get("out"), body.get("key")
+        if conv is not None and not isinstance(conv, str):
+            return self._response({"error": "conv must be a string or null"}, status_code=400)
+        if not is_number(isl):
+            return self._response({"error": "isl must be a number"}, status_code=400)
+        if body["op"] == "record" and not is_number(out):
+            return self._response({"error": "out must be a number"}, status_code=400)
+        if key is not None and (not isinstance(key, int) or isinstance(key, bool)):
+            return self._response({"error": "key must be an integer or null"}, status_code=400)
+        try:
+            if body["op"] == "predict":
+                tokens, key = await self._coordinator.predict_output_length(conv, isl)
+                return self._response({"tokens": tokens, "key": key})
+            learned = await self._coordinator.record_output_length(conv, isl, out, key)
+            return self._response({"learned": learned})
+        except ValueError as e:
+            return self._response({"error": str(e)}, status_code=503)
 
     async def renew(self, raw_req: Request) -> Response:
         try:

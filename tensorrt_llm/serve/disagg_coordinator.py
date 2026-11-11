@@ -62,6 +62,7 @@ from tensorrt_llm.serve.cluster_storage import (
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient
+from tensorrt_llm.serve.output_length_predictor import OnlineLengthPredictor
 from tensorrt_llm.serve.render.fingerprint import fingerprint_summary
 from tensorrt_llm.serve.router import (
     ROUTING_CONTENT_REQUIRED,
@@ -122,6 +123,21 @@ class DisaggCoordinator(ABC):
 
     @abstractmethod
     async def get_disagg_request_id(self) -> int: ...
+
+    async def predict_output_length(
+        self, conv_id: Optional[str], prompt_tokens: float
+    ) -> Tuple[float, int]:
+        """Predict a generation request's output tokens (``output_length_prediction``).
+
+        Returns the prediction and a key that ``record_output_length`` passes back.
+        """
+        raise NotImplementedError("output_length_prediction is not configured")
+
+    async def record_output_length(
+        self, conv_id: Optional[str], prompt_tokens: float, output_tokens: float, key: Optional[int]
+    ) -> bool:
+        """Learn a finished reply's output tokens; returns whether it was learned."""
+        raise NotImplementedError("output_length_prediction is not configured")
 
 
 class DisaggCoordinatorService(DisaggCoordinator):
@@ -193,6 +209,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._ctx_client: Optional[OpenAIClient] = None
         self._gen_client: Optional[OpenAIClient] = None
         self._disagg_cluster_manager: Optional[DisaggClusterManager] = None
+        # One predictor for every frontend, so that it learns from all replies.
+        self._output_length_predictor: Optional[OnlineLengthPredictor] = None
+        if config.output_length_prediction is not None:
+            self._output_length_predictor = OnlineLengthPredictor(
+                config.output_length_prediction.predictor
+            )
 
     @property
     def ctx_router(self) -> Router:
@@ -264,6 +286,23 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     async def get_disagg_request_id(self) -> int:
         return get_global_disagg_request_id(self._config.node_id)
+
+    def _length_predictor(self) -> OnlineLengthPredictor:
+        if self._output_length_predictor is None:
+            raise ValueError("output_length_prediction is not configured")
+        return self._output_length_predictor
+
+    async def predict_output_length(
+        self, conv_id: Optional[str], prompt_tokens: float
+    ) -> Tuple[float, int]:
+        return self._length_predictor().predict(conv_id, float(prompt_tokens), time.monotonic())
+
+    async def record_output_length(
+        self, conv_id: Optional[str], prompt_tokens: float, output_tokens: float, key: Optional[int]
+    ) -> bool:
+        return self._length_predictor().record(
+            conv_id, float(prompt_tokens), float(output_tokens), key, time.monotonic()
+        )
 
     async def finish(self, role: str, req_id, success: bool = True) -> None:
         _t0 = time.monotonic()
@@ -659,6 +698,40 @@ class CoordinatorClient(DisaggCoordinator):
         # so the per-worker (node_id, process_id) avoids collisions without any HTTP
         # hop. See disagg_utils.get_global_disagg_request_id.
         return get_global_disagg_request_id(self._node_id, self._process_id)
+
+    async def _output_length_call(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        async with self.session.post(
+            f"{self._remote_url}/output_length",
+            data=msgpack.packb(body, use_bin_type=True),
+            headers={"Content-Type": "application/msgpack"},
+            timeout=self._request_timeout_s,
+        ) as resp:
+            reply = msgpack.unpackb(await resp.read(), raw=False)
+            if resp.status != 200:
+                raise RuntimeError(f"coordinator /output_length returned {resp.status}: {reply}")
+            return reply
+
+    async def predict_output_length(
+        self, conv_id: Optional[str], prompt_tokens: float
+    ) -> Tuple[float, int]:
+        reply = await self._output_length_call(
+            {"op": "predict", "conv": conv_id, "isl": float(prompt_tokens)}
+        )
+        return float(reply["tokens"]), int(reply["key"])
+
+    async def record_output_length(
+        self, conv_id: Optional[str], prompt_tokens: float, output_tokens: float, key: Optional[int]
+    ) -> bool:
+        reply = await self._output_length_call(
+            {
+                "op": "record",
+                "conv": conv_id,
+                "isl": float(prompt_tokens),
+                "out": float(output_tokens),
+                "key": key,
+            }
+        )
+        return bool(reply["learned"])
 
     async def is_ready(self) -> bool:
         return self._is_ready
