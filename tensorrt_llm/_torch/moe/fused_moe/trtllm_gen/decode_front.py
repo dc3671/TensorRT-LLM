@@ -1228,7 +1228,12 @@ class DecodeFront:
         race covers the front's token counts, the race of the two fronts. Returns the stock output."""
         out = moe(x, gate(x), output_dtype=x.dtype, **moe_kwargs)
         dispatcher = low_m_gemm_dispatcher(gate)
-        if dispatcher is not None and x.shape[0] <= ROUTER_MAX_TOKENS:
+        # The one-launch front runs the router GEMM in it: power-of-two hidden sizes only.
+        if (
+            dispatcher is not None
+            and x.shape[0] <= ROUTER_MAX_TOKENS
+            and router_front_supports(x.shape[1])
+        ):
             AutoTuner.get().choose_one(
                 FrontRunner.OP,
                 [self._front_runner(gate, moe)],
