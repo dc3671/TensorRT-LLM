@@ -100,14 +100,14 @@ def test_deferred_release_closes_generation_only_request_on_flush() -> None:
     assert 7 not in manager.kv_cache_map
     assert len(manager._deferred_closes) == 1
 
-    manager.flush_deferred_closes()
+    assert manager.flush_deferred_closes() is True
 
     cache.close.assert_called_once_with()
     manager.impl.clear_stats_excluded.assert_called_once_with(7)
     manager.index_mapper.remove_sequence.assert_called_once_with(7)
     assert not manager._deferred_closes
     assert not manager._early_freed_index_requests
-    manager.flush_deferred_closes()
+    assert manager.flush_deferred_closes() is False
     cache.close.assert_called_once_with()
 
 

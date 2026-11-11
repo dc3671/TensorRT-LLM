@@ -8382,11 +8382,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self._deferred_closes.append((request_id, kv_cache))
         return True
 
-    def flush_deferred_closes(self) -> None:
+    def flush_deferred_closes(self) -> bool:
         """Close the KvCaches `_defer_remove_kv_cache` left open, oldest first.
 
-        A close that raises leaves the later ones queued; its own request is forgotten all the same.
+        Returns whether any was pending. A close that raises leaves the later ones queued; its own
+        request is forgotten all the same.
         """
+        if not self._deferred_closes:
+            return False
         while self._deferred_closes:
             request_id, kv_cache = self._deferred_closes.popleft()
             try:
@@ -8395,6 +8398,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.close()
             finally:
                 self.impl.clear_stats_excluded(request_id)
+        return True
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
