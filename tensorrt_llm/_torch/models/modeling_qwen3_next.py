@@ -163,10 +163,9 @@ def _mid_decode_layout(model_config: ModelConfig) -> bool:
 
 
 # Small decode layouts: every CUDA-graph decode step above the one-launch
-# front's rows holds at most this many requests. There the GDN verify runs as
-# one launch from in_proj on, and the expert prefetch ranks the experts by
-# routed rows and stops issuing after a per-layer-kind budget (GDN /
-# full-attention layers, ns).
+# front's rows holds at most this many requests. There the expert prefetch
+# ranks the experts by routed rows and stops issuing after a per-layer-kind
+# budget (GDN / full-attention layers, ns).
 _SMALL_LAYOUT_MAX_REQUESTS = 5
 _EXPERT_PREFETCH_BUDGET_NS = (18500, 12500)
 
@@ -1364,8 +1363,6 @@ class Qwen3NextLinearDecoderLayer(_Qwen3NextDecoderLayerBase):
             resident_ba_min_rows=resident_ba_min_rows,
             verify_tcgen05_min_rows=_verify_tcgen05_min_rows(model_config)
             if _uses_decode_kernels(model_config) else 0,
-            verify_chain=_uses_tp_decode_kernels(model_config)
-            and _small_decode_layout(model_config),
             fused_prefill=_uses_prefill_kernels(model_config))
         self._init_common(model_config, layer_idx, aux_stream,
                           shared_gate_stream)

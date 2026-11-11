@@ -697,7 +697,7 @@ def test_decode_layout_decisions(
     """Where the Qwen3.5 decode paths engage, derived from the layout (MTP rows per request, CUDA-graph batch
     sizes, attention DP): the large-step rows (tcgen05 GDN verify, the MoE engine's spare SMs), pass 0's kept rows,
     the mid-layout glue (state promotion beside the draft loop, sample + accept in one launch) and the small layouts
-    (one-launch GDN verify chain, budgeted expert prefetch)."""
+    (budgeted expert prefetch)."""
     from tensorrt_llm._torch.models import modeling_qwen3_next as m
 
     monkeypatch.setattr(m, "_uses_decode_kernels", lambda model_config: True)

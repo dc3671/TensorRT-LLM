@@ -460,8 +460,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     # Row gate of the verify replay + gated norm on the tcgen05 kernel (0: never), and its draft rows per request.
     verify_tcgen05_min_rows: int = 0
     verify_tcgen05_tokens: int = 0
-    # A verify step with an E4M3 input runs in_proj through the gated norm as one launch (qwen3_5_gdn_verify_chain).
-    verify_chain: bool = False
 
     def __init__(
         self,
@@ -473,7 +471,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         resident_min_rows: int = 0,
         resident_ba_min_rows: int = 0,
         verify_tcgen05_min_rows: int = 0,
-        verify_chain: bool = False,
         fused_prefill: bool = False,
     ):
         """Gated DeltaNet mixer.
@@ -487,8 +484,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 of cuBLAS with its weights loaded before the PDL wait.
             verify_tcgen05_min_rows: From this many rows (0: never), a fused verify step that writes the E4M3
                 out_proj input runs the replay + gated RMSNorm on the tcgen05 kernel (gdn_verify_tcgen05).
-            verify_chain: A fused verify step with an E4M3 input runs in_proj_qkvz, in_proj_ba, the conv1d update,
-                the replay and the gated RMSNorm in one launch (qwen3_5_gdn_verify_chain) where it takes the step.
             fused_prefill: Run context-only prefill on the fused conv1d + post-conv kernel and the in-forward
                 snapshot split's copies on the fused copy kernels, where the layer's shapes allow it.
         """
@@ -683,12 +678,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 tcgen05.compile_gdn_verify_tcgen05(tokens, hv, hk)
                 self.verify_tcgen05_min_rows = verify_tcgen05_min_rows
                 self.verify_tcgen05_tokens = tokens
-        if self.fused_verify and verify_chain:
-            from ...kernels.blackwell import qwen3_5_gdn_verify_chain as chain
-
-            # Its launch tickets and hand-off buffer exist before any CUDA-graph capture.
-            chain.prepare_qwen3_5_gdn_verify_chain(torch.cuda.current_device())
-            self.verify_chain = True
         self.fused_split_copies = fused_prefill
         self.fused_prefill_conv = fused_prefill and gdn_prefill_conv_supported(
             self.head_k_dim,
@@ -1021,67 +1010,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         b = out_ba[:, : self.num_v_heads_per_tp]
         a = out_ba[:, self.num_v_heads_per_tp :]
         return self._fused_verify_replay_norm(plan, mixed_qkv, z, a, b)
-
-    def _verify_chain(
-        self,
-        hidden_states: torch.Tensor,
-        h_fp8: Optional[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-        spec_metadata: Optional[SpecMetadata],
-    ) -> Optional[torch.Tensor]:
-        """The whole decode-only MTP target-verify chain (in_proj_qkvz, in_proj_ba, conv1d update, replay, gated
-        RMSNorm, E4M3 out_proj input) in one launch, or None when the step, the shapes or the caches do not
-        qualify."""
-        if h_fp8 is None or is_torch_compiling():
-            return None
-        qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
-        if not isinstance(qkvz.quant_method, FP8QDQLinearMethod):
-            return None
-        plan = self._fused_verify_plan(attn_metadata, spec_metadata, hidden_states.shape[0])
-        if plan is None:
-            return None
-        from ...kernels.blackwell import qwen3_5_gdn_verify_chain as chain
-
-        layer_cache = plan.layer_cache
-        args = (
-            h_fp8,
-            hidden_states,
-            qkvz.quant_method.get_static_input_scale(qkvz),
-            qkvz.weight,
-            qkvz.weight_scale,
-            ba.weight,
-            plan.conv_weight,
-            layer_cache.conv,
-            layer_cache.intermediate_conv_window,
-            self.A_log,
-            self.dt_bias,
-            self.norm.weight,
-            self.norm.fp8_scale,
-        )
-        caches = (
-            layer_cache.temporal,
-            plan.state_indices,
-            layer_cache.old_x,
-            layer_cache.old_B,
-            layer_cache.old_dt,
-            layer_cache.cache_buf_idx,
-            layer_cache.prev_num_accepted_tokens,
-        )
-        if not chain.qwen3_5_gdn_verify_chain_supported(
-            *args,
-            *caches,
-            plan.draft_token_num,
-            qkvz_bias=qkvz.bias,
-            ba_bias=ba.bias,
-            conv_bias=self.conv1d.bias,
-        ):
-            return None
-        y = torch.empty(
-            (hidden_states.shape[0], self.value_dim_per_tp),
-            dtype=torch.float8_e4m3fn,
-            device=h_fp8.device,
-        )
-        return chain.qwen3_5_gdn_verify_chain(*args, self.norm.eps, *caches, 1, y)
 
     def _resident_verify_inproj(
         self,
@@ -1998,11 +1926,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         h_fp8: Optional[torch.Tensor] = None,
     ):
-        fused = None
-        if self.verify_chain:
-            fused = self._verify_chain(hidden_states, h_fp8, attn_metadata, spec_metadata)
-        if fused is None:
-            fused = self._fused_verify_inproj(hidden_states, h_fp8, attn_metadata, spec_metadata)
+        fused = self._fused_verify_inproj(hidden_states, h_fp8, attn_metadata, spec_metadata)
         if fused is None:
             fused = self._resident_verify_inproj(hidden_states, h_fp8, attn_metadata, spec_metadata)
         if fused is not None:
