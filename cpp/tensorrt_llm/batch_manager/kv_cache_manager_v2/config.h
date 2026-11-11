@@ -96,17 +96,10 @@ struct HostCacheTierConfig
     }
 };
 
-//! What the tiers the GPU cannot address share: a quota and a directory. Their pages move only through the
-//! page-staging buffer.
-struct StagedCacheTierConfig
+struct DiskCacheTierConfig
 {
     size_t quota = 0; // bytes
-    std::string path;
-};
-
-struct DiskCacheTierConfig : StagedCacheTierConfig
-{
-    // path: directory for temp files
+    std::string path; // directory for temp files
 
     [[nodiscard]] CacheTier tier() const noexcept
     {
@@ -125,10 +118,11 @@ enum class RemoteTransport : int
     FABRIC = 1,
 };
 
-//! Slots in host memory other processes donate (storage/remoteMem.h); `path` is the rendezvous directory the donors
-//! publish into.
-struct RemoteCacheTierConfig : StagedCacheTierConfig
+//! Slots in host memory other processes donate (storage/remoteMem.h). Shares nothing with the disk tier.
+struct RemoteCacheTierConfig
 {
+    size_t quota = 0; // bytes
+    std::string path; // the rendezvous directory the donors publish into
     //! Required: how long creating the level waits for donor capacity, and how long one transfer may take
     //! (RemoteCacheConfig.donor_wait_timeout_s and transfer_timeout_s).
     int64_t waitTimeoutMs = 0;

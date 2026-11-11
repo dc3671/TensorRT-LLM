@@ -56,8 +56,8 @@ size_t tierAllocationGranularity(CacheTier tier, size_t quota)
     // so the unit is a fill chunk rather than a quantum and one size serves every tier. The
     // backing raises it to a page should a platform ever ask for more.
     case CacheTier::HOST_MEM: return hostMemSizeGranularity();
-    case CacheTier::DISK:
-    case CacheTier::REMOTE: return kStagedPoolSizeGranularity;
+    case CacheTier::DISK: return kDiskPoolSizeGranularity;
+    case CacheTier::REMOTE: return kRemotePoolSizeGranularity;
     default: throw std::invalid_argument("Invalid cache tier");
     }
 }
@@ -432,7 +432,7 @@ Address HostSlotPool::slotAddress(SlotId slot) const
 // ---------------------------------------------------------------------------
 
 DiskSlotPool::DiskSlotPool(std::string const& directory, size_t slotSize, SlotCount numSlots)
-    : StagedSlotPool(slotSize)
+    : SlotPoolBase(slotSize)
 {
     // Try O_TMPFILE first, fall back to mkstemp.
     mFd = ::open(directory.c_str(), O_TMPFILE | O_RDWR | O_EXCL, 0664);
@@ -462,6 +462,11 @@ DiskSlotPool::~DiskSlotPool()
     destroy();
 }
 
+SlotCount DiskSlotPool::numSlots() const noexcept
+{
+    return mNumSlots;
+}
+
 void DiskSlotPool::destroy()
 {
     if (mFd != kBadFileDescriptor)
@@ -474,7 +479,6 @@ void DiskSlotPool::destroy()
 
 void DiskSlotPool::resize(SlotCount newNumSlots)
 {
-    TLLM_CHECK_WITH_INFO(mFd != kBadFileDescriptor, "DiskSlotPool::resize after destroy");
     // Recorded only once the file really changed size: resizeFile throws without resizing.
     resizeFile(mFd, slotCountToSizeT(newNumSlots) * mSlotSize);
     mNumSlots = newNumSlots;
@@ -494,7 +498,7 @@ Address DiskSlotPool::slotAddress(SlotId slot) const
 // ---------------------------------------------------------------------------
 
 RemoteSlotPool::RemoteSlotPool(SharedPtr<RemoteMemClient> client, size_t slotSize, SlotCount numSlots)
-    : StagedSlotPool(slotSize)
+    : SlotPoolBase(slotSize)
     , mRange(std::make_unique<RemoteRange>(std::move(client), slotSize))
 {
     resize(numSlots);

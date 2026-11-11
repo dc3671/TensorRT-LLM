@@ -202,9 +202,13 @@ private:
     DynamicBitset mOccupiedMask;
 };
 
-//! Granularity a staged (disk or remote) pool is sized in. Neither has an allocation
-//! unit to match, so this is just a rounding quantum.
-inline constexpr size_t kStagedPoolSizeGranularity = size_t{2} << 20;
+//! Granularity a disk pool is sized in. Disk has no allocation unit to match,
+//! so this is just a rounding quantum.
+inline constexpr size_t kDiskPoolSizeGranularity = size_t{2} << 20;
+
+//! Granularity a remote pool is sized in. Its slots come in whole donated chunks, which RemoteRange
+//! claims as needed, so this is only a rounding quantum.
+inline constexpr size_t kRemotePoolSizeGranularity = size_t{2} << 20;
 
 //! The grain a hot-level pool of `medium` rounds its bytes to, where
 //! `deviceGranularity` is the VMM allocation granularity device pools grow in.
@@ -360,44 +364,24 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// StagedSlotPool — a pool the GPU cannot address (disk, remote); its pages move
-// only through the page-staging buffer.
-// ---------------------------------------------------------------------------
-class StagedSlotPool : public SlotPoolBase
-{
-public:
-    using SlotPoolBase::SlotPoolBase;
-
-    SlotCount numSlots() const noexcept override
-    {
-        return mNumSlots;
-    }
-
-    [[nodiscard]] size_t sizeGranularity() const noexcept override
-    {
-        return kStagedPoolSizeGranularity;
-    }
-
-protected:
-    // Tracks the backing's size, which only resize() changes: the backing is owned solely by this
-    // pool, so nothing else can grow or shrink it behind us. Held here because slot lookups
-    // bounds-check against it on every call, and querying the backing would cost a call per page.
-    SlotCount mNumSlots{0};
-};
-
-// ---------------------------------------------------------------------------
 // DiskSlotPool — temp-file backed disk pool.
 // ---------------------------------------------------------------------------
-class DiskSlotPool : public StagedSlotPool
+class DiskSlotPool : public SlotPoolBase
 {
 public:
     // directory: path under which to create the temp file.
     DiskSlotPool(std::string const& directory, size_t slotSize, SlotCount numSlots);
     ~DiskSlotPool() override;
 
+    SlotCount numSlots() const noexcept override;
     void destroy() override;
     void resize(SlotCount newNumSlots) override;
     Address slotAddress(SlotId slot) const override;
+
+    [[nodiscard]] size_t sizeGranularity() const noexcept override
+    {
+        return kDiskPoolSizeGranularity;
+    }
 
     [[nodiscard]] CacheTier medium() const noexcept override
     {
@@ -411,16 +395,32 @@ public:
 
 private:
     int mFd = kBadFileDescriptor;
+    // Tracks the file size, which only resize() changes: the file is created unlinked and owned
+    // solely by this pool, so nothing else can grow or shrink it behind us. Held here because
+    // slotAddress() bounds-checks against it on every call, and querying the file would make that
+    // an lseek per page of a migration.
+    SlotCount mNumSlots{0};
 };
 
 // ---------------------------------------------------------------------------
 // RemoteSlotPool — slots in host memory other processes donate (remoteMem.h).
+// The GPU cannot address them: their pages move through the page-staging buffer.
 // ---------------------------------------------------------------------------
-class RemoteSlotPool : public StagedSlotPool
+class RemoteSlotPool : public SlotPoolBase
 {
 public:
     RemoteSlotPool(SharedPtr<RemoteMemClient> client, size_t slotSize, SlotCount numSlots);
     ~RemoteSlotPool() override;
+
+    SlotCount numSlots() const noexcept override
+    {
+        return mNumSlots;
+    }
+
+    [[nodiscard]] size_t sizeGranularity() const noexcept override
+    {
+        return kRemotePoolSizeGranularity;
+    }
 
     void destroy() override;
     //! Growing claims more chunks and throws without resizing if none can be had; shrinking keeps them.
@@ -437,6 +437,8 @@ public:
 
 private:
     std::unique_ptr<RemoteRange> mRange;
+    // The slots resize() asked for; the range may hold more (whole chunks).
+    SlotCount mNumSlots{0};
 };
 
 // ---------------------------------------------------------------------------

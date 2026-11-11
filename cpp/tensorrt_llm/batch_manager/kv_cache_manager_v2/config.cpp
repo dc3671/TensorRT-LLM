@@ -94,32 +94,28 @@ void AttentionLayerConfig::validate() const
         "AttentionLayerConfig: sparse_cache is set on a layer with no sparse buffer to serve");
 }
 
-namespace
-{
-
-//! The checks every staged tier shares: a positive quota and an existing directory. `kind` names the tier.
-void validateStagedTier(StagedCacheTierConfig const& cfg, std::string const& kind)
-{
-    if (cfg.quota == 0)
-    {
-        throw std::invalid_argument(kind + ": quota must be > 0");
-    }
-    if (!std::filesystem::is_directory(cfg.path))
-    {
-        throw std::invalid_argument(kind + ": path '" + cfg.path + "' is not a directory");
-    }
-}
-
-} // namespace
-
 void DiskCacheTierConfig::validate() const
 {
-    validateStagedTier(*this, "DiskCacheTierConfig");
+    if (quota == 0)
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: quota must be > 0");
+    }
+    if (!std::filesystem::is_directory(path))
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: path '" + path + "' is not a directory");
+    }
 }
 
 void RemoteCacheTierConfig::validate() const
 {
-    validateStagedTier(*this, "RemoteCacheTierConfig");
+    if (quota == 0)
+    {
+        throw std::invalid_argument("RemoteCacheTierConfig: quota must be > 0");
+    }
+    if (!std::filesystem::is_directory(path))
+    {
+        throw std::invalid_argument("RemoteCacheTierConfig: rendezvous directory '" + path + "' is not a directory");
+    }
     if (waitTimeoutMs <= 0 || transferTimeoutMs <= 0)
     {
         throw std::invalid_argument("RemoteCacheTierConfig: timeouts must be positive");

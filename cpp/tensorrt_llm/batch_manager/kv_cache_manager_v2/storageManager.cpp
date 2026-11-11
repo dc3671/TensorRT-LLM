@@ -872,6 +872,12 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
         return;
     }
 
+    if (remoteLevel(srcIsHot ? dstLevel : srcLevel) != nullptr)
+    {
+        submitRemoteHotMigration(dstLevel, srcLevel, batchingLayerGroupId, pageIndices, numPages, stream);
+        return;
+    }
+
     CacheLevel const coldLevel = srcIsHot ? dstLevel : srcLevel;
     PoolGroupIndex const coldPgIdx = srcIsHot ? dstPgIdx : srcPgIdx;
     // Only a GPU-tier pool is ever host-backed, so for a cold level cacheTier() and
@@ -912,90 +918,10 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
         return;
     }
 
+    TLLM_CHECK_WITH_INFO(coldTier == CacheTier::DISK, "Unsupported cold cache tier");
     thread_local std::vector<PageIndexPair> stagingPageIndices;
     size_t remaining = numPages;
     size_t offset = 0;
-
-    if (coldTier == CacheTier::REMOTE)
-    {
-        // Remote level: the codec runs against the page staging buffer, and the client moves the bytes between
-        // staging and the remote slots, on the stream or on the host (a failure then throws before _batchedMigrate
-        // points any page at its new slot).
-        RemoteRange& range = remoteLevel(coldLevel)->remoteRange(coldPgIdx, PoolIndex{0});
-        RemoteMemClient& client = range.client();
-        bool const streamOrdered = client.streamOrdered();
-        std::vector<RemoteIo> ios;
-        while (remaining > 0)
-        {
-            size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / coldPageBytes
-                ? std::numeric_limits<size_t>::max()
-                : coldPageBytes * remaining;
-            ios.clear();
-            if (srcIsHot)
-            {
-                // Hot -> remote: encode into staging on the stream, then WRITE once the encode is done.
-                StagingBuffer staging
-                    = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, stream);
-                size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
-                stagingPageIndices.resize(batchSize);
-                for (size_t index = 0; index < batchSize; ++index)
-                {
-                    stagingPageIndices[index]
-                        = PageIndexPair{static_cast<int32_t>(index), pageIndices[offset + index].src};
-                }
-                TLLM_CHECK_WITH_INFO(encodeBatch(reinterpret_cast<void*>(staging.address()), stagingPageIndices.data(),
-                                         batchSize, stream),
-                    "Cold-page codec rejected a migration batch");
-                for (size_t index = 0; index < batchSize; ++index)
-                {
-                    auto const [donor, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].dst));
-                    ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, donor, remoteAddr});
-                }
-                // Stream-ordered, the WRITE starts when the stream has encoded the batch and the lease retires after
-                // it; on the host, it waits for the encode.
-                if (!streamOrdered)
-                {
-                    cuCheck(cuStreamSynchronize(stream));
-                }
-                client.transfer(/*write=*/true, ios, coldPageBytes, stream);
-                offset += batchSize;
-                remaining -= batchSize;
-            }
-            else
-            {
-                // Remote -> hot: READ into staging, then decode on the stream. Stream-ordered, the lease is the
-                // stream's from the start and the READ begins when the stream reaches it; on the host, the lease is
-                // host-synchronous and moves to the stream only after the READ has finished.
-                StagingBuffer staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16,
-                    streamOrdered ? std::optional<CUstream>{stream} : std::nullopt);
-                size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
-                for (size_t index = 0; index < batchSize; ++index)
-                {
-                    auto const [donor, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].src));
-                    ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, donor, remoteAddr});
-                }
-                client.transfer(/*write=*/false, ios, coldPageBytes, stream);
-                if (!streamOrdered)
-                {
-                    staging.setStream(stream);
-                }
-                stagingPageIndices.resize(batchSize);
-                for (size_t index = 0; index < batchSize; ++index)
-                {
-                    stagingPageIndices[index]
-                        = PageIndexPair{pageIndices[offset + index].dst, static_cast<int32_t>(index)};
-                }
-                TLLM_CHECK_WITH_INFO(decodeBatch(reinterpret_cast<void const*>(staging.address()),
-                                         stagingPageIndices.data(), batchSize, stream),
-                    "Cold-page codec rejected a migration batch");
-                offset += batchSize;
-                remaining -= batchSize;
-            }
-        }
-        return;
-    }
-
-    TLLM_CHECK_WITH_INFO(coldTier == CacheTier::DISK, "Unsupported cold cache tier");
     while (remaining > 0)
     {
         size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / coldPageBytes
@@ -1054,6 +980,121 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     if (stagingPageIndices.capacity() > kMaxRetainedPageIndexPairs)
     {
         std::vector<PageIndexPair>().swap(stagingPageIndices);
+    }
+}
+
+void StorageManager::submitRemoteHotMigration(CacheLevel dstLevel, CacheLevel srcLevel,
+    LayerGroupId batchingLayerGroupId, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+{
+    TLLM_CHECK_WITH_INFO(mPageStagingManager != nullptr, "A remote cache level needs page staging");
+    bool const srcIsHot = srcLevel == kHotLevel;
+    CacheLevel const coldLevel = srcIsHot ? dstLevel : srcLevel;
+    PoolGroupIndex const coldPgIdx = getPoolGroupIndex(coldLevel, batchingLayerGroupId);
+    size_t const coldPageBytes = slotSize(coldLevel, coldPgIdx).at(PoolIndex{0});
+    PageIndexLocation const pageIndexLocation = mPageIndexLocations.at(batchingLayerGroupId);
+    auto toSlotId = [](int32_t pageIndex)
+    {
+        TLLM_CHECK_DEBUG(pageIndex >= 0);
+        return SlotId{pageIndex};
+    };
+    auto encodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
+                           void* dstBasePtr, PageIndexPair const* indices, size_t count, CUstream batchStream)
+    {
+        return submitColdPageCodec(pageIndexLocation, indices, count, batchStream,
+            [this, batchingLayerGroupId, dstBasePtr](
+                PageIndexPair const* submittedIndices, size_t submittedPages, CUstream submittedStream)
+            {
+                return mColdPageCodec->encode(batchingLayerGroupId, dstBasePtr, submittedIndices, submittedPages,
+                    reinterpret_cast<cudaStream_t>(submittedStream));
+            });
+    };
+    auto decodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
+                           void const* srcBasePtr, PageIndexPair const* indices, size_t count, CUstream batchStream)
+    {
+        return submitColdPageCodec(pageIndexLocation, indices, count, batchStream,
+            [this, batchingLayerGroupId, srcBasePtr](
+                PageIndexPair const* submittedIndices, size_t submittedPages, CUstream submittedStream)
+            {
+                return mColdPageCodec->decode(batchingLayerGroupId, srcBasePtr, submittedIndices, submittedPages,
+                    reinterpret_cast<cudaStream_t>(submittedStream));
+            });
+    };
+
+    // Kept across calls, as the disk path's: a migration batch reuses the previous one's allocation.
+    thread_local std::vector<PageIndexPair> stagingPageIndices;
+    size_t remaining = numPages;
+    size_t offset = 0;
+    // Remote level: the codec runs against the page staging buffer, and the client moves the bytes between
+    // staging and the remote slots, on the stream or on the host (a failure then throws before _batchedMigrate
+    // points any page at its new slot).
+    RemoteRange& range = remoteLevel(coldLevel)->remoteRange(coldPgIdx, PoolIndex{0});
+    RemoteMemClient& client = range.client();
+    bool const streamOrdered = client.streamOrdered();
+    std::vector<RemoteIo> ios;
+    while (remaining > 0)
+    {
+        size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / coldPageBytes
+            ? std::numeric_limits<size_t>::max()
+            : coldPageBytes * remaining;
+        ios.clear();
+        if (srcIsHot)
+        {
+            // Hot -> remote: encode into staging on the stream, then WRITE once the encode is done.
+            StagingBuffer staging
+                = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, stream);
+            size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
+            stagingPageIndices.resize(batchSize);
+            for (size_t index = 0; index < batchSize; ++index)
+            {
+                stagingPageIndices[index] = PageIndexPair{static_cast<int32_t>(index), pageIndices[offset + index].src};
+            }
+            TLLM_CHECK_WITH_INFO(
+                encodeBatch(reinterpret_cast<void*>(staging.address()), stagingPageIndices.data(), batchSize, stream),
+                "Cold-page codec rejected a migration batch");
+            for (size_t index = 0; index < batchSize; ++index)
+            {
+                auto const [donor, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].dst));
+                ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, donor, remoteAddr});
+            }
+            // Stream-ordered, the WRITE starts when the stream has encoded the batch and the lease retires after
+            // it; on the host, it waits for the encode.
+            if (!streamOrdered)
+            {
+                cuCheck(cuStreamSynchronize(stream));
+            }
+            client.transfer(/*write=*/true, ios, coldPageBytes, stream);
+            offset += batchSize;
+            remaining -= batchSize;
+        }
+        else
+        {
+            // Remote -> hot: READ into staging, then decode on the stream. Stream-ordered, the lease is the
+            // stream's from the start and the READ begins when the stream reaches it; on the host, the lease is
+            // host-synchronous and moves to the stream only after the READ has finished.
+            StagingBuffer staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16,
+                streamOrdered ? std::optional<CUstream>{stream} : std::nullopt);
+            size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
+            for (size_t index = 0; index < batchSize; ++index)
+            {
+                auto const [donor, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].src));
+                ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, donor, remoteAddr});
+            }
+            client.transfer(/*write=*/false, ios, coldPageBytes, stream);
+            if (!streamOrdered)
+            {
+                staging.setStream(stream);
+            }
+            stagingPageIndices.resize(batchSize);
+            for (size_t index = 0; index < batchSize; ++index)
+            {
+                stagingPageIndices[index] = PageIndexPair{pageIndices[offset + index].dst, static_cast<int32_t>(index)};
+            }
+            TLLM_CHECK_WITH_INFO(decodeBatch(reinterpret_cast<void const*>(staging.address()),
+                                     stagingPageIndices.data(), batchSize, stream),
+                "Cold-page codec rejected a migration batch");
+            offset += batchSize;
+            remaining -= batchSize;
+        }
     }
 }
 
@@ -1921,7 +1962,7 @@ int64_t StorageManager::prefetch(
         _batchedMigrate(dstLevel, srcLevel, migrationPages, /*updateSrc=*/true);
         // Per batch, after it landed: the pages are already grouped by source level, so this costs
         // nothing per page and never credits a batch that did not run.
-        if (!isGpuAccessibleMemory(cacheTier(srcLevel)))
+        if (cacheTier(srcLevel) == CacheTier::DISK)
         {
             diskBlocksMigrated += static_cast<int64_t>(migrationPages.size());
         }

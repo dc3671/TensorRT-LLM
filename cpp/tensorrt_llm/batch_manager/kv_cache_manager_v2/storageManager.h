@@ -468,6 +468,10 @@ private:
     void dropPagesOfFailedRemoteLevels();
     //! The client of a remote tier's rendezvous directory, created on first use; null for any other tier.
     SharedPtr<RemoteMemClient> remoteClientFor(CacheTierConfig const& tier);
+    //! A hot-to-remote or remote-to-hot migration: the cold-page codec runs against the page-staging buffer and the
+    //! remote level's client moves the bytes. Separate from the disk path.
+    void submitRemoteHotMigration(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
+        PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
     //! A cold-to-cold migration where either side is a remote level, through the page-staging buffer. A failed
     //! transfer on the host throws RemoteMemError before any page is pointed at its new slot.
     void submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel srcLevel, PoolGroupIndex dstPgIdx,
