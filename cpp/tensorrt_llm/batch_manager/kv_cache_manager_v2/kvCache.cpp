@@ -1373,15 +1373,24 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
 
         CUstream stream = cudaStream();
         newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
-        try
-        {
-            storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
-        }
-        catch (...)
+        auto const releaseNewSlot = [&]()
         {
             // Whatever the copy enqueued finishes before the slot is reused.
             newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
             storageMgr.releaseSlot(lcIdx, lvl, std::move(newSlot));
+        };
+        try
+        {
+            storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
+        }
+        catch (RemoteMemError const&)
+        {
+            releaseNewSlot();
+            continue; // the snapshot is optional: a failed remote level holds none, as for the allocation above
+        }
+        catch (...)
+        {
+            releaseNewSlot();
             throw;
         }
 
