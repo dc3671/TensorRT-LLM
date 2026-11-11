@@ -58,6 +58,15 @@ COORDINATOR_UDS_BACKLOG = 16384
 MSGPACK_MEDIA_TYPE = "application/msgpack"
 
 
+def _effective_uds_backlog() -> int:
+    """COORDINATOR_UDS_BACKLOG as capped by net.core.somaxconn, where Linux exposes it."""
+    try:
+        with open("/proc/sys/net/core/somaxconn") as f:
+            return min(COORDINATOR_UDS_BACKLOG, int(f.read()))
+    except (OSError, ValueError):
+        return COORDINATOR_UDS_BACKLOG
+
+
 class CoordinatorServer:
     """Serve a :class:`DisaggCoordinatorService`'s coordination API over HTTP."""
 
@@ -205,6 +214,13 @@ class CoordinatorServer:
             import asyncio as _asyncio
 
             await self._coordinator.start()
+            backlog = _effective_uds_backlog()
+            if backlog < COORDINATOR_UDS_BACKLOG:
+                logger.warning(
+                    f"Coordinator UNIX socket accept queue is {backlog}, capped by "
+                    f"net.core.somaxconn (requested {COORDINATOR_UDS_BACKLOG}); raise the "
+                    "sysctl if routers report coordinator connect failures under bursts."
+                )
             try:
                 uds_cfg = uvicorn.Config(
                     self.app, uds=uds, lifespan="off", backlog=COORDINATOR_UDS_BACKLOG, **kwargs
