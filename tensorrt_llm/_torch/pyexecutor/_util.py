@@ -3698,9 +3698,8 @@ class KvCacheCreator:
                 estimating_kv_cache,
                 kv_cache_config_override=draft_build_kv_cache_config,
                 cold_page_codec_provider=cold_page_codec_provider,
-                remote_lender=(kv_cache_manager.remote_lender
-                               if self_kv_cache_config.remote_cache_config
-                               is not None else None))
+                remote_lender=(kv_cache_manager.remote_lender if isinstance(
+                    kv_cache_manager, KVCacheManagerV2) else None))
 
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None
