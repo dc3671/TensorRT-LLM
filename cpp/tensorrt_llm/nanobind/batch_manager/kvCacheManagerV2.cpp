@@ -1765,18 +1765,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
     nb::class_<kv::RemoteCacheTierConfig>(m, "RemoteCacheTierConfig")
-        .def(nb::init<size_t, std::string, int64_t, int64_t, uint32_t, kv::RemoteTransport, std::string,
-                 std::vector<double>>(),
+        .def(nb::init<size_t, std::string, int64_t, int64_t, uint32_t, kv::RemoteTransport,
+                 std::map<std::string, std::string>, std::vector<double>>(),
             nb::arg("quota"), nb::arg("path"), nb::arg("wait_timeout_ms") = 0, nb::arg("transfer_timeout_ms") = 0,
             nb::arg("expected_donors") = 0, nb::arg("transport") = kv::RemoteTransport::NIXL,
-            nb::arg("ucx_devices") = std::string{}, nb::arg("pool_ratio") = std::vector<double>{})
+            nb::arg("agent_backend_params") = std::map<std::string, std::string>{},
+            nb::arg("pool_ratio") = std::vector<double>{})
         .def_rw("quota", &kv::RemoteCacheTierConfig::quota)
         .def_rw("path", &kv::RemoteCacheTierConfig::path)
         .def_rw("wait_timeout_ms", &kv::RemoteCacheTierConfig::waitTimeoutMs)
         .def_rw("transfer_timeout_ms", &kv::RemoteCacheTierConfig::transferTimeoutMs)
         .def_rw("expected_donors", &kv::RemoteCacheTierConfig::expectedDonors)
         .def_rw("transport", &kv::RemoteCacheTierConfig::transport)
-        .def_rw("ucx_devices", &kv::RemoteCacheTierConfig::ucxDevices)
+        .def_rw("agent_backend_params", &kv::RemoteCacheTierConfig::agentBackendParams)
         .def_rw("pool_ratio", &kv::RemoteCacheTierConfig::poolRatio)
         .def_prop_ro("tier", &kv::RemoteCacheTierConfig::tier)
         .def("validate", &kv::RemoteCacheTierConfig::validate) DEF_COPY(kv::RemoteCacheTierConfig);

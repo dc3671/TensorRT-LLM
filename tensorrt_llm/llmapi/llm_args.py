@@ -5348,8 +5348,10 @@ class RemoteCacheConfig(StrictBaseModel):
         status="prototype",
         description=
         "NIXL transport only: comma-separated UCX devices of the remote level's "
-        "NIXL agents (for example 'mlx5_0:1'); '{GPU}' is replaced by the rank's "
-        "physical GPU index. None uses the process's UCX environment.")
+        "and the donor's NIXL agents (for example 'mlx5_0:1'), each on port 1 "
+        "(NIXL's UCX backend takes device names and uses port 1); '{GPU}' is "
+        "replaced by the rank's physical GPU index. None uses the process's "
+        "UCX environment.")
 
     pool_ratio: Optional[List[_PositiveFiniteFloat]] = Field(
         default=None,
@@ -5433,6 +5435,13 @@ class RemoteCacheConfig(StrictBaseModel):
             raise ValueError(
                 "remote_cache_config.ucx_devices applies to transport='nixl' only"
             )
+        for entry in (self.ucx_devices or "").split(","):
+            name, _, port = entry.strip().partition(":")
+            if self.ucx_devices is not None and (not name
+                                                 or port not in ("", "1")):
+                raise ValueError(
+                    f"remote_cache_config.ucx_devices entry {entry.strip()!r} "
+                    "is not '<device>' or '<device>:1'")
         return self
 
 

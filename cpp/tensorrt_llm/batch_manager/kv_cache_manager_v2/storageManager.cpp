@@ -603,7 +603,7 @@ SharedPtr<RemoteMemClient> StorageManager::remoteClientFor(CacheTierConfig const
         return nullptr;
     }
     RemoteMemOptions options{remote->path, remote->waitTimeoutMs, remote->transferTimeoutMs, remote->transport,
-        remote->ucxDevices, remote->expectedDonors};
+        remote->agentBackendParams, remote->expectedDonors};
     for (auto const& client : mRemoteClients)
     {
         if (client->directory() != remote->path)

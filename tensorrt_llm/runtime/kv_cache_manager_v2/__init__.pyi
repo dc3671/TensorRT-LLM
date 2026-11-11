@@ -295,7 +295,7 @@ class RemoteCacheTierConfig:
     transfer_timeout_ms: int = 0  # required
     expected_donors: int = 0  # 0: unknown
     transport: RemoteTransport = RemoteTransport.NIXL
-    ucx_devices: str = ""  # NIXL only
+    agent_backend_params: dict[str, str] = ...  # NIXL only: e.g. {"device_list": "mlx5_0"}
     pool_ratio: list[float] = ...  # empty: the hot level's split
     @property
     def tier(self) -> CacheTier: ...

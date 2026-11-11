@@ -108,6 +108,26 @@ def resolve_ucx_devices(devices: Optional[str], device: Optional[int] = None) ->
     return resolved
 
 
+def nixl_ucx_backend_params(devices: Optional[str]) -> dict:
+    """The NIXL UCX backend parameters that restrict an agent to `devices` (UCX_NET_DEVICES form, e.g.
+    "mlx5_0:1,mlx5_1:1", ``{GPU}`` already resolved); empty for None.
+
+    NIXL's UCX backend reads only ``device_list``: device names split on ", ", each given port 1 (``ucx_devices``, the
+    key its plugin lists, is never read). A device on another port cannot be expressed and raises."""
+    if not devices:
+        return {}
+    names = []
+    for entry in devices.split(","):
+        name, _, port = entry.strip().partition(":")
+        if not name or port not in ("", "1"):
+            raise ValueError(
+                f"UCX devices {devices!r}: {entry.strip()!r} is not '<device>' or '<device>:1' (NIXL's UCX "
+                "backend uses port 1 of each device)"
+            )
+        names.append(name)
+    return {"device_list": ", ".join(names)}
+
+
 def _log(message: str) -> None:
     logger.info(f"KVCM2 remote donor: {message}")
 
@@ -740,7 +760,7 @@ class NixlDonor(RemoteMemDonor):
         )
 
         ensure_rendezvous_directory(self.directory)
-        ucx_devices = resolve_ucx_devices(self.ucx_devices, self.device)
+        backend_params = nixl_ucx_backend_params(resolve_ucx_devices(self.ucx_devices, self.device))
         t0 = time.monotonic()
         flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_NORESERVE
         self._map = mmap.mmap(-1, self.nbytes, flags=flags)
@@ -764,8 +784,8 @@ class NixlDonor(RemoteMemDonor):
         config.multi_thread = False
         config.use_listen_thread = False
         # This agent's own UCX devices; the process-wide UCX_NET_DEVICES stays as the serving process needs it.
-        if ucx_devices:
-            config.backend_params = {"ucx_devices": ucx_devices}
+        if backend_params:
+            config.backend_params = backend_params
         self._agent = NixlTransferAgent(config)
         self._agent.register_memory(
             MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, self.nbytes, 0)])

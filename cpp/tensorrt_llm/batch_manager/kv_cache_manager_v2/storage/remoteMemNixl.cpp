@@ -44,10 +44,7 @@ NixlRemoteMemClient::NixlRemoteMemClient(RemoteMemOptions options)
         config.useListenThread = false;
         config.enableTelemetry = false;
         // This agent's own devices, so the process-wide UCX_NET_DEVICES of the KV transceiver's agent stays.
-        if (!mOptions.ucxDevices.empty())
-        {
-            config.backendParams["ucx_devices"] = mOptions.ucxDevices;
-        }
+        config.backendParams.insert(mOptions.agentBackendParams.begin(), mOptions.agentBackendParams.end());
         mNixlAgent = kvc::makeTransferAgent("nixl", &config);
         TLLM_CHECK_WITH_INFO(mNixlAgent != nullptr, "KVCM2 remote level: creating the NIXL agent failed");
         discoverDonors();

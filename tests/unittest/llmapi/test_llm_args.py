@@ -2083,6 +2083,14 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
             "pool_ratio": [0.5, 0.0]
         },
         {
+            "donate_size": 1 << 30,
+            "ucx_devices": "mlx5_0:2"  # NIXL's UCX backend uses port 1
+        },
+        {
+            "donate_size": 1 << 30,
+            "ucx_devices": "mlx5_0:1,,mlx5_1:1"
+        },
+        {
             "donate_size": (1 << 30) - 1  # below the donor's 1 GiB chunk
         },
         {
@@ -2143,6 +2151,9 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
     assert remote(directory=str(tmp_path),
                   donate_size=1 << 30,
                   ucx_devices="mlx5_0:1").ucx_devices == "mlx5_0:1"
+    assert remote(directory=str(tmp_path),
+                  donate_size=1 << 30,
+                  ucx_devices="rdma_vf_rail{GPU}:1, mlx5_1").ucx_devices
     with pytest.raises(ValidationError):
         KvCacheConfig(remote_cache_config={
             "directory": str(tmp_path),

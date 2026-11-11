@@ -8309,13 +8309,16 @@ class KVCacheManagerV2(BaseResourceManager):
         from .remote_donor import (
             check_remote_capacity,
             ensure_rendezvous_directory,
+            nixl_ucx_backend_params,
             resolve_ucx_devices,
             start_donation,
         )
 
         remote_dir = os.path.expandvars(os.path.expanduser(remote_config.directory))
         ensure_rendezvous_directory(remote_dir)
-        ucx_devices = resolve_ucx_devices(remote_config.ucx_devices)
+        agent_backend_params = nixl_ucx_backend_params(
+            resolve_ucx_devices(remote_config.ucx_devices)
+        )
         if remote_config.donate_size and self._remote_donor is None:
             # This rank's memory joins the pool before its own cache exists: clients wait for donors.
             self._remote_donor = start_donation(remote_config, torch.cuda.current_device())
@@ -8337,7 +8340,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     transfer_timeout_ms=math.ceil(remote_config.transfer_timeout_s * 1000),
                     expected_donors=remote_config.expected_num_donors or 0,
                     transport=RemoteTransport[remote_config.transport.upper()],
-                    ucx_devices=ucx_devices or "",
+                    agent_backend_params=agent_backend_params,
                     pool_ratio=list(remote_config.pool_ratio or []),
                 )
             )

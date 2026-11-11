@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cuda.h>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -49,8 +50,8 @@ struct RemoteMemOptions
     //! How long one NIXL transfer may take before it counts as failed (RemoteCacheTierConfig::transferTimeoutMs).
     int64_t transferTimeoutMs = 0;
     RemoteTransport transport = RemoteTransport::NIXL;
-    //! NIXL only: the UCX devices of this client's agent; empty uses the process's UCX environment.
-    std::string ucxDevices;
+    //! NIXL only: backend parameters of this client's agent (RemoteCacheTierConfig::agentBackendParams).
+    std::map<std::string, std::string> agentBackendParams;
     //! Donors the job starts (RemoteCacheTierConfig::expectedDonors); 0 if unknown.
     uint32_t expectedDonors = 0;
 

@@ -12,14 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The {GPU} token in remote_cache_config.ucx_devices (the remote level's NIXL devices). No GPU needed."""
+"""remote_cache_config.ucx_devices: the {GPU} token and the NIXL backend parameter. No GPU needed."""
 
 import os
+import shutil
+import sys
+import tempfile
+import types
 import unittest
 from unittest import mock
 
 from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
-from tensorrt_llm._torch.pyexecutor.kv_cache.remote_donor import resolve_ucx_devices
+from tensorrt_llm._torch.pyexecutor.kv_cache.remote_donor import (
+    make_donor,
+    nixl_ucx_backend_params,
+    resolve_ucx_devices,
+)
 
 
 def _visible(value=None):
@@ -67,6 +75,88 @@ class TestRemoteUcxDevices(unittest.TestCase):
             with self.subTest(devices=devices, visible=visible), _visible(visible):
                 with self.assertRaises(ValueError):
                     resolve_ucx_devices(devices, device=1)
+
+
+class TestNixlUcxBackendParams(unittest.TestCase):
+    """NIXL 1.5.2's UCX backend reads `device_list` (names split on ", ", port 1 appended); `ucx_devices` is ignored."""
+
+    def test_devices_become_the_device_list_nixl_reads(self):
+        self.assertEqual(nixl_ucx_backend_params(None), {})
+        self.assertEqual(nixl_ucx_backend_params("mlx5_0:1"), {"device_list": "mlx5_0"})
+        self.assertEqual(
+            nixl_ucx_backend_params("rdma_vf_rail0:1, rdma_vf_rail2:1,mlx5_3"),
+            {"device_list": "rdma_vf_rail0, rdma_vf_rail2, mlx5_3"},
+        )
+
+    def test_a_port_other_than_1_raises(self):
+        for devices in ("mlx5_0:2", "mlx5_0:1,", ":1"):
+            with self.subTest(devices=devices), self.assertRaises(ValueError):
+                nixl_ucx_backend_params(devices)
+
+    def test_the_donor_agent_gets_the_device_list(self):
+        """The donor's NIXL agent is created with `device_list` in its backend parameters."""
+        configs = []
+
+        class _Config:
+            def __init__(self):
+                self.backend_params = {}
+
+        class _Agent:
+            def __init__(self, config):
+                configs.append(config)
+
+            def register_memory(self, descs):
+                pass
+
+            def deregister_memory(self, descs):
+                pass
+
+            def get_local_agent_desc(self):
+                return types.SimpleNamespace(serialize=lambda: b"desc")
+
+        binding = types.ModuleType("tensorrt_llm.tensorrt_llm_transfer_agent_binding")
+        binding.BaseAgentConfig = _Config
+        binding.NixlTransferAgent = _Agent
+        binding.MemoryDesc = lambda *args: args
+        binding.MemoryDescs = lambda *args: args
+        binding.MemoryType = types.SimpleNamespace(DRAM="DRAM")
+        directory = tempfile.mkdtemp(prefix="kvcm2_ucx_devices_")
+        try:
+            donor = make_donor(
+                directory,
+                4 << 20,
+                transport="nixl",
+                chunk_bytes=2 << 20,
+                ucx_devices="mlx5_0:1,mlx5_3:1",
+            )
+            with mock.patch.dict(sys.modules, {binding.__name__: binding}):
+                donor.start()
+                donor.close()
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(configs[0].backend_params, {"device_list": "mlx5_0, mlx5_3"})
+
+    def test_the_remote_level_agent_gets_the_device_list(self):
+        """The remote level's tier carries `device_list` to its NIXL agent's backend parameters."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+        from tensorrt_llm.llmapi.llm_args import RemoteCacheConfig
+
+        manager = object.__new__(KVCacheManagerV2)
+        manager.is_draft = False
+        directory = tempfile.mkdtemp(prefix="kvcm2_ucx_devices_")
+        try:
+            tiers = []
+            manager._add_remote_level(
+                RemoteCacheConfig(
+                    directory=directory, cache_size=1 << 30, ucx_devices="mlx5_0:1,mlx5_3:1"
+                ),
+                tiers,
+            )
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+        self.assertEqual(len(tiers), 1)
+        self.assertEqual(tiers[0].agent_backend_params, {"device_list": "mlx5_0, mlx5_3"})
 
 
 if __name__ == "__main__":

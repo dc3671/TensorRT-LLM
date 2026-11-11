@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -135,8 +136,9 @@ struct RemoteCacheTierConfig : StagedCacheTierConfig
     //! Donors the job starts; once all have reported, a claim stops waiting. 0 if unknown.
     uint32_t expectedDonors = 0;
     RemoteTransport transport = RemoteTransport::NIXL;
-    //! NIXL only: the UCX devices of the level's agent (e.g. "mlx5_0:1"); empty uses the process's.
-    std::string ucxDevices;
+    //! NIXL only: backend parameters of the level's agent, passed to the backend as they are (e.g. UCX's
+    //! {"device_list": "mlx5_0, mlx5_1"}); empty uses the process's UCX environment.
+    std::map<std::string, std::string> agentBackendParams;
     //! Positive weights, one per layer group, that split the quota across layer groups instead of the hot level's
     //! ratio; normalized by the storage manager. Empty follows the hot level.
     std::vector<double> poolRatio;
