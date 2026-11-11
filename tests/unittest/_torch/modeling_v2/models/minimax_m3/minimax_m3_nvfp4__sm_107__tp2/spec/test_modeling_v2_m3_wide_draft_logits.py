@@ -130,3 +130,28 @@ def test_a_wide_draft_pick_reaches_the_shard_argmax(monkeypatch) -> None:
     tokens = w.sample_draft_tokens(logits, meta, rows, draft_step=0)
     assert calls == [((rows, shard), torch.bfloat16, shard, (rows, 0))]
     assert torch.equal(tokens, torch.arange(rows, dtype=torch.int32) + 7)
+
+
+def test_the_greedy_draft_override_takes_the_base_signature() -> None:
+    """SpecWorkerBase.sample_draft_tokens passes ``tokens_out`` to greedy_sample_draft_with_tp_gather; the M3 override
+    must accept it and hand it on, and the step's ``out`` row must hold the tokens on every path."""
+    import inspect
+
+    from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+
+    base = inspect.signature(SpecWorkerBase.greedy_sample_draft_with_tp_gather).parameters
+    assert list(
+        inspect.signature(M3Eagle3Worker.greedy_sample_draft_with_tp_gather).parameters
+    ) == list(base)
+
+    w = _worker()
+    w.mapping.tp_size = 1  # replicated logits: the base sampler's plain argmax
+    w._d2t = None
+    meta = SimpleNamespace(wants_advanced_draft_sampling=False, is_cuda_graph=False)
+    logits = torch.randn(5, 64)
+    out = torch.full((5,), -1, dtype=torch.int32)
+    tokens = w.sample_draft_tokens(logits, meta, 5, draft_step=0, out=out)
+    expected = logits.argmax(dim=-1).to(torch.int32)
+    assert torch.equal(out, expected)
+    assert torch.equal(tokens, expected)
+    assert torch.equal(w.sample_draft_tokens(logits, meta, 5, draft_step=0), expected)

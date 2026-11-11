@@ -5,7 +5,7 @@ import copy
 import inspect
 import os
 from dataclasses import replace
-from typing import Dict, Generic, Iterator, List, Optional, Tuple
+from typing import ClassVar, Dict, Generic, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -36,7 +36,7 @@ from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.interface import SpeculativeDecodingMode
-from ..utils import AuxStreamType
+from ..utils import AuxStreamType, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
@@ -1389,8 +1389,11 @@ class MTPForCausalLM(nn.Module):
         mtp_layer = None
         lm_head_quant_config = None
         # Whether the MTP layer's forward takes the draft loop's deferred
-        # ``kv_lens_increment``.
+        # ``kv_lens_increment`` and pass 0's ``kept_rows``, and whether the
+        # target's recurrent-state promotion may run beside the draft loop.
         folds_kv_lens_increment = False
+        takes_kept_rows = False
+        promotes_target_state_beside = False
         # A target model that owns its MTP layer class (a Modeling V2
         # target, for example) names it, and the drafter builds that class
         # instead of the built-in one registered for the model type.
@@ -1414,6 +1417,9 @@ class MTPForCausalLM(nn.Module):
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
                 folds_kv_lens_increment = True
+                takes_kept_rows = Qwen3NextMTP.takes_kept_rows(model_config)
+                promotes_target_state_beside = (
+                    Qwen3NextMTP.promotes_target_state_beside(model_config))
             case "qwen4_exp_text":
                 from .modeling_qwen4_exp import Qwen4ExpMTP
                 mtp_layer = Qwen4ExpMTP
@@ -1463,6 +1469,8 @@ class MTPForCausalLM(nn.Module):
             for layer_idx in range(mtp_num_layers)
         ])
         self.folds_kv_lens_increment = folds_kv_lens_increment
+        self.takes_kept_rows = takes_kept_rows
+        self.promotes_target_state_beside = promotes_target_state_beside
         dwdp_manager = get_global_dwdp_manager()
         if dwdp_manager is not None and mtp_repeat_count > 1:
             for layer_idx in range(mtp_num_layers):
@@ -1732,7 +1740,10 @@ def get_draft_model(model_config, draft_config, lm_head, model):
 
 
 # The step-loop hooks of a model with the one-engine speculative fast paths.
-_FAST_PATH_RUNTIME_HOOKS = RuntimeHooks(loop_on_execution_stream=True)
+_FAST_PATH_RUNTIME_HOOKS = RuntimeHooks(loop_on_execution_stream=True,
+                                        pack_spec_rng_uploads=True,
+                                        iteration_timing_one_event=True,
+                                        perf_metrics_timing_side_stream=True)
 
 
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
@@ -1740,10 +1751,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
     # Set per instance from supports_spec_decode_fast_paths in __init__.
     spec_decode_fast_paths: bool = False
+    # Declared by the model: under the fast paths, temperature rows of the TP
+    # key exchange draw Gumbel noise four entries per Philox call (another
+    # noise stream; TPKeyExchange fast_gumbel).
+    spec_decode_fast_gumbel: ClassVar[bool] = False
+    # Declared by the model: under the fast paths, the TP key exchange's
+    # argmax splits rows by its row-split bounds (TPKeyExchange
+    # argmax_row_split; same tokens, another launch shape).
+    spec_decode_argmax_row_split: ClassVar[bool] = False
 
     @property
     def runtime_hooks(self) -> Optional[RuntimeHooks]:
-        """The fast paths run the overlap loop on the execution stream."""
+        """The fast paths run the overlap loop on the execution stream, stage
+        the sampler's Philox state with the step inputs and keep the timing
+        events off the current stream."""
         return (_FAST_PATH_RUNTIME_HOOKS
                 if self.spec_decode_fast_paths else None)
 
@@ -1791,7 +1812,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 # only; None elsewhere).
                 from ..distributed import ll_exchange
                 key_exchange = ll_exchange.create_tp_key_exchange(
-                    model_config.mapping, model_config.max_num_tokens)
+                    model_config.mapping,
+                    model_config.max_num_tokens,
+                    fast_gumbel=self.spec_decode_fast_gumbel,
+                    argmax_row_split=self.spec_decode_argmax_row_split)
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
                 requested_draft_moe_backend = _get_requested_draft_moe_backend(
@@ -1934,10 +1958,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         # copy here instead of one per attention layer that needs them dense.
         # Not with context requests: a breakable prefill CUDA graph replays its
         # body against the capture-time position tensor.
+        # Not under torch.compile: the inference-mode copy differs from the
+        # position-buffer view context batches pass, so every switch between
+        # them would recompile; the compiled graph makes its own dense copies.
         hoist_positions = (self.spec_decode_fast_paths
                            and self.spec_worker is not None
                            and position_ids is not None
-                           and attn_metadata.num_contexts == 0)
+                           and attn_metadata.num_contexts == 0
+                           and not is_torch_compiling())
         if hoist_positions:
             position_ids = position_ids.contiguous()
         hidden_states = self.model(
