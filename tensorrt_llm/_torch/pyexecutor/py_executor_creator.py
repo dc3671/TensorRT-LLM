@@ -1502,6 +1502,7 @@ def _create_py_executor(
                 )
                 py_executor.rebind_resources(execution_resources)
         except BaseException as error:
+            # Also past the final build, whose target manager's shutdown would withdraw the lend unmarked.
             kv_cache_creator.close_remote_lender(error)
             py_executor.shutdown()
             raise

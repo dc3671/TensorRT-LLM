@@ -1020,6 +1020,8 @@ class KvCacheCreator:
     # estimation so that clients do not wait out the warmup; the final target
     # manager takes it over.
     _remote_lender = None
+    # The lend handed to the final target manager (close_remote_lender).
+    _handed_remote_lender = None
 
     def __init__(
         self,
@@ -3549,8 +3551,8 @@ class KvCacheCreator:
         the tier to the manager's own device quota; V1 builds no secondary pool.
         The disk tier is V2 only and has no auto policy, so dropping its budget
         leaves the tier out; so does dropping the remote cache config: the
-        lend starts beside the probe (_start_remote_lend), the claim waits for
-        the final build.
+        lend is placed before the probe (_start_remote_lend), the claim waits
+        for the final build.
         """
         if kv_cache_config is None:
             return kv_cache_config
@@ -3649,7 +3651,8 @@ class KvCacheCreator:
             remote_lender=early_lender,
         )
         if not estimating_kv_cache:
-            self._remote_lender = None  # the manager owns it now
+            # The manager owns it now; kept only to mark it should startup fail after this.
+            self._handed_remote_lender, self._remote_lender = self._remote_lender, None
         try:
             draft_kv_cache_manager, cross_kv_cache_manager = (
                 self._build_secondary_managers(
@@ -3711,7 +3714,7 @@ class KvCacheCreator:
         return draft_kv_cache_manager, cross_kv_cache_manager
 
     def _start_remote_lend(self) -> None:
-        """Start this rank's lend for the final target manager, once."""
+        """Start this rank's lend for the final target manager, once, and wait until it is placed or failed."""
         remote_config = self._kv_cache_config.remote_cache_config
         if (remote_config is None or not remote_config.lend_size
                 or self._remote_lender is not None):
@@ -3719,12 +3722,16 @@ class KvCacheCreator:
         from .kv_cache.remote_lender import start_lend
         self._remote_lender = start_lend(remote_config,
                                          torch.cuda.current_device())
+        # Placed before the estimation probe and its warmup take host memory, which would leave the lend short.
+        self._remote_lender.wait_started()
 
     def close_remote_lender(self,
                             error: Optional[BaseException] = None) -> None:
-        """Withdraw a lend that no manager took over (startup failed before the final build), leaving its failure
-        marker when `error` is given."""
+        """Withdraw a lend that no manager took over, leaving its failure marker when `error` is given. With `error`,
+        a lend already handed to the final target manager is withdrawn and marked too; its later close is a no-op."""
         lender, self._remote_lender = self._remote_lender, None
+        if lender is None and error is not None:
+            lender, self._handed_remote_lender = self._handed_remote_lender, None
         if lender is not None:
             lender.close(error)
 

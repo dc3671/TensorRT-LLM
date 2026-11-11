@@ -1280,6 +1280,32 @@ class TestBuildManagersBudgetGates:
         lender.close.assert_called_once_with(error)
         assert c._remote_lender is None
 
+    def test_the_estimation_probe_waits_for_the_lend_to_be_placed(self, tmp_path, monkeypatch):
+        """The lend starts on a thread; the probe and its warmup take host memory only once it is placed."""
+        c, lender, events = self._gen_style_lend(tmp_path, monkeypatch)
+        lender.wait_started.side_effect = lambda: events.append("placed")
+
+        c.build_managers({}, estimating_kv_cache=True)
+
+        assert events == ["lend", "placed", ("target", None)]
+
+    def test_a_failure_after_the_hand_over_still_marks_the_lend(self, tmp_path, monkeypatch):
+        """Once the final target manager owns the lend, a later startup failure (rebind_resources) still leaves its
+        failure marker: the manager's shutdown alone would withdraw it unmarked."""
+        c, lender, _ = self._gen_style_lend(tmp_path, monkeypatch)
+        resources = {}
+        c.build_managers(resources, estimating_kv_cache=True)
+        c.teardown_managers(resources)
+        c.build_managers(resources, estimating_kv_cache=False)
+        assert c._remote_lender is None
+
+        error = RuntimeError("rebind failed")
+        c.close_remote_lender(error)
+
+        lender.close.assert_called_once_with(error)
+        c.close_remote_lender(error)  # once only
+        lender.close.assert_called_once_with(error)
+
     def test_without_estimation_the_manager_starts_the_lend(self, tmp_path, monkeypatch):
         c, _, events = self._gen_style_lend(tmp_path, monkeypatch)
 
