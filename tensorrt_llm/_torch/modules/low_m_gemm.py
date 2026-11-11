@@ -474,14 +474,17 @@ def low_m_gemm_takes_rows(module: Optional[torch.nn.Module], rows: int) -> bool:
     if not LOW_M_GEMM_ACTIVE and dispatcher is None:
         return False
     # The AutoTuner race is host code that torch.compile cannot trace.
-    if rows > _MAX_M or torch.compiler.is_compiling():
+    if torch.compiler.is_compiling() or rows > _MAX_M:
         return False
     return dispatcher is None or dispatcher.takes_rows(module, rows)
 
 
 def _should_apply_low_m_gemm(input: torch.Tensor, module: Optional[torch.nn.Module] = None) -> bool:
-    """Fast pre-filter: :func:`low_m_gemm_takes_rows` for the rows of ``input``."""
-    if input.ndim < 1:
+    """Fast pre-filter: :func:`low_m_gemm_takes_rows` for the rows of ``input``, after the enable flag (or a
+    dispatcher attached to ``module``) and the compile check, which cost no shape reads."""
+    if not LOW_M_GEMM_ACTIVE and getattr(module, "_low_m_gemm_dispatcher", None) is None:
+        return False
+    if input.ndim < 1 or torch.compiler.is_compiling():
         return False
     k = int(input.shape[-1])
     if k <= 0:

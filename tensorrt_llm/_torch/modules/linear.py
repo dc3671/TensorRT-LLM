@@ -896,6 +896,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
             if output is not None:
                 return output
         if (module.resident_fp8_min_rows > 0 and bias is None
+                and not torch.compiler.is_compiling()
                 and input.dtype == torch.float8_e4m3fn and input.dim() == 2
                 and input.shape[0] >= module.resident_fp8_min_rows
                 and (module.dtype or torch.bfloat16) == torch.bfloat16):
@@ -985,6 +986,9 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         GEMM for this projection (same summation order as the plain projection), or, for an E4M3 or BF16 input of
         the rows the two-shot kernel takes, the tcgen05 GEMM + two-shot all-reduce kernel (a BF16 input is quantized
         as apply() would)."""
+        # Both kernels are CuTe DSL host launches that torch.compile cannot trace.
+        if torch.compiler.is_compiling():
+            return None
         static_input_scale = self.get_static_input_scale(module)
         if (static_input_scale is not None and module.bias is None
                 and input.dim() == 2

@@ -203,7 +203,8 @@ class ExpertL2Prefetch:
             self._budget_ns[layer_idx] = issue_budget_ns
 
     def takes_rows(self, rows: int) -> bool:
-        return self.min_rows <= rows <= self.max_rows
+        # Side-stream forks and Triton launches: not under torch.compile.
+        return self.min_rows <= rows <= self.max_rows and not torch.compiler.is_compiling()
 
     def _device_state(self, device: torch.device) -> _DeviceState:
         if self._state is None:

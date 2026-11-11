@@ -4,10 +4,11 @@
 (``kernels/blackwell/tp2_allreduce_norm.py``), one per TP2 mapping.
 
 ``AllReduce`` builds it (one per mapping, ``AllReduce.tp2_fused_norm_kernels``) when the model declares
-``allreduce_tp2_fused_norm``, the strategy is AUTO or TWOSHOT (the kernel is a two-shot) and the TP2 group has no
-MNNVL all-reduce; ``AllReduce.forward`` routes the residual RMSNorm fusions of BF16 calls of ``MIN_TOKENS`` to
-``max_tokens`` tokens here. The workspace (each rank's two landing buffers of max_tokens / 2 rows and its flags) is
-a McastGPUBuffer allocated when the first AllReduce of the mapping is built, before any CUDA graph capture.
+``allreduce_tp2_fused_norm``, the strategy is AUTO and the TP2 group has no MNNVL all-reduce; ``AllReduce.forward``
+routes the residual RMSNorm fusions of BF16 calls of ``MIN_TOKENS`` to ``max_tokens`` tokens here. The workspace (each
+rank's two landing buffers of max_tokens / 2 rows and its flags: max_tokens x hidden x 2 bytes, e.g. 128 MiB for
+16384 tokens at hidden 4096) is a McastGPUBuffer allocated when the first AllReduce of the mapping is built, before
+the KV cache is sized and any CUDA graph is captured.
 """
 
 from __future__ import annotations
@@ -36,14 +37,14 @@ class Tp2AllReduceNorm:
 
     @classmethod
     def is_supported(cls, mapping, hidden: int, max_tokens: int) -> bool:
-        """A TP2 mapping, calls that reach MIN_TOKENS, and a row the kernel's reduction tree spans."""
+        """CuTe DSL, a TP2 mapping, calls that reach MIN_TOKENS, and a row the kernel's reduction tree spans."""
+        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+        if not (IS_CUTLASS_DSL_AVAILABLE and mapping.tp_size == 2 and max_tokens >= cls.MIN_TOKENS):
+            return False
         from ..kernels.blackwell.tp2_allreduce_norm import Tp2WarpAllReduceNormKernel
 
-        return (
-            mapping.tp_size == 2
-            and max_tokens >= cls.MIN_TOKENS
-            and Tp2WarpAllReduceNormKernel.supports_hidden(hidden)
-        )
+        return Tp2WarpAllReduceNormKernel.supports_hidden(hidden)
 
     def __init__(self, mapping, hidden: int, max_tokens: int):
         from .ops import (

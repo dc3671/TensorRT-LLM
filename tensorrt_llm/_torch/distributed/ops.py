@@ -1497,8 +1497,8 @@ class AllReduce(nn.Module):
                     )
                     self.mnnvl_allreduce = None
 
-            if (tp2_fused_norm and self.strategy in (AllReduceStrategy.AUTO,
-                                                     AllReduceStrategy.TWOSHOT)
+            # Only under AUTO: an explicitly chosen strategy runs as chosen.
+            if (tp2_fused_norm and self.strategy == AllReduceStrategy.AUTO
                     and self.mapping.tp_size == 2 and not self._disable_mpi
                     and self.mnnvl_allreduce is None
                     and dtype in (None, torch.bfloat16)
@@ -1663,7 +1663,9 @@ class AllReduce(nn.Module):
                 "AllReduce takes MoEAllReduceParams only where supports_moe_fold() holds"
             )
         tp2 = self.tp2_allreduce
-        if (tp2 is not None and all_reduce_params.bias is None
+        # A CuTe DSL host launch, which torch.compile cannot trace.
+        if (tp2 is not None and not torch.compiler.is_compiling()
+                and all_reduce_params.bias is None
                 and all_reduce_params.residual is not None
                 and all_reduce_params.norm_weight is not None and tp2.supports(
                     input, all_reduce_params.fusion_op,
