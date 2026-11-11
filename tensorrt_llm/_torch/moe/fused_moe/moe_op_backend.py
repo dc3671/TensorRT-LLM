@@ -433,31 +433,27 @@ class TRTLLMOpBackend(MoEOpBackend):
                 gemm1_weights_scale is not None
                 and gemm1_weights_scale.shape[-1] == hidden_size // 16
             ):
-                # nvfp4; the op that writes the decode kernels' state where the model declares them
-                if not decode_tuning and (
-                    decode_engine_state is not None
+                # nvfp4; calls that take the decode kernels' buffers go to the op that declares their writes
+                decode_kwargs = dict(
+                    prerouted_candidates=None if prerouted is None else prerouted.candidates,
+                    decode_engine_state=decode_engine_state,
+                    lamport_fc2_out=lamport_fc2_out,
+                    decode_early_release_rows=decode_early_release_rows,
+                    decode_shared_expert_rows=decode_shared_expert_rows,
+                )
+                decode_call = (
+                    decode_tuning
+                    or decode_engine_state is not None
                     or lamport_fc2_out is not None
                     or (prerouted is not None and prerouted.candidates is not None)
-                ):
-                    raise ValueError(
-                        "the decode engine state, Lamport FC2 rows and engine routing need decode_tuning"
-                    )
-                decode_kwargs = (
-                    dict(
-                        prerouted_candidates=None if prerouted is None else prerouted.candidates,
-                        decode_engine_state=decode_engine_state,
-                        lamport_fc2_out=lamport_fc2_out,
-                        decode_early_release_rows=decode_early_release_rows,
-                        decode_shared_expert_rows=decode_shared_expert_rows,
-                    )
-                    if decode_tuning
-                    else {}
                 )
                 fp4_op = (
                     torch.ops.trtllm.fp4_block_scale_moe_decode_runner
-                    if decode_tuning
+                    if decode_call
                     else torch.ops.trtllm.fp4_block_scale_moe_runner
                 )
+                if not decode_call:
+                    decode_kwargs = {}
                 outputs = fp4_op(
                     router_logits,
                     routing_bias,
