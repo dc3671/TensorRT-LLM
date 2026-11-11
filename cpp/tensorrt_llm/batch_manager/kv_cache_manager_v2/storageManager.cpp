@@ -602,24 +602,21 @@ SharedPtr<RemoteMemClient> StorageManager::remoteClientFor(CacheTierConfig const
     {
         return nullptr;
     }
-    RemoteMemOptions options{remote->path, remote->waitTimeoutMs, remote->transferTimeoutMs,
-        remote->transport == RemoteTransport::FABRIC, remote->ucxDevices, remote->expectedLenders};
+    RemoteMemOptions options{remote->path, remote->waitTimeoutMs, remote->transferTimeoutMs, remote->transport,
+        remote->ucxDevices, remote->expectedLenders};
     for (auto const& client : mRemoteClients)
     {
         if (client->directory() != remote->path)
         {
             continue;
         }
-        auto const& held = client->options();
-        TLLM_CHECK_WITH_INFO(held.waitTimeoutMs == options.waitTimeoutMs
-                && held.transferTimeoutMs == options.transferTimeoutMs && held.fabric == options.fabric
-                && held.ucxDevices == options.ucxDevices && held.expectedLenders == options.expectedLenders,
+        TLLM_CHECK_WITH_INFO(client->options() == options,
             "remote cache levels sharing rendezvous directory '%s' must use the same timeouts, transport, devices and "
             "expected lenders",
             remote->path.c_str());
         return client;
     }
-    return mRemoteClients.emplace_back(makeShared<RemoteMemClient>(std::move(options)));
+    return mRemoteClients.emplace_back(makeRemoteMemClient(std::move(options)));
 }
 
 RemoteCacheLevelStorage* StorageManager::remoteLevel(CacheLevel level) const
@@ -921,11 +918,12 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
 
     if (coldTier == CacheTier::REMOTE)
     {
-        // Remote level: the codec runs against the page staging buffer, and the bytes move between staging and
-        // the remote slots, on the stream (fabric) or synchronously (NIXL: a failure throws before _batchedMigrate
+        // Remote level: the codec runs against the page staging buffer, and the client moves the bytes between
+        // staging and the remote slots, on the stream or on the host (a failure then throws before _batchedMigrate
         // points any page at its new slot).
         RemoteRange& range = remoteLevel(coldLevel)->remoteRange(coldPgIdx, PoolIndex{0});
-        bool const streamOrdered = range.client().fabric();
+        RemoteMemClient& client = range.client();
+        bool const streamOrdered = client.streamOrdered();
         std::vector<RemoteIo> ios;
         while (remaining > 0)
         {
@@ -953,23 +951,20 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                     auto const [lender, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].dst));
                     ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, lender, remoteAddr});
                 }
-                if (streamOrdered)
-                {
-                    // The WRITE starts when the stream has encoded the batch; the lease retires after it.
-                    range.client().transferOnStream(/*write=*/true, ios, coldPageBytes, stream);
-                }
-                else
+                // Stream-ordered, the WRITE starts when the stream has encoded the batch and the lease retires after
+                // it; on the host, it waits for the encode.
+                if (!streamOrdered)
                 {
                     cuCheck(cuStreamSynchronize(stream));
-                    range.client().transfer(/*write=*/true, ios, coldPageBytes);
                 }
+                client.transfer(/*write=*/true, ios, coldPageBytes, stream);
                 offset += batchSize;
                 remaining -= batchSize;
             }
             else
             {
                 // Remote -> hot: READ into staging, then decode on the stream. Stream-ordered, the lease is the
-                // stream's from the start and the READ begins when the stream reaches it; synchronous, the lease is
+                // stream's from the start and the READ begins when the stream reaches it; on the host, the lease is
                 // host-synchronous and moves to the stream only after the READ has finished.
                 StagingBuffer staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16,
                     streamOrdered ? std::optional<CUstream>{stream} : std::nullopt);
@@ -979,13 +974,9 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                     auto const [lender, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].src));
                     ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, lender, remoteAddr});
                 }
-                if (streamOrdered)
+                client.transfer(/*write=*/false, ios, coldPageBytes, stream);
+                if (!streamOrdered)
                 {
-                    range.client().transferOnStream(/*write=*/false, ios, coldPageBytes, stream);
-                }
-                else
-                {
-                    range.client().transfer(/*write=*/false, ios, coldPageBytes);
                     staging.setStream(stream);
                 }
                 stagingPageIndices.resize(batchSize);
@@ -1093,10 +1084,10 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
             "Remote level: unsupported source medium");
         TLLM_CHECK_WITH_INFO(dstRange != nullptr || isGpuAccessibleMemory(poolMedium(dstLevel, dstPgIdx, poolIdx)),
             "Remote level: unsupported destination medium");
-        // Stream-ordered only if every remote side is fabric: the legs (and the local copies) then follow one another
-        // on the stream.
-        bool const streamOrdered = (srcRange == nullptr || srcRange->client().fabric())
-            && (dstRange == nullptr || dstRange->client().fabric());
+        // Stream-ordered only if every remote side's transfers are: the legs (and the local copies) then follow one
+        // another on the stream.
+        bool const streamOrdered = (srcRange == nullptr || srcRange->client().streamOrdered())
+            && (dstRange == nullptr || dstRange->client().streamOrdered());
         std::vector<RemoteIo> ios;
         std::vector<Task<MemAddress, MemAddress>> tasks;
         size_t remaining = numPages;
@@ -1107,7 +1098,7 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
                 ? std::numeric_limits<size_t>::max()
                 : pageBytes * remaining;
             // Stream-ordered: the stream's lease, so every leg below is ordered after the range's previous users.
-            // Synchronous: a host-synchronous lease, nothing else is using this range of staging once acquire returns.
+            // On the host: a host-synchronous lease, nothing else is using this range of staging once acquire returns.
             StagingBuffer staging = mPageStagingManager->acquire(pageBytes, maxStagingBytes, pageBytes, 16,
                 streamOrdered ? std::optional<CUstream>{stream} : std::nullopt);
             size_t const batchSize = std::min(remaining, staging.size() / pageBytes);
@@ -1122,14 +1113,7 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
                     auto const [lender, remoteAddr] = srcRange->locate(toSlotId(pageIndices[offset + index].src));
                     ios.push_back(RemoteIo{base + index * pageBytes, lender, remoteAddr});
                 }
-                if (streamOrdered)
-                {
-                    srcRange->client().transferOnStream(/*write=*/false, ios, pageBytes, stream);
-                }
-                else
-                {
-                    srcRange->client().transfer(/*write=*/false, ios, pageBytes);
-                }
+                srcRange->client().transfer(/*write=*/false, ios, pageBytes, stream);
             }
             else
             {
@@ -1158,15 +1142,8 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
                     auto const [lender, remoteAddr] = dstRange->locate(toSlotId(pageIndices[offset + index].dst));
                     ios.push_back(RemoteIo{base + index * pageBytes, lender, remoteAddr});
                 }
-                if (streamOrdered)
-                {
-                    // Starts when the stream has the source bytes in staging.
-                    dstRange->client().transferOnStream(/*write=*/true, ios, pageBytes, stream);
-                }
-                else
-                {
-                    dstRange->client().transfer(/*write=*/true, ios, pageBytes);
-                }
+                // Stream-ordered, starts when the stream has the source bytes in staging; on the host, they are there.
+                dstRange->client().transfer(/*write=*/true, ios, pageBytes, stream);
             }
             else
             {
@@ -1177,7 +1154,7 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
                                          dstGroup.slotAddress(toSlotId(pageIndices[offset + index].dst)).at(poolIdx)),
                         base + index * pageBytes});
                 }
-                // Synchronous: the READ above has finished, so handing the lease to the stream needs no
+                // On the host: the READ above has finished, so handing the lease to the stream needs no
                 // synchronization. Stream-ordered: the lease is the stream's already, and the copy waits for the READ.
                 staging.setStream(stream);
                 cuCheck(copyHostToDevice(tasks, static_cast<ssize_t>(pageBytes), stream));

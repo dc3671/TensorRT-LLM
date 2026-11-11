@@ -1,0 +1,232 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "kv_cache_manager_v2/storage/remoteMemFabric.h"
+#include "kv_cache_manager_v2/exceptions.h"
+
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
+
+#include <cstring>
+#include <iterator>
+#include <string>
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
+{
+
+namespace
+{
+
+std::string cuErrorName(CUresult result)
+{
+    char const* name = nullptr;
+    if (cuGetErrorName(result, &name) != CUDA_SUCCESS || name == nullptr)
+    {
+        return "CUresult " + std::to_string(static_cast<int>(result));
+    }
+    return name;
+}
+
+} // namespace
+
+FabricRemoteMemClient::FabricRemoteMemClient(RemoteMemOptions options)
+    : RemoteMemClient(std::move(options))
+{
+    try
+    {
+        retainContext();
+        discoverLenders();
+    }
+    catch (...)
+    {
+        // No destructor runs for a failed constructor, and nothing is claimed yet.
+        releaseTransport();
+        throw;
+    }
+}
+
+FabricRemoteMemClient::~FabricRemoteMemClient()
+{
+    releaseTransport();
+}
+
+void FabricRemoteMemClient::retainContext()
+{
+    CUcontext context = nullptr;
+    cuCheck(cuCtxGetCurrent(&context));
+    if (context == nullptr)
+    {
+        throw RemoteMemError(
+            "KVCM2 remote level: the fabric transport needs a current CUDA context on the calling "
+            "thread");
+    }
+    cuCheck(cuCtxGetDevice(&mDevice));
+    // Callers enqueue copies in the device's primary context (as PyTorch does); teardown synchronizes it.
+    CUcontext primary = nullptr;
+    cuCheck(cuDevicePrimaryCtxRetain(&primary, mDevice));
+    if (primary != context)
+    {
+        cuDevicePrimaryCtxRelease(mDevice);
+        throw RemoteMemError("KVCM2 remote level: the fabric transport needs the device's primary context current");
+    }
+    mContext = primary; // released by releaseTransport()
+}
+
+void FabricRemoteMemClient::releaseTransport() noexcept
+{
+    // Copies still queued on callers' streams must finish before their mappings go.
+    if (CUresult const result = synchronizeContext(); result != CUDA_SUCCESS)
+    {
+        TLLM_LOG_WARNING("KVCM2 remote level: teardown of %s: synchronizing failed: %s", name().c_str(),
+            cuErrorName(result).c_str());
+    }
+    for (auto const& mapping : mMappings)
+    {
+        cuMemUnmap(mapping.address, mapping.bytes);
+        cuMemAddressFree(mapping.address, mapping.bytes);
+        cuMemRelease(mapping.handle);
+    }
+    mMappings.clear();
+    mMappingEnd.clear();
+    if (mContext != nullptr)
+    {
+        cuDevicePrimaryCtxRelease(mDevice);
+        mContext = nullptr;
+    }
+}
+
+void FabricRemoteMemClient::drain() noexcept
+{
+    // Copies on callers' streams reach memory that is about to be released or reused.
+    if (CUresult const result = synchronizeContext(); result != CUDA_SUCCESS)
+    {
+        TLLM_LOG_ERROR("KVCM2 remote level: draining the fabric copies of %s failed: %s", mOptions.directory.c_str(),
+            cuErrorName(result).c_str());
+    }
+}
+
+CUresult FabricRemoteMemClient::synchronizeContext() const noexcept
+{
+    if (mContext == nullptr)
+    {
+        return CUDA_SUCCESS;
+    }
+    CUresult result = cuCtxPushCurrent(mContext);
+    if (result != CUDA_SUCCESS)
+    {
+        return result;
+    }
+    result = cuCtxSynchronize();
+    CUcontext popped = nullptr;
+    cuCtxPopCurrent(&popped);
+    return result;
+}
+
+bool FabricRemoteMemClient::acceptPayload(Lender const& lender) const
+{
+    if (lender.payload.size() != lender.chunks.size() * sizeof(CUmemFabricHandle))
+    {
+        TLLM_LOG_WARNING(
+            "KVCM2 remote level: ignoring lender %s: %zu B of fabric handles for %zu chunk(s), "
+            "expected %zu B each",
+            lender.name.c_str(), lender.payload.size(), lender.chunks.size(), sizeof(CUmemFabricHandle));
+        return false;
+    }
+    return true;
+}
+
+uint64_t FabricRemoteMemClient::attachChunk(Lender& lender, size_t chunk)
+{
+    // The chunk is its own fabric allocation, imported only as it is claimed.
+    uint64_t const bytes = lender.chunks[chunk].second;
+    CUmemFabricHandle fabricHandle{};
+    std::memcpy(&fabricHandle, lender.payload.data() + chunk * sizeof(CUmemFabricHandle), sizeof(fabricHandle));
+    CUmemGenericAllocationHandle handle = 0;
+    CUresult result = cuMemImportFromShareableHandle(&handle, &fabricHandle, CU_MEM_HANDLE_TYPE_FABRIC);
+    if (result != CUDA_SUCCESS)
+    {
+        throw RemoteMemError("KVCM2 remote level: importing chunk " + std::to_string(chunk) + " of lender "
+            + lender.name + " (" + lender.host + ") failed: " + cuErrorName(result)
+            + "; fabric memory needs both trays in one NVLink domain (NVL72 rack), the job's IMEX channel and a live "
+              "lender");
+    }
+    CUdeviceptr address = 0;
+    result = cuMemAddressReserve(&address, bytes, 0, 0, 0);
+    if (result == CUDA_SUCCESS)
+    {
+        // An imported fabric allocation maps only whole: offset 0, its full size.
+        result = cuMemMap(address, bytes, 0, handle, 0);
+        if (result == CUDA_SUCCESS)
+        {
+            CUmemAccessDesc access{};
+            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id = static_cast<int>(mDevice);
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            result = cuMemSetAccess(address, bytes, &access, 1);
+            if (result != CUDA_SUCCESS)
+            {
+                cuMemUnmap(address, bytes);
+            }
+        }
+        if (result != CUDA_SUCCESS)
+        {
+            cuMemAddressFree(address, bytes);
+        }
+    }
+    if (result != CUDA_SUCCESS)
+    {
+        cuMemRelease(handle);
+        throw RemoteMemError("KVCM2 remote level: mapping chunk " + std::to_string(chunk) + " (" + std::to_string(bytes)
+            + " B) of lender " + lender.name + " (" + lender.host + ") failed: " + cuErrorName(result));
+    }
+    mMappings.push_back(FabricMapping{address, bytes, handle});
+    mMappingEnd.emplace(address, address + bytes);
+    lender.loaded = true;
+    return address;
+}
+
+void FabricRemoteMemClient::doTransfer(bool write, std::vector<RemoteIo> const& ios, size_t bytes, CUstream stream)
+{
+    // Runs of pages that are contiguous on both sides go as one copy, within one mapped chunk: two chunks' separate
+    // mappings may happen to be adjacent in the address space.
+    size_t i = 0;
+    while (i < ios.size())
+    {
+        auto const mapping = mMappingEnd.upper_bound(static_cast<CUdeviceptr>(ios[i].remoteAddr));
+        TLLM_CHECK_WITH_INFO(mapping != mMappingEnd.begin(), "KVCM2 remote level: fabric address outside every chunk");
+        CUdeviceptr const mappingEnd = std::prev(mapping)->second;
+        size_t j = i + 1;
+        while (j < ios.size() && ios[j].local == ios[j - 1].local + bytes
+            && ios[j].remoteAddr == ios[j - 1].remoteAddr + bytes && ios[j].remoteAddr + bytes <= mappingEnd)
+        {
+            ++j;
+        }
+        auto const local = static_cast<CUdeviceptr>(ios[i].local);
+        auto const remote = static_cast<CUdeviceptr>(ios[i].remoteAddr);
+        size_t const n = (j - i) * bytes;
+        CUresult const result
+            = write ? cuMemcpyAsync(remote, local, n, stream) : cuMemcpyAsync(local, remote, n, stream);
+        if (result != CUDA_SUCCESS)
+        {
+            fail(std::string("KVCM2 remote level: enqueuing a fabric ") + (write ? "WRITE" : "READ") + " of "
+                + std::to_string(n) + " B failed: " + cuErrorName(result));
+        }
+        i = j;
+    }
+}
+
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

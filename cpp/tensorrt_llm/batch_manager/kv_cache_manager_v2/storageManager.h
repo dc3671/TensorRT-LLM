@@ -469,7 +469,7 @@ private:
     //! The client of a remote tier's rendezvous directory, created on first use; null for any other tier.
     SharedPtr<RemoteMemClient> remoteClientFor(CacheTierConfig const& tier);
     //! A cold-to-cold migration where either side is a remote level, through the page-staging buffer. A failed
-    //! NIXL transfer throws RemoteMemError before any page is pointed at its new slot.
+    //! transfer on the host throws RemoteMemError before any page is pointed at its new slot.
     void submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel srcLevel, PoolGroupIndex dstPgIdx,
         PoolGroupIndex srcPgIdx, PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
 
