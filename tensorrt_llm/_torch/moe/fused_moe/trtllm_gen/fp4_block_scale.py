@@ -77,10 +77,11 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         factor = 1 if act_type in [ActType_TrtllmGen.Relu2, ActType_TrtllmGen.Silu] else 2
         return self.w3_w1_weight.shape[-2] // factor
 
-    def decode_tactic(self, num_tokens: int) -> list[int] | None:
-        """The [tile, config] ``run_moe`` runs for ``num_tokens`` tokens with router logits (the tuned
-        choice of the FP4 MoE op), or None when the shape is not tuned. A caller that routes the tokens
-        itself builds the tables for this tactic's tile."""
+    def decode_tactic(self, num_tokens: int, do_finalize: bool) -> list[int] | None:
+        """The [tile, config] ``run_moe`` runs for ``num_tokens`` tokens with router logits and
+        ``do_finalize`` (the tuned choice of the FP4 MoE op, whose decode-tuning key carries
+        ``do_finalize``), or None when the shape is not tuned. A caller that routes the tokens itself
+        builds the tables for this tactic's tile."""
         from ....custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
 
         rp = extract_routing_params(self.routing_method)
@@ -94,7 +95,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             self.expert_size_per_partition,
             rp.routed_scaling_factor,
             self.routing_method.routing_method_type,
-            True,
+            do_finalize,
             to_trtllm_gen_act_type(self.activation_type),
             tune_max_num_tokens=self.max_num_tokens,
             use_dp=self.use_dp,

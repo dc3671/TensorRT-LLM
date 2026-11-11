@@ -1066,7 +1066,14 @@ class FrontRunner(TunableRunner):
     )
 
     def __init__(
-        self, front: "DecodeFront", gate, num_local: int, local_start: int, top_k: int, tile_of
+        self,
+        front: "DecodeFront",
+        gate,
+        num_local: int,
+        local_start: int,
+        top_k: int,
+        tile_of,
+        do_finalize: bool = True,
     ):
         self.front = front
         self.gate = gate
@@ -1074,9 +1081,17 @@ class FrontRunner(TunableRunner):
         self.local_start = local_start
         self.top_k = top_k
         self.tile_of = tile_of
+        self.do_finalize = do_finalize
 
     def unique_id(self):
-        return (tuple(self.gate.weight.shape), self.num_local, self.top_k, self.front.fused_only)
+        # tile_of(m) is the MoE tactic of calls with this do_finalize, which the tactics offered depend on.
+        return (
+            tuple(self.gate.weight.shape),
+            self.num_local,
+            self.top_k,
+            self.front.fused_only,
+            self.do_finalize,
+        )
 
     def get_valid_tactics(self, inputs, profile, **kwargs):
         x = inputs[0]
@@ -1172,12 +1187,15 @@ class DecodeFront:
     def set_expert_prefetch(self, prefetch: "ExpertL2Prefetch", layer_idx: int) -> None:
         self._expert_prefetch = (prefetch, layer_idx)
 
-    def _moe_tactic(self, backend: "TRTLLMGenFp4BlockScaleBase", m: int) -> Optional[list]:
-        tactic = self._tactics.get(m)
+    def _moe_tactic(
+        self, backend: "TRTLLMGenFp4BlockScaleBase", m: int, do_finalize: bool
+    ) -> Optional[list]:
+        """The MoE op's tuned tactic for a call of ``m`` rows and ``do_finalize`` (part of its tuning key)."""
+        tactic = self._tactics.get((m, do_finalize))
         if tactic is None:
-            tactic = backend.decode_tactic(m)
+            tactic = backend.decode_tactic(m, do_finalize)
             if tactic is not None:
-                self._tactics[m] = tactic
+                self._tactics[(m, do_finalize)] = tactic
         return tactic
 
     def _engine_routes(
@@ -1209,7 +1227,9 @@ class DecodeFront:
             self._tables[(m, tile)] = flat
         return flat
 
-    def _front_runner(self, gate: torch.nn.Module, moe: "ConfigurableMoE") -> FrontRunner:
+    def _front_runner(
+        self, gate: torch.nn.Module, moe: "ConfigurableMoE", do_finalize: bool
+    ) -> FrontRunner:
         backend = moe.backend
         return FrontRunner(
             self,
@@ -1217,22 +1237,33 @@ class DecodeFront:
             backend.expert_size_per_partition,
             backend.slot_start,
             moe.routing_method.experts_per_token,
-            lambda m: (t[0] if (t := self._moe_tactic(backend, m)) is not None else None),
+            lambda m: (
+                t[0] if (t := self._moe_tactic(backend, m, do_finalize)) is not None else None
+            ),
+            do_finalize,
         )
 
     def _front_tactic(
-        self, gate: torch.nn.Module, moe: "ConfigurableMoE", x: torch.Tensor, gs: torch.Tensor
+        self,
+        gate: torch.nn.Module,
+        moe: "ConfigurableMoE",
+        x: torch.Tensor,
+        gs: torch.Tensor,
+        do_finalize: bool,
     ) -> int:
-        """The raced FrontRunner tactic for x's token count (0 until the race has run)."""
+        """The raced FrontRunner tactic for x's token count and ``do_finalize`` (0 until the race has run)."""
         m = x.shape[0]
-        tactic = self._front_tactics.get(m)
+        tactic = self._front_tactics.get((m, do_finalize))
         if tactic is None:
             _, tactic = AutoTuner.get().choose_one(
-                FrontRunner.OP, [self._front_runner(gate, moe)], FrontRunner.TUNING_CONFIG, [x, gs]
+                FrontRunner.OP,
+                [self._front_runner(gate, moe, do_finalize)],
+                FrontRunner.TUNING_CONFIG,
+                [x, gs],
             )
             if tactic == -1:
                 return 0
-            self._front_tactics[m] = tactic
+            self._front_tactics[(m, do_finalize)] = tactic
         return tactic
 
     def _tune(
@@ -1250,7 +1281,7 @@ class DecodeFront:
         ):
             AutoTuner.get().choose_one(
                 FrontRunner.OP,
-                [self._front_runner(gate, moe)],
+                [self._front_runner(gate, moe, moe_kwargs.get("do_finalize", True))],
                 FrontRunner.TUNING_CONFIG,
                 [x[:FUSED_FRONT_MAX_TOKENS], moe.backend.fc31_input_scale],
             )
@@ -1282,7 +1313,8 @@ class DecodeFront:
         if AutoTuner.get().is_tuning_mode:
             return self._tune(gate, moe, x, **moe_kwargs)
         backend = moe.backend
-        tactic = self._moe_tactic(backend, m)
+        do_finalize = moe_kwargs.get("do_finalize", True)
+        tactic = self._moe_tactic(backend, m, do_finalize)
         if tactic is None:
             return None
         tile = tactic[0]
@@ -1316,7 +1348,7 @@ class DecodeFront:
             dispatcher = low_m_gemm_dispatcher(gate)
             fused = None
             k_warps = (
-                self._front_tactic(gate, moe, x, gs)
+                self._front_tactic(gate, moe, x, gs, do_finalize)
                 if dispatcher is not None and m <= FUSED_FRONT_MAX_TOKENS
                 else 0
             )

@@ -785,7 +785,7 @@ class _RecordingMoe:
             "Backend",
             (),
             dict(
-                decode_tactic=lambda _, m: [8, 0],
+                decode_tactic=lambda _, m, do_finalize: [8, 0],
                 slot_start=0,
                 expert_size_per_partition=E,
                 fc31_input_scale=torch.ones(1),
@@ -916,7 +916,7 @@ def _engine_backend(
         return torch.empty(shape, dtype=dtype, device="meta")
 
     return SimpleNamespace(
-        decode_tactic=lambda m: [8, 0],
+        decode_tactic=lambda m, do_finalize: [8, 0],
         slot_start=0,
         expert_size_per_partition=num_local,
         fc31_input_scale=torch.ones(1),
@@ -1037,3 +1037,33 @@ def test_decode_front_engine_route_gate(
     assert out == "front" and calls == path, calls
     engine = path[0] == "engine_router"
     assert (seen[0].candidates is cand) == engine and (seen[0].candidates is None) != engine
+
+
+@pytest.mark.cpu_only
+def test_decode_front_tactics_per_do_finalize() -> None:
+    """The MoE tactic and the front race are looked up and cached per (rows, do_finalize), the key the MoE op
+    tunes them under: an un-finalized call never takes a finalized call's tactic or its miss."""
+    asked = []
+
+    def decode_tactic(m: int, do_finalize: bool):
+        asked.append((m, do_finalize))
+        return None if do_finalize else [8, 0]
+
+    backend = SimpleNamespace(decode_tactic=decode_tactic)
+    front = df.DecodeFront(frozenset())
+    assert front._moe_tactic(backend, 14, True) is None
+    assert front._moe_tactic(backend, 14, False) == [8, 0]
+    assert front._moe_tactic(backend, 14, False) == [8, 0]  # cached
+    assert asked == [(14, True), (14, False)]
+
+    moe = SimpleNamespace(
+        backend=SimpleNamespace(
+            decode_tactic=decode_tactic, expert_size_per_partition=E, slot_start=0
+        ),
+        routing_method=SimpleNamespace(experts_per_token=K),
+    )
+    gate = SimpleNamespace(weight=torch.empty(E, 16))
+    unfinalized = front._front_runner(gate, moe, False)
+    finalized = front._front_runner(gate, moe, True)
+    assert unfinalized.tile_of(7) == 8 and finalized.tile_of(7) is None
+    assert unfinalized.unique_id() != finalized.unique_id()

@@ -641,6 +641,70 @@ def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("do_finalize", [False, True])
+def test_fp4_block_scale_decode_tactic_key_matches_tuning(
+    monkeypatch: pytest.MonkeyPatch, do_finalize: bool
+) -> None:
+    """``decode_tactic`` looks the tactic up under the key the MoE op tunes a call of that ``do_finalize``
+    under; a mismatch leaves every decode front without a tactic, so it falls back to the stock MoE."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+    from tensorrt_llm._torch.moe.fused_moe.routing import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.fp4_block_scale import (
+        TRTLLMGenFp4BlockScaleBase,
+    )
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.kernel_inputs import to_trtllm_gen_act_type
+    from tensorrt_llm._torch.utils import ActivationType
+
+    looked_up = []
+    monkeypatch.setattr(
+        FP4BlockScaleMoERunner,
+        "lookup_tactic",
+        lambda self, inputs: looked_up.append(self.unique_id()),
+    )
+    num_local, inter, hidden = 64, 512, 4096
+
+    def meta(*shape):
+        return torch.empty(shape, dtype=torch.uint8, device="meta")
+
+    backend = SimpleNamespace(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=10),
+        num_slots=512,
+        slot_start=0,
+        expert_size_per_partition=num_local,
+        _intermediate_size_padded=lambda: inter,
+        activation_type=ActivationType.Swiglu,
+        max_num_tokens=8192,
+        use_dp=False,
+        decode_tuning=True,
+        bias=False,
+        act_alpha=None,
+        act_beta=None,
+        act_clamp=None,
+        w3_w1_weight=meta(num_local, 2 * inter, hidden // 2),
+        w3_w1_weight_scale=meta(num_local, 2 * inter, hidden // 16),
+        w2_weight=meta(num_local, hidden, inter // 2),
+        w2_weight_scale=meta(num_local, hidden, inter // 16),
+    )
+    TRTLLMGenFp4BlockScaleBase.decode_tactic(backend, 14, do_finalize)
+    # The runner the op tunes with for a call of this do_finalize (_run_fp4_block_scale_moe).
+    tuned = FP4BlockScaleMoERunner(
+        512,
+        10,
+        None,
+        None,
+        inter,
+        0,
+        num_local,
+        None,
+        int(backend.routing_method.routing_method_type),
+        do_finalize,
+        to_trtllm_gen_act_type(ActivationType.Swiglu),
+        decode_tuning=True,
+    )
+    assert looked_up == [tuned.unique_id()]
+
+
+@pytest.mark.cpu_only
 def test_fp4_block_scale_moe_op_mutability() -> None:
     """The NVFP4 MoE op every model reaches is functional (torch.compile can trace it); the decode kernels' op
     declares the buffers its engine writes."""
