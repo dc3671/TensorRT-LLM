@@ -26,10 +26,16 @@ class PerfMetricsManager:
     Args:
         enabled: Whether performance metrics collection is turned on
             (mirrors ``LlmArgs.return_perf_metrics``).
+        timing_side_stream: Record the timing events on a side stream that waits
+            for the current stream (``RuntimeHooks.perf_metrics_timing_side_stream``).
     """
 
-    def __init__(self, enabled: bool):
+    _timing_stream: Optional[torch.cuda.Stream] = None
+
+    def __init__(self, enabled: bool, timing_side_stream: bool = False):
         self.enabled = enabled
+        if enabled and timing_side_stream:
+            self._timing_stream = torch.cuda.Stream()
         self._perf_events = None
         self._perf_event_idx = 0
         self._forward_event_pool = []
@@ -99,7 +105,7 @@ class PerfMetricsManager:
 
         # --- Pre-execution: record start ---
         if start_event is not None:
-            start_event.record()
+            self._record(start_event)
         if self.enabled:
             timing.start_time = get_steady_clock_now_in_seconds()
 
@@ -107,9 +113,17 @@ class PerfMetricsManager:
 
         # --- Post-execution: record end ---
         if end_event is not None:
-            end_event.record()
+            self._record(end_event)
         if self.enabled:
             timing.end_time = get_steady_clock_now_in_seconds()
+
+    def _record(self, event: torch.cuda.Event) -> None:
+        """Record ``event`` after the current stream's work, on the side stream when there is one."""
+        if self._timing_stream is None or torch.cuda.is_current_stream_capturing():
+            event.record()
+            return
+        self._timing_stream.wait_stream(torch.cuda.current_stream())
+        event.record(self._timing_stream)
 
     # ------------------------------------------------------------------
     # Saving / computing timing data

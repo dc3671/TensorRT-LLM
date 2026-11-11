@@ -1502,6 +1502,7 @@ def _create_py_executor(
                 )
                 py_executor.rebind_resources(execution_resources)
         except BaseException:
+            kv_cache_creator.close_remote_lender()
             py_executor.shutdown()
             raise
 

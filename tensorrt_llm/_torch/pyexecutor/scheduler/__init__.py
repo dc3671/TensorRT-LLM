@@ -45,6 +45,7 @@ from .scheduler_v2 import KVCacheV2Scheduler
 from .waiting_queue import (
     FCFSWaitingQueue,
     PriorityWaitingQueue,
+    ShortestDecodeFirstWaitingQueue,
     WaitingQueue,
     create_waiting_queue,
 )
@@ -75,6 +76,7 @@ __all__ = [
     # Waiting queues
     "FCFSWaitingQueue",
     "PriorityWaitingQueue",
+    "ShortestDecodeFirstWaitingQueue",
     "WaitingQueue",
     "create_waiting_queue",
 ]

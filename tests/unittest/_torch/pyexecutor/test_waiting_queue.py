@@ -18,6 +18,7 @@
 This module tests the waiting queue functionality including:
 - FCFSWaitingQueue operations
 - PriorityWaitingQueue operations
+- ShortestDecodeFirstWaitingQueue operations
 - WaitingQueue abstract interface
 - create_waiting_queue factory function
 """
@@ -32,9 +33,12 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     WaitingQueue,
     create_waiting_queue,
 )
-from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import PriorityWaitingQueue
+from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import (
+    PriorityWaitingQueue,
+    ShortestDecodeFirstWaitingQueue,
+)
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
-from tensorrt_llm.llmapi.llm_args import WaitingQueuePolicy
+from tensorrt_llm.llmapi.llm_args import SchedulerConfig, WaitingQueuePolicy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -590,3 +594,87 @@ class TestPriorityWaitingQueue:
     def test_is_waiting_queue_subclass(self):
         """PriorityWaitingQueue is a WaitingQueue."""
         assert isinstance(PriorityWaitingQueue(), WaitingQueue)
+
+
+def create_decode_request_item(request_id: int, max_tokens, arrival=None) -> RequestQueueItem:
+    """Create a mock RequestQueueItem with max_tokens and rank 0's arrival stamp."""
+    mock_request = Mock()
+    mock_request.max_tokens = max_tokens
+    item = RequestQueueItem(request_id, mock_request)
+    item.admit_arrival = arrival
+    return item
+
+
+class TestShortestDecodeFirstWaitingQueue:
+    """Tests for ShortestDecodeFirstWaitingQueue."""
+
+    def test_fewest_max_tokens_first_ties_in_arrival_order(self):
+        queue = ShortestDecodeFirstWaitingQueue()
+        queue.add_requests(
+            [
+                create_decode_request_item(1, 300),
+                create_decode_request_item(2, 100),
+                create_decode_request_item(3, None),
+                create_decode_request_item(4, 100),
+            ]
+        )
+        assert [item.id for item in queue] == [2, 4, 1, 3]
+        assert [item.id for item in queue.peek_requests(2)] == [2, 4]
+        assert [queue.pop_request().id for _ in range(4)] == [2, 4, 1, 3]
+
+    def test_put_back_keeps_arrival_order(self):
+        queue = ShortestDecodeFirstWaitingQueue()
+        queue.add_requests([create_decode_request_item(1, 100), create_decode_request_item(2, 100)])
+        first = queue.pop_request()
+        queue.add_request(create_decode_request_item(3, 100))
+        queue.prepend_request(first)
+        assert [item.id for item in queue] == [1, 2, 3]
+
+    @pytest.mark.parametrize("now, first", [(59.0, 2), (60.0, 1)])
+    def test_wait_cap_goes_ahead_oldest_first(self, now, first):
+        queue = ShortestDecodeFirstWaitingQueue(max_wait_s=60.0)
+        queue.add_requests(
+            [create_decode_request_item(1, 8000, 0.0), create_decode_request_item(2, 100, 30.0)]
+        )
+        queue.set_now(now)
+        assert queue.pop_request().id == first
+
+    def test_no_cap_never_ages(self):
+        queue = ShortestDecodeFirstWaitingQueue()
+        queue.add_requests(
+            [create_decode_request_item(1, 8000, 0.0), create_decode_request_item(2, 100, 30.0)]
+        )
+        queue.set_now(1.0e6)
+        assert queue.pop_request().id == 2
+
+    def test_cap_needs_clock(self):
+        queue = ShortestDecodeFirstWaitingQueue(max_wait_s=60.0)
+        queue.add_request(create_decode_request_item(1, 100, 0.0))
+        with pytest.raises(RuntimeError):
+            queue.pop_request()
+
+    def test_remove_by_ids(self):
+        queue = ShortestDecodeFirstWaitingQueue()
+        queue.add_requests([create_decode_request_item(i, 10 * i) for i in range(1, 4)])
+        queue.remove_by_ids({2})
+        assert len(queue) == 2 and [item.id for item in queue] == [1, 3]
+
+    def test_factory(self):
+        queue = create_waiting_queue(WaitingQueuePolicy.SHORTEST_DECODE_FIRST, max_wait_s=120.0)
+        assert isinstance(queue, ShortestDecodeFirstWaitingQueue)
+        assert queue.max_wait_s == 120.0
+
+    def test_scheduler_config_max_wait(self):
+        assert SchedulerConfig().waiting_queue_max_wait_s == 60.0
+        config = SchedulerConfig(
+            waiting_queue_policy=WaitingQueuePolicy.SHORTEST_DECODE_FIRST,
+            waiting_queue_max_wait_s=120.0,
+        )
+        assert config.waiting_queue_max_wait_s == 120.0
+        # Other policies ignore the cap; a dumped default config validates again.
+        SchedulerConfig(**SchedulerConfig().model_dump())
+        # The queue needs a finite cap; None disables it.
+        assert SchedulerConfig(waiting_queue_max_wait_s=None).waiting_queue_max_wait_s is None
+        for bad in (float("inf"), float("nan"), 0.0):
+            with pytest.raises(ValueError):
+                SchedulerConfig(waiting_queue_max_wait_s=bad)

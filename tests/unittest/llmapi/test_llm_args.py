@@ -1628,6 +1628,21 @@ def test_KvCacheConfig_declaration(offload_field):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_defer_generation_only_release():
+    assert KvCacheConfig().defer_generation_only_release is False
+    for v2 in (True, "auto"):
+        assert KvCacheConfig(
+            defer_generation_only_release=True,
+            use_kv_cache_manager_v2=v2).defer_generation_only_release is True
+    assert KvCacheConfig(use_kv_cache_manager_v2=False,
+                         defer_generation_only_release=False)
+    with pytest.raises(ValidationError,
+                       match="defer_generation_only_release requires"):
+        KvCacheConfig(defer_generation_only_release=True,
+                      use_kv_cache_manager_v2=False)
+
+
+@pytest.mark.cpu_only
 def test_KvCacheConfig_offload_priority_compatibility():
     assert KvCacheConfig().cold_tier_offload_min_priority is None
     for field in ("cold_tier_offload_min_priority",
@@ -2033,6 +2048,151 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
     with pytest.raises(ValidationError) as exc_info:
         KvCacheConfig(disk_cache_size=2048)
     assert "disk_cache_path" in str(exc_info.value)
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_remote_cache_validation(tmp_path):
+    remote = llm_args_mod.RemoteCacheConfig
+    config = KvCacheConfig(
+        remote_cache_config={
+            "directory": str(tmp_path),
+            "cache_size": 200 << 30,
+            "transport": "fabric",
+            "pool_ratio": [0.02, 0.98],
+            "expected_num_lenders": 8,
+            "expected_claim_size": 406 << 30,
+        })
+    assert config.remote_cache_config.cache_size == 200 << 30
+    assert config.remote_cache_config.lender_wait_timeout_s == 900.0
+    assert config.remote_cache_config.transfer_timeout_s == 30.0
+    assert KvCacheConfig().remote_cache_config is None
+
+    for bad in (
+        {},  # neither cache_size nor lend_size
+        {
+            "cache_size": 1,
+            "expected_num_lenders": 8
+        },
+        {
+            "lend_size": 1 << 30,
+            "transport": "fabric",
+            "ucx_devices": "mlx5_0:1"
+        },
+        {
+            "cache_size": 1,
+            "pool_ratio": [0.5, 0.0]
+        },
+        {
+            "lend_size": (1 << 30) - 1  # below the lender's 1 GiB chunk
+        },
+        {
+            "cache_size": 1,
+            "lender_wait_timeout_s": 0
+        },
+        {
+            "cache_size": 1,
+            "transfer_timeout_s": float("inf")
+        },
+            # Fields a lend-only rank, or a NIXL lender, would ignore.
+        {
+            "lend_size": 1 << 30,
+            "pool_ratio": [1.0]
+        },
+        {
+            "lend_size": 1 << 30,
+            "expected_num_lenders": 8,
+            "expected_claim_size": 1 << 30
+        },
+        {
+            "lend_size": 1 << 30,
+            "transfer_timeout_s": 10.0
+        },
+        {
+            "lend_size": 1 << 30,
+            "lend_reserve_size": 8 << 30
+        },
+        {
+            "cache_size": 1,
+            "transport": "fabric",
+            "lend_reserve_size": 8 << 30
+        },
+        {
+            "cache_size": 1,
+            "transport": "fabric",
+            "transfer_timeout_s": 10.0
+        },
+    ):
+        with pytest.raises(ValidationError):
+            remote(directory=str(tmp_path), **bad)
+    # A dumped config, defaults included, validates again.
+    for good in (
+            config.remote_cache_config,
+            remote(directory=str(tmp_path), lend_size=1 << 30),
+            remote(directory=str(tmp_path),
+                   lend_size=1 << 30,
+                   transport="fabric",
+                   lend_reserve_size=8 << 30),
+    ):
+        assert remote(**good.model_dump()) == good
+    assert remote(directory=str(tmp_path),
+                  lend_size=1 << 30).lend_size == 1 << 30
+    assert remote(directory=str(tmp_path),
+                  lend_size=1 << 30,
+                  transport="fabric",
+                  lend_reserve_size=8 << 30).lend_reserve_size == 8 << 30
+    assert remote(directory=str(tmp_path),
+                  lend_size=1 << 30,
+                  ucx_devices="mlx5_0:1").ucx_devices == "mlx5_0:1"
+    with pytest.raises(ValidationError):
+        KvCacheConfig(remote_cache_config={
+            "directory": str(tmp_path),
+            "lend_size": 1 << 30
+        },
+                      use_kv_cache_manager_v2=False)
+    with pytest.raises(ValidationError):
+        KvCacheConfig(remote_cache_config={
+            "directory": str(tmp_path),
+            "cache_size": 1
+        },
+                      disk_cache_size=1,
+                      disk_cache_path=str(tmp_path))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "remote_config",
+    [
+        # CTX style: a remote level and a lend.
+        {
+            "cache_size": 200 << 30,
+            "lend_size": 8 << 30,
+            "transport": "fabric",
+            "pool_ratio": [0.02, 0.98],
+            "expected_num_lenders": 8,
+            "expected_claim_size": 406 << 30,
+        },
+        # GEN style: lend only.
+        {
+            "lend_size": 160 << 30,
+            "transport": "fabric",
+        },
+    ],
+    ids=["ctx", "gen"])
+def test_remote_cache_config_survives_model_defaults(tmp_path, remote_config):
+    # apply_model_defaults_to_llm_args rebuilds the args from a full dump, defaults included.
+    remote_config = dict(remote_config, directory=str(tmp_path))
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        kv_cache_config=KvCacheConfig(remote_cache_config=remote_config))
+    expected = llm_args.kv_cache_config.remote_cache_config
+    apply_model_defaults_to_llm_args(
+        llm_args, {"kv_cache_config": {
+            "enable_block_reuse": False
+        }})
+    assert llm_args.kv_cache_config.enable_block_reuse is False
+    assert llm_args.kv_cache_config.remote_cache_config == expected
+    rebuilt = TorchLlmArgs(**llm_args.model_dump())
+    assert rebuilt.kv_cache_config.remote_cache_config == expected
 
 
 @pytest.mark.cpu_only

@@ -40,7 +40,9 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
     hash_v1_block_key, responses_request_text, truncate_sha256_hash_to_int64)
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
-COORDINATOR_SELECT_MAX_ATTEMPTS = 2
+# Retries ride out a burst that fills the coordinator's accept queue; select is
+# idempotent per req_id (see _post_select), so a replay is safe.
+COORDINATOR_SELECT_MAX_ATTEMPTS = 4
 COORDINATOR_SELECT_RETRY_DELAY_S = 0.05
 COORDINATOR_FINISH_MAX_ATTEMPTS = 3
 COORDINATOR_FINISH_RETRY_DELAY_S = 0.1

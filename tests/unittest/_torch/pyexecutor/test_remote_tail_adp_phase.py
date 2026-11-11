@@ -637,6 +637,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
             enable_iter_req_stats=False,
             iter_perf_stats_interval=1,
             stream_interval=1,
+            return_perf_metrics=False,
             attention_dp_config=None,
             kv_connector_config=None,
             batch_wait_timeout_ms=0,

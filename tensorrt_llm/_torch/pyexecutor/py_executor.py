@@ -90,6 +90,7 @@ from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .cuda_graph_runner import ADPShapeAgreement
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
+from .engine.model_setup import DYNAMO_RECOMPILE_LIMIT
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
                                      ExecutorRequestQueue,
@@ -670,6 +671,8 @@ class _ExecutorExecutionConfig:
     enable_kv_pool_rebalance: bool
     # cache_transceiver_config.max_tokens_in_buffer was set by the user.
     transfer_budget_is_explicit: bool = False
+    # kv_cache_config.defer_generation_only_release.
+    defer_generation_only_release: bool = False
 
 
 class PyExecutor:
@@ -682,8 +685,11 @@ class PyExecutor:
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
-    # Whether the KV cache manager is a KVCacheManagerV2; set at construction.
-    _is_kv_manager_v2 = False
+    # Whether the waiting queue's wait cap needs rank 0's clock on every rank.
+    _waiting_queue_needs_clock = False
+    # Whether the overlap loop defers the KV cache close of finished
+    # generation-only requests (kv_cache_config.defer_generation_only_release).
+    _defer_generation_only_release = False
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
 
@@ -733,6 +739,7 @@ class PyExecutor:
         enable_non_overlap_adp_forward_intent: bool = False,
         gen_preemption: Optional[GenPreemptionConfig] = None,
         transfer_budget_is_explicit: bool = False,
+        defer_generation_only_release: bool = False,
     ) -> None:
         if kv_pool_rebalance_check_interval <= 0:
             raise ValueError(
@@ -837,6 +844,7 @@ class PyExecutor:
             hang_detection_timeout=hang_detection_timeout,
             enable_kv_pool_rebalance=enable_kv_pool_rebalance,
             transfer_budget_is_explicit=transfer_budget_is_explicit,
+            defer_generation_only_release=defer_generation_only_release,
         )
         self._resources_released = False
         self._closed = False
@@ -991,8 +999,12 @@ class PyExecutor:
         self._late_compile_detect = False
         if model_hooks.mxfp8_pinned_tactics or model_hooks.late_compile_detect:
             self._late_compile_detect = _arm_runtime_opt_ins(model_hooks)
+        timing_side_stream = False
+        if model_hooks.perf_metrics_timing_side_stream:
+            timing_side_stream = True
         self.perf_manager = PerfMetricsManager(
-            enabled=getattr(self.llm_args, 'return_perf_metrics', False))
+            enabled=self.llm_args.return_perf_metrics,
+            timing_side_stream=timing_side_stream)
         self.attention_dp_enable_balance = (
             self.llm_args.attention_dp_config is not None
             and self.llm_args.attention_dp_config.enable_balance)
@@ -1093,6 +1105,9 @@ class PyExecutor:
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
+        self._defer_generation_only_release = (
+            self._is_kv_manager_v2
+            and self._execution_config.defer_generation_only_release)
         # The KV cache manager takes Mamba snapshots inside the forward and
         # finishes them on the execution stream right after it (_forward_step).
         self._finish_inforward_snapshots = (
@@ -1420,6 +1435,13 @@ class PyExecutor:
                                               torch.cuda.Event)
 
         self._gen_admission = GenAdmissionConfig.from_env()
+        waiting_queue_max_wait_s = None
+        if waiting_queue_policy == WaitingQueuePolicy.SHORTEST_DECODE_FIRST:
+            waiting_queue_max_wait_s = (
+                self.llm_args.scheduler_config.waiting_queue_max_wait_s)
+        # The wait cap ages requests by rank 0's arrival stamps on rank 0's
+        # clock, so that every rank pops the same order.
+        self._waiting_queue_needs_clock = waiting_queue_max_wait_s is not None
 
         # request fetcher initialization
         self._set_global_steady_clock_offset()
@@ -1428,7 +1450,8 @@ class PyExecutor:
             max_batch_size=max_batch_size,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
-            stamp_admission_times=self._gen_admission.enabled,
+            stamp_admission_times=self._gen_admission.enabled
+            or self._waiting_queue_needs_clock,
         )
         # When overlap scheduler is enabled then when starting to handle a new prompt,
         # _sample_async is called twice before the first call to update_requests:
@@ -1453,11 +1476,14 @@ class PyExecutor:
         self.request_broadcaster = RequestBroadcaster(
             self.dist,
             self.hang_detector,
-            sync_clock=self._gen_admission.needs_clock)
+            sync_clock=self._gen_admission.needs_clock
+            or self._waiting_queue_needs_clock)
 
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
-            waiting_queue_policy, gen_admission=self._gen_admission)
+            waiting_queue_policy,
+            gen_admission=self._gen_admission,
+            max_wait_s=waiting_queue_max_wait_s)
         self._first_token_timer = None
         if self.dist.rank == 0 and isinstance(self.waiting_queue,
                                               GenAdmissionWaitingQueue):
@@ -1962,9 +1988,19 @@ class PyExecutor:
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
+    def _apply_dynamo_recompile_limit(self) -> None:
+        """Apply the compiled model's Dynamo recompile limit on this thread.
+
+        torch keeps each Dynamo config value per thread, so the limit set
+        while the engine was built does not reach the worker thread.
+        """
+        if self.model_engine.uses_torch_compile:
+            torch._dynamo.config.cache_size_limit = DYNAMO_RECOMPILE_LIMIT
+
     def _event_loop_wrapper(self) -> None:
         crashed = False
         self._event_loop_completed = False
+        self._apply_dynamo_recompile_limit()
         try:
             # Skip line profiler during warmup/memory estimation phase to avoid
             # saving incomplete results that would be overwritten anyway
@@ -7008,6 +7044,9 @@ class PyExecutor:
         underneath whatever holds them.
         """
         mgr = self.kv_cache_manager
+        if self._defer_generation_only_release:
+            # adjust() moves pages; a deferred close must not hold any.
+            mgr.flush_deferred_closes()
 
         paused: List[LlmRequest] = []
         for req in self.active_requests:
@@ -7261,6 +7300,12 @@ class PyExecutor:
         CUASSERT(cudart.cudaSetDevice(self.device_id))
         if self._executor_events is not None:
             self._executor_events.before_overlap_loop()
+        # A finished generation-only request's KV cache close (a host-side page
+        # release) runs after the next forward is queued instead of before the
+        # next batch's preparation.
+        defer_kv_close = self._defer_generation_only_release
+        if defer_kv_close:
+            self.kv_cache_manager.enable_deferred_close(True)
         with self._overlap_loop_stream_scope(), self._profiler() as profile_step, \
                 self.hang_detector:
             iter_start_time = time.time()
@@ -7312,6 +7357,9 @@ class PyExecutor:
                         self._pause_recompute_paused_requests(scheduled_batch)
                     self._finalize_adp_dummy_allocation(False)
                     self._flush_pending_transfer_responses()
+                    if defer_kv_close:
+                        # The flush after the forward is skipped this round.
+                        self.kv_cache_manager.flush_deferred_closes()
                     continue
 
                 if (self._mm_encoder_item_scheduling_enabled
@@ -7445,6 +7493,10 @@ class PyExecutor:
                     else:
                         self._maybe_prefetch_next_iter_mm_encoders(
                             scheduled_batch)
+
+                if defer_kv_close:
+                    # Closes left by the previous iteration's terminations.
+                    self.kv_cache_manager.flush_deferred_closes()
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
@@ -7597,6 +7649,11 @@ class PyExecutor:
 
                 if not self.enable_attention_dp:
                     self._kv_connector_terminate_requests()
+
+                if defer_kv_close and not self.active_requests:
+                    # No next forward to overlap with; do not hold the pages
+                    # while the next fetch may block.
+                    self.kv_cache_manager.flush_deferred_closes()
 
                 if not can_queue:
                     self.disagg.pace_idle()
@@ -8107,6 +8164,8 @@ class PyExecutor:
                                       self.request_broadcaster.rank0_aux)
             else:
                 waiting_queue.set_now(time.monotonic())
+        elif self._waiting_queue_needs_clock:
+            waiting_queue.set_now(self.request_broadcaster.rank0_now)
 
         # Validate and filter requests
         new_requests = self._handle_special_queue_items(new_requests)

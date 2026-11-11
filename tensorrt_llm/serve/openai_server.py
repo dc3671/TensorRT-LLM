@@ -2023,9 +2023,10 @@ class OpenAIServer(_VideoRoutesMixin):
                                       0 if woken_by_timer else 0.5):
                         self._record_iteration_stat(llm_stat)
                 except Exception as e:
-                    # Log errors but continue collecting stats
-                    logger.error(f"Error collecting iteration stats: {e}",
-                                 exc_info=True)
+                    # Log errors but continue collecting stats. TRT-LLM's logger
+                    # takes no exc_info keyword.
+                    logger.error(f"Error collecting iteration stats: {e}\n"
+                                 f"{traceback.format_exc()}")
                     # Brief sleep to avoid tight loop on persistent errors
                     await asyncio.sleep(0.1)
         except asyncio.CancelledError:

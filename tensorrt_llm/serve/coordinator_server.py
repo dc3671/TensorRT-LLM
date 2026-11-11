@@ -51,6 +51,10 @@ from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.version import __version__ as VERSION
 
 TIMEOUT_KEEP_ALIVE = 10  # seconds
+# Accept queue of the fleet UNIX socket: a burst opens one connect per concurrent
+# /select, and a connect to a full queue fails with ENOTCONN on its first send.
+# The kernel caps the value at net.core.somaxconn.
+COORDINATOR_UDS_BACKLOG = 16384
 MSGPACK_MEDIA_TYPE = "application/msgpack"
 
 
@@ -202,7 +206,9 @@ class CoordinatorServer:
 
             await self._coordinator.start()
             try:
-                uds_cfg = uvicorn.Config(self.app, uds=uds, lifespan="off", **kwargs)
+                uds_cfg = uvicorn.Config(
+                    self.app, uds=uds, lifespan="off", backlog=COORDINATOR_UDS_BACKLOG, **kwargs
+                )
                 tcp_cfg = uvicorn.Config(self.app, host=host, port=port, lifespan="off", **kwargs)
                 await _asyncio.gather(
                     create_uvicorn_server(uds_cfg).serve(),

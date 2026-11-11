@@ -2321,6 +2321,17 @@ class AttentionDpConfig(StrictBaseModel):
             "Active prompt tokens estimate work, not cached KV residency. Existing "
             "conversation->rank pins are unaffected. Only used when "
             "kv_cache_routing_conversation_affinity is True.")
+    kv_cache_routing_home_wait_rounds: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Conversation-affinity routing: a returning conversation whose home "
+        "rank is full waits for a slot there for up to this many scheduling "
+        "rounds in which another rank had room, then overflows by "
+        "kv_cache_routing_new_conv_placement (keeping its home rank). Later "
+        "requests of the same admission group may pass a waiting one. None "
+        "overflows at once. Only used when "
+        "kv_cache_routing_conversation_affinity is True.",
+        status="prototype")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
@@ -2333,6 +2344,11 @@ class AttentionDpConfig(StrictBaseModel):
                 raise ValueError(
                     "attention_dp_config.timeout_iters must be greater or equal to 0 when enable_balance is true"
                 )
+        if (self.kv_cache_routing_home_wait_rounds is not None
+                and not self.kv_cache_routing_conversation_affinity):
+            raise ValueError(
+                "attention_dp_config.kv_cache_routing_home_wait_rounds requires "
+                "kv_cache_routing_conversation_affinity=True")
         return self
 
 
@@ -4591,6 +4607,8 @@ class WaitingQueuePolicy(StrEnum):
 
     FCFS = "fcfs"  # First-Come-First-Served
     PRIORITY = "priority"  # Higher request.priority value is served first; ties broken by FCFS
+    # Fewest max_tokens first; ties, and requests without max_tokens (last), in arrival order
+    SHORTEST_DECODE_FIRST = "shortest_decode_first"
 
 
 class ContextSchedulingPolicy(StrEnum):
@@ -4628,6 +4646,10 @@ class DynamicBatchConfig(StrictBaseModel, PybindMirror):
             enable_max_num_tokens_tuning=self.enable_max_num_tokens_tuning,
             dynamic_batch_moving_average_window=self.
             dynamic_batch_moving_average_window)
+
+
+_PositiveFiniteFloat = Annotated[float,
+                                 PydanticField(gt=0, allow_inf_nan=False)]
 
 
 class GenPreemptionConfig(StrictBaseModel):
@@ -4685,6 +4707,15 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
     waiting_queue_policy: WaitingQueuePolicy = Field(
         default=WaitingQueuePolicy.FCFS,
         description="The waiting queue scheduling policy")
+
+    waiting_queue_max_wait_s: Optional[_PositiveFiniteFloat] = Field(
+        default=60.0,
+        description=(
+            "With waiting_queue_policy='shortest_decode_first': a request "
+            "that has waited this many seconds goes ahead of every request "
+            "that has not, oldest first. None disables the cap. Other "
+            "policies ignore it."),
+        status="prototype")
 
     use_python_scheduler: bool = Field(
         default=False,
@@ -5240,6 +5271,153 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "should be attempted.")
 
 
+# Lenders publish host memory in chunks of this many bytes (remote_lender.py).
+REMOTE_CACHE_CHUNK_BYTES = 1 << 30
+# Default of RemoteCacheConfig.lend_reserve_size.
+REMOTE_CACHE_LEND_RESERVE_BYTES = 24 << 30
+
+
+class RemoteCacheConfig(StrictBaseModel):
+    """KV cache manager v2 remote cache level in host memory that other ranks lend.
+
+    A rank with ``cache_size`` gets a cache level below the host tier whose slots
+    live in memory that ranks with ``lend_size`` publish in ``directory``.
+    """
+
+    directory: str = Field(
+        min_length=1,
+        status="prototype",
+        description=
+        "Rendezvous directory, on a file system every rank of the job sees, where "
+        "lenders publish their memory and remote cache levels claim chunks of it. "
+        "Environment variables are expanded; the directory is created if missing. "
+        "Use one directory per job.")
+
+    cache_size: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Bytes of this rank's remote cache level. Pages are byte copies, so the "
+        "level is lossless. It takes the disk level's place, so it cannot be "
+        "combined with `disk_cache_size`.")
+
+    lend_size: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Bytes of host memory this rank lends to remote cache levels, in whole "
+        "1 GiB chunks, for the lifetime of the process.")
+
+    lend_reserve_size: NonNegativeInt = Field(
+        default=REMOTE_CACHE_LEND_RESERVE_BYTES,
+        status="prototype",
+        description=
+        "Fabric transport only: bytes of free plus reclaimable memory each host "
+        "NUMA node keeps for the processes on it while the lend is placed. "
+        "Chunks go to the GPU's node first, then to the others; a lend that "
+        "does not fit is published short. Requires `lend_size`.")
+
+    transport: Literal["nixl", "fabric"] = Field(
+        default="nixl",
+        status="prototype",
+        description=
+        "How pages move: 'nixl' uses one-sided NIXL RDMA; 'fabric' lends "
+        "CUDA fabric memory that clients in the same multi-node NVLink domain "
+        "copy over NVLink. Every rank sharing `directory` must use the same value."
+    )
+
+    ucx_devices: Optional[str] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "NIXL transport only: comma-separated UCX devices of the remote level's "
+        "NIXL agents (for example 'mlx5_0:1'); '{GPU}' is replaced by the rank's "
+        "physical GPU index. None uses the process's UCX environment.")
+
+    pool_ratio: Optional[List[_PositiveFiniteFloat]] = Field(
+        default=None,
+        min_length=1,
+        status="prototype",
+        description=
+        "Split of `cache_size` across layer groups, one positive weight per "
+        "layer group in KV cache manager v2 layer-group ID order (normalized). "
+        "None follows the hot tier's split.")
+
+    expected_num_lenders: Optional[PositiveInt] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Number of lending ranks the job starts. With `expected_claim_size`, a "
+        "rank with `cache_size` waits until these lenders have reported and fails "
+        "at once if they cannot cover the claims, instead of after the claim wait."
+    )
+
+    expected_claim_size: Optional[PositiveInt] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Bytes all ranks of the job claim from `directory` together. Used with "
+        "`expected_num_lenders`.")
+
+    lender_wait_timeout_s: _PositiveFiniteFloat = Field(
+        default=900.0,
+        status="prototype",
+        description=
+        "Seconds a rank with `cache_size` waits for lenders: for the expected "
+        "lenders to report, and for a free chunk to claim. Lenders publish "
+        "while their own servers start, so this bounds the job's startup skew.")
+
+    transfer_timeout_s: _PositiveFiniteFloat = Field(
+        default=30.0,
+        status="prototype",
+        description=
+        "NIXL transport only: seconds one batch of page transfers may take "
+        "before the remote level fails, e.g. on a lender that died.")
+
+    @model_validator(mode="after")
+    def validate_remote_cache(self) -> 'RemoteCacheConfig':
+        if self.cache_size == 0 and self.lend_size == 0:
+            raise ValueError(
+                "remote_cache_config needs a positive cache_size or lend_size")
+        if 0 < self.lend_size < REMOTE_CACHE_CHUNK_BYTES:
+            raise ValueError(
+                "remote_cache_config.lend_size must be 0 or at least one "
+                f"{REMOTE_CACHE_CHUNK_BYTES}-byte chunk, got {self.lend_size}")
+        # Fields off their defaults, so a dumped config validates again.
+        given = {
+            name
+            for name, field in type(self).model_fields.items()
+            if getattr(self, name) != field.default
+        }
+        ignored = []
+        if self.cache_size == 0:
+            # Read only by a rank with a remote cache level.
+            ignored += [
+                name for name in ("pool_ratio", "expected_num_lenders",
+                                  "expected_claim_size",
+                                  "lender_wait_timeout_s", "transfer_timeout_s")
+                if name in given
+            ]
+        elif "transfer_timeout_s" in given and self.transport != "nixl":
+            ignored.append("transfer_timeout_s")
+        if "lend_reserve_size" in given and (self.lend_size == 0
+                                             or self.transport != "fabric"):
+            ignored.append("lend_reserve_size")
+        if ignored:
+            raise ValueError(
+                f"remote_cache_config sets {', '.join(ignored)}, which a rank "
+                "with this cache_size, lend_size and transport ignores")
+        if (self.expected_num_lenders is None) != (self.expected_claim_size
+                                                   is None):
+            raise ValueError("remote_cache_config.expected_num_lenders and "
+                             "expected_claim_size must be set together")
+        if self.ucx_devices is not None and self.transport != "nixl":
+            raise ValueError(
+                "remote_cache_config.ucx_devices applies to transport='nixl' only"
+            )
+        return self
+
+
 # Mixed-precision KV dtype: "mixed_<low dtype>_<high dtype>". The
 # first/last tokens and the attention inputs use the second dtype;
 # the full history is stored in the first. Requires KV cache manager V2.
@@ -5304,6 +5482,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Directory used for disk KV cache files. Must be set when `disk_cache_size` is positive."
     )
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    remote_cache_config: Optional[RemoteCacheConfig] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "KV cache manager v2 remote cache level in host memory that other ranks "
+        "lend (usually generation ranks to context ranks). None disables it.")
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -5478,6 +5663,18 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
     )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    defer_generation_only_release: bool = Field(
+        default=False,
+        status="prototype",
+        description="Release the KV cache of a finished generation-only request "
+        "(disaggregated generation server) after the next forward is enqueued, "
+        "so that the host-side release overlaps GPU work. The pages return one "
+        "iteration later: the next iteration's scheduler cannot admit requests "
+        "into them, so leave this off on generation servers bound by KV cache "
+        "capacity. Requires KV cache manager v2 and the overlap scheduler "
+        "without pipeline parallelism.")
 
     enable_kv_pool_rebalance: bool = Field(
         default=False,
@@ -5755,6 +5952,30 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     f"kv_cache_config.disk_cache_path {self.disk_cache_path} does not exist or is not a directory"
                 )
+        return self
+
+    @model_validator(mode='after')
+    def validate_remote_cache_config(self) -> 'KvCacheConfig':
+        remote = self.remote_cache_config
+        if remote is None:
+            return self
+        if self.use_kv_cache_manager_v2 is False:
+            raise ValueError("kv_cache_config.remote_cache_config requires "
+                             "use_kv_cache_manager_v2")
+        if remote.cache_size and self.disk_cache_size:
+            raise ValueError(
+                "kv_cache_config.remote_cache_config.cache_size and "
+                "disk_cache_size cannot both be set: the remote level takes the "
+                "disk level's place")
+        return self
+
+    @model_validator(mode='after')
+    def validate_defer_generation_only_release(self) -> 'KvCacheConfig':
+        if (self.defer_generation_only_release
+                and self.use_kv_cache_manager_v2 is False):
+            raise ValueError(
+                "kv_cache_config.defer_generation_only_release requires "
+                "kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @model_validator(mode='after')

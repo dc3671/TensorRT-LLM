@@ -127,6 +127,43 @@ def save_mooncake_worker_config(worker_config, log_dir, role, instance_id):
     return config_path
 
 
+#: Rendezvous directory of the KV cache manager v2 remote level, under log_dir.
+REMOTE_CACHE_DIR_NAME = 'kvcm2_remote'
+
+
+def resolve_remote_cache(worker_config, num_ranks, directory):
+    """Fill the job-wide fields of the KV cache remote level from the layout.
+
+    Each role's kv_cache_config.remote_cache_config gets the job's rendezvous
+    directory; a role with a cache_size also gets the number of lending ranks
+    and the bytes all caching ranks claim, which only the launcher can count.
+    The claim is the sum of cache_size: ranks round each layer group up to
+    whole chunks, which the launcher cannot see, so a claim that runs out stops
+    once every expected lender has reported. Explicit values are left alone.
+
+    Args:
+        worker_config: {'ctx': ..., 'gen': ...} worker configs, edited in place.
+        num_ranks: {'ctx': ..., 'gen': ...} ranks of each role in the job.
+        directory: Rendezvous directory to use when none is set.
+    """
+    remote = {}
+    for role in ('ctx', 'gen'):
+        kv_cache_config = worker_config[role].get('kv_cache_config') or {}
+        if kv_cache_config.get('remote_cache_config'):
+            remote[role] = kv_cache_config['remote_cache_config']
+    num_lenders = sum(num_ranks[role] for role, config in remote.items()
+                      if config.get('lend_size'))
+    claim_size = sum(num_ranks[role] * config.get('cache_size', 0)
+                     for role, config in remote.items())
+    for config in remote.values():
+        config.setdefault('directory', directory)
+        explicit = ('expected_num_lenders' in config
+                    or 'expected_claim_size' in config)
+        if config.get('cache_size') and num_lenders and not explicit:
+            config['expected_num_lenders'] = num_lenders
+            config['expected_claim_size'] = claim_size
+
+
 def calculate_nodes(world_size, num_servers, gpus_per_node):
     """Required node count under per-worker whole-node ownership.
 
@@ -639,6 +676,10 @@ def submit_job(config, log_dir, dry_run):
                                               mooncake_pool_file)
     gen_uses_mooncake = resolve_mooncake_pool(worker_config['gen'],
                                               mooncake_pool_file)
+    resolve_remote_cache(worker_config, {
+        'ctx': ctx_num * ctx_world_size,
+        'gen': gen_num * gen_world_size
+    }, os.path.join(log_dir, REMOTE_CACHE_DIR_NAME))
     save_worker_config(worker_config['ctx'], ctx_config_path)
     save_worker_config(worker_config['gen'], gen_config_path)
 

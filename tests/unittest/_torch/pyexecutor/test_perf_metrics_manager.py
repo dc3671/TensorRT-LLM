@@ -122,3 +122,31 @@ def test_handle_responses_shares_gpu_times_cache():
     assert first_call == call([requests[0]], gpu_times_cache=first_call.kwargs["gpu_times_cache"])
     assert second_call == call([requests[1]], gpu_times_cache=second_call.kwargs["gpu_times_cache"])
     assert first_call.kwargs["gpu_times_cache"] is second_call.kwargs["gpu_times_cache"]
+
+
+def test_timing_side_stream_records_after_the_current_stream(monkeypatch):
+    import torch
+
+    current = object()
+    side = MagicMock()
+    event = MagicMock()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    manager = PerfMetricsManager(enabled=True)
+    manager._timing_stream = side
+
+    with manager.record_perf_events(event, None):
+        pass
+
+    side.wait_stream.assert_called_once_with(current)
+    event.record.assert_called_once_with(side)
+
+
+def test_timing_events_stay_on_the_current_stream_by_default():
+    event = MagicMock()
+    manager = PerfMetricsManager(enabled=True)
+
+    with manager.record_perf_events(None, event):
+        pass
+
+    event.record.assert_called_once_with()

@@ -440,6 +440,7 @@ def executor_for_preemption(p, reqs, scheduler):
         enable_attention_dp=False,
         enable_batch_waiting=False,
         _cap_context_by_total_kv_len=lambda requests: requests,
+        _cancelled_disagg_model_request_ids=set,
         _maybe_record_hang_diagnostic_phase=Mock(),
     )
     executor._cancelled_disagg_model_request_ids = MethodType(
