@@ -14,7 +14,7 @@
 # limitations under the License.
 """KV cache manager v2 with a remote cold level (``RemoteCacheTierConfig``).
 
-The level keeps its slots in host memory that lender processes (``remote_lender.py``) publish in a rendezvous
+The level keeps its slots in host memory that donor processes (``remote_donor.py``) publish in a rendezvous
 directory, and moves pages with NIXL READ / WRITE or over NVLink fabric memory (``storage/remoteMem.h``). Every test
 class runs once per transport; a transport this machine lacks (remote_test_utils) is skipped.
 """
@@ -82,19 +82,19 @@ pytestmark = pytest.mark.skipif(
 # One concrete class per transport: <Class>_0_nixl, <Class>_1_fabric.
 _per_transport = parameterized_class(("transport",), [("nixl",), ("fabric",)])
 # The largest claim of one test (the suite's 1 GiB disk quota, rounded up to whole chunks per pool group) and room.
-_LENDER_BYTES = 2 << 30
+_DONOR_BYTES = 2 << 30
 _CHUNK_BYTES = 8 << 20
 _counter = itertools.count()
 _NIXL_DEATH_ONLY = (
-    "fabric: a dead lender's effect is the driver's; this test checks NIXL's fail-stop"
+    "fabric: a dead donor's effect is the driver's; this test checks NIXL's fail-stop"
 )
 
 
-class _Lender:
-    """A lender in its own process, as on a GEN tray.
+class _Donor:
+    """A donor in its own process, as on a GEN tray.
 
     Inside a Slurm step the subprocess joins the step's PMIx job (`import tensorrt_llm` runs MPI_Init), so it is
-    stopped with SIGTERM and exits normally: a SIGKILLed lender makes Slurm abort the whole step. A stopped lender has
+    stopped with SIGTERM and exits normally: a SIGKILLed donor makes Slurm abort the whole step. A stopped donor has
     deregistered its memory and destroyed its NIXL agent, which is what a client sees of a dead one.
     """
 
@@ -102,13 +102,13 @@ class _Lender:
         self, directory: str, nbytes: int, transport: str, chunk_bytes: int = _CHUNK_BYTES
     ):
         self.directory = directory
-        self.name = f"test-lender-{os.getpid()}-{next(_counter)}"
-        self.log_path = os.path.join(directory, f"lender_{self.name}.log")
+        self.name = f"test-donor-{os.getpid()}-{next(_counter)}"
+        self.log_path = os.path.join(directory, f"donor_{self.name}.log")
         self._log = open(self.log_path, "w")
         self.proc = subprocess.Popen(
             [
                 sys.executable,
-                os.path.join(_TEST_DIR, "remote_lender_cli.py"),
+                os.path.join(_TEST_DIR, "remote_donor_cli.py"),
                 "--dir",
                 directory,
                 "--bytes",
@@ -119,7 +119,7 @@ class _Lender:
                 self.name,
                 "--transport",
                 transport,
-                # The last GPU, so that on a multi-GPU node lender and client sit on different devices.
+                # The last GPU, so that on a multi-GPU node donor and client sit on different devices.
                 "--device",
                 str(gpu_count() - 1),
                 "--parent-pid",
@@ -129,16 +129,16 @@ class _Lender:
             stderr=subprocess.STDOUT,
             text=True,
         )
-        ready = os.path.join(directory, f"lender.{self.name}.ready")
+        ready = os.path.join(directory, f"donor.{self.name}.ready")
         deadline = time.monotonic() + 300
         while not os.path.exists(ready):
             if self.proc.poll() is not None:
                 raise RuntimeError(
-                    f"lender exited early (rc {self.proc.returncode}):\n{self._tail()}"
+                    f"donor exited early (rc {self.proc.returncode}):\n{self._tail()}"
                 )
             if time.monotonic() > deadline:
                 self.stop()
-                raise TimeoutError(f"lender did not publish within 300 s:\n{self._tail()}")
+                raise TimeoutError(f"donor did not publish within 300 s:\n{self._tail()}")
             time.sleep(0.2)
 
     def _tail(self, n: int = 40) -> str:
@@ -158,25 +158,25 @@ class _Lender:
         self._log.close()
 
 
-# Per transport: the rendezvous directory of the module's lender, and the lender.
+# Per transport: the rendezvous directory of the module's donor, and the donor.
 _module_dirs: "dict[str, str]" = {}
-_module_lenders: "list[_Lender]" = []
+_module_donors: "list[_Donor]" = []
 
 
 def setUpModule() -> None:
     try:
         for transport in _TRANSPORTS:
             _module_dirs[transport] = tempfile.mkdtemp(prefix=f"kvcm2_remote_{transport}_")
-            _module_lenders.append(_Lender(_module_dirs[transport], _LENDER_BYTES, transport))
+            _module_donors.append(_Donor(_module_dirs[transport], _DONOR_BYTES, transport))
     except BaseException:
         tearDownModule()  # unittest skips it after a failed setUpModule
         raise
 
 
 def tearDownModule() -> None:
-    for lender in _module_lenders:
-        lender.stop()
-    _module_lenders.clear()
+    for donor in _module_donors:
+        donor.stop()
+    _module_donors.clear()
     for directory in _module_dirs.values():
         shutil.rmtree(directory, ignore_errors=True)
     _module_dirs.clear()
@@ -203,48 +203,46 @@ class _Transport:
         transfer_timeout_ms: int = 30_000,
         pool_ratio: "list[float] | None" = None,
         wait_timeout_ms: int = 60_000,
-        expected_lenders: int = 0,
+        expected_donors: int = 0,
     ):
         return RemoteCacheTierConfig(
             quota=quota,
             path=directory or self.module_dir,
             wait_timeout_ms=wait_timeout_ms,
             transfer_timeout_ms=transfer_timeout_ms,
-            expected_lenders=expected_lenders,
+            expected_donors=expected_donors,
             transport=RemoteTransport[self.transport.upper()],
             pool_ratio=pool_ratio or [],
         )
 
 
 @_per_transport
-class TestRemoteLender(_Transport, unittest.TestCase):
-    def test_lender_publishes_whole_chunks_and_withdraws_them(self) -> None:
-        directory = tempfile.mkdtemp(prefix="kvcm2_lender_")
+class TestRemoteMemDonor(_Transport, unittest.TestCase):
+    def test_donor_publishes_whole_chunks_and_withdraws_them(self) -> None:
+        directory = tempfile.mkdtemp(prefix="kvcm2_donor_")
         try:
-            lender = _Lender(
-                directory, (64 << 20) + (3 << 20), self.transport, chunk_bytes=16 << 20
-            )
-            meta = open(os.path.join(directory, f"lender.{lender.name}.meta")).read().split("\n")
+            donor = _Donor(directory, (64 << 20) + (3 << 20), self.transport, chunk_bytes=16 << 20)
+            meta = open(os.path.join(directory, f"donor.{donor.name}.meta")).read().split("\n")
             fields = dict(line.split(" ", 1) for line in meta if line)
             self.assertEqual(fields["version"], "1")
-            self.assertEqual(fields["name"], lender.name)
+            self.assertEqual(fields["name"], donor.name)
             self.assertEqual(int(fields["chunk_bytes"]), 16 << 20)
             base_address, nbytes = (int(x) for x in fields["segment"].split())
-            self.assertEqual(nbytes, 64 << 20)  # the partial fifth chunk is not lent
+            self.assertEqual(nbytes, 64 << 20)  # the partial fifth chunk is not donated
             if self.transport == "fabric":
                 # Each chunk is its own fabric allocation: one 64-byte handle per chunk, in chunk order.
                 self.assertEqual(fields.get("transport"), "fabric")
                 self.assertEqual(base_address, 0)
                 self.assertEqual(
-                    os.path.getsize(os.path.join(directory, f"lender.{lender.name}.fabric")), 4 * 64
+                    os.path.getsize(os.path.join(directory, f"donor.{donor.name}.fabric")), 4 * 64
                 )
             else:
                 self.assertGreater(base_address, 0)
                 self.assertGreater(
-                    os.path.getsize(os.path.join(directory, f"lender.{lender.name}.desc")), 0
+                    os.path.getsize(os.path.join(directory, f"donor.{donor.name}.desc")), 0
                 )
-            lender.stop()
-            self.assertEqual(glob.glob(os.path.join(directory, f"lender.{lender.name}.*")), [])
+            donor.stop()
+            self.assertEqual(glob.glob(os.path.join(directory, f"donor.{donor.name}.*")), [])
         finally:
             shutil.rmtree(directory, ignore_errors=True)
 
@@ -281,7 +279,7 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
         transfer_timeout_ms: int = 30_000,
         remote_quota: int = 512 << 20,
         wait_timeout_ms: int = 60_000,
-        expected_lenders: int = 0,
+        expected_donors: int = 0,
     ):
         layers = []
         for lid in range(2):
@@ -310,7 +308,7 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
                 directory,
                 transfer_timeout_ms,
                 wait_timeout_ms=wait_timeout_ms,
-                expected_lenders=expected_lenders,
+                expected_donors=expected_donors,
             )
         )
         return KVCacheManagerConfig(
@@ -419,11 +417,11 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
         self._reuse_and_check(prompt, stream)
 
     def test_rebase_onto_remote_copies_reads_nothing(self) -> None:
-        """The same rebase with the lender gone: moving a remote copy back would fail the commit."""
+        """The same rebase with the donor gone: moving a remote copy back would fail the commit."""
         if self.transport == "fabric":
             self.skipTest(_NIXL_DEATH_ONLY)
         directory = tempfile.mkdtemp(prefix="kvcm2_rebase_")
-        lender = _Lender(directory, 1 << 30, self.transport)
+        donor = _Donor(directory, 1 << 30, self.transport)
         try:
             self.cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=10_000)
             self.manager = KVCacheManager(self.cfg)
@@ -433,22 +431,22 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             prompt = self._prompt(4 * self.tokens_per_block)
             self._prefill(prompt, stream)
             self._push_to_last_level(prompt, stream)
-            # Take the second request's GPU pages while the lender still serves the evictions that frees.
+            # Take the second request's GPU pages while the donor still serves the evictions that frees.
             kv = self.manager.create_kv_cache()
             self.assertTrue(kv.resume(stream))
             kv.capacity = len(prompt)
             kv.history_length = len(prompt)
             _sync_device()
-            lender.stop()
+            donor.stop()
             self.engine.execute([Step(kv, prompt, [])], stream)
             # Rebasing must not move the remote copies back to the GPU here: making room for them would evict to the
-            # remote level and read the copies from it, so the commit would fail on a WRITE to the gone lender.
+            # remote level and read the copies from it, so the commit would fail on a WRITE to the gone donor.
             kv.commit(prompt)
             kv.stop_committing()
             kv.close()
             del kv
         finally:
-            lender.stop()
+            donor.stop()
             if hasattr(self, "manager"):
                 try:
                     self.manager.shutdown()
@@ -459,12 +457,12 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             base.take_poison()
             shutil.rmtree(directory, ignore_errors=True)
 
-    def test_dead_lender_fails_the_promotion_instead_of_reusing(self) -> None:
+    def test_dead_donor_fails_the_promotion_instead_of_reusing(self) -> None:
         """The promotion itself raises."""
         if self.transport == "fabric":
             self.skipTest(_NIXL_DEATH_ONLY)
         directory = tempfile.mkdtemp(prefix="kvcm2_dead_")
-        lender = _Lender(directory, 1 << 30, self.transport)
+        donor = _Donor(directory, 1 << 30, self.transport)
         try:
             self.cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=10_000)
             self.manager = KVCacheManager(self.cfg)
@@ -474,9 +472,9 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             prompt = self._prompt(4 * self.tokens_per_block)
             self._prefill(prompt, stream)
             self._push_to_last_level(prompt, stream)
-            # The lender goes away with its memory registration and agent (its files go too; this client has loaded
+            # The donor goes away with its memory registration and agent (its files go too; this client has loaded
             # it already), so the next READ of the prompt's pages has nowhere to go.
-            lender.stop()
+            donor.stop()
             kv = self.manager.create_kv_cache(input_tokens=prompt)
             # Its own class, not RuntimeError: callers tell a retired remote level from any other failure.
             with self.assertRaisesRegex(RemoteMemError, "remote level"):
@@ -487,7 +485,7 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
                 pass
             del kv
         finally:
-            lender.stop()
+            donor.stop()
             if hasattr(self, "manager"):
                 try:
                     self.manager.shutdown()
@@ -508,7 +506,7 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
         if self.transport == "fabric":
             self.skipTest(_NIXL_DEATH_ONLY)
         directory = tempfile.mkdtemp(prefix="kvcm2_retired_")
-        lender = _Lender(directory, 1 << 30, self.transport)
+        donor = _Donor(directory, 1 << 30, self.transport)
         try:
             self.cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=10_000)
             self.manager = KVCacheManager(self.cfg)
@@ -518,7 +516,7 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             prompt = self._prompt(4 * self.tokens_per_block)
             self._prefill(prompt, stream)
             self._push_to_last_level(prompt, stream)
-            lender.stop()
+            donor.stop()
             kv = self.manager.create_kv_cache(input_tokens=prompt)
             with self.assertRaisesRegex(Exception, "remote level"):
                 kv.resume(stream)
@@ -533,7 +531,7 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             self._reuse_and_check(fresh, stream)
             self.assertEqual(self._residency(prompt)[-1], 0)
         finally:
-            lender.stop()
+            donor.stop()
             if hasattr(self, "manager"):
                 try:
                     self.manager.shutdown()
@@ -544,70 +542,70 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             base.take_poison()
             shutil.rmtree(directory, ignore_errors=True)
 
-    def test_withdrawn_lender_takes_no_new_claims(self) -> None:
-        """Growing the level after its lender withdrew claims nothing from it, though the client knew its chunks."""
+    def test_withdrawn_donor_takes_no_new_claims(self) -> None:
+        """Growing the level after its donor withdrew claims nothing from it, though the client knew its chunks."""
         directory = tempfile.mkdtemp(prefix="kvcm2_withdrawn_")
-        lender = _Lender(directory, 128 << 20, self.transport)
+        donor = _Donor(directory, 128 << 20, self.transport)
         try:
             self.cfg = self._config(
                 with_host=False, directory=directory, remote_quota=32 << 20, wait_timeout_ms=2_000
             )
             self.manager = KVCacheManager(self.cfg)
-            claims = sorted(glob.glob(os.path.join(directory, f"claim.{lender.name}.*")))
+            claims = sorted(glob.glob(os.path.join(directory, f"claim.{donor.name}.*")))
             self.assertTrue(claims, "no chunk was claimed")
-            lender.stop()
+            donor.stop()
             last = cast(CacheLevel, CacheLevel(len(self.cfg.cache_tiers) - 1))
-            self.assertFalse(self.manager.resize(last, 96 << 20), "grew on a withdrawn lender")
+            self.assertFalse(self.manager.resize(last, 96 << 20), "grew on a withdrawn donor")
             self.assertEqual(
-                sorted(glob.glob(os.path.join(directory, f"claim.{lender.name}.*"))), claims
+                sorted(glob.glob(os.path.join(directory, f"claim.{donor.name}.*"))), claims
             )
         finally:
-            lender.stop()
+            donor.stop()
             if hasattr(self, "manager"):
                 self.manager.shutdown()
                 del self.manager
             gc.collect()
             shutil.rmtree(directory, ignore_errors=True)
 
-    def test_claims_stop_once_every_expected_lender_reported(self) -> None:
-        """With every expected lender reported (published or failed) and no free chunk, a claim fails at once."""
+    def test_claims_stop_once_every_expected_donor_reported(self) -> None:
+        """With every expected donor reported (published or failed) and no free chunk, a claim fails at once."""
         directory = tempfile.mkdtemp(prefix="kvcm2_reported_")
-        lender = _Lender(directory, 128 << 20, self.transport)
-        with open(os.path.join(directory, "lender.gone.failed"), "w") as f:
+        donor = _Donor(directory, 128 << 20, self.transport)
+        with open(os.path.join(directory, "donor.gone.failed"), "w") as f:
             f.write("version 1\nname gone\n")
         try:
             self.cfg = self._config(
                 with_host=False,
                 directory=directory,
                 wait_timeout_ms=600_000,
-                expected_lenders=2,
+                expected_donors=2,
             )
             start = time.monotonic()
-            with self.assertRaisesRegex(Exception, "expected lenders reported"):
+            with self.assertRaisesRegex(Exception, "expected donors reported"):
                 self.manager = KVCacheManager(self.cfg)
             self.assertLess(time.monotonic() - start, 120)
         finally:
-            lender.stop()
+            donor.stop()
             gc.collect()
             base.take_poison()
             shutil.rmtree(directory, ignore_errors=True)
 
-    def test_crashed_lender_is_passed_over(self) -> None:
-        """A lender that died without withdrawing (its files stay) gets no claims; the next lender serves them."""
+    def test_crashed_donor_is_passed_over(self) -> None:
+        """A donor that died without withdrawing (its files stay) gets no claims; the next donor serves them."""
         if self.transport != "fabric":
-            self.skipTest("a dead NIXL lender shows at its first transfer, not at the claim")
+            self.skipTest("a dead NIXL donor shows at its first transfer, not at the claim")
         directory = tempfile.mkdtemp(prefix="kvcm2_crashed_")
-        dead = _Lender(directory, 128 << 20, self.transport)
-        files = sorted(glob.glob(os.path.join(directory, f"lender.{dead.name}.*")))
+        dead = _Donor(directory, 128 << 20, self.transport)
+        files = sorted(glob.glob(os.path.join(directory, f"donor.{dead.name}.*")))
         contents = {path: open(path, "rb").read() for path in files}
         dead.stop()
         for path in sorted(files, key=lambda path: path.endswith(".ready")):  # .ready last
             with open(path, "wb") as f:
                 f.write(contents[path])
-        # The live lender publishes while the client already waits, so the client meets the dead one first.
+        # The live donor publishes while the client already waits, so the client meets the dead one first.
         live = []
         thread = threading.Thread(
-            target=lambda: live.append(_Lender(directory, 128 << 20, self.transport))
+            target=lambda: live.append(_Donor(directory, 128 << 20, self.transport))
         )
         thread.start()
         try:
@@ -623,8 +621,8 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             if hasattr(self, "manager"):
                 self.manager.shutdown()
                 del self.manager
-            for lender in live:
-                lender.stop()
+            for donor in live:
+                donor.stop()
             gc.collect()
             shutil.rmtree(directory, ignore_errors=True)
 

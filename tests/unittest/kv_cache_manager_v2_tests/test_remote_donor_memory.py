@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The remote-level lender makes all of its memory resident before it publishes it. Linux only, no GPU."""
+"""The remote-level donor makes all of its memory resident before it publishes it. Linux only, no GPU."""
 
 import ctypes
 import errno
@@ -21,7 +21,7 @@ import sys
 import unittest
 from unittest import mock
 
-from tensorrt_llm._torch.pyexecutor.kv_cache import remote_lender
+from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
 
 _SIZE = 96 << 20
 
@@ -45,7 +45,7 @@ def _resident_bytes(address: int, size: int) -> int:
 @unittest.skipUnless(sys.platform.startswith("linux"), "uses mincore(2)")
 class TestPopulate(unittest.TestCase):
     def _region(self):
-        flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | remote_lender._MAP_NORESERVE
+        flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | remote_donor._MAP_NORESERVE
         region = mmap.mmap(-1, _SIZE, flags=flags)
         self.addCleanup(region.close)
         return region, ctypes.addressof(ctypes.c_char.from_buffer(region))
@@ -53,7 +53,7 @@ class TestPopulate(unittest.TestCase):
     def test_every_page_is_resident(self):
         region, address = self._region()
         self.assertEqual(_resident_bytes(address, _SIZE), 0)
-        remote_lender._populate(region, address, _SIZE)
+        remote_donor._populate(region, address, _SIZE)
         self.assertEqual(_resident_bytes(address, _SIZE), _SIZE)
 
     def test_fallback_without_madv_populate_write(self):
@@ -61,9 +61,9 @@ class TestPopulate(unittest.TestCase):
         self.assertEqual(_resident_bytes(address, _SIZE), 0)
         # A kernel without MADV_POPULATE_WRITE (EINVAL) takes the zero-fill path.
         with mock.patch.object(
-            remote_lender, "madvise_range", side_effect=OSError(errno.EINVAL, "EINVAL")
+            remote_donor, "madvise_range", side_effect=OSError(errno.EINVAL, "EINVAL")
         ):
-            remote_lender._populate(region, address, _SIZE)
+            remote_donor._populate(region, address, _SIZE)
         self.assertEqual(_resident_bytes(address, _SIZE), _SIZE)
 
 

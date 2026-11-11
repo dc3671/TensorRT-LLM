@@ -12,13 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The remote level's capacity check, lender failure markers and fabric chunk placement.
+"""The remote level's capacity check, donor failure markers and fabric chunk placement.
 
 No GPU, except TestFabricPlacement (the fabric transport).
 
-check_remote_capacity waits until the expected lenders have published (lender.<name>.ready + .meta) or failed
-(lender.<name>.failed), then compares what they offer with what the clients claim. It must fail as soon as the
-last lender reports with a shortfall, pass as soon as the offer covers the need, and name failed and short lenders.
+check_remote_capacity waits until the expected donors have published (donor.<name>.ready + .meta) or failed
+(donor.<name>.failed), then compares what they offer with what the clients claim. It must fail as soon as the
+last donor reports with a shortfall, pass as soon as the offer covers the need, and name failed and short donors.
 """
 
 import contextlib
@@ -34,12 +34,12 @@ import time
 import unittest
 from unittest import mock
 
-from tensorrt_llm._torch.pyexecutor.kv_cache import remote_lender
-from tensorrt_llm._torch.pyexecutor.kv_cache.remote_lender import (
-    FabricLender,
-    NixlLender,
+from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
+from tensorrt_llm._torch.pyexecutor.kv_cache.remote_donor import (
+    FabricDonor,
+    NixlDonor,
     check_remote_capacity,
-    scan_lenders,
+    scan_donors,
 )
 
 _TEST_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -69,9 +69,9 @@ def _publish(directory, name, gib, chunk_gib=1, short_gib=0, host="hostA", extra
     ]
     if short_gib:
         lines.append(f"short_bytes {short_gib * _GIB}")
-    with open(os.path.join(directory, f"lender.{name}.meta"), "w") as f:
+    with open(os.path.join(directory, f"donor.{name}.meta"), "w") as f:
         f.write("\n".join(lines) + "\n")
-    open(os.path.join(directory, f"lender.{name}.ready"), "w").close()
+    open(os.path.join(directory, f"donor.{name}.ready"), "w").close()
 
 
 class TestCapacityCheck(unittest.TestCase):
@@ -84,10 +84,10 @@ class TestCapacityCheck(unittest.TestCase):
     def test_scan_counts_whole_chunks_and_failures(self):
         _publish(self.dir, "a", 160)
         _publish(self.dir, "b", 100, short_gib=60)
-        lender = NixlLender(self.dir, 160 * _GIB, chunk_bytes=_GIB, name="c")
-        lender.publish_failure(RuntimeError("CUDA_ERROR_OUT_OF_MEMORY"))
-        open(os.path.join(self.dir, "claim.a.0"), "w").close()  # claims are not lenders
-        published, failed = scan_lenders(self.dir)
+        donor = NixlDonor(self.dir, 160 * _GIB, chunk_bytes=_GIB, name="c")
+        donor.publish_failure(RuntimeError("CUDA_ERROR_OUT_OF_MEMORY"))
+        open(os.path.join(self.dir, "claim.a.0"), "w").close()  # claims are not donors
+        published, failed = scan_donors(self.dir)
         self.assertEqual(sorted(p["name"] for p in published), ["a", "b"])
         self.assertEqual(sum(p["offered_bytes"] for p in published), 260 * _GIB)
         self.assertEqual([p["short_bytes"] for p in published if p["name"] == "b"], [60 * _GIB])
@@ -101,12 +101,12 @@ class TestCapacityCheck(unittest.TestCase):
         result = check_remote_capacity(self.dir, 8, 1218 * _GIB, timeout_s=10, log=lambda _: None)
         self.assertEqual(result["offered_bytes"], 1280 * _GIB)
 
-    def test_fails_fast_when_all_lenders_reported_short(self):
-        # 5 of 8 lenders published 160 GiB, 3 failed; the clients claim 6 x 203 GiB.
+    def test_fails_fast_when_all_donors_reported_short(self):
+        # 5 of 8 donors published 160 GiB, 3 failed; the clients claim 6 x 203 GiB.
         for i in range(5):
             _publish(self.dir, f"ok{i}", 160)
         for i in range(3):
-            NixlLender(self.dir, 160 * _GIB, chunk_bytes=_GIB, name=f"bad{i}").publish_failure(
+            NixlDonor(self.dir, 160 * _GIB, chunk_bytes=_GIB, name=f"bad{i}").publish_failure(
                 RuntimeError("CUDA_ERROR_OUT_OF_MEMORY")
             )
         t0 = time.monotonic()
@@ -121,14 +121,14 @@ class TestCapacityCheck(unittest.TestCase):
             )
         self.assertLess(
             time.monotonic() - t0, 5.0
-        )  # no wait for the timeout: every lender has reported
+        )  # no wait for the timeout: every donor has reported
         message = str(ctx.exception)
-        self.assertIn("5 of 8 planned lenders published 800 GiB, 3 failed", message)
+        self.assertIn("5 of 8 planned donors published 800 GiB, 3 failed", message)
         self.assertIn("claim 1218 GiB", message)
         self.assertIn("bad0", message)
         self.assertIn("OUT_OF_MEMORY", message)
 
-    def test_names_short_lenders(self):
+    def test_names_short_donors(self):
         _publish(self.dir, "a", 100, short_gib=60)
         _publish(self.dir, "b", 160)
         with self.assertRaises(RuntimeError) as ctx:
@@ -142,10 +142,10 @@ class TestCapacityCheck(unittest.TestCase):
             )
         self.assertIn("a (hostA) is 60 GiB short", str(ctx.exception))
 
-    def test_short_lender_note_names_its_numa_placement(self):
+    def test_short_donor_note_names_its_numa_placement(self):
         _publish(self.dir, "a", 100, short_gib=60, extra=["numa_chunks 0:60,1:40"])
         _publish(self.dir, "b", 160)
-        published, _ = scan_lenders(self.dir)
+        published, _ = scan_donors(self.dir)
         self.assertEqual(
             {p["name"]: p["numa_chunks"] for p in published}, {"a": "0:60,1:40", "b": ""}
         )
@@ -162,7 +162,7 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertIn("a (hostA) is 60 GiB short (chunks per NUMA node 0:60,1:40)", message)
         self.assertNotIn("\n", message)
 
-    def test_times_out_when_lenders_do_not_report(self):
+    def test_times_out_when_donors_do_not_report(self):
         _publish(self.dir, "a", 10)
         t0 = time.monotonic()
         with self.assertRaises(RuntimeError) as ctx:
@@ -191,7 +191,7 @@ class TestCapacityCheck(unittest.TestCase):
         )
         self.assertLess(time.monotonic() - t0, 5.0)
 
-    def test_waits_for_a_lender_that_publishes_later(self):
+    def test_waits_for_a_donor_that_publishes_later(self):
         _publish(self.dir, "a", 100)
         threading.Timer(0.3, lambda: _publish(self.dir, "b", 100)).start()
         result = check_remote_capacity(
@@ -205,26 +205,26 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertEqual(result["offered_bytes"], 200 * _GIB)
 
     def test_failure_marker_survives_close(self):
-        lender = NixlLender(self.dir, 4 * _GIB, chunk_bytes=_GIB, name="gone")
-        lender.close()
-        lender.publish_failure(RuntimeError("boom\nsecond line"))
-        path = os.path.join(self.dir, "lender.gone.failed")
+        donor = NixlDonor(self.dir, 4 * _GIB, chunk_bytes=_GIB, name="gone")
+        donor.close()
+        donor.publish_failure(RuntimeError("boom\nsecond line"))
+        path = os.path.join(self.dir, "donor.gone.failed")
         self.assertTrue(os.path.exists(path))
         text = open(path).read()
         self.assertIn("planned_bytes 4294967296", text)
         self.assertNotIn("\nsecond line", text)  # the error stays on one line
 
     def test_close_waits_for_a_failed_background_start_closing_itself(self):
-        # The start thread closes the lender itself on failure; a concurrent close() must not withdraw alongside it.
-        lender = NixlLender(self.dir, 4 * _GIB, chunk_bytes=_GIB, name="racy")
+        # The start thread closes the donor itself on failure; a concurrent close() must not withdraw alongside it.
+        donor = NixlDonor(self.dir, 4 * _GIB, chunk_bytes=_GIB, name="racy")
         entered, release = threading.Event(), threading.Event()
         active, depths = [0], []
-        real_withdraw = lender._withdraw
+        real_withdraw = donor._withdraw
 
         def withdraw():
             active[0] += 1
             depths.append(active[0])
-            if threading.current_thread().name == "kvcm2-remote-lender":
+            if threading.current_thread().name == "kvcm2-remote-donor":
                 entered.set()
                 release.wait(10)
             real_withdraw()
@@ -236,11 +236,11 @@ class TestCapacityCheck(unittest.TestCase):
             start_threads.append(threading.current_thread())
             raise RuntimeError("no memory")
 
-        lender._withdraw = withdraw
-        lender.start = failing_start
-        lender.start_in_background()
+        donor._withdraw = withdraw
+        donor.start = failing_start
+        donor.start_in_background()
         self.assertTrue(entered.wait(10))
-        closer = threading.Thread(target=lender.close)
+        closer = threading.Thread(target=donor.close)
         closer.start()
         closer.join(0.3)
         self.assertTrue(
@@ -254,46 +254,46 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertFalse(start_threads[0].is_alive())
 
     def _started(self, name):
-        lender = FabricLender(self.dir, 4 * _GIB, chunk_bytes=_GIB, name=name)
+        donor = FabricDonor(self.dir, 4 * _GIB, chunk_bytes=_GIB, name=name)
         with mock.patch.object(
-            FabricLender,
+            FabricDonor,
             "_start_transport",
             lambda self: self._publish([], ["segment 0 1"], "test"),
         ):
-            lender.start()
-        return lender
+            donor.start()
+        return donor
 
-    def test_a_lender_nobody_closed_withdraws_and_leaves_a_marker(self):
-        # E.g. startup failed between the lend start and the manager that would own it.
-        lender = self._started("orphan")
-        ready = os.path.join(self.dir, "lender.orphan.ready")
+    def test_a_donor_nobody_closed_withdraws_and_leaves_a_marker(self):
+        # E.g. startup failed between the donation start and the manager that would own it.
+        donor = self._started("orphan")
+        ready = os.path.join(self.dir, "donor.orphan.ready")
         self.assertTrue(os.path.exists(ready))
-        del lender
+        del donor
         gc.collect()
         self.assertFalse(os.path.exists(ready))
-        _, failed = scan_lenders(self.dir)
+        _, failed = scan_donors(self.dir)
         self.assertEqual([f["name"] for f in failed], ["orphan"])
 
-    def test_a_closed_lender_leaves_no_marker(self):
-        lender = self._started("done")
-        lender.close()
-        del lender
+    def test_a_closed_donor_leaves_no_marker(self):
+        donor = self._started("done")
+        donor.close()
+        del donor
         gc.collect()
-        self.assertEqual(scan_lenders(self.dir), ([], []))
+        self.assertEqual(scan_donors(self.dir), ([], []))
 
     def test_close_with_an_error_leaves_a_marker(self):
-        lender = self._started("aborted")
-        lender.close(RuntimeError("initialization failed on another rank"))
-        _, failed = scan_lenders(self.dir)
+        donor = self._started("aborted")
+        donor.close(RuntimeError("initialization failed on another rank"))
+        _, failed = scan_donors(self.dir)
         self.assertIn("another rank", failed[0]["error"])
 
-    def test_lender_names_are_unique_within_a_process(self):
-        names = {NixlLender(self.dir, _GIB, chunk_bytes=_GIB).name for _ in range(64)}
+    def test_donor_names_are_unique_within_a_process(self):
+        names = {NixlDonor(self.dir, _GIB, chunk_bytes=_GIB).name for _ in range(64)}
         self.assertEqual(len(names), 64)
 
 
 class TestRendezvousPermissions(unittest.TestCase):
-    """Lender files hold NIXL registration keys and fabric handles: the directory and its files are the user's."""
+    """Donor files hold NIXL registration keys and fabric handles: the directory and its files are the user's."""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="kvcm2_perm_")
@@ -304,29 +304,29 @@ class TestRendezvousPermissions(unittest.TestCase):
 
     def test_a_new_directory_is_private(self):
         path = os.path.join(self.dir, "rendezvous")
-        remote_lender.ensure_rendezvous_directory(path)
+        remote_donor.ensure_rendezvous_directory(path)
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o700)
 
     def test_a_directory_others_can_write_is_refused(self):
         os.chmod(self.dir, 0o777)
         with self.assertRaises(PermissionError):
-            remote_lender.ensure_rendezvous_directory(self.dir)
+            remote_donor.ensure_rendezvous_directory(self.dir)
         os.chmod(self.dir, 0o755)
-        remote_lender.ensure_rendezvous_directory(self.dir)
+        remote_donor.ensure_rendezvous_directory(self.dir)
 
-    def test_lender_files_are_private(self):
-        NixlLender(self.dir, _GIB, chunk_bytes=_GIB, name="x").publish_failure(RuntimeError("e"))
-        self.assertEqual(os.stat(os.path.join(self.dir, "lender.x.failed")).st_mode & 0o077, 0)
+    def test_donor_files_are_private(self):
+        NixlDonor(self.dir, _GIB, chunk_bytes=_GIB, name="x").publish_failure(RuntimeError("e"))
+        self.assertEqual(os.stat(os.path.join(self.dir, "donor.x.failed")).st_mode & 0o077, 0)
 
 
 class TestPopulate(unittest.TestCase):
-    """Populate errors other than a missing MADV_POPULATE_WRITE (test_remote_lender_memory) raise."""
+    """Populate errors other than a missing MADV_POPULATE_WRITE (test_remote_donor_memory) raise."""
 
     def _populate_with(self, error):
         region = mmap.mmap(-1, 1 << 20, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
         try:
-            with mock.patch.object(remote_lender, "madvise_range", side_effect=error):
-                remote_lender._populate(region, 0, 1 << 20)
+            with mock.patch.object(remote_donor, "madvise_range", side_effect=error):
+                remote_donor._populate(region, 0, 1 << 20)
         finally:
             region.close()
 
@@ -384,7 +384,7 @@ class TestPlaceChunks(unittest.TestCase):
             node_lock=self._node_lock,
         )
         args.update(overrides)
-        return remote_lender._place_chunks(n_chunks, [0, 1], create, **args)
+        return remote_donor._place_chunks(n_chunks, [0, 1], create, **args)
 
     def _allocator(self, refuse):
         """create(node) refuses when refuse(node, call number) says so; an accepted chunk takes 1 GiB of the node."""
@@ -448,7 +448,7 @@ class TestPlaceChunks(unittest.TestCase):
         handles, placement = self._place(10, create)
         self.assertEqual(len(handles), 3)
         self.assertEqual(placement, {0: 3, 1: 0})
-        self.assertEqual(len(self._passes_on(0)), remote_lender._MAX_PASSES_PER_REFUSAL)
+        self.assertEqual(len(self._passes_on(0)), remote_donor._MAX_PASSES_PER_REFUSAL)
 
     def test_a_failing_pass_stops_passes_on_the_node(self):
         attempts = []
@@ -462,7 +462,7 @@ class TestPlaceChunks(unittest.TestCase):
         self.assertEqual(placement, {0: 2, 1: 2})
         self.assertEqual(attempts, [0])
 
-    def test_a_pass_is_sized_to_the_lend_still_missing(self):
+    def test_a_pass_is_sized_to_the_donation_still_missing(self):
         create, _ = self._allocator(lambda node, i: node == 0 and i > 5 and not self.passes)
         self._place(40, create)
         self.assertEqual(self.passes, [(0, 35.0)])  # 40 - 5 chunks, more than the smallest pass
@@ -497,7 +497,7 @@ class TestPlaceChunks(unittest.TestCase):
 
     def test_a_node_given_up_on_is_swept_once_more(self):
         # Node 0 is fragmented while node 1 still has room; once node 1 is full, node 0 holds memory in >= 2 MiB blocks
-        # again after the lender left it.
+        # again after the donor left it.
         self.room[1] = 24.0 + 4.0  # four chunks above the reserve
 
         def contiguous(node):
@@ -506,10 +506,10 @@ class TestPlaceChunks(unittest.TestCase):
         create, _ = self._allocator(lambda node, i: node == 0 and contiguous(0) < 1.0)
         handles, placement = self._place(8, create, contiguous=contiguous)
         self.assertEqual(placement, {0: 4, 1: 4})
-        self.assertEqual(len(self._passes_on(0)), remote_lender._MAX_PASSES_PER_REFUSAL)
+        self.assertEqual(len(self._passes_on(0)), remote_donor._MAX_PASSES_PER_REFUSAL)
 
     def test_the_sweep_runs_once(self):
-        # Nodes that look recovered but refuse every chunk: the lend ends short after one sweep, without looping.
+        # Nodes that look recovered but refuse every chunk: the donation ends short after one sweep, without looping.
         create, calls = self._allocator(lambda node, i: i > 3)
         self.contig = {0: 5.0, 1: 5.0}
         handles, placement = self._place(10, create)
@@ -517,12 +517,12 @@ class TestPlaceChunks(unittest.TestCase):
         self.assertLess(len(calls), 200)
 
     def test_a_pass_is_sized_from_the_memory_left_once_it_holds_the_lock(self):
-        # Another lender on the node fills 160 GiB of it while this one waits for the lock.
-        def other_lender_ran(node):
+        # Another donor on the node fills 160 GiB of it while this one waits for the lock.
+        def other_donor_ran(node):
             self.room[node] -= 160.0
             return True
 
-        self.on_lock = other_lender_ran
+        self.on_lock = other_donor_ran
         create, _ = self._allocator(lambda node, i: node == 0 and i > 5 and not self.passes)
         self._place(150, create)
         self.assertEqual(len(self.passes), 1)
@@ -544,7 +544,7 @@ class TestPlaceChunks(unittest.TestCase):
 
 
 class TestNodeCompactionLock(unittest.TestCase):
-    """The flock that lets one lender per host and NUMA node run reclaim-and-compact passes at a time."""
+    """The flock that lets one donor per host and NUMA node run reclaim-and-compact passes at a time."""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="kvcm2_compaction_lock_")
@@ -552,35 +552,35 @@ class TestNodeCompactionLock(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def test_lenders_on_one_node_take_turns(self):
+    def test_donors_on_one_node_take_turns(self):
         order = []
         holding = threading.Event()
 
         def second():
             holding.wait(10)
-            with remote_lender._node_compaction_lock(self.dir, "hostA", 0) as locked:
+            with remote_donor._node_compaction_lock(self.dir, "hostA", 0) as locked:
                 order.append(("second", locked))
 
         thread = threading.Thread(target=second)
         thread.start()
-        with remote_lender._node_compaction_lock(self.dir, "hostA", 0) as locked:
+        with remote_donor._node_compaction_lock(self.dir, "hostA", 0) as locked:
             holding.set()
             thread.join(0.3)
-            self.assertTrue(thread.is_alive(), "the second lender passed a held lock")
+            self.assertTrue(thread.is_alive(), "the second donor passed a held lock")
             order.append(("first", locked))
         thread.join(10)
         self.assertEqual(order, [("first", True), ("second", True)])
 
     def test_other_nodes_and_hosts_do_not_wait(self):
-        with remote_lender._node_compaction_lock(self.dir, "hostA", 0) as locked:
+        with remote_donor._node_compaction_lock(self.dir, "hostA", 0) as locked:
             self.assertTrue(locked)
             for host, node in (("hostA", 1), ("hostB", 0)):
-                with remote_lender._node_compaction_lock(self.dir, host, node) as other:
+                with remote_donor._node_compaction_lock(self.dir, host, node) as other:
                     self.assertTrue(other)
 
     def test_unusable_directory_refuses_the_lock(self):
         missing = os.path.join(self.dir, "missing")
-        with remote_lender._node_compaction_lock(missing, "hostA", 0) as locked:
+        with remote_donor._node_compaction_lock(missing, "hostA", 0) as locked:
             self.assertFalse(locked)
 
 
@@ -591,7 +591,7 @@ class TestBuddyInfo(unittest.TestCase):
     )
 
     def test_free_memory_in_blocks_of_2_mib_or_more(self):
-        f = remote_lender._contiguous_free_gib
+        f = remote_donor._contiguous_free_gib
         # 4 KiB pages: order 9 is 2 MiB, order 10 is 4 MiB: 4 x 2 + 2 x 4 = 16 MiB on node 0, none on node 1.
         self.assertAlmostEqual(f(0, text=self.TEXT, page=4096), 16 / 1024)
         self.assertEqual(f(1, text=self.TEXT, page=4096), 0.0)
@@ -602,11 +602,11 @@ class TestBuddyInfo(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    len(remote_lender._host_numa_nodes()) >= 2 and fabric_available(),
+    len(remote_donor._host_numa_nodes()) >= 2 and fabric_available(),
     "needs the fabric transport (a Grace GPU with an IMEX channel) and two NUMA nodes with memory",
 )
 class TestFabricPlacement(unittest.TestCase):
-    """Where a fabric lend's chunks go when its node is full or the driver refuses them.
+    """Where a fabric donation's chunks go when its node is full or the driver refuses them.
 
     A HOST_NUMA allocation never leaves its node, and the driver can refuse chunks with room left. Node fullness and
     refusals are faked; the allocations are real.
@@ -616,7 +616,7 @@ class TestFabricPlacement(unittest.TestCase):
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="kvcm2_fabric_placement_")
-        self.real = remote_lender._node_meminfo
+        self.real = remote_donor._node_meminfo
 
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -624,11 +624,11 @@ class TestFabricPlacement(unittest.TestCase):
     def _full(self, node):
         return dict(self.real(node), MemFree=0.0, **{"Active(file)": 0.0, "Inactive(file)": 0.0})
 
-    def _meta(self, lender):
-        return remote_lender._meta_fields(os.path.join(self.dir, f"lender.{lender.name}.meta"))
+    def _meta(self, donor):
+        return remote_donor._meta_fields(os.path.join(self.dir, f"donor.{donor.name}.meta"))
 
     def test_full_preferred_node_spills_to_the_other(self):
-        lender = FabricLender(
+        donor = FabricDonor(
             self.dir,
             4 * self.CHUNK,
             chunk_bytes=self.CHUNK,
@@ -636,20 +636,20 @@ class TestFabricPlacement(unittest.TestCase):
             device=0,
         )
         fake = lambda n: self._full(n) if n == 0 else self.real(n)  # noqa: E731
-        with mock.patch.object(remote_lender, "_node_meminfo", fake):
-            lender.start()
+        with mock.patch.object(remote_donor, "_node_meminfo", fake):
+            donor.start()
         try:
-            fields = self._meta(lender)
+            fields = self._meta(donor)
             self.assertEqual(fields["numa_chunks"], "1:4")
             self.assertEqual(fields["segments"], [[0, 4 * self.CHUNK]])
             self.assertNotIn("short_bytes", fields)
-            fabric = os.path.join(self.dir, f"lender.{lender.name}.fabric")
+            fabric = os.path.join(self.dir, f"donor.{donor.name}.fabric")
             self.assertEqual(os.path.getsize(fabric), 4 * 64)
         finally:
-            lender.close()
+            donor.close()
 
-    def test_lend_that_only_partly_fits_is_published_short(self):
-        lender = FabricLender(
+    def test_donation_that_only_partly_fits_is_published_short(self):
+        donor = FabricDonor(
             self.dir,
             4 * self.CHUNK,
             chunk_bytes=self.CHUNK,
@@ -657,28 +657,29 @@ class TestFabricPlacement(unittest.TestCase):
             device=0,
         )
         # Node 0 is full, node 1 has room for two chunks.
-        fake = lambda n: self._full(n) if n == 0 or len(lender._fabric) >= 2 else self.real(n)  # noqa: E731
-        with mock.patch.object(remote_lender, "_node_meminfo", fake):
-            lender.start()
+        fake = lambda n: self._full(n) if n == 0 or len(donor._fabric) >= 2 else self.real(n)  # noqa: E731
+        with mock.patch.object(remote_donor, "_node_meminfo", fake):
+            donor.start()
         try:
-            fields = self._meta(lender)
+            fields = self._meta(donor)
             self.assertEqual(fields["segments"], [[0, 2 * self.CHUNK]])
             self.assertEqual(int(fields["short_bytes"]), 2 * self.CHUNK)
-            published, _ = scan_lenders(self.dir)
+            published, _ = scan_donors(self.dir)
             self.assertEqual(published[0]["offered_bytes"], 2 * self.CHUNK)
         finally:
-            lender.close()
+            donor.close()
 
     def test_refused_chunks_are_retried_with_real_allocations(self):
-        # The driver refuses two calls (chunk 1's first try and its first retry); the lend still completes on node 0.
-        real_create = FabricLender._try_create
+        # The driver refuses two calls (chunk 1's first try and its first retry); the donation still completes on
+        # node 0.
+        real_create = FabricDonor._try_create
         calls = [0]
 
-        def flaky(lender, drv, prop):
+        def flaky(donor, drv, prop):
             calls[0] += 1
-            return None if calls[0] in (2, 3) else real_create(lender, drv, prop)
+            return None if calls[0] in (2, 3) else real_create(donor, drv, prop)
 
-        lender = FabricLender(
+        donor = FabricDonor(
             self.dir,
             4 * self.CHUNK,
             chunk_bytes=self.CHUNK,
@@ -686,32 +687,32 @@ class TestFabricPlacement(unittest.TestCase):
             device=0,
         )
         with (
-            mock.patch.object(FabricLender, "_try_create", flaky),
-            mock.patch.object(remote_lender, "_FABRIC_RETRY_S", 0.5),
+            mock.patch.object(FabricDonor, "_try_create", flaky),
+            mock.patch.object(remote_donor, "_FABRIC_RETRY_S", 0.5),
         ):
-            lender.start()
+            donor.start()
         try:
-            fields = self._meta(lender)
+            fields = self._meta(donor)
             self.assertEqual(fields["numa_chunks"], "0:4")
             self.assertEqual(calls[0], 6)
         finally:
-            lender.close()
+            donor.close()
 
     def test_a_real_reclaim_pass_recovers_a_refusal(self):
         # Refuse until one real reclaim-and-compact pass (64 chunks of 16 MiB, libnuma-bound, huge pages) has run on
         # node 0.
-        real_create = FabricLender._try_create
-        real_compact = remote_lender._compact_node
+        real_create = FabricDonor._try_create
+        real_compact = remote_donor._compact_node
         passes = []
 
         def counted(node, gib):
             passes.append((node, gib))
             return real_compact(node, gib)
 
-        def refusing(lender, drv, prop):
-            return real_create(lender, drv, prop) if passes or not lender._fabric else None
+        def refusing(donor, drv, prop):
+            return real_create(donor, drv, prop) if passes or not donor._fabric else None
 
-        lender = FabricLender(
+        donor = FabricDonor(
             self.dir,
             3 * self.CHUNK,
             chunk_bytes=self.CHUNK,
@@ -719,26 +720,26 @@ class TestFabricPlacement(unittest.TestCase):
             device=0,
         )
         with (
-            mock.patch.object(FabricLender, "_try_create", refusing),
-            mock.patch.object(remote_lender, "_compact_node", counted),
-            mock.patch.object(remote_lender, "_FABRIC_RETRY_S", 0.2),
+            mock.patch.object(FabricDonor, "_try_create", refusing),
+            mock.patch.object(remote_donor, "_compact_node", counted),
+            mock.patch.object(remote_donor, "_FABRIC_RETRY_S", 0.2),
         ):
-            lender.start()
+            donor.start()
         try:
-            fields = self._meta(lender)
+            fields = self._meta(donor)
             self.assertEqual(fields["numa_chunks"], "0:3")
             self.assertEqual(passes, [(0, 1.0)])
         finally:
-            lender.close()
+            donor.close()
 
     def test_no_room_anywhere_leaves_a_failure_marker(self):
-        lender = FabricLender(self.dir, 4 * self.CHUNK, chunk_bytes=self.CHUNK)
-        with mock.patch.object(remote_lender, "_node_meminfo", self._full):
-            lender.start_or_report()
-        self.assertFalse(os.path.exists(os.path.join(self.dir, f"lender.{lender.name}.ready")))
-        published, failed = scan_lenders(self.dir)
+        donor = FabricDonor(self.dir, 4 * self.CHUNK, chunk_bytes=self.CHUNK)
+        with mock.patch.object(remote_donor, "_node_meminfo", self._full):
+            donor.start_or_report()
+        self.assertFalse(os.path.exists(os.path.join(self.dir, f"donor.{donor.name}.ready")))
+        published, failed = scan_donors(self.dir)
         self.assertEqual(published, [])
-        self.assertEqual([f["name"] for f in failed], [lender.name])
+        self.assertEqual([f["name"] for f in failed], [donor.name])
         self.assertIn("no NUMA node can hold", failed[0]["error"])
 
 

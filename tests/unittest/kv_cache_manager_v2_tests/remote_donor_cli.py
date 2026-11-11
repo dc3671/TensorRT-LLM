@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A remote-level lender in its own process, for the remote-level tests (test_remote_level.py).
+"""A remote-level donor in its own process, for the remote-level tests (test_remote_level.py).
 
 Usage::
 
-    python remote_lender_cli.py --dir /shared/dir --gib 128
+    python remote_donor_cli.py --dir /shared/dir --gib 128
 
 Stop it with SIGTERM: it withdraws its files, deregisters its memory and exits.
 """
@@ -27,9 +27,9 @@ import signal
 import sys
 import threading
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.remote_lender import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.remote_donor import (
     TRANSPORTS,
-    make_lender,
+    make_donor,
     resolve_ucx_devices,
 )
 from tensorrt_llm.llmapi.llm_args import REMOTE_CACHE_CHUNK_BYTES
@@ -39,15 +39,15 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dir", required=True, help="rendezvous directory (shared file system)")
     size = parser.add_mutually_exclusive_group(required=True)
-    size.add_argument("--gib", type=float, help="GiB to lend")
-    size.add_argument("--bytes", type=int, help="bytes to lend")
+    size.add_argument("--gib", type=float, help="GiB to donate")
+    size.add_argument("--bytes", type=int, help="bytes to donate")
     parser.add_argument("--chunk-mib", type=float, default=REMOTE_CACHE_CHUNK_BYTES / (1 << 20))
     parser.add_argument("--numa-node", type=int, default=None)
     parser.add_argument(
         "--device",
         type=int,
         default=None,
-        help="CUDA device for a fabric lend's context (default 0)",
+        help="CUDA device for a fabric donation's context (default 0)",
     )
     parser.add_argument("--transport", choices=TRANSPORTS, default="nixl")
     parser.add_argument(
@@ -64,7 +64,7 @@ def main(argv=None) -> int:
         "--parent-pid",
         type=int,
         default=None,
-        help="exit once this process is gone (a test runner that died without stopping the lender)",
+        help="exit once this process is gone (a test runner that died without stopping the donor)",
     )
     args = parser.parse_args(argv)
     nbytes = args.bytes if args.bytes is not None else int(args.gib * (1 << 30))
@@ -72,7 +72,7 @@ def main(argv=None) -> int:
     options = {}
     if args.ucx_devices is not None:
         options["ucx_devices"] = resolve_ucx_devices(args.ucx_devices, args.device)
-    lender = make_lender(
+    donor = make_donor(
         args.dir,
         nbytes,
         transport=args.transport,
@@ -94,16 +94,16 @@ def main(argv=None) -> int:
 
         threading.Thread(target=watch_parent, daemon=True).start()
     try:
-        lender.start()
+        donor.start()
     except Exception as error:
-        lender.close()
-        lender.publish_failure(error)
+        donor.close()
+        donor.publish_failure(error)
         raise
-    print(f"READY {lender.name} {lender.transport} {lender.nbytes}", flush=True)
+    print(f"READY {donor.name} {donor.transport} {donor.nbytes}", flush=True)
     try:
         stop.wait(args.seconds)
     finally:
-        lender.close()
+        donor.close()
     return 0
 
 

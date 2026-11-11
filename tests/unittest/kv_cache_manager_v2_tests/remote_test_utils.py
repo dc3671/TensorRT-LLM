@@ -41,15 +41,12 @@ def nixl_available() -> bool:
 
 @functools.cache
 def fabric_available() -> bool:
-    """Whether device 0 can export a host-NUMA fabric allocation, as a fabric lender does (driver, Grace, IMEX)."""
+    """Whether device 0 can export a host-NUMA fabric allocation, as a fabric donor does (driver, Grace, IMEX)."""
     if gpu_count() == 0:
         return False
     from cuda.bindings import driver as drv
 
-    from tensorrt_llm._torch.pyexecutor.kv_cache.remote_lender import (
-        FabricLender,
-        _host_numa_node_of,
-    )
+    from tensorrt_llm._torch.pyexecutor.kv_cache.remote_donor import FabricDonor, _host_numa_node_of
 
     ok = drv.CUresult.CUDA_SUCCESS
     err, device = drv.cuDeviceGet(0)
@@ -61,7 +58,7 @@ def fabric_available() -> bool:
         return False
     drv.cuCtxPushCurrent(ctx)
     try:
-        prop = FabricLender._fabric_prop(drv, _host_numa_node_of(drv, device))
+        prop = FabricDonor._fabric_prop(drv, _host_numa_node_of(drv, device))
         err, gran = drv.cuMemGetAllocationGranularity(
             prop, drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
         )

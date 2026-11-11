@@ -3539,7 +3539,7 @@
             }
           ],
           "default": null,
-          "description": "KV cache manager v2 remote cache level in host memory that other ranks lend (usually generation ranks to context ranks). None disables it.",
+          "description": "KV cache manager v2 remote cache level in host memory that other ranks donate (usually generation ranks to context ranks). None disables it.",
           "status": "prototype"
         },
         "secondary_offload_min_priority": {
@@ -5770,12 +5770,12 @@
             },
             {
               "properties": {
-                "lend_size": {
+                "donate_size": {
                   "minimum": 1
                 }
               },
               "required": [
-                "lend_size"
+                "donate_size"
               ]
             }
           ]
@@ -5783,17 +5783,17 @@
         {
           "if": {
             "properties": {
-              "lend_size": {
+              "donate_size": {
                 "exclusiveMinimum": 0
               }
             },
             "required": [
-              "lend_size"
+              "donate_size"
             ]
           },
           "then": {
             "properties": {
-              "lend_size": {
+              "donate_size": {
                 "minimum": 1073741824
               }
             }
@@ -5814,14 +5814,14 @@
           },
           "then": {
             "properties": {
+              "donor_wait_timeout_s": {
+                "const": 900.0
+              },
               "expected_claim_size": {
                 "const": null
               },
-              "expected_num_lenders": {
+              "expected_num_donors": {
                 "const": null
-              },
-              "lender_wait_timeout_s": {
-                "const": 900.0
               },
               "pool_ratio": {
                 "const": null
@@ -5857,12 +5857,12 @@
               {
                 "not": {
                   "properties": {
-                    "lend_size": {
+                    "donate_size": {
                       "minimum": 1
                     }
                   },
                   "required": [
-                    "lend_size"
+                    "donate_size"
                   ]
                 }
               },
@@ -5882,7 +5882,7 @@
           },
           "then": {
             "properties": {
-              "lend_reserve_size": {
+              "donor_reserve_size": {
                 "const": 25769803776
               }
             }
@@ -5891,12 +5891,12 @@
         {
           "if": {
             "properties": {
-              "expected_num_lenders": {
+              "expected_num_donors": {
                 "type": "integer"
               }
             },
             "required": [
-              "expected_num_lenders"
+              "expected_num_donors"
             ]
           },
           "then": {
@@ -5923,12 +5923,12 @@
           },
           "then": {
             "properties": {
-              "expected_num_lenders": {
+              "expected_num_donors": {
                 "type": "integer"
               }
             },
             "required": [
-              "expected_num_lenders"
+              "expected_num_donors"
             ]
           }
         },
@@ -5952,7 +5952,7 @@
           }
         }
       ],
-      "description": "KV cache manager v2 remote cache level in host memory that other ranks lend.\n\nA rank with ``cache_size`` gets a cache level below the host tier whose slots\nlive in memory that ranks with ``lend_size`` publish in ``directory``.",
+      "description": "KV cache manager v2 remote cache level in host memory that other ranks donate.\n\nA rank with ``cache_size`` gets a cache level below the host tier whose slots\nlive in memory that ranks with ``donate_size`` publish in ``directory``.",
       "properties": {
         "cache_size": {
           "default": 0,
@@ -5963,11 +5963,35 @@
           "type": "integer"
         },
         "directory": {
-          "description": "Rendezvous directory, on a file system every rank of the job sees, where lenders publish their memory and remote cache levels claim chunks of it. Environment variables are expanded; the directory is created if missing. Use one directory per job.",
+          "description": "Rendezvous directory, on a file system every rank of the job sees, where donors publish their memory and remote cache levels claim chunks of it. Environment variables are expanded; the directory is created if missing. Use one directory per job.",
           "minLength": 1,
           "status": "prototype",
           "title": "Directory",
           "type": "string"
+        },
+        "donate_size": {
+          "default": 0,
+          "description": "Bytes of host memory this rank donates to remote cache levels, in whole 1 GiB chunks, for the lifetime of the process.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Donate Size",
+          "type": "integer"
+        },
+        "donor_reserve_size": {
+          "default": 25769803776,
+          "description": "Fabric transport only: bytes of free plus reclaimable memory each host NUMA node keeps for the processes on it while the donation is placed. Chunks go to the GPU's node first, then to the others; a donation that does not fit is published short. Requires `donate_size`.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Donor Reserve Size",
+          "type": "integer"
+        },
+        "donor_wait_timeout_s": {
+          "default": 900.0,
+          "description": "Seconds a rank with `cache_size` waits for donors, applied to each wait on its own: for the expected donors to report, and for each chunk claim. Donors publish while their own servers start, so this bounds the job's startup skew per wait, not in total.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Donor Wait Timeout S",
+          "type": "number"
         },
         "expected_claim_size": {
           "anyOf": [
@@ -5980,11 +6004,11 @@
             }
           ],
           "default": null,
-          "description": "Bytes all ranks of the job claim from `directory` together. Used with `expected_num_lenders`.",
+          "description": "Bytes all ranks of the job claim from `directory` together. Used with `expected_num_donors`.",
           "status": "prototype",
           "title": "Expected Claim Size"
         },
-        "expected_num_lenders": {
+        "expected_num_donors": {
           "anyOf": [
             {
               "exclusiveMinimum": 0,
@@ -5995,33 +6019,9 @@
             }
           ],
           "default": null,
-          "description": "Number of lending ranks the job starts. With `expected_claim_size`, a rank with `cache_size` waits until these lenders have reported and fails at once if they cannot cover the claims, instead of after the claim wait.",
+          "description": "Number of donating ranks the job starts. With `expected_claim_size`, a rank with `cache_size` waits until these donors have reported and fails at once if they cannot cover the claims, instead of after the claim wait.",
           "status": "prototype",
-          "title": "Expected Num Lenders"
-        },
-        "lend_reserve_size": {
-          "default": 25769803776,
-          "description": "Fabric transport only: bytes of free plus reclaimable memory each host NUMA node keeps for the processes on it while the lend is placed. Chunks go to the GPU's node first, then to the others; a lend that does not fit is published short. Requires `lend_size`.",
-          "minimum": 0,
-          "status": "prototype",
-          "title": "Lend Reserve Size",
-          "type": "integer"
-        },
-        "lend_size": {
-          "default": 0,
-          "description": "Bytes of host memory this rank lends to remote cache levels, in whole 1 GiB chunks, for the lifetime of the process.",
-          "minimum": 0,
-          "status": "prototype",
-          "title": "Lend Size",
-          "type": "integer"
-        },
-        "lender_wait_timeout_s": {
-          "default": 900.0,
-          "description": "Seconds a rank with `cache_size` waits for lenders, applied to each wait on its own: for the expected lenders to report, and for each chunk claim. Lenders publish while their own servers start, so this bounds the job's startup skew per wait, not in total.",
-          "exclusiveMinimum": 0,
-          "status": "prototype",
-          "title": "Lender Wait Timeout S",
-          "type": "number"
+          "title": "Expected Num Donors"
         },
         "pool_ratio": {
           "anyOf": [
@@ -6044,7 +6044,7 @@
         },
         "transfer_timeout_s": {
           "default": 30.0,
-          "description": "NIXL transport only: seconds one batch of page transfers may take before the remote level fails, e.g. on a lender that died.",
+          "description": "NIXL transport only: seconds one batch of page transfers may take before the remote level fails, e.g. on a donor that died.",
           "exclusiveMinimum": 0,
           "status": "prototype",
           "title": "Transfer Timeout S",
@@ -6052,7 +6052,7 @@
         },
         "transport": {
           "default": "nixl",
-          "description": "How pages move: 'nixl' uses one-sided NIXL RDMA; 'fabric' lends CUDA fabric memory that clients in the same multi-node NVLink domain copy over NVLink. Every rank sharing `directory` must use the same value.",
+          "description": "How pages move: 'nixl' uses one-sided NIXL RDMA; 'fabric' donates CUDA fabric memory that clients in the same multi-node NVLink domain copy over NVLink. Every rank sharing `directory` must use the same value.",
           "enum": [
             "nixl",
             "fabric"
@@ -6071,7 +6071,7 @@
             }
           ],
           "default": null,
-          "description": "NIXL transport only: comma-separated UCX devices of the remote level's NIXL agents (for example 'mlx5_0:1'); '{GPU}' is replaced by the rank's physical GPU index. None uses the process's UCX environment.",
+          "description": "NIXL transport only: comma-separated UCX devices of the remote level's and the donor's NIXL agents (for example 'mlx5_0:1'), each on port 1 (NIXL's UCX backend takes device names and uses port 1); '{GPU}' is replaced by the rank's physical GPU index. None uses the process's UCX environment.",
           "status": "prototype",
           "title": "Ucx Devices"
         }

@@ -49,7 +49,7 @@ FabricRemoteMemClient::FabricRemoteMemClient(RemoteMemOptions options)
     try
     {
         retainContext();
-        discoverLenders();
+        discoverDonors();
     }
     catch (...)
     {
@@ -136,33 +136,33 @@ CUresult FabricRemoteMemClient::synchronizeContext() const noexcept
     return result;
 }
 
-bool FabricRemoteMemClient::acceptPayload(Lender const& lender) const
+bool FabricRemoteMemClient::acceptPayload(Donor const& donor) const
 {
-    if (lender.payload.size() != lender.chunks.size() * sizeof(CUmemFabricHandle))
+    if (donor.payload.size() != donor.chunks.size() * sizeof(CUmemFabricHandle))
     {
         TLLM_LOG_WARNING(
-            "KVCM2 remote level: ignoring lender %s: %zu B of fabric handles for %zu chunk(s), "
+            "KVCM2 remote level: ignoring donor %s: %zu B of fabric handles for %zu chunk(s), "
             "expected %zu B each",
-            lender.name.c_str(), lender.payload.size(), lender.chunks.size(), sizeof(CUmemFabricHandle));
+            donor.name.c_str(), donor.payload.size(), donor.chunks.size(), sizeof(CUmemFabricHandle));
         return false;
     }
     return true;
 }
 
-uint64_t FabricRemoteMemClient::attachChunk(Lender& lender, size_t chunk)
+uint64_t FabricRemoteMemClient::attachChunk(Donor& donor, size_t chunk)
 {
     // The chunk is its own fabric allocation, imported only as it is claimed.
-    uint64_t const bytes = lender.chunks[chunk].second;
+    uint64_t const bytes = donor.chunks[chunk].second;
     CUmemFabricHandle fabricHandle{};
-    std::memcpy(&fabricHandle, lender.payload.data() + chunk * sizeof(CUmemFabricHandle), sizeof(fabricHandle));
+    std::memcpy(&fabricHandle, donor.payload.data() + chunk * sizeof(CUmemFabricHandle), sizeof(fabricHandle));
     CUmemGenericAllocationHandle handle = 0;
     CUresult result = cuMemImportFromShareableHandle(&handle, &fabricHandle, CU_MEM_HANDLE_TYPE_FABRIC);
     if (result != CUDA_SUCCESS)
     {
-        throw RemoteMemError("KVCM2 remote level: importing chunk " + std::to_string(chunk) + " of lender "
-            + lender.name + " (" + lender.host + ") failed: " + cuErrorName(result)
+        throw RemoteMemError("KVCM2 remote level: importing chunk " + std::to_string(chunk) + " of donor "
+            + donor.name + " (" + donor.host + ") failed: " + cuErrorName(result)
             + "; fabric memory needs both trays in one NVLink domain (NVL72 rack), the job's IMEX channel and a live "
-              "lender");
+              "donor");
     }
     CUdeviceptr address = 0;
     result = cuMemAddressReserve(&address, bytes, 0, 0, 0);
@@ -191,11 +191,11 @@ uint64_t FabricRemoteMemClient::attachChunk(Lender& lender, size_t chunk)
     {
         cuMemRelease(handle);
         throw RemoteMemError("KVCM2 remote level: mapping chunk " + std::to_string(chunk) + " (" + std::to_string(bytes)
-            + " B) of lender " + lender.name + " (" + lender.host + ") failed: " + cuErrorName(result));
+            + " B) of donor " + donor.name + " (" + donor.host + ") failed: " + cuErrorName(result));
     }
     mMappings.push_back(FabricMapping{address, bytes, handle});
     mMappingEnd.emplace(address, address + bytes);
-    lender.loaded = true;
+    donor.loaded = true;
     return address;
 }
 

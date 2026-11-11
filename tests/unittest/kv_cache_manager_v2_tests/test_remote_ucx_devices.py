@@ -18,8 +18,8 @@ import os
 import unittest
 from unittest import mock
 
-from tensorrt_llm._torch.pyexecutor.kv_cache import remote_lender
-from tensorrt_llm._torch.pyexecutor.kv_cache.remote_lender import resolve_ucx_devices
+from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
+from tensorrt_llm._torch.pyexecutor.kv_cache.remote_donor import resolve_ucx_devices
 
 
 def _visible(value=None):
@@ -51,7 +51,7 @@ class TestRemoteUcxDevices(unittest.TestCase):
     def test_gpu_token_maps_a_uuid_through_the_pci_bus_id(self):
         with (
             _visible("GPU-1a2b,GPU-3c4d"),
-            mock.patch.object(remote_lender, "_nvml_gpu_index", return_value=5) as nvml,
+            mock.patch.object(remote_donor, "_nvml_gpu_index", return_value=5) as nvml,
         ):
             self.assertEqual(
                 resolve_ucx_devices("rdma_vf_rail{GPU}:1", device=1), "rdma_vf_rail5:1"

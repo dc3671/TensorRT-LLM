@@ -222,18 +222,18 @@ def _cross_field_rules(definitions: dict) -> None:
         name: default(RemoteCacheConfig, name)
         for name in (
             "pool_ratio",
-            "expected_num_lenders",
+            "expected_num_donors",
             "expected_claim_size",
-            "lender_wait_timeout_s",
+            "donor_wait_timeout_s",
             "transfer_timeout_s",
         )
     }
     definitions["RemoteCacheConfig"].setdefault("allOf", []).extend(
         [
-            {"anyOf": [_set("cache_size", {"minimum": 1}), _set("lend_size", {"minimum": 1})]},
+            {"anyOf": [_set("cache_size", {"minimum": 1}), _set("donate_size", {"minimum": 1})]},
             when(
-                _set("lend_size", {"exclusiveMinimum": 0}),
-                {"properties": {"lend_size": {"minimum": REMOTE_CACHE_CHUNK_BYTES}}},
+                _set("donate_size", {"exclusiveMinimum": 0}),
+                {"properties": {"donate_size": {"minimum": REMOTE_CACHE_CHUNK_BYTES}}},
             ),
             when(unset_or_zero, {"properties": remote_unread}),
             when(
@@ -247,23 +247,23 @@ def _cross_field_rules(definitions: dict) -> None:
             when(
                 {
                     "anyOf": [
-                        {"not": _set("lend_size", {"minimum": 1})},
+                        {"not": _set("donate_size", {"minimum": 1})},
                         {"not": _set("transport", {"const": "fabric"})},
                     ]
                 },
                 {
                     "properties": {
-                        "lend_reserve_size": default(RemoteCacheConfig, "lend_reserve_size")
+                        "donor_reserve_size": default(RemoteCacheConfig, "donor_reserve_size")
                     }
                 },
             ),
             when(
-                _set("expected_num_lenders", {"type": "integer"}),
+                _set("expected_num_donors", {"type": "integer"}),
                 _set("expected_claim_size", {"type": "integer"}),
             ),
             when(
                 _set("expected_claim_size", {"type": "integer"}),
-                _set("expected_num_lenders", {"type": "integer"}),
+                _set("expected_num_donors", {"type": "integer"}),
             ),
             when(
                 _set("ucx_devices", {"type": "string"}),

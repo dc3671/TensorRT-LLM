@@ -38,7 +38,7 @@ NixlRemoteMemClient::NixlRemoteMemClient(RemoteMemOptions options)
     {
         kvc::BaseAgentConfig config{};
         config.mName = name();
-        // NIXL's progress thread completes connection set-up with lenders that never call into NIXL themselves.
+        // NIXL's progress thread completes connection set-up with donors that never call into NIXL themselves.
         config.useProgThread = true;
         config.multiThread = false;
         config.useListenThread = false;
@@ -50,7 +50,7 @@ NixlRemoteMemClient::NixlRemoteMemClient(RemoteMemOptions options)
         }
         mNixlAgent = kvc::makeTransferAgent("nixl", &config);
         TLLM_CHECK_WITH_INFO(mNixlAgent != nullptr, "KVCM2 remote level: creating the NIXL agent failed");
-        discoverLenders();
+        discoverDonors();
     }
     catch (...)
     {
@@ -83,11 +83,11 @@ void NixlRemoteMemClient::releaseTransport() noexcept
             mNixlAgent->deregisterMemory(
                 kvc::MemoryDescs(kvc::MemoryType::kDRAM, {kvc::MemoryDesc(base, info.first, /*deviceId=*/0)}));
         }
-        for (auto const& lender : mLenders)
+        for (auto const& donor : mDonors)
         {
-            if (lender.loaded)
+            if (donor.loaded)
             {
-                mNixlAgent->invalidateRemoteAgent(lender.name);
+                mNixlAgent->invalidateRemoteAgent(donor.name);
             }
         }
     }
@@ -99,22 +99,22 @@ void NixlRemoteMemClient::releaseTransport() noexcept
     mNixlAgent.reset();
 }
 
-uint64_t NixlRemoteMemClient::attachChunk(Lender& lender, size_t chunk)
+uint64_t NixlRemoteMemClient::attachChunk(Donor& donor, size_t chunk)
 {
-    if (!lender.loaded)
+    if (!donor.loaded)
     {
         try
         {
-            mNixlAgent->loadRemoteAgent(lender.name, kvc::AgentDesc::deserialize(lender.payload));
+            mNixlAgent->loadRemoteAgent(donor.name, kvc::AgentDesc::deserialize(donor.payload));
         }
         catch (std::exception const& e)
         {
             throw RemoteMemError(
-                "KVCM2 remote level: loading lender " + lender.name + " (" + lender.host + ") failed: " + e.what());
+                "KVCM2 remote level: loading donor " + donor.name + " (" + donor.host + ") failed: " + e.what());
         }
-        lender.loaded = true;
+        donor.loaded = true;
     }
-    return lender.chunks[chunk].first;
+    return donor.chunks[chunk].first;
 }
 
 void NixlRemoteMemClient::registerLocal(MemAddress base, size_t bytes)
@@ -155,18 +155,18 @@ void NixlRemoteMemClient::deregisterLocal(MemAddress base, size_t bytes) noexcep
 
 void NixlRemoteMemClient::doTransfer(bool write, std::vector<RemoteIo> const& ios, size_t bytes, CUstream /*stream*/)
 {
-    std::vector<std::vector<size_t>> byLender(mLenders.size());
+    std::vector<std::vector<size_t>> byDonor(mDonors.size());
     for (size_t i = 0; i < ios.size(); ++i)
     {
-        TLLM_CHECK_DEBUG(ios[i].lender < mLenders.size());
-        byLender[ios[i].lender].push_back(i);
+        TLLM_CHECK_DEBUG(ios[i].donor < mDonors.size());
+        byDonor[ios[i].donor].push_back(i);
     }
     auto const opName = write ? std::string("WRITE to") : std::string("READ from");
     std::vector<std::pair<uint32_t, std::unique_ptr<kvc::TransferStatus>>> pending;
     std::string error; // the first failure; the requests already submitted settle before it is thrown
-    for (uint32_t lenderIdx = 0; lenderIdx < byLender.size(); ++lenderIdx)
+    for (uint32_t donorIdx = 0; donorIdx < byDonor.size(); ++donorIdx)
     {
-        auto const& entries = byLender[lenderIdx];
+        auto const& entries = byDonor[donorIdx];
         if (entries.empty())
         {
             continue;
@@ -183,14 +183,14 @@ void NixlRemoteMemClient::doTransfer(bool write, std::vector<RemoteIo> const& io
         // NIXL's request names the local descriptors first and the remote ones second, whichever way data flows.
         kvc::TransferRequest request(write ? kvc::TransferOp::kWRITE : kvc::TransferOp::kREAD,
             kvc::MemoryDescs(kvc::MemoryType::kDRAM, std::move(local)),
-            kvc::MemoryDescs(kvc::MemoryType::kDRAM, std::move(remote)), mLenders[lenderIdx].name);
+            kvc::MemoryDescs(kvc::MemoryType::kDRAM, std::move(remote)), mDonors[donorIdx].name);
         try
         {
-            pending.emplace_back(lenderIdx, mNixlAgent->submitTransferRequests(request));
+            pending.emplace_back(donorIdx, mNixlAgent->submitTransferRequests(request));
         }
         catch (std::exception const& e)
         {
-            error = opName + " lender " + mLenders[lenderIdx].name + " (" + mLenders[lenderIdx].host
+            error = opName + " donor " + mDonors[donorIdx].name + " (" + mDonors[donorIdx].host
                 + "): submitting failed: " + e.what();
             break;
         }
@@ -198,7 +198,7 @@ void NixlRemoteMemClient::doTransfer(bool write, std::vector<RemoteIo> const& io
     // Wait for every request, cancelling the ones still in flight at the deadline, before returning or throwing:
     // the caller reuses the local buffers, which a late request could still write.
     auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(mOptions.transferTimeoutMs);
-    for (auto& [lenderIdx, status] : pending)
+    for (auto& [donorIdx, status] : pending)
     {
         auto const remaining = std::max<int64_t>(0,
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count());
@@ -213,8 +213,8 @@ void NixlRemoteMemClient::doTransfer(bool write, std::vector<RemoteIo> const& io
             // so a timed-out request counts as uncancelled: this client keeps its claims until it is destroyed.
             if (!status->release())
             {
-                TLLM_LOG_ERROR("KVCM2 remote level: a timed-out %s lender %s (%s) could not be cancelled",
-                    opName.c_str(), mLenders[lenderIdx].name.c_str(), mLenders[lenderIdx].host.c_str());
+                TLLM_LOG_ERROR("KVCM2 remote level: a timed-out %s donor %s (%s) could not be cancelled",
+                    opName.c_str(), mDonors[donorIdx].name.c_str(), mDonors[donorIdx].host.c_str());
             }
             mUncancelled.push_back(std::move(status));
         }
@@ -223,8 +223,8 @@ void NixlRemoteMemClient::doTransfer(bool write, std::vector<RemoteIo> const& io
             std::string const why = state == kvc::TransferState::kIN_PROGRESS
                 ? "timed out after " + std::to_string(mOptions.transferTimeoutMs) + " ms"
                 : "failed (" + status->getLastStatusStr() + ")";
-            error = opName + " lender " + mLenders[lenderIdx].name + " (" + mLenders[lenderIdx].host + ") of "
-                + std::to_string(byLender[lenderIdx].size()) + " page(s) x " + std::to_string(bytes) + " B " + why;
+            error = opName + " donor " + mDonors[donorIdx].name + " (" + mDonors[donorIdx].host + ") of "
+                + std::to_string(byDonor[donorIdx].size()) + " page(s) x " + std::to_string(bytes) + " B " + why;
         }
     }
     if (!error.empty())

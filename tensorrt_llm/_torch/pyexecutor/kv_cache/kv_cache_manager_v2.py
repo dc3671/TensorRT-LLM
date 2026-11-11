@@ -164,7 +164,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-    from .remote_lender import RemoteLender
+    from .remote_donor import RemoteMemDonor
 
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
@@ -1972,15 +1972,15 @@ class _BasePageTableMaterializer:
         )
 
 
-def _withdraws_remote_lend_on_error(init):
-    """Wrap ``__init__`` so a construction that raises withdraws the lend the manager took over."""
+def _withdraws_remote_donation_on_error(init):
+    """Wrap ``__init__`` so a construction that raises withdraws the donation the manager took over."""
 
     @functools.wraps(init)
     def wrapper(self, *args, **kwargs):
         try:
             init(self, *args, **kwargs)
         except BaseException as error:
-            self._close_remote_lender(error)
+            self._close_remote_donor(error)
             raise
 
     return wrapper
@@ -1988,10 +1988,10 @@ def _withdraws_remote_lend_on_error(init):
 
 class KVCacheManagerV2(BaseResourceManager):
     gen_preemption_headroom: int = 0
-    # Host memory this rank lends to remote cache levels (remote_cache_config.lend_size); closed by shutdown().
-    _remote_lender: Optional["RemoteLender"] = None
-    # The remote config of a lend this manager owns, started or not; a failure leaves its marker.
-    _planned_lend: Optional[RemoteCacheConfig] = None
+    # Host memory this rank donates to remote cache levels (remote_cache_config.donate_size); closed by shutdown().
+    _remote_donor: Optional["RemoteMemDonor"] = None
+    # The remote config of a donation this manager owns, started or not; a failure leaves its marker.
+    _planned_donation: Optional[RemoteCacheConfig] = None
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -2090,7 +2090,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # device quota; None until offload sizing first asks for it.
     _offload_sizing_config: Optional[KVCacheManagerConfigPy] = None
 
-    @_withdraws_remote_lend_on_error
+    @_withdraws_remote_donation_on_error
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -2128,17 +2128,17 @@ class KVCacheManagerV2(BaseResourceManager):
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         sparse_kv_offload_config: Optional[SparseKvCacheOffloadConfig] = None,
         shared_draft_block_width: Optional[int] = None,
-        remote_lender: Optional["RemoteLender"] = None,
+        remote_donor: Optional["RemoteMemDonor"] = None,
         gen_preemption_headroom: int = 0,
         **kwargs,
     ) -> None:
-        # A lend started before this manager (remote_lender.start_lend) is owned from here and closed by shutdown(). A
-        # draft manager gets the target's lend only to wait for it before measuring host memory.
+        # A donation started before this manager (remote_donor.start_donation) is owned from here and closed by
+        # shutdown(). A draft manager gets the target's donation only to wait for it before measuring host memory.
         remote_config = kv_cache_config.remote_cache_config
         if not is_draft:
-            self._remote_lender = remote_lender
-            if remote_config is not None and remote_config.lend_size:
-                self._planned_lend = remote_config
+            self._remote_donor = remote_donor
+            if remote_config is not None and remote_config.donate_size:
+                self._planned_donation = remote_config
         self.mapping = mapping
         self.gen_preemption_headroom = gen_preemption_headroom
         self.dtype = dtype
@@ -2778,27 +2778,27 @@ class KVCacheManagerV2(BaseResourceManager):
             # OOM the host (observed on GB300 NVL72 with 4 ranks/node and
             # ~170GiB device quota each on a 975GiB node).
             remote_config = kv_cache_config.remote_cache_config
-            lend_started = remote_lender is not None
-            if lend_started:
-                # The co-located ranks started their lends as early as this one: measure with them resident.
-                remote_lender.wait_started()
+            donation_started = remote_donor is not None
+            if donation_started:
+                # The co-located ranks started their donations as early as this one: measure with them resident.
+                remote_donor.wait_started()
             local_ranks, mem_available, memlock_limit = get_host_memory_limits(mapping)
             # Every rank on the node also pins its host-backed sparse pools and
             # its sparse Batch's staging copy.
             offload_pinned_bytes = self._host_history_budget + self._sparse_batch_staging_bytes
             mem_available = max(0.0, mem_available - local_ranks * offload_pinned_bytes)
             memlock_limit = max(0.0, memlock_limit - offload_pinned_bytes)
-            if remote_config is not None and remote_config.lend_size and not lend_started:
-                # Every co-located rank lends this much more, faulted in after this sizing.
-                lent = local_ranks * remote_config.lend_size
-                if lent >= mem_available:
+            if remote_config is not None and remote_config.donate_size and not donation_started:
+                # Every co-located rank donates this much more, faulted in after this sizing.
+                donated = local_ranks * remote_config.donate_size
+                if donated >= mem_available:
                     remote_init_error = ValueError(
-                        f"remote_cache_config.lend_size x {local_ranks} rank(s) leaves none of the "
+                        f"remote_cache_config.donate_size x {local_ranks} rank(s) leaves none of the "
                         f"{mem_available / (1 << 30):.2f}GiB available host memory to the automatic "
                         "host tier; set kv_cache_config.host_cache_size."
                     )
                 else:
-                    mem_available -= lent
+                    mem_available -= donated
             host_quota = _compute_auto_host_tier_quota(
                 quota,
                 local_ranks,
@@ -2916,7 +2916,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Aggregated helix CP ranks need a common verdict even without a host
         # tier: a rank that fails to allocate would otherwise leave its peers
         # waiting in the first collective. So do ranks with a remote tier,
-        # whose lend and claims can fail on one rank.
+        # whose donation and claims can fail on one rank.
         sync_init_status = (
             has_host_cache_tier
             or kv_cache_config.remote_cache_config is not None
@@ -2951,7 +2951,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if init_status == _KVCacheManagerInitStatus.ABORT:
                 if candidate is not None:
                     candidate.shutdown()
-                # The construction guard withdraws the lend and leaves its failure marker.
+                # The construction guard withdraws the donation and leaves its failure marker.
                 if init_error is not None:
                     raise init_error
                 raise RuntimeError("KV cache manager initialization failed on another rank")
@@ -8299,33 +8299,33 @@ class KVCacheManagerV2(BaseResourceManager):
             self.index_mapper.remove_sequence(request_id)
 
     def _add_remote_level(self, remote_config: RemoteCacheConfig, cache_tiers: list) -> None:
-        """Start this rank's lend, unless it was started before, and append the remote cache level to
+        """Start this rank's donation, unless it was started before, and append the remote cache level to
         `cache_tiers`.
 
         Both happen once per rank, in the target manager; a draft manager only counts the
-        lend in its automatic host tier."""
+        donation in its automatic host tier."""
         if self.is_draft:
             return
-        from .remote_lender import (
+        from .remote_donor import (
             check_remote_capacity,
             ensure_rendezvous_directory,
             resolve_ucx_devices,
-            start_lend,
+            start_donation,
         )
 
         remote_dir = os.path.expandvars(os.path.expanduser(remote_config.directory))
         ensure_rendezvous_directory(remote_dir)
         ucx_devices = resolve_ucx_devices(remote_config.ucx_devices)
-        if remote_config.lend_size and self._remote_lender is None:
-            # This rank's memory joins the pool before its own cache exists: clients wait for lenders.
-            self._remote_lender = start_lend(remote_config, torch.cuda.current_device())
+        if remote_config.donate_size and self._remote_donor is None:
+            # This rank's memory joins the pool before its own cache exists: clients wait for donors.
+            self._remote_donor = start_donation(remote_config, torch.cuda.current_device())
         if remote_config.cache_size:
-            if remote_config.expected_num_lenders is not None:
+            if remote_config.expected_num_donors is not None:
                 check_remote_capacity(
                     remote_dir,
-                    remote_config.expected_num_lenders,
+                    remote_config.expected_num_donors,
                     remote_config.expected_claim_size,
-                    timeout_s=remote_config.lender_wait_timeout_s,
+                    timeout_s=remote_config.donor_wait_timeout_s,
                     log=logger.info,
                 )
             # The remote level goes below the host tier.
@@ -8333,9 +8333,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 RemoteCacheTierConfig(
                     quota=remote_config.cache_size,
                     path=remote_dir,
-                    wait_timeout_ms=math.ceil(remote_config.lender_wait_timeout_s * 1000),
+                    wait_timeout_ms=math.ceil(remote_config.donor_wait_timeout_s * 1000),
                     transfer_timeout_ms=math.ceil(remote_config.transfer_timeout_s * 1000),
-                    expected_lenders=remote_config.expected_num_lenders or 0,
+                    expected_donors=remote_config.expected_num_donors or 0,
                     transport=RemoteTransport[remote_config.transport.upper()],
                     ucx_devices=ucx_devices or "",
                     pool_ratio=list(remote_config.pool_ratio or []),
@@ -8346,17 +8346,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{remote_config.cache_size / (1 << 30):.2f}GiB via {remote_dir} ({remote_config.transport})"
             )
 
-    def _close_remote_lender(self, error: Optional[BaseException] = None) -> None:
-        """Withdraw this rank's lend: clients still holding its chunks fail their next transfer. With `error`, leave
-        the lend's failure marker too, also for a lend that never started, so that peers stop waiting for it."""
-        lender, self._remote_lender = self._remote_lender, None
-        planned, self._planned_lend = self._planned_lend, None
-        if lender is not None:
-            lender.close(error)
+    def _close_remote_donor(self, error: Optional[BaseException] = None) -> None:
+        """Withdraw this rank's donation: clients still holding its chunks fail their next transfer. With `error`, leave
+        the donation's failure marker too, also for a donation that never started, so that peers stop waiting for it."""
+        donor, self._remote_donor = self._remote_donor, None
+        planned, self._planned_donation = self._planned_donation, None
+        if donor is not None:
+            donor.close(error)
         elif error is not None and planned is not None:
-            from .remote_lender import publish_lend_failure
+            from .remote_donor import publish_donation_failure
 
-            publish_lend_failure(planned, error)
+            publish_donation_failure(planned, error)
 
     def enable_deferred_close(self, enabled: bool) -> None:
         """Turn the deferred close of finished generation-only requests on or off
@@ -8767,7 +8767,7 @@ class KVCacheManagerV2(BaseResourceManager):
         try:
             self._shutdown_caches()
         finally:
-            self._close_remote_lender()
+            self._close_remote_donor()
         # Shut the streaming event manager down last so removals emitted during
         # cache / impl teardown (via the radix tree's own event-manager
         # reference) are still flushed before the publisher stops. Do not null

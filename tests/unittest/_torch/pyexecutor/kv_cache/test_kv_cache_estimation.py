@@ -2379,7 +2379,7 @@ def _make_v2_field_creator(
 @pytest.mark.parametrize(
     "field",
     [
-        {"remote_cache_config": {"directory": "/shared/dir", "lend_size": 1 << 30}},
+        {"remote_cache_config": {"directory": "/shared/dir", "donate_size": 1 << 30}},
         {"defer_generation_only_release": True},
     ],
 )

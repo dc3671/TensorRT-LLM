@@ -293,7 +293,7 @@ class RemoteCacheTierConfig:
     path: str  # the rendezvous directory
     wait_timeout_ms: int = 0  # required
     transfer_timeout_ms: int = 0  # required
-    expected_lenders: int = 0  # 0: unknown
+    expected_donors: int = 0  # 0: unknown
     transport: RemoteTransport = RemoteTransport.NIXL
     ucx_devices: str = ""  # NIXL only
     pool_ratio: list[float] = ...  # empty: the hot level's split

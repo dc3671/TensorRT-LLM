@@ -34,7 +34,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 //! The NIXL transport: one-sided RDMA READ / WRITE through this client's own agent, finished on the host before a
-//! transfer returns. Lenders publish their agent's AgentDesc in lender.<name>.desc.
+//! transfer returns. Donors publish their agent's AgentDesc in donor.<name>.desc.
 class NixlRemoteMemClient final : public RemoteMemClient
 {
 public:
@@ -60,18 +60,18 @@ protected:
         return "desc";
     }
 
-    [[nodiscard]] bool acceptPayload(Lender const& /*lender*/) const override
+    [[nodiscard]] bool acceptPayload(Donor const& /*donor*/) const override
     {
         return true;
     }
 
-    uint64_t attachChunk(Lender& lender, size_t chunk) override;
+    uint64_t attachChunk(Donor& donor, size_t chunk) override;
     //! Waits for every request it submitted, cancelling the ones still running at the transfer timeout, before it
     //! returns or throws.
     void doTransfer(bool write, std::vector<RemoteIo> const& ios, size_t bytes, CUstream stream) override;
 
 private:
-    //! Deregister local memory, forget the lenders and destroy the agent; the destructor and a failed constructor
+    //! Deregister local memory, forget the donors and destroy the agent; the destructor and a failed constructor
     //! run it.
     void releaseTransport() noexcept;
 

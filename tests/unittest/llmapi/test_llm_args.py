@@ -2059,22 +2059,22 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
             "cache_size": 200 << 30,
             "transport": "fabric",
             "pool_ratio": [0.02, 0.98],
-            "expected_num_lenders": 8,
+            "expected_num_donors": 8,
             "expected_claim_size": 406 << 30,
         })
     assert config.remote_cache_config.cache_size == 200 << 30
-    assert config.remote_cache_config.lender_wait_timeout_s == 900.0
+    assert config.remote_cache_config.donor_wait_timeout_s == 900.0
     assert config.remote_cache_config.transfer_timeout_s == 30.0
     assert KvCacheConfig().remote_cache_config is None
 
     for bad in (
-        {},  # neither cache_size nor lend_size
+        {},  # neither cache_size nor donate_size
         {
             "cache_size": 1,
-            "expected_num_lenders": 8
+            "expected_num_donors": 8
         },
         {
-            "lend_size": 1 << 30,
+            "donate_size": 1 << 30,
             "transport": "fabric",
             "ucx_devices": "mlx5_0:1"
         },
@@ -2083,38 +2083,38 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
             "pool_ratio": [0.5, 0.0]
         },
         {
-            "lend_size": (1 << 30) - 1  # below the lender's 1 GiB chunk
+            "donate_size": (1 << 30) - 1  # below the donor's 1 GiB chunk
         },
         {
             "cache_size": 1,
-            "lender_wait_timeout_s": 0
+            "donor_wait_timeout_s": 0
         },
         {
             "cache_size": 1,
             "transfer_timeout_s": float("inf")
         },
-            # Fields a lend-only rank, or a NIXL lender, would ignore.
+            # Fields a donation-only rank, or a NIXL donor, would ignore.
         {
-            "lend_size": 1 << 30,
+            "donate_size": 1 << 30,
             "pool_ratio": [1.0]
         },
         {
-            "lend_size": 1 << 30,
-            "expected_num_lenders": 8,
+            "donate_size": 1 << 30,
+            "expected_num_donors": 8,
             "expected_claim_size": 1 << 30
         },
         {
-            "lend_size": 1 << 30,
+            "donate_size": 1 << 30,
             "transfer_timeout_s": 10.0
         },
         {
-            "lend_size": 1 << 30,
-            "lend_reserve_size": 8 << 30
+            "donate_size": 1 << 30,
+            "donor_reserve_size": 8 << 30
         },
         {
             "cache_size": 1,
             "transport": "fabric",
-            "lend_reserve_size": 8 << 30
+            "donor_reserve_size": 8 << 30
         },
         {
             "cache_size": 1,
@@ -2127,26 +2127,26 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
     # A dumped config, defaults included, validates again.
     for good in (
             config.remote_cache_config,
-            remote(directory=str(tmp_path), lend_size=1 << 30),
+            remote(directory=str(tmp_path), donate_size=1 << 30),
             remote(directory=str(tmp_path),
-                   lend_size=1 << 30,
+                   donate_size=1 << 30,
                    transport="fabric",
-                   lend_reserve_size=8 << 30),
+                   donor_reserve_size=8 << 30),
     ):
         assert remote(**good.model_dump()) == good
     assert remote(directory=str(tmp_path),
-                  lend_size=1 << 30).lend_size == 1 << 30
+                  donate_size=1 << 30).donate_size == 1 << 30
     assert remote(directory=str(tmp_path),
-                  lend_size=1 << 30,
+                  donate_size=1 << 30,
                   transport="fabric",
-                  lend_reserve_size=8 << 30).lend_reserve_size == 8 << 30
+                  donor_reserve_size=8 << 30).donor_reserve_size == 8 << 30
     assert remote(directory=str(tmp_path),
-                  lend_size=1 << 30,
+                  donate_size=1 << 30,
                   ucx_devices="mlx5_0:1").ucx_devices == "mlx5_0:1"
     with pytest.raises(ValidationError):
         KvCacheConfig(remote_cache_config={
             "directory": str(tmp_path),
-            "lend_size": 1 << 30
+            "donate_size": 1 << 30
         },
                       use_kv_cache_manager_v2=False)
     with pytest.raises(ValidationError):
@@ -2156,7 +2156,7 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
         },
                       disk_cache_size=1,
                       disk_cache_path=str(tmp_path))
-    # A rebalance would claim lender chunks inside adjust(), which holds every request.
+    # A rebalance would claim donor chunks inside adjust(), which holds every request.
     with pytest.raises(ValidationError, match="enable_kv_pool_rebalance"):
         KvCacheConfig(remote_cache_config={
             "directory": str(tmp_path),
@@ -2165,7 +2165,7 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
                       enable_kv_pool_rebalance=True)
     assert KvCacheConfig(remote_cache_config={
         "directory": str(tmp_path),
-        "lend_size": 1 << 30
+        "donate_size": 1 << 30
     },
                          enable_kv_pool_rebalance=True).enable_kv_pool_rebalance
 
@@ -2174,18 +2174,18 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
 @pytest.mark.parametrize(
     "remote_config",
     [
-        # CTX style: a remote level and a lend.
+        # CTX style: a remote level and a donation.
         {
             "cache_size": 200 << 30,
-            "lend_size": 8 << 30,
+            "donate_size": 8 << 30,
             "transport": "fabric",
             "pool_ratio": [0.02, 0.98],
-            "expected_num_lenders": 8,
+            "expected_num_donors": 8,
             "expected_claim_size": 406 << 30,
         },
-        # GEN style: lend only.
+        # GEN style: donation only.
         {
-            "lend_size": 160 << 30,
+            "donate_size": 160 << 30,
             "transport": "fabric",
         },
     ],

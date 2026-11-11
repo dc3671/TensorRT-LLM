@@ -5287,17 +5287,17 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "should be attempted.")
 
 
-# Lenders publish host memory in chunks of this many bytes (remote_lender.py).
+# Donors publish host memory in chunks of this many bytes (remote_donor.py).
 REMOTE_CACHE_CHUNK_BYTES = 1 << 30
-# Default of RemoteCacheConfig.lend_reserve_size.
-REMOTE_CACHE_LEND_RESERVE_BYTES = 24 << 30
+# Default of RemoteCacheConfig.donor_reserve_size.
+REMOTE_CACHE_DONOR_RESERVE_BYTES = 24 << 30
 
 
 class RemoteCacheConfig(StrictBaseModel):
-    """KV cache manager v2 remote cache level in host memory that other ranks lend.
+    """KV cache manager v2 remote cache level in host memory that other ranks donate.
 
     A rank with ``cache_size`` gets a cache level below the host tier whose slots
-    live in memory that ranks with ``lend_size`` publish in ``directory``.
+    live in memory that ranks with ``donate_size`` publish in ``directory``.
     """
 
     directory: str = Field(
@@ -5305,7 +5305,7 @@ class RemoteCacheConfig(StrictBaseModel):
         status="prototype",
         description=
         "Rendezvous directory, on a file system every rank of the job sees, where "
-        "lenders publish their memory and remote cache levels claim chunks of it. "
+        "donors publish their memory and remote cache levels claim chunks of it. "
         "Environment variables are expanded; the directory is created if missing. "
         "Use one directory per job.")
 
@@ -5318,27 +5318,27 @@ class RemoteCacheConfig(StrictBaseModel):
         "(kv_cache_compression_config) when one is set. It takes the disk "
         "level's place, so it cannot be combined with `disk_cache_size`.")
 
-    lend_size: NonNegativeInt = Field(
+    donate_size: NonNegativeInt = Field(
         default=0,
         status="prototype",
         description=
-        "Bytes of host memory this rank lends to remote cache levels, in whole "
+        "Bytes of host memory this rank donates to remote cache levels, in whole "
         "1 GiB chunks, for the lifetime of the process.")
 
-    lend_reserve_size: NonNegativeInt = Field(
-        default=REMOTE_CACHE_LEND_RESERVE_BYTES,
+    donor_reserve_size: NonNegativeInt = Field(
+        default=REMOTE_CACHE_DONOR_RESERVE_BYTES,
         status="prototype",
         description=
         "Fabric transport only: bytes of free plus reclaimable memory each host "
-        "NUMA node keeps for the processes on it while the lend is placed. "
-        "Chunks go to the GPU's node first, then to the others; a lend that "
-        "does not fit is published short. Requires `lend_size`.")
+        "NUMA node keeps for the processes on it while the donation is placed. "
+        "Chunks go to the GPU's node first, then to the others; a donation that "
+        "does not fit is published short. Requires `donate_size`.")
 
     transport: Literal["nixl", "fabric"] = Field(
         default="nixl",
         status="prototype",
         description=
-        "How pages move: 'nixl' uses one-sided NIXL RDMA; 'fabric' lends "
+        "How pages move: 'nixl' uses one-sided NIXL RDMA; 'fabric' donates "
         "CUDA fabric memory that clients in the same multi-node NVLink domain "
         "copy over NVLink. Every rank sharing `directory` must use the same value."
     )
@@ -5360,12 +5360,12 @@ class RemoteCacheConfig(StrictBaseModel):
         "layer group in KV cache manager v2 layer-group ID order (normalized). "
         "None follows the hot tier's split.")
 
-    expected_num_lenders: Optional[PositiveInt] = Field(
+    expected_num_donors: Optional[PositiveInt] = Field(
         default=None,
         status="prototype",
         description=
-        "Number of lending ranks the job starts. With `expected_claim_size`, a "
-        "rank with `cache_size` waits until these lenders have reported and fails "
+        "Number of donating ranks the job starts. With `expected_claim_size`, a "
+        "rank with `cache_size` waits until these donors have reported and fails "
         "at once if they cannot cover the claims, instead of after the claim wait."
     )
 
@@ -5374,15 +5374,15 @@ class RemoteCacheConfig(StrictBaseModel):
         status="prototype",
         description=
         "Bytes all ranks of the job claim from `directory` together. Used with "
-        "`expected_num_lenders`.")
+        "`expected_num_donors`.")
 
-    lender_wait_timeout_s: _PositiveFiniteFloat = Field(
+    donor_wait_timeout_s: _PositiveFiniteFloat = Field(
         default=900.0,
         status="prototype",
         description=
-        "Seconds a rank with `cache_size` waits for lenders, applied to each "
-        "wait on its own: for the expected lenders to report, and for each "
-        "chunk claim. Lenders publish while their own servers start, so this "
+        "Seconds a rank with `cache_size` waits for donors, applied to each "
+        "wait on its own: for the expected donors to report, and for each "
+        "chunk claim. Donors publish while their own servers start, so this "
         "bounds the job's startup skew per wait, not in total.")
 
     transfer_timeout_s: _PositiveFiniteFloat = Field(
@@ -5390,17 +5390,17 @@ class RemoteCacheConfig(StrictBaseModel):
         status="prototype",
         description=
         "NIXL transport only: seconds one batch of page transfers may take "
-        "before the remote level fails, e.g. on a lender that died.")
+        "before the remote level fails, e.g. on a donor that died.")
 
     @model_validator(mode="after")
     def validate_remote_cache(self) -> 'RemoteCacheConfig':
-        if self.cache_size == 0 and self.lend_size == 0:
+        if self.cache_size == 0 and self.donate_size == 0:
             raise ValueError(
-                "remote_cache_config needs a positive cache_size or lend_size")
-        if 0 < self.lend_size < REMOTE_CACHE_CHUNK_BYTES:
+                "remote_cache_config needs a positive cache_size or donate_size")
+        if 0 < self.donate_size < REMOTE_CACHE_CHUNK_BYTES:
             raise ValueError(
-                "remote_cache_config.lend_size must be 0 or at least one "
-                f"{REMOTE_CACHE_CHUNK_BYTES}-byte chunk, got {self.lend_size}")
+                "remote_cache_config.donate_size must be 0 or at least one "
+                f"{REMOTE_CACHE_CHUNK_BYTES}-byte chunk, got {self.donate_size}")
         # Fields off their defaults, so a dumped config validates again.
         given = {
             name
@@ -5411,23 +5411,23 @@ class RemoteCacheConfig(StrictBaseModel):
         if self.cache_size == 0:
             # Read only by a rank with a remote cache level.
             ignored += [
-                name for name in ("pool_ratio", "expected_num_lenders",
+                name for name in ("pool_ratio", "expected_num_donors",
                                   "expected_claim_size",
-                                  "lender_wait_timeout_s", "transfer_timeout_s")
+                                  "donor_wait_timeout_s", "transfer_timeout_s")
                 if name in given
             ]
         elif "transfer_timeout_s" in given and self.transport != "nixl":
             ignored.append("transfer_timeout_s")
-        if "lend_reserve_size" in given and (self.lend_size == 0
+        if "donor_reserve_size" in given and (self.donate_size == 0
                                              or self.transport != "fabric"):
-            ignored.append("lend_reserve_size")
+            ignored.append("donor_reserve_size")
         if ignored:
             raise ValueError(
                 f"remote_cache_config sets {', '.join(ignored)}, which a rank "
-                "with this cache_size, lend_size and transport ignores")
-        if (self.expected_num_lenders is None) != (self.expected_claim_size
+                "with this cache_size, donate_size and transport ignores")
+        if (self.expected_num_donors is None) != (self.expected_claim_size
                                                    is None):
-            raise ValueError("remote_cache_config.expected_num_lenders and "
+            raise ValueError("remote_cache_config.expected_num_donors and "
                              "expected_claim_size must be set together")
         if self.ucx_devices is not None and self.transport != "nixl":
             raise ValueError(
@@ -5506,7 +5506,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description=
         "KV cache manager v2 remote cache level in host memory that other ranks "
-        "lend (usually generation ranks to context ranks). None disables it.")
+        "donate (usually generation ranks to context ranks). None disables it.")
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -5990,7 +5990,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.remote_cache_config.cache_size and "
                 "enable_kv_pool_rebalance cannot both be set: a rebalance "
-                "would claim lender chunks while every request waits")
+                "would claim donor chunks while every request waits")
         return self
 
     @model_validator(mode='after')

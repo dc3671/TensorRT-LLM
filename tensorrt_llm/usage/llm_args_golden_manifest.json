@@ -899,6 +899,21 @@
       "path": "kv_cache_config.remote_cache_config.cache_size"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.donate_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.donor_reserve_size"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.donor_wait_timeout_s"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "kv_cache_config.remote_cache_config.expected_claim_size"
@@ -906,22 +921,7 @@
     {
       "capture_policy": "int|none",
       "kind": "value",
-      "path": "kv_cache_config.remote_cache_config.expected_num_lenders"
-    },
-    {
-      "capture_policy": "int",
-      "kind": "value",
-      "path": "kv_cache_config.remote_cache_config.lend_reserve_size"
-    },
-    {
-      "capture_policy": "int",
-      "kind": "value",
-      "path": "kv_cache_config.remote_cache_config.lend_size"
-    },
-    {
-      "capture_policy": "float",
-      "kind": "value",
-      "path": "kv_cache_config.remote_cache_config.lender_wait_timeout_s"
+      "path": "kv_cache_config.remote_cache_config.expected_num_donors"
     },
     {
       "capture_policy": "list[float]|none",

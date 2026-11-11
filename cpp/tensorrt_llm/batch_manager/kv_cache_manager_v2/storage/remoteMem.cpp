@@ -56,9 +56,9 @@ std::string hostName()
     return buf;
 }
 
-//! The contents of a lender's file, or nullopt when it cannot be read: the lender withdrew after the directory was
-//! listed, or the file is unreadable, which only passes over that lender until the next refresh.
-std::optional<std::string> readLenderFile(std::filesystem::path const& path)
+//! The contents of a donor's file, or nullopt when it cannot be read: the donor withdrew after the directory was
+//! listed, or the file is unreadable, which only passes over that donor until the next refresh.
+std::optional<std::string> readDonorFile(std::filesystem::path const& path)
 {
     std::ifstream file(path, std::ios::binary);
     if (!file)
@@ -66,18 +66,18 @@ std::optional<std::string> readLenderFile(std::filesystem::path const& path)
         std::error_code ec;
         if (std::filesystem::exists(path, ec) || ec)
         {
-            TLLM_LOG_WARNING("KVCM2 remote level: cannot read %s; passing over its lender", path.c_str());
+            TLLM_LOG_WARNING("KVCM2 remote level: cannot read %s; passing over its donor", path.c_str());
         }
         return std::nullopt;
     }
     return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
 }
 
-//! Bounds on what a lender's .meta may declare, so a malformed file cannot make a client allocate without limit.
+//! Bounds on what a donor's .meta may declare, so a malformed file cannot make a client allocate without limit.
 constexpr uint64_t kMinChunkBytes = 1ULL << 20;
-constexpr uint64_t kMaxChunksPerLender = 1ULL << 20;
+constexpr uint64_t kMaxChunksPerDonor = 1ULL << 20;
 
-constexpr std::string_view kLenderPrefix = "lender.";
+constexpr std::string_view kDonorPrefix = "donor.";
 constexpr std::string_view kReadySuffix = ".ready";
 constexpr std::string_view kFailedSuffix = ".failed";
 
@@ -114,17 +114,17 @@ RemoteMemClient::~RemoteMemClient()
     }
 }
 
-void RemoteMemClient::discoverLenders()
+void RemoteMemClient::discoverDonors()
 {
     {
         std::lock_guard<std::mutex> lock(mMutex);
-        refreshLenders();
+        refreshDonors();
     }
-    TLLM_LOG_INFO("KVCM2 remote level: client %s, rendezvous %s, %zu lender(s) published, transport %s", mName.c_str(),
-        mOptions.directory.c_str(), mLenders.size(), transportName());
+    TLLM_LOG_INFO("KVCM2 remote level: client %s, rendezvous %s, %zu donor(s) published, transport %s", mName.c_str(),
+        mOptions.directory.c_str(), mDonors.size(), transportName());
 }
 
-void RemoteMemClient::refreshLenders()
+void RemoteMemClient::refreshDonors()
 {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -133,13 +133,12 @@ void RemoteMemClient::refreshLenders()
     for (auto const& entry : fs::directory_iterator(mOptions.directory, ec))
     {
         auto const file = entry.path().filename().string();
-        if (file.size() > kLenderPrefix.size() + kReadySuffix.size() && file.starts_with(kLenderPrefix)
+        if (file.size() > kDonorPrefix.size() + kReadySuffix.size() && file.starts_with(kDonorPrefix)
             && file.ends_with(kReadySuffix))
         {
-            ready.push_back(
-                file.substr(kLenderPrefix.size(), file.size() - kLenderPrefix.size() - kReadySuffix.size()));
+            ready.push_back(file.substr(kDonorPrefix.size(), file.size() - kDonorPrefix.size() - kReadySuffix.size()));
         }
-        else if (file.size() > kLenderPrefix.size() + kFailedSuffix.size() && file.starts_with(kLenderPrefix)
+        else if (file.size() > kDonorPrefix.size() + kFailedSuffix.size() && file.starts_with(kDonorPrefix)
             && file.ends_with(kFailedSuffix))
         {
             ++failed;
@@ -149,25 +148,25 @@ void RemoteMemClient::refreshLenders()
     {
         throw RemoteMemError("KVCM2 remote level: cannot list " + mOptions.directory + ": " + ec.message());
     }
-    mReportedLenders = ready.size() + failed;
+    mReportedDonors = ready.size() + failed;
     std::sort(ready.begin(), ready.end());
-    for (auto& lender : mLenders)
+    for (auto& donor : mDonors)
     {
-        if (!std::binary_search(ready.begin(), ready.end(), lender.name))
+        if (!std::binary_search(ready.begin(), ready.end(), donor.name))
         {
-            stillPublished(lender);
+            stillPublished(donor);
         }
     }
     for (auto const& name : ready)
     {
-        if (mLenderIndex.count(name) != 0)
+        if (mDonorIndex.count(name) != 0)
         {
             continue;
         }
         fs::path const dir(mOptions.directory);
-        Lender lender;
-        auto const metaPath = dir / ("lender." + name + ".meta");
-        // Lender files hold memory registration keys and fabric handles: only this user's lenders are trusted.
+        Donor donor;
+        auto const metaPath = dir / ("donor." + name + ".meta");
+        // Donor files hold memory registration keys and fabric handles: only this user's donors are trusted.
         struct stat metaStat = {};
         if (::stat(metaPath.c_str(), &metaStat) != 0)
         {
@@ -175,11 +174,11 @@ void RemoteMemClient::refreshLenders()
         }
         if (metaStat.st_uid != ::geteuid())
         {
-            TLLM_LOG_WARNING("KVCM2 remote level: ignoring lender %s: owned by uid %u, not this user", name.c_str(),
+            TLLM_LOG_WARNING("KVCM2 remote level: ignoring donor %s: owned by uid %u, not this user", name.c_str(),
                 static_cast<unsigned>(metaStat.st_uid));
             continue;
         }
-        auto const metaText = readLenderFile(metaPath);
+        auto const metaText = readDonorFile(metaPath);
         if (!metaText)
         {
             continue; // withdrawn since the listing
@@ -208,86 +207,86 @@ void RemoteMemClient::refreshLenders()
             }
             else if (key == "host")
             {
-                fields >> lender.host;
+                fields >> donor.host;
             }
             else if (key == "chunk_bytes")
             {
-                fields >> lender.chunkBytes;
+                fields >> donor.chunkBytes;
             }
             else if (key == "segment")
             {
                 uint64_t base = 0;
                 uint64_t bytes = 0;
                 fields >> base >> bytes;
-                lender.segments.emplace_back(base, bytes);
+                donor.segments.emplace_back(base, bytes);
             }
         }
-        if (version != 1 || agentName != name || lender.chunkBytes == 0 || lender.segments.empty())
+        if (version != 1 || agentName != name || donor.chunkBytes == 0 || donor.segments.empty())
         {
-            TLLM_LOG_WARNING("KVCM2 remote level: ignoring lender %s: malformed meta (version %d, name '%s')",
+            TLLM_LOG_WARNING("KVCM2 remote level: ignoring donor %s: malformed meta (version %d, name '%s')",
                 name.c_str(), version, agentName.c_str());
             continue;
         }
         if (transport != transportName())
         {
-            TLLM_LOG_WARNING("KVCM2 remote level: ignoring lender %s: it lends over %s, this client uses %s",
+            TLLM_LOG_WARNING("KVCM2 remote level: ignoring donor %s: it donates over %s, this client uses %s",
                 name.c_str(), transport.c_str(), transportName());
             continue;
         }
         uint64_t numChunks = 0;
-        bool segmentsValid = lender.chunkBytes >= kMinChunkBytes;
-        for (auto const& [base, bytes] : lender.segments)
+        bool segmentsValid = donor.chunkBytes >= kMinChunkBytes;
+        for (auto const& [base, bytes] : donor.segments)
         {
             segmentsValid = segmentsValid && base <= UINT64_MAX - bytes;
-            numChunks += segmentsValid ? bytes / lender.chunkBytes : 0;
+            numChunks += segmentsValid ? bytes / donor.chunkBytes : 0;
         }
-        if (!segmentsValid || numChunks > kMaxChunksPerLender)
+        if (!segmentsValid || numChunks > kMaxChunksPerDonor)
         {
-            TLLM_LOG_WARNING("KVCM2 remote level: ignoring lender %s: chunk size %llu B or its segments out of bounds",
-                name.c_str(), static_cast<unsigned long long>(lender.chunkBytes));
+            TLLM_LOG_WARNING("KVCM2 remote level: ignoring donor %s: chunk size %llu B or its segments out of bounds",
+                name.c_str(), static_cast<unsigned long long>(donor.chunkBytes));
             continue;
         }
-        lender.name = name;
-        for (auto const& [base, bytes] : lender.segments)
+        donor.name = name;
+        for (auto const& [base, bytes] : donor.segments)
         {
-            for (uint64_t chunk = 0; chunk < bytes / lender.chunkBytes; ++chunk)
+            for (uint64_t chunk = 0; chunk < bytes / donor.chunkBytes; ++chunk)
             {
-                lender.chunks.emplace_back(base + chunk * lender.chunkBytes, lender.chunkBytes);
+                donor.chunks.emplace_back(base + chunk * donor.chunkBytes, donor.chunkBytes);
             }
         }
-        auto payload = readLenderFile(dir / ("lender." + name + "." + payloadSuffix()));
+        auto payload = readDonorFile(dir / ("donor." + name + "." + payloadSuffix()));
         if (!payload)
         {
             continue; // withdrawn since the listing
         }
-        lender.payload = std::move(*payload);
-        if (!acceptPayload(lender))
+        donor.payload = std::move(*payload);
+        if (!acceptPayload(donor))
         {
             continue;
         }
-        TLLM_LOG_INFO("KVCM2 remote level: found lender %s on %s, %zu chunk(s) of %.2f GiB", name.c_str(),
-            lender.host.c_str(), lender.chunks.size(),
-            static_cast<double>(lender.chunkBytes) / static_cast<double>(1ULL << 30));
-        mLenderIndex.emplace(name, mLenders.size());
-        mLenders.push_back(std::move(lender));
+        TLLM_LOG_INFO("KVCM2 remote level: found donor %s on %s, %zu chunk(s) of %.2f GiB", name.c_str(),
+            donor.host.c_str(), donor.chunks.size(),
+            static_cast<double>(donor.chunkBytes) / static_cast<double>(1ULL << 30));
+        mDonorIndex.emplace(name, mDonors.size());
+        mDonors.push_back(std::move(donor));
     }
 }
 
-bool RemoteMemClient::stillPublished(Lender& lender)
+bool RemoteMemClient::stillPublished(Donor& donor)
 {
-    if (!lender.withdrawn)
+    if (!donor.withdrawn)
     {
         std::error_code ec;
-        auto const ready = std::filesystem::path(mOptions.directory) / ("lender." + lender.name + ".ready");
+        auto const ready = std::filesystem::path(mOptions.directory) / ("donor." + donor.name + ".ready");
         if (!std::filesystem::exists(ready, ec) && !ec)
         {
-            // Lender names are unique per lender process, so a withdrawn one never comes back.
-            lender.withdrawn = true;
-            TLLM_LOG_WARNING("KVCM2 remote level: lender %s (%s) withdrew; no new claims from it", lender.name.c_str(),
-                lender.host.c_str());
+            // Donor names are unique per donor process, so a withdrawn one never comes back.
+            donor.withdrawn = true;
+            TLLM_LOG_WARNING("KVCM2 remote level: donor %s (%s) withdrew; no new claims from it", donor.name.c_str(),
+                donor.host.c_str());
         }
     }
-    return !lender.withdrawn;
+    return !donor.withdrawn;
 }
 
 void RemoteMemClient::throwIfFailed() const
@@ -313,30 +312,30 @@ void RemoteMemClient::fail(std::string const& message)
 
 bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
 {
-    if (mLenders.empty())
+    if (mDonors.empty())
     {
         return false;
     }
     std::string const owner = mName + " " + hostName() + " " + std::to_string(::getpid()) + "\n";
-    // Clients start at different lenders, so the first claims of many clients spread out.
-    size_t const start = std::hash<std::string>{}(mName) % mLenders.size();
-    for (size_t k = 0; k < mLenders.size(); ++k)
+    // Clients start at different donors, so the first claims of many clients spread out.
+    size_t const start = std::hash<std::string>{}(mName) % mDonors.size();
+    for (size_t k = 0; k < mDonors.size(); ++k)
     {
-        uint32_t const index = static_cast<uint32_t>((start + k) % mLenders.size());
-        auto& lender = mLenders[index];
-        if (lender.chunkBytes < minBytes || lender.full || !stillPublished(lender))
+        uint32_t const index = static_cast<uint32_t>((start + k) % mDonors.size());
+        auto& donor = mDonors[index];
+        if (donor.chunkBytes < minBytes || donor.full || !stillPublished(donor))
         {
             continue;
         }
         // Chunks are probed from the last one this client claimed or found taken, wrapping around once: claims
         // last as long as their client, so earlier chunks rarely free up, and the shared file system sees one
         // exclusive create per chunk per client instead of one per claim.
-        size_t const numChunks = lender.chunks.size();
+        size_t const numChunks = donor.chunks.size();
         for (size_t probe = 0; probe < numChunks; ++probe)
         {
-            size_t const chunk = (lender.nextClaim + probe) % numChunks;
+            size_t const chunk = (donor.nextClaim + probe) % numChunks;
             auto const path
-                = (std::filesystem::path(mOptions.directory) / ("claim." + lender.name + "." + std::to_string(chunk)))
+                = (std::filesystem::path(mOptions.directory) / ("claim." + donor.name + "." + std::to_string(chunk)))
                       .string();
             int const fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
             if (fd < 0)
@@ -358,16 +357,16 @@ bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
             uint64_t address = 0;
             try
             {
-                address = attachChunk(lender, chunk);
+                address = attachChunk(donor, chunk);
             }
             catch (RemoteMemError const& e)
             {
-                // E.g. a crashed lender whose .ready file stayed: no claims from it, the next lender is tried.
+                // E.g. a crashed donor whose .ready file stayed: no claims from it, the next donor is tried.
                 ::unlink(path.c_str());
-                lender.withdrawn = true;
+                donor.withdrawn = true;
                 mLastClaimError = e.what();
-                TLLM_LOG_WARNING("KVCM2 remote level: no claims from lender %s (%s): %s", lender.name.c_str(),
-                    lender.host.c_str(), e.what());
+                TLLM_LOG_WARNING("KVCM2 remote level: no claims from donor %s (%s): %s", donor.name.c_str(),
+                    donor.host.c_str(), e.what());
                 break;
             }
             catch (...)
@@ -375,18 +374,18 @@ bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
                 ::unlink(path.c_str());
                 throw;
             }
-            out = RemoteChunk{index, address, lender.chunks[chunk].second};
-            lender.nextClaim = chunk + 1;
+            out = RemoteChunk{index, address, donor.chunks[chunk].second};
+            donor.nextClaim = chunk + 1;
             mClaims.push_back(path);
             mClaimedBytes += out.bytes;
             return true;
         }
-        lender.full = !lender.withdrawn;
+        donor.full = !donor.withdrawn;
     }
-    // No lender had a chunk: the next attempt probes the ones found full again, in case a client let go of one.
-    for (auto& lender : mLenders)
+    // No donor had a chunk: the next attempt probes the ones found full again, in case a client let go of one.
+    for (auto& donor : mDonors)
     {
-        lender.full = false;
+        donor.full = false;
     }
     return false;
 }
@@ -397,7 +396,7 @@ RemoteChunk RemoteMemClient::acquireChunk(size_t minBytes)
     throwIfFailed();
     for (auto it = mFreeChunks.begin(); it != mFreeChunks.end(); ++it)
     {
-        if (it->bytes >= minBytes && !mLenders[it->lender].withdrawn)
+        if (it->bytes >= minBytes && !mDonors[it->donor].withdrawn)
         {
             RemoteChunk chunk = std::move(*it);
             mFreeChunks.erase(it);
@@ -413,30 +412,31 @@ RemoteChunk RemoteMemClient::acquireChunk(size_t minBytes)
         {
             return chunk;
         }
-        // Once every lender the job starts has reported, no chunk can appear: claims last as long as their client.
-        bool const allReported = mOptions.expectedLenders > 0 && mReportedLenders >= mOptions.expectedLenders;
+        // Once every donor the job starts has reported, no chunk can appear: claims last as long as their client.
+        bool const allReported = mOptions.expectedDonors > 0 && mReportedDonors >= mOptions.expectedDonors;
         if (allReported || std::chrono::steady_clock::now() >= deadline)
         {
-            throw RemoteMemError("KVCM2 remote level: no lender in " + mOptions.directory + " has a free chunk of "
+            throw RemoteMemError("KVCM2 remote level: no donor in " + mOptions.directory + " has a free chunk of "
                 + std::to_string(minBytes) + " B or more "
-                + (allReported ? "and all " + std::to_string(mOptions.expectedLenders)
-                            + " expected lenders reported (each layer group of a rank claims whole chunks, so the lend "
+                + (allReported ? "and all " + std::to_string(mOptions.expectedDonors)
+                            + " expected donors reported (each layer group of a rank claims whole chunks, so the "
+                              "donation "
                               "must exceed the summed cache_size by up to one chunk per layer group per rank)"
                                : "after " + std::to_string(mOptions.waitTimeoutMs) + " ms")
-                + "; this process holds " + std::to_string(mClaimedBytes) + " B of " + std::to_string(mLenders.size())
-                + " lender(s)" + (mLastClaimError.empty() ? "" : "; last lender withdrawn: " + mLastClaimError));
+                + "; this process holds " + std::to_string(mClaimedBytes) + " B of " + std::to_string(mDonors.size())
+                + " donor(s)" + (mLastClaimError.empty() ? "" : "; last donor withdrawn: " + mLastClaimError));
         }
         if (!warned)
         {
-            TLLM_LOG_INFO("KVCM2 remote level: waiting for lender capacity in %s (holding %.2f GiB, %zu lender(s))",
+            TLLM_LOG_INFO("KVCM2 remote level: waiting for donor capacity in %s (holding %.2f GiB, %zu donor(s))",
                 mOptions.directory.c_str(), static_cast<double>(mClaimedBytes) / static_cast<double>(1ULL << 30),
-                mLenders.size());
+                mDonors.size());
             warned = true;
         }
         lock.unlock();
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         lock.lock();
-        refreshLenders();
+        refreshDonors();
     }
 }
 
@@ -508,7 +508,7 @@ std::pair<uint32_t, uint64_t> RemoteRange::locate(SlotId slot) const
     auto const it = std::upper_bound(mFirstSlot.begin(), mFirstSlot.end(), s);
     size_t const index = static_cast<size_t>(std::distance(mFirstSlot.begin(), it)) - 1;
     auto const& chunk = mChunks[index];
-    return {chunk.lender, chunk.remoteAddr + static_cast<uint64_t>(s - mFirstSlot[index]) * mSlotSize};
+    return {chunk.donor, chunk.remoteAddr + static_cast<uint64_t>(s - mFirstSlot[index]) * mSlotSize};
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

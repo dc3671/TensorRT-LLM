@@ -414,7 +414,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// RemoteSlotPool — slots in host memory other processes lend (remoteMem.h).
+// RemoteSlotPool — slots in host memory other processes donate (remoteMem.h).
 // ---------------------------------------------------------------------------
 class RemoteSlotPool : public StagedSlotPool
 {
@@ -1022,7 +1022,7 @@ private:
     std::string mDirectory;
 };
 
-//! A level whose slots are memory other processes lend, reached through one client (remoteMem.h).
+//! A level whose slots are memory other processes donate, reached through one client (remoteMem.h).
 class RemoteCacheLevelStorage : public CacheLevelStorage
 {
 public:

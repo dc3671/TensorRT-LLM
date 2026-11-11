@@ -26,9 +26,9 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-//! The NVLink fabric transport: each claimed chunk (one fabric allocation of the lender) is imported and mapped into
-//! this client's device, and pages are copied on the caller's stream. Lenders publish one CUmemFabricHandle per chunk
-//! in lender.<name>.fabric.
+//! The NVLink fabric transport: each claimed chunk (one fabric allocation of the donor) is imported and mapped into
+//! this client's device, and pages are copied on the caller's stream. Donors publish one CUmemFabricHandle per chunk
+//! in donor.<name>.fabric.
 class FabricRemoteMemClient final : public RemoteMemClient
 {
 public:
@@ -54,9 +54,9 @@ protected:
         return "fabric";
     }
 
-    [[nodiscard]] bool acceptPayload(Lender const& lender) const override;
+    [[nodiscard]] bool acceptPayload(Donor const& donor) const override;
     //! Imports the chunk and maps it whole, readable and writable by this client's device; returns the device address.
-    uint64_t attachChunk(Lender& lender, size_t chunk) override;
+    uint64_t attachChunk(Donor& donor, size_t chunk) override;
     //! Enqueues the copies on `stream`, merging runs that are contiguous on both sides within one mapped chunk.
     void doTransfer(bool write, std::vector<RemoteIo> const& ios, size_t bytes, CUstream stream) override;
 

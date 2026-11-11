@@ -135,11 +135,11 @@ def resolve_remote_cache(worker_config, num_ranks, directory):
     """Fill the job-wide fields of the KV cache remote level from the layout.
 
     Each role's kv_cache_config.remote_cache_config gets the job's rendezvous
-    directory; a role with a cache_size also gets the number of lending ranks
+    directory; a role with a cache_size also gets the number of donating ranks
     and the bytes all caching ranks claim, which only the launcher can count.
     The claim is the sum of cache_size: ranks round each layer group up to
     whole chunks, which the launcher cannot see, so a claim that runs out stops
-    once every expected lender has reported. Explicit values are left alone.
+    once every expected donor has reported. Explicit values are left alone.
 
     Args:
         worker_config: {'ctx': ..., 'gen': ...} worker configs, edited in place.
@@ -151,16 +151,16 @@ def resolve_remote_cache(worker_config, num_ranks, directory):
         kv_cache_config = worker_config[role].get('kv_cache_config') or {}
         if kv_cache_config.get('remote_cache_config'):
             remote[role] = kv_cache_config['remote_cache_config']
-    num_lenders = sum(num_ranks[role] for role, config in remote.items()
-                      if config.get('lend_size'))
+    num_donors = sum(num_ranks[role] for role, config in remote.items()
+                      if config.get('donate_size'))
     claim_size = sum(num_ranks[role] * config.get('cache_size', 0)
                      for role, config in remote.items())
     for config in remote.values():
         config.setdefault('directory', directory)
-        explicit = ('expected_num_lenders' in config
+        explicit = ('expected_num_donors' in config
                     or 'expected_claim_size' in config)
-        if config.get('cache_size') and num_lenders and not explicit:
-            config['expected_num_lenders'] = num_lenders
+        if config.get('cache_size') and num_donors and not explicit:
+            config['expected_num_donors'] = num_donors
             config['expected_claim_size'] = claim_size
 
 

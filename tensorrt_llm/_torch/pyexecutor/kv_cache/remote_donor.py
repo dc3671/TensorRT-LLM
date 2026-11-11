@@ -12,28 +12,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Lend host memory to the remote cache levels of KV cache manager v2.
+"""Donate host memory to the remote cache levels of KV cache manager v2.
 
-A lender publishes host memory in a rendezvous directory on a shared file system; a remote cache level
+A donor publishes host memory in a rendezvous directory on a shared file system; a remote cache level
 (``KvCacheConfig.remote_cache_config``; C++ ``storage/remoteMem.h``, which also describes the directory layout) claims
-whole chunks of it with O_EXCL claim files and moves cold pages itself, so the lender does no work after publishing.
+whole chunks of it with O_EXCL claim files and moves cold pages itself, so the donor does no work after publishing.
 
-``RemoteLender`` holds what every transport shares (the files, the failure marker, start and close); each transport
+``RemoteMemDonor`` holds what every transport shares (the files, the failure marker, start and close); each transport
 allocates and publishes the memory its own way:
 
-* ``NixlLender``: anonymous memory registered with a NIXL agent; ``lender.<name>.desc`` holds the agent's ``AgentDesc``.
-* ``FabricLender``: Grace DRAM allocated with cuMemCreate (``CU_MEM_LOCATION_TYPE_HOST_NUMA``), one allocation per
-  chunk because an imported fabric allocation maps only whole; ``lender.<name>.fabric`` holds one 64-byte handle per
-  chunk. Chunks fill the GPU's host NUMA node first, then the other nodes; a lend that only partly fits is published
-  with ``short_bytes``. Lenders on one host take turns at reclaim-and-compact passes per NUMA node by flock on
+* ``NixlDonor``: anonymous memory registered with a NIXL agent; ``donor.<name>.desc`` holds the agent's ``AgentDesc``.
+* ``FabricDonor``: Grace DRAM allocated with cuMemCreate (``CU_MEM_LOCATION_TYPE_HOST_NUMA``), one allocation per
+  chunk because an imported fabric allocation maps only whole; ``donor.<name>.fabric`` holds one 64-byte handle per
+  chunk. Chunks fill the GPU's host NUMA node first, then the other nodes; a donation that only partly fits is published
+  with ``short_bytes``. Donors on one host take turns at reclaim-and-compact passes per NUMA node by flock on
   ``compact.<host>.node<N>.lock``.
 
-A lender that cannot start, or whose owner fails, leaves ``lender.<name>.failed``, which clients ignore and capacity
-checks count. In a serving process ``start_lend`` starts the lend (``remote_cache_config.lend_size``) before the KV
-cache estimation, and the final ``KVCacheManagerV2`` owns it.
+A donor that cannot start, or whose owner fails, leaves ``donor.<name>.failed``, which clients ignore and capacity
+checks count. In a serving process ``start_donation`` starts the donation (``remote_cache_config.donate_size``)
+before the KV cache estimation, and the final ``KVCacheManagerV2`` owns it.
 
 Trust model: the directory is private to the job's user (``ensure_rendezvous_directory``) and every file in it is
-0600, since lender files hold NIXL memory registration keys and fabric handles; use one directory per job.
+0600, since donor files hold NIXL memory registration keys and fabric handles; use one directory per job.
 """
 
 import contextlib
@@ -50,7 +50,7 @@ import weakref
 from typing import TYPE_CHECKING, Optional
 
 from tensorrt_llm._torch.mmap_utils import madvise_range
-from tensorrt_llm.llmapi.llm_args import REMOTE_CACHE_CHUNK_BYTES, REMOTE_CACHE_LEND_RESERVE_BYTES
+from tensorrt_llm.llmapi.llm_args import REMOTE_CACHE_CHUNK_BYTES, REMOTE_CACHE_DONOR_RESERVE_BYTES
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -109,7 +109,7 @@ def resolve_ucx_devices(devices: Optional[str], device: Optional[int] = None) ->
 
 
 def _log(message: str) -> None:
-    logger.info(f"KVCM2 remote lender: {message}")
+    logger.info(f"KVCM2 remote donor: {message}")
 
 
 def ensure_rendezvous_directory(directory: str) -> None:
@@ -134,7 +134,7 @@ def _write_atomically(path: str, data: bytes) -> None:
 
 
 def _withdraw_unowned(published: list, failed_path: str, marker: bytes) -> None:
-    """Finalizer of a lender nobody closed: withdraw its files and leave the failure marker."""
+    """Finalizer of a donor nobody closed: withdraw its files and leave the failure marker."""
     for path in reversed(published):
         with contextlib.suppress(OSError):
             os.unlink(path)
@@ -201,7 +201,7 @@ def _cuda_check(result):
 _GIB = 1 << 30
 # Seconds a refused fabric chunk is retried with backoff before a pass: the driver refuses transiently while reclaiming.
 _FABRIC_RETRY_S = 2.0
-# A reclaim-and-compact pass (_compact_node) covers the lend still missing, at least this share of the node reserve
+# A reclaim-and-compact pass (_compact_node) covers the donation still missing, at least this share of the node reserve
 # and at most _MAX_PASS_CHUNKS chunks, and leaves this share of the reserve free above the reserve and the chunk.
 _PASS_RESERVE_SHARE = 1 / 3
 _MAX_PASS_CHUNKS = 64
@@ -342,7 +342,7 @@ def _place_chunks(
 ):
     """Place up to `n_chunks` chunks over `nodes`, the preferred node first; `create(node)` returns a handle, or None
     when the driver refuses. A node takes chunks while it keeps `reserve_gib`; a refused chunk is retried, then
-    compacted for under `node_lock(node)` (see the constants), which lenders sharing the node take in turn; a node
+    compacted for under `node_lock(node)` (see the constants), which donors sharing the node take in turn; a node
     that still refuses is left, and swept once more when no node takes the chunk. Returns (handles, {node: placed})."""
     meminfo = meminfo or _node_meminfo
     compact = compact or _compact_node
@@ -377,7 +377,7 @@ def _place_chunks(
                 if not locked:
                     pass_failed.add(node)
                     return None
-                # Sized from the node's memory once the lock is held: another lender may have used it meanwhile.
+                # Sized from the node's memory once the lock is held: another donor may have used it meanwhile.
                 missing = (n_chunks - len(handles)) * chunk_gib
                 size = min(
                     max(min_pass_gib, missing),
@@ -420,7 +420,7 @@ def _place_chunks(
         if handle is None:
             if swept:
                 break
-            # A node given up on can recover after the lender left it (compaction and other lenders' frees go on).
+            # A node given up on can recover after the donor left it (compaction and other donors' frees go on).
             swept = True
             revived = {
                 n
@@ -449,21 +449,21 @@ def _meta_fields(path: str) -> dict:
     return fields
 
 
-def scan_lenders(directory: str):
-    """The lenders of a rendezvous directory that have reported: (published, failed). A published lender offers the
-    whole chunks of its segments; a failed one left lender.<name>.failed (RemoteLender.publish_failure)."""
+def scan_donors(directory: str):
+    """The donors of a rendezvous directory that have reported: (published, failed). A published donor offers the
+    whole chunks of its segments; a failed one left donor.<name>.failed (RemoteMemDonor.publish_failure)."""
     published, failed = [], []
     try:
         files = sorted(os.listdir(directory))
     except FileNotFoundError:
         return published, failed
     for file in files:
-        if not file.startswith("lender."):
+        if not file.startswith("donor."):
             continue
-        name = file[len("lender.") :].rsplit(".", 1)[0]
+        name = file[len("donor.") :].rsplit(".", 1)[0]
         try:
             if file.endswith(".ready"):
-                fields = _meta_fields(os.path.join(directory, f"lender.{name}.meta"))
+                fields = _meta_fields(os.path.join(directory, f"donor.{name}.meta"))
                 chunk = int(fields.get("chunk_bytes", 0))
                 offered = sum(b - b % chunk for _, b in fields["segments"]) if chunk else 0
                 published.append(
@@ -492,29 +492,29 @@ def scan_lenders(directory: str):
 
 def check_remote_capacity(
     directory: str,
-    num_lenders: int,
+    num_donors: int,
     need_bytes: int,
     *,
     timeout_s: float,
     poll_s: float = 2.0,
     log=None,
 ) -> dict:
-    """Wait until `num_lenders` lenders have published or failed (at most `timeout_s`), or until they offer
-    `need_bytes`, then raise if the offer falls short, naming the failed and short lenders. A job whose lenders cannot
-    cover its clients thus stops when the last lender reports instead of after the clients' claim wait."""
+    """Wait until `num_donors` donors have published or failed (at most `timeout_s`), or until they offer
+    `need_bytes`, then raise if the offer falls short, naming the failed and short donors. A job whose donors cannot
+    cover its clients thus stops when the last donor reports instead of after the clients' claim wait."""
     log = log or _log
     need = need_bytes
-    expected = num_lenders
+    expected = num_donors
     deadline = time.monotonic() + timeout_s
     while True:
-        published, failed = scan_lenders(directory)
+        published, failed = scan_donors(directory)
         offered = sum(p["offered_bytes"] for p in published)
         reported = len(published) + len(failed)
         if offered >= need or reported >= expected or time.monotonic() >= deadline:
             break
         time.sleep(poll_s)
     summary = (
-        f"{len(published)} of {expected} planned lenders published {offered / _GIB:.0f} GiB, {len(failed)} failed, "
+        f"{len(published)} of {expected} planned donors published {offered / _GIB:.0f} GiB, {len(failed)} failed, "
         f"{max(0, expected - reported)} not reported; the plan's clients claim {need / _GIB:.0f} GiB"
     )
     if offered < need:
@@ -533,15 +533,15 @@ def check_remote_capacity(
     return {"published": published, "failed": failed, "offered_bytes": offered, "need_bytes": need}
 
 
-class RemoteLender:
-    """One lent region: allocated, registered and published by ``start()``, withdrawn by ``close()``.
+class RemoteMemDonor:
+    """One donated region: allocated, registered and published by ``start()``, withdrawn by ``close()``.
 
     The rendezvous files, the failure marker and the start / close lifecycle are common to every transport; a transport
-    (``NixlLender``, ``FabricLender``; ``make_lender`` picks one) allocates and publishes the memory in
-    ``_start_transport`` and frees it in ``_release_transport``. A lender collected or left at exit without
+    (``NixlDonor``, ``FabricDonor``; ``make_donor`` picks one) allocates and publishes the memory in
+    ``_start_transport`` and frees it in ``_release_transport``. A donor collected or left at exit without
     ``close()`` withdraws its files and leaves the failure marker."""
 
-    # The transport's name, as written to the lender's files; set by each transport.
+    # The transport's name, as written to the donor's files; set by each transport.
     transport: str = ""
     directory: str = ""
     nbytes: int = 0
@@ -555,7 +555,7 @@ class RemoteLender:
     _start_thread: Optional[threading.Thread] = None
     # Serializes close(): a failed background start closes on its own thread.
     _close_lock: Optional[threading.Lock] = None
-    # Withdraws the files of a lender nobody closed; close() detaches it.
+    # Withdraws the files of a donor nobody closed; close() detaches it.
     _finalizer: Optional[weakref.finalize] = None
 
     def __init__(
@@ -569,7 +569,7 @@ class RemoteLender:
         device: Optional[int] = None,
     ):
         if nbytes < chunk_bytes:
-            raise ValueError(f"lend size {nbytes} is below one chunk ({chunk_bytes})")
+            raise ValueError(f"donation size {nbytes} is below one chunk ({chunk_bytes})")
         self.directory = directory
         # Whole chunks only: a client never sees a partial chunk.
         self.nbytes = nbytes - nbytes % chunk_bytes
@@ -577,8 +577,8 @@ class RemoteLender:
         self.numa_node = numa_node
         self.device = device
         host = socket.gethostname().split(".")[0]
-        # Unique per lender, also within one process: clients never take claims from a withdrawn name again.
-        self.name = name or f"kvcm2-lender-{host}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        # Unique per donor, also within one process: clients never take claims from a withdrawn name again.
+        self.name = name or f"kvcm2-donor-{host}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self.host = host
         self._published = []
         self._start_thread = None
@@ -591,14 +591,14 @@ class RemoteLender:
         return {}
 
     def _start_transport(self) -> None:
-        """Allocate and register the lend, then publish it (``_publish``)."""
+        """Allocate and register the donation, then publish it (``_publish``)."""
         raise NotImplementedError
 
     def _release_transport(self) -> None:
         """Free what ``_start_transport`` made; teardown keeps going past errors."""
 
     def _path(self, suffix: str) -> str:
-        return os.path.join(self.directory, f"lender.{self.name}.{suffix}")
+        return os.path.join(self.directory, f"donor.{self.name}.{suffix}")
 
     def _publish(self, extra_files, meta_lines, timing: str) -> None:
         meta = "\n".join(
@@ -620,7 +620,7 @@ class RemoteLender:
         _write_atomically(self._path("ready"), b"")
         self._published.append(self._path("ready"))
         _log(
-            f"{self.name} lends {self.nbytes / (1 << 30):.2f} GiB in {self.nbytes // self.chunk_bytes} chunk(s) "
+            f"{self.name} donates {self.nbytes / (1 << 30):.2f} GiB in {self.nbytes // self.chunk_bytes} chunk(s) "
             f"of {self.chunk_bytes / (1 << 30):.2f} GiB via {self.directory} ({timing})"
         )
 
@@ -639,8 +639,8 @@ class RemoteLender:
         ).encode()
 
     def publish_failure(self, error: BaseException) -> None:
-        """Leave lender.<name>.failed (planned bytes and the error) so capacity checks count this lender as reported
-        instead of waiting for it. Clients ignore the file: they list only .ready lenders."""
+        """Leave donor.<name>.failed (planned bytes and the error) so capacity checks count this donor as reported
+        instead of waiting for it. Clients ignore the file: they list only .ready donors."""
         try:
             ensure_rendezvous_directory(self.directory)
             _write_atomically(self._path("failed"), self._failure_text(error))
@@ -654,7 +654,7 @@ class RemoteLender:
                 _withdraw_unowned,
                 self._published,
                 self._path("failed"),
-                self._failure_text(RuntimeError("the lender's owner exited without closing it")),
+                self._failure_text(RuntimeError("the donor's owner exited without closing it")),
             )
         self._start_transport()
 
@@ -662,15 +662,15 @@ class RemoteLender:
         """``start()``; on failure, release what was made and leave the failure marker (``publish_failure``)."""
         try:
             self.start()
-        except Exception as error:  # noqa: BLE001 - a failed lender only removes capacity
-            logger.warning(f"KVCM2 remote lender: {self.name} failed to start: {error!r}")
+        except Exception as error:  # noqa: BLE001 - a failed donor only removes capacity
+            logger.warning(f"KVCM2 remote donor: {self.name} failed to start: {error!r}")
             self.close(error)
 
     def start_in_background(self) -> None:
         """``start_or_report()`` on a thread, so the caller does not wait for the memory to be faulted in and
         registered; clients wait for the ``.ready`` file."""
         self._start_thread = threading.Thread(
-            target=self.start_or_report, name="kvcm2-remote-lender", daemon=True
+            target=self.start_or_report, name="kvcm2-remote-donor", daemon=True
         )
         self._start_thread.start()
 
@@ -703,8 +703,8 @@ class RemoteLender:
         self._release_transport()
 
 
-class NixlLender(RemoteLender):
-    """Anonymous memory registered with this lender's own NIXL agent; ``lender.<name>.desc`` holds the agent's
+class NixlDonor(RemoteMemDonor):
+    """Anonymous memory registered with this donor's own NIXL agent; ``donor.<name>.desc`` holds the agent's
     ``AgentDesc``. ``ucx_devices`` (``{GPU}`` resolved at start) selects the agent's UCX devices."""
 
     transport = "nixl"
@@ -754,7 +754,7 @@ class NixlLender(RemoteLender):
         ):
             _log(f"libnuma unavailable; {self.name} relies on first touch for NUMA placement")
         # Fault every page in now: registration does not pin memory where the NIC pages on demand, and a resident
-        # lend fails here rather than mid-run and never makes a remote write wait on a page fault.
+        # donation fails here rather than mid-run and never makes a remote write wait on a page fault.
         _populate(self._map, self._address, self.nbytes)
         t1 = time.monotonic()
 
@@ -804,15 +804,15 @@ class NixlLender(RemoteLender):
             self._map = None
 
 
-class FabricLender(RemoteLender):
+class FabricDonor(RemoteMemDonor):
     """Grace DRAM allocated with cuMemCreate (``CU_MEM_LOCATION_TYPE_HOST_NUMA``), one allocation per chunk because an
     imported fabric allocation maps only whole, published as one 64-byte CUDA fabric handle per chunk in
-    ``lender.<name>.fabric``. Chunks fill NUMA node ``numa_node`` (default: the node of CUDA device ``device``) first,
-    then the other nodes, leaving ``reserve_bytes`` free per node; a lend that only partly fits is published with
+    ``donor.<name>.fabric``. Chunks fill NUMA node ``numa_node`` (default: the node of CUDA device ``device``) first,
+    then the other nodes, leaving ``reserve_bytes`` free per node; a donation that only partly fits is published with
     ``short_bytes``."""
 
     transport = "fabric"
-    reserve_bytes: int = REMOTE_CACHE_LEND_RESERVE_BYTES
+    reserve_bytes: int = REMOTE_CACHE_DONOR_RESERVE_BYTES
     _fabric: Optional[list] = None  # the cuMemCreate handles, one per chunk
     _fabric_ctx = None
     # The device whose primary context _fabric_ctx retains; close() releases it.
@@ -823,7 +823,7 @@ class FabricLender(RemoteLender):
         directory: str,
         nbytes: int,
         *,
-        reserve_bytes: int = REMOTE_CACHE_LEND_RESERVE_BYTES,
+        reserve_bytes: int = REMOTE_CACHE_DONOR_RESERVE_BYTES,
         **kwargs,
     ):
         super().__init__(directory, nbytes, **kwargs)
@@ -834,7 +834,7 @@ class FabricLender(RemoteLender):
 
     @classmethod
     def options_from(cls, remote_config: "RemoteCacheConfig") -> dict:
-        return {"reserve_bytes": remote_config.lend_reserve_size}
+        return {"reserve_bytes": remote_config.donor_reserve_size}
 
     def _release_fabric(self) -> None:
         from cuda.bindings import driver as drv
@@ -865,8 +865,8 @@ class FabricLender(RemoteLender):
             raise
 
     def _start_transport(self) -> None:
-        """Allocate the lend one chunk at a time, placed by _place_chunks, and publish their fabric handles in chunk
-        order. What fits is published with short_bytes; a lender that fits nothing raises."""
+        """Allocate the donation one chunk at a time, placed by _place_chunks, and publish their fabric handles in chunk
+        order. What fits is published with short_bytes; a donor that fits nothing raises."""
         from cuda.bindings import driver as drv
 
         ensure_rendezvous_directory(self.directory)
@@ -989,7 +989,7 @@ class FabricLender(RemoteLender):
                     finally:
                         _cuda_check(drv.cuCtxPopCurrent())
                 except Exception as error:  # noqa: BLE001 - teardown keeps going
-                    _log(f"{self.name}: releasing the fabric lend failed: {error}")
+                    _log(f"{self.name}: releasing the fabric donation failed: {error}")
             try:
                 _cuda_check(drv.cuDevicePrimaryCtxRelease(self._fabric_device))
             except Exception as error:  # noqa: BLE001 - teardown keeps going
@@ -999,41 +999,41 @@ class FabricLender(RemoteLender):
         self._fabric = []
 
 
-# The lender of each RemoteCacheConfig.transport.
-LENDERS = {"nixl": NixlLender, "fabric": FabricLender}
-TRANSPORTS = tuple(LENDERS)
+# The donor of each RemoteCacheConfig.transport.
+DONORS = {"nixl": NixlDonor, "fabric": FabricDonor}
+TRANSPORTS = tuple(DONORS)
 
 
-def make_lender(directory: str, nbytes: int, transport: str = "nixl", **kwargs) -> RemoteLender:
-    """A lender of `transport` (one of ``TRANSPORTS``); `kwargs` go to its constructor."""
-    if transport not in LENDERS:
+def make_donor(directory: str, nbytes: int, transport: str = "nixl", **kwargs) -> RemoteMemDonor:
+    """A donor of `transport` (one of ``TRANSPORTS``); `kwargs` go to its constructor."""
+    if transport not in DONORS:
         raise ValueError(f"transport {transport!r} is not one of {TRANSPORTS}")
-    return LENDERS[transport](directory, nbytes, **kwargs)
+    return DONORS[transport](directory, nbytes, **kwargs)
 
 
-def _lender_for(remote_config: "RemoteCacheConfig", device: Optional[int]) -> RemoteLender:
-    lender_cls = LENDERS[remote_config.transport]
-    return lender_cls(
+def _donor_for(remote_config: "RemoteCacheConfig", device: Optional[int]) -> RemoteMemDonor:
+    donor_cls = DONORS[remote_config.transport]
+    return donor_cls(
         os.path.expandvars(os.path.expanduser(remote_config.directory)),
-        remote_config.lend_size,
+        remote_config.donate_size,
         device=device,
-        **lender_cls.options_from(remote_config),
+        **donor_cls.options_from(remote_config),
     )
 
 
-def start_lend(remote_config: "RemoteCacheConfig", device: int) -> RemoteLender:
-    """Start lending ``remote_config.lend_size`` bytes of host memory near CUDA device `device`, in the background.
-    Every start error, ``{GPU}`` resolution included, surfaces as the lender's failure marker."""
-    lender = _lender_for(remote_config, device)
-    directory = lender.directory
-    lender.start_in_background()
+def start_donation(remote_config: "RemoteCacheConfig", device: int) -> RemoteMemDonor:
+    """Start donating ``remote_config.donate_size`` bytes of host memory near CUDA device `device`, in the background.
+    Every start error, ``{GPU}`` resolution included, surfaces as the donor's failure marker."""
+    donor = _donor_for(remote_config, device)
+    directory = donor.directory
+    donor.start_in_background()
     logger.info(
-        f"KV cache manager v2 lends {remote_config.lend_size / _GIB:.2f}GiB of host memory "
+        f"KV cache manager v2 donates {remote_config.donate_size / _GIB:.2f}GiB of host memory "
         f"to remote cache levels via {directory} ({remote_config.transport})"
     )
-    return lender
+    return donor
 
 
-def publish_lend_failure(remote_config: "RemoteCacheConfig", error: BaseException) -> None:
-    """Leave the failure marker of a lend this rank planned but never started, so peers stop waiting for it."""
-    _lender_for(remote_config, None).publish_failure(error)
+def publish_donation_failure(remote_config: "RemoteCacheConfig", error: BaseException) -> None:
+    """Leave the failure marker of a donation this rank planned but never started, so peers stop waiting for it."""
+    _donor_for(remote_config, None).publish_failure(error)

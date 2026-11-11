@@ -1016,12 +1016,12 @@ class KvCacheCreator:
     _joint_kv_cache_reuse = False
     _gen_preemption_headroom: int = 0
 
-    # This rank's lend (remote_cache_config.lend_size), started before the
+    # This rank's donation (remote_cache_config.donate_size), started before the
     # estimation so that clients do not wait out the warmup; the final target
     # manager takes it over.
-    _remote_lender = None
-    # The lend handed to the final target manager (close_remote_lender).
-    _handed_remote_lender = None
+    _remote_donor = None
+    # The donation handed to the final target manager (close_remote_donor).
+    _handed_remote_donor = None
 
     def __init__(
         self,
@@ -2232,7 +2232,7 @@ class KvCacheCreator:
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
         cold_page_codec_provider: Optional[object] = None,
-        remote_lender=None,
+        remote_donor=None,
     ) -> KVCacheManager:
         mapping = self._mapping
         assert self._model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
@@ -2290,7 +2290,7 @@ class KvCacheCreator:
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
             layer_specs=unified_layer_specs,
             shared_draft_block_width=shared_draft_block_width,
-            remote_lender=remote_lender,
+            remote_donor=remote_donor,
         )
 
         if not self._skip_est:
@@ -2810,12 +2810,12 @@ class KvCacheCreator:
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
         cold_page_codec_provider: Optional[object] = None,
-        remote_lender=None,
+        remote_donor=None,
     ) -> Optional[KVCacheManager]:
         """
         Create a KV cache manager for draft model layers in one-model mode
-        when target and draft have different KV cache layouts. `remote_lender`
-        is the target's lend, which the draft waits for but does not own.
+        when target and draft have different KV cache layouts. `remote_donor`
+        is the target's donation, which the draft waits for but does not own.
         """
         num_draft_layers = self._get_num_draft_layers()
         spec_dec_layer_mask = self._get_one_model_draft_layer_mask()
@@ -2896,7 +2896,7 @@ class KvCacheCreator:
             disable_overlap_scheduler=self._disable_overlap_scheduler,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
-            remote_lender=remote_lender,
+            remote_donor=remote_donor,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -3394,7 +3394,7 @@ class KvCacheCreator:
                              "KV cache pool.")
 
         self_kv_cache_config = base_kv_cache_config.model_copy()
-        # The self-attention manager owns the rank's remote level and lend.
+        # The self-attention manager owns the rank's remote level and donation.
         cross_kv_cache_config = base_kv_cache_config.model_copy(
             update={"remote_cache_config": None})
         split_any_budget = False
@@ -3551,7 +3551,7 @@ class KvCacheCreator:
         the tier to the manager's own device quota; V1 builds no secondary pool.
         The disk tier is V2 only and has no auto policy, so dropping its budget
         leaves the tier out; so does dropping the remote cache config: the
-        lend is placed before the probe (_start_remote_lend), the claim waits
+        donation is placed before the probe (_start_remote_donation), the claim waits
         for the final build.
         """
         if kv_cache_config is None:
@@ -3603,7 +3603,7 @@ class KvCacheCreator:
             cross_kv_cache_config = self._drop_explicit_offload_tier_budgets(
                 cross_kv_cache_config)
             if not self._skip_est:
-                self._start_remote_lend()
+                self._start_remote_donation()
 
         # Split combined KV cache budgets before creating managers.
         draft_kv_cache_config = None
@@ -3642,26 +3642,26 @@ class KvCacheCreator:
             compression_manager if compression_manager is not None
             and compression_manager.provides_cold_page_codec else None)
 
-        # The early lend goes to the final target, which owns it; a separate draft only waits for it.
-        early_lender = None if estimating_kv_cache else self._remote_lender
+        # The early donation goes to the final target, which owns it; a separate draft only waits for it.
+        early_donor = None if estimating_kv_cache else self._remote_donor
         kv_cache_manager = self._create_kv_cache_manager(
             estimating_kv_cache,
             kv_cache_config_override=self_kv_cache_config,
             cold_page_codec_provider=cold_page_codec_provider,
-            remote_lender=early_lender,
+            remote_donor=early_donor,
         )
         if not estimating_kv_cache:
             # The manager owns it now; kept only to mark it should startup fail after this.
-            self._handed_remote_lender, self._remote_lender = self._remote_lender, None
+            self._handed_remote_donor, self._remote_donor = self._remote_donor, None
         try:
             draft_kv_cache_manager, cross_kv_cache_manager = (
                 self._build_secondary_managers(
                     has_separate_one_model_draft, original_max_seq_len,
                     estimating_kv_cache, self_kv_cache_config,
                     draft_kv_cache_config, cross_kv_cache_config,
-                    cold_page_codec_provider, early_lender))
+                    cold_page_codec_provider, early_donor))
         except BaseException:
-            # Nothing holds the target manager yet; shutting it down withdraws its lend.
+            # Nothing holds the target manager yet; shutting it down withdraws its donation.
             if kv_cache_manager is not None:
                 kv_cache_manager.shutdown()
             raise
@@ -3688,9 +3688,9 @@ class KvCacheCreator:
             estimating_kv_cache: bool, self_kv_cache_config: KvCacheConfig,
             draft_kv_cache_config: Optional[KvCacheConfig],
             cross_kv_cache_config: Optional[KvCacheConfig],
-            cold_page_codec_provider, early_lender):
+            cold_page_codec_provider, early_donor):
         """The one-model draft and encoder-decoder cross managers built beside the target; the draft waits for
-        `early_lender`, the target's lend, before measuring host memory."""
+        `early_donor`, the target's donation, before measuring host memory."""
         draft_kv_cache_manager = None
         draft_build_kv_cache_config = (draft_kv_cache_config
                                        if draft_kv_cache_config is not None else
@@ -3703,7 +3703,7 @@ class KvCacheCreator:
                 estimating_kv_cache,
                 kv_cache_config_override=draft_build_kv_cache_config,
                 cold_page_codec_provider=cold_page_codec_provider,
-                remote_lender=early_lender)
+                remote_donor=early_donor)
 
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None
@@ -3713,27 +3713,27 @@ class KvCacheCreator:
                 original_max_seq_len)
         return draft_kv_cache_manager, cross_kv_cache_manager
 
-    def _start_remote_lend(self) -> None:
-        """Start this rank's lend for the final target manager, once, and wait until it is placed or failed."""
+    def _start_remote_donation(self) -> None:
+        """Start this rank's donation for the final target manager, once, and wait until it is placed or failed."""
         remote_config = self._kv_cache_config.remote_cache_config
-        if (remote_config is None or not remote_config.lend_size
-                or self._remote_lender is not None):
+        if (remote_config is None or not remote_config.donate_size
+                or self._remote_donor is not None):
             return
-        from .kv_cache.remote_lender import start_lend
-        self._remote_lender = start_lend(remote_config,
+        from .kv_cache.remote_donor import start_donation
+        self._remote_donor = start_donation(remote_config,
                                          torch.cuda.current_device())
-        # Placed before the estimation probe and its warmup take host memory, which would leave the lend short.
-        self._remote_lender.wait_started()
+        # Placed before the estimation probe and its warmup take host memory, which would leave the donation short.
+        self._remote_donor.wait_started()
 
-    def close_remote_lender(self,
+    def close_remote_donor(self,
                             error: Optional[BaseException] = None) -> None:
-        """Withdraw a lend that no manager took over, leaving its failure marker when `error` is given. With `error`,
-        a lend already handed to the final target manager is withdrawn and marked too; its later close is a no-op."""
-        lender, self._remote_lender = self._remote_lender, None
-        if lender is None and error is not None:
-            lender, self._handed_remote_lender = self._handed_remote_lender, None
-        if lender is not None:
-            lender.close(error)
+        """Withdraw a donation that no manager took over, leaving its failure marker when `error` is given. With `error`,
+        a donation already handed to the final target manager is withdrawn and marked too; its later close is a no-op."""
+        donor, self._remote_donor = self._remote_donor, None
+        if donor is None and error is not None:
+            donor, self._handed_remote_donor = self._handed_remote_donor, None
+        if donor is not None:
+            donor.close(error)
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model, draft model, and cross pool."""
@@ -3862,7 +3862,7 @@ def _create_kv_cache_manager(
         max_cuda_graph_batch_size: Optional[int] = None,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         shared_draft_block_width: Optional[int] = None,
-        remote_lender=None,
+        remote_donor=None,
         gen_preemption_headroom: int = 0) -> KVCacheManager:
     """
     Returns:
@@ -4024,7 +4024,7 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["layer_specs"] = layer_specs
         manager_extra_kwargs[
             "shared_draft_block_width"] = shared_draft_block_width
-        manager_extra_kwargs["remote_lender"] = remote_lender
+        manager_extra_kwargs["remote_donor"] = remote_donor
         # Vocab size also enables multimodal event decoding and its per-block
         # digest scan. Leave it unset for text-only engines. Without an engine
         # (e.g. separate one-model draft caches), preserve config resolution:

@@ -115,7 +115,7 @@ struct DiskCacheTierConfig : StagedCacheTierConfig
     void validate() const;
 };
 
-//! How a remote tier moves pages (storage/remoteMem.h). Lenders must use the same one.
+//! How a remote tier moves pages (storage/remoteMem.h). Donors must use the same one.
 enum class RemoteTransport : int
 {
     //! One-sided NIXL RDMA, finished on the host before a transfer returns.
@@ -124,16 +124,16 @@ enum class RemoteTransport : int
     FABRIC = 1,
 };
 
-//! Slots in host memory other processes lend (storage/remoteMem.h); `path` is the rendezvous directory the lenders
+//! Slots in host memory other processes donate (storage/remoteMem.h); `path` is the rendezvous directory the donors
 //! publish into.
 struct RemoteCacheTierConfig : StagedCacheTierConfig
 {
-    //! Required: how long creating the level waits for lender capacity, and how long one transfer may take
-    //! (RemoteCacheConfig.lender_wait_timeout_s and transfer_timeout_s).
+    //! Required: how long creating the level waits for donor capacity, and how long one transfer may take
+    //! (RemoteCacheConfig.donor_wait_timeout_s and transfer_timeout_s).
     int64_t waitTimeoutMs = 0;
     int64_t transferTimeoutMs = 0;
-    //! Lenders the job starts; once all have reported, a claim stops waiting. 0 if unknown.
-    uint32_t expectedLenders = 0;
+    //! Donors the job starts; once all have reported, a claim stops waiting. 0 if unknown.
+    uint32_t expectedDonors = 0;
     RemoteTransport transport = RemoteTransport::NIXL;
     //! NIXL only: the UCX devices of the level's agent (e.g. "mlx5_0:1"); empty uses the process's.
     std::string ucxDevices;

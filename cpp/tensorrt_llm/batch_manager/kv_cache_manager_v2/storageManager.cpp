@@ -603,7 +603,7 @@ SharedPtr<RemoteMemClient> StorageManager::remoteClientFor(CacheTierConfig const
         return nullptr;
     }
     RemoteMemOptions options{remote->path, remote->waitTimeoutMs, remote->transferTimeoutMs, remote->transport,
-        remote->ucxDevices, remote->expectedLenders};
+        remote->ucxDevices, remote->expectedDonors};
     for (auto const& client : mRemoteClients)
     {
         if (client->directory() != remote->path)
@@ -612,7 +612,7 @@ SharedPtr<RemoteMemClient> StorageManager::remoteClientFor(CacheTierConfig const
         }
         TLLM_CHECK_WITH_INFO(client->options() == options,
             "remote cache levels sharing rendezvous directory '%s' must use the same timeouts, transport, devices and "
-            "expected lenders",
+            "expected donors",
             remote->path.c_str());
         return client;
     }
@@ -948,8 +948,8 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                     "Cold-page codec rejected a migration batch");
                 for (size_t index = 0; index < batchSize; ++index)
                 {
-                    auto const [lender, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].dst));
-                    ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, lender, remoteAddr});
+                    auto const [donor, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].dst));
+                    ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, donor, remoteAddr});
                 }
                 // Stream-ordered, the WRITE starts when the stream has encoded the batch and the lease retires after
                 // it; on the host, it waits for the encode.
@@ -971,8 +971,8 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                 size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
                 for (size_t index = 0; index < batchSize; ++index)
                 {
-                    auto const [lender, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].src));
-                    ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, lender, remoteAddr});
+                    auto const [donor, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].src));
+                    ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, donor, remoteAddr});
                 }
                 client.transfer(/*write=*/false, ios, coldPageBytes, stream);
                 if (!streamOrdered)
@@ -1110,8 +1110,8 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
                 ios.clear();
                 for (size_t index = 0; index < batchSize; ++index)
                 {
-                    auto const [lender, remoteAddr] = srcRange->locate(toSlotId(pageIndices[offset + index].src));
-                    ios.push_back(RemoteIo{base + index * pageBytes, lender, remoteAddr});
+                    auto const [donor, remoteAddr] = srcRange->locate(toSlotId(pageIndices[offset + index].src));
+                    ios.push_back(RemoteIo{base + index * pageBytes, donor, remoteAddr});
                 }
                 srcRange->client().transfer(/*write=*/false, ios, pageBytes, stream);
             }
@@ -1139,8 +1139,8 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
                 ios.clear();
                 for (size_t index = 0; index < batchSize; ++index)
                 {
-                    auto const [lender, remoteAddr] = dstRange->locate(toSlotId(pageIndices[offset + index].dst));
-                    ios.push_back(RemoteIo{base + index * pageBytes, lender, remoteAddr});
+                    auto const [donor, remoteAddr] = dstRange->locate(toSlotId(pageIndices[offset + index].dst));
+                    ios.push_back(RemoteIo{base + index * pageBytes, donor, remoteAddr});
                 }
                 // Stream-ordered, starts when the stream has the source bytes in staging; on the host, they are there.
                 dstRange->client().transfer(/*write=*/true, ios, pageBytes, stream);

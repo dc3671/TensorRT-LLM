@@ -639,17 +639,23 @@ _GIB = 1 << 30
     [
         # RemoteCacheConfig
         ("kv_cache_config", {"remote_cache_config": {"directory": "d", "cache_size": _GIB}}, True),
-        ("kv_cache_config", {"remote_cache_config": {"directory": "d", "lend_size": _GIB}}, True),
+        ("kv_cache_config", {"remote_cache_config": {"directory": "d", "donate_size": _GIB}}, True),
         ("kv_cache_config", {"remote_cache_config": {"directory": "d"}}, False),
-        ("kv_cache_config", {"remote_cache_config": {"directory": "d", "lend_size": 1}}, False),
+        ("kv_cache_config", {"remote_cache_config": {"directory": "d", "donate_size": 1}}, False),
         (
             "kv_cache_config",
-            {"remote_cache_config": {"directory": "d", "lend_size": _GIB, "transfer_timeout_s": 5}},
+            {
+                "remote_cache_config": {
+                    "directory": "d",
+                    "donate_size": _GIB,
+                    "transfer_timeout_s": 5,
+                }
+            },
             False,
         ),
         (
             "kv_cache_config",
-            {"remote_cache_config": {"directory": "d", "cache_size": 1, "expected_num_lenders": 2}},
+            {"remote_cache_config": {"directory": "d", "cache_size": 1, "expected_num_donors": 2}},
             False,
         ),
         (
@@ -658,7 +664,7 @@ _GIB = 1 << 30
                 "remote_cache_config": {
                     "directory": "d",
                     "cache_size": 1,
-                    "expected_num_lenders": 2,
+                    "expected_num_donors": 2,
                     "expected_claim_size": _GIB,
                 }
             },
@@ -690,7 +696,13 @@ _GIB = 1 << 30
         ),
         (
             "kv_cache_config",
-            {"remote_cache_config": {"directory": "d", "lend_size": _GIB, "lend_reserve_size": 0}},
+            {
+                "remote_cache_config": {
+                    "directory": "d",
+                    "donate_size": _GIB,
+                    "donor_reserve_size": 0,
+                }
+            },
             False,
         ),
         (
@@ -698,9 +710,9 @@ _GIB = 1 << 30
             {
                 "remote_cache_config": {
                     "directory": "d",
-                    "lend_size": _GIB,
+                    "donate_size": _GIB,
                     "transport": "fabric",
-                    "lend_reserve_size": 0,
+                    "donor_reserve_size": 0,
                 }
             },
             True,
@@ -718,7 +730,7 @@ _GIB = 1 << 30
         (
             "kv_cache_config",
             {
-                "remote_cache_config": {"directory": "d", "lend_size": _GIB},
+                "remote_cache_config": {"directory": "d", "donate_size": _GIB},
                 "disk_cache_size": 1,
                 "disk_cache_path": str(_REPO_ROOT),
             },
