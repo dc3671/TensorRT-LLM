@@ -18,9 +18,12 @@
   ``routed + sigmoid(gate) * shared`` computed in-kernel (``routed`` finalized, or finalized in-kernel from
   the fc2 rows). Calls below ``TWO_SHOT_ROWS`` rows run the
   one-shot slot kernel on its own multicast workspace, larger ones the two-shot kernel on the library's Lamport
-  workspace and flags. Both produce the library op's outputs.
+  workspace and flags. Both produce the library op's outputs. Calls of ``TWO_SHOT_ROWS`` to ``SLOT_MAX_ROWS``
+  rows run the slot transport with the two-shot kernel's arithmetic, so their outputs are the two-shot's.
 * ``GemmAllReduceNorm``: FP8 per-tensor row-parallel GEMM (low-M warp MMA) + one-shot all-reduce + residual +
   RMSNorm in one launch, on the library's Lamport workspace.
+* ``GemmTwoShotAllReduceNorm``: the same for 17-128 rows with an E4M3 input: tcgen05 GEMM + two-shot all-reduce
+  (``kernels/blackwell/gemm_twoshot_allreduce_norm.py``), on the same workspace.
 
 The all-reduce kernels take the row count at run time and compile per static geometry; the GEMM kernel compiles
 per row count (at most ``GemmAllReduceNorm.MAX_ROWS``).
@@ -40,6 +43,10 @@ from ..flashinfer_utils import get_env_enable_pdl
 
 # Rows from which a call takes the two-shot kernel.
 TWO_SHOT_ROWS = 64
+
+
+# Largest call on the slot (one-shot) transport; from TWO_SHOT_ROWS on it runs the two-shot kernel's arithmetic.
+SLOT_MAX_ROWS = 128
 
 
 def _ctas_per_token(rows: int, hidden: int, sms: int) -> int:
@@ -79,6 +86,8 @@ def _compiled_two_shot(
     quant: bool,
     moe_topk: int,
     fc2_row: int,
+    l2pf: bool = False,
+    fc2_lamport: bool = False,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -98,6 +107,8 @@ def _compiled_two_shot(
         moe_topk=moe_topk,
         fc2_row=fc2_row,
         tpc=tpc,
+        l2pf=l2pf,
+        fc2_lamport=fc2_lamport,
     )
     x, gate, w, scale, q, table = _example_operands(hidden, nranks)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -118,6 +129,9 @@ def _compiled_two_shot(
         cutlass.Int64(0),
         cutlass.Int64(0),
         cutlass.Int32(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        cutlass.Int64(0),
         stream,
     )
 
@@ -135,6 +149,9 @@ def _compiled_slot(
     moe_topk: int,
     fc2_row: int,
     region_bytes: int,
+    l2pf: bool = False,
+    fc2_lamport: bool = False,
+    ts_ctas: int = 0,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -154,6 +171,9 @@ def _compiled_slot(
         region_bytes=region_bytes,
         moe_topk=moe_topk,
         fc2_row=fc2_row,
+        l2pf=l2pf,
+        fc2_lamport=fc2_lamport,
+        ts_ctas=ts_ctas,
     )
     x, gate, w, scale, q, _ = _example_operands(hidden, nranks)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -177,8 +197,22 @@ def _compiled_slot(
         z,
         z,
         cutlass.Int32(0),
+        z,
+        z,
+        z,
         stream,
     )
+
+
+def _l2pf_args(weight: Optional[torch.Tensor], nblk: int):
+    """(l2pf, ptr, bytes, bytes per CTA) for a launch of ``nblk`` CTAs that prefetches ``weight`` into L2, a
+    16-byte aligned slice per CTA; no prefetch without a weight."""
+    if weight is None or nblk <= 0:
+        return False, 0, 0, 0
+    nbytes = weight.numel() * weight.element_size()
+    per = -(-nbytes // nblk)
+    per = -(-per // 16) * 16
+    return True, weight.data_ptr(), nbytes, per
 
 
 def _example_operands(hidden: int, nranks: int):
@@ -297,7 +331,7 @@ class MnnvlAllReduceNorm:
         props = torch.cuda.get_device_properties(table.table.device)
         self._sms = props.multi_processor_count
         self._smem_bytes = props.shared_memory_per_block_optin
-        self.slot = _SlotWorkspace(mapping, comm, hidden_size, self.SLOT_CTAS, TWO_SHOT_ROWS)
+        self.slot = _SlotWorkspace(mapping, comm, hidden_size, self.SLOT_CTAS, SLOT_MAX_ROWS)
         dev = table.table.device
         # Never-read operands of the compiled signature (gate, FP8 out, scale); rows are runtime values.
         # zeros, not empty: models are built under MetaInitMode, which turns torch.empty into meta tensors
@@ -307,11 +341,11 @@ class MnnvlAllReduceNorm:
         self._unused_scale = torch.zeros((1,), dtype=torch.float32, device=dev)
 
     def supports_rows(self, rows: int) -> bool:
-        """Whether one launch takes ``rows`` tokens: below TWO_SHOT_ROWS the slot workspace holds them, above it
+        """Whether one launch takes ``rows`` tokens: up to SLOT_MAX_ROWS the slot workspace holds them, above it
         the shared memory of a CTA holds its tokens' residuals."""
         if rows <= 0:
             return False
-        if rows < TWO_SHOT_ROWS:
+        if rows <= SLOT_MAX_ROWS:
             return True
         tpc = _tokens_per_cta(rows, _ctas_per_token(rows, self.hidden, self._sms), self._sms)
         # kernel_mt: FP32 warp sums, eight Int32 flags, and BF16 residuals.
@@ -348,11 +382,19 @@ class MnnvlAllReduceNorm:
         moe_fold: Optional[Tuple] = None,
         scale: Optional[torch.Tensor] = None,
         norm_out: bool = True,
+        l2_prefetch: Optional[torch.Tensor] = None,
+        fc2_lamport: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
         """Input ``x`` [M, H] BF16, or ``moe_fold`` = (routed, shared [M, H], gate logits [M] / [M, 1]) giving
         ``routed + sigmoid(gate) * shared``. ``routed`` is the finalized routed output [M, H] BF16, or the
         un-finalized (fc2 [P, >= H] BF16, topk_weights [M, K] BF16, expanded_idx_to_permuted_idx [M, K] int32),
         finalized in-kernel.
+
+        ``l2_prefetch``: a contiguous CUDA tensor the launch pulls into L2 after its pushes (the next GEMM's weight).
+
+        ``fc2_lamport``: the un-finalized fc2 is a Lamport FC2 buffer (``decode_moe.LamportFc2Buffer``): the fold polls
+        the rows it reads instead of waiting for FC2 and writes them back to 0xFFFFFFFF. The caller fences the shared
+        expert's stream before this launch, so the shared output and gate are read without a dependency wait.
 
         Returns ``(norm, residual_out)``, ``(norm, fp8, residual_out)`` with ``scale``, or ``(fp8, residual_out)``
         with ``scale`` and ``norm_out=False``, as the library op."""
@@ -363,7 +405,11 @@ class MnnvlAllReduceNorm:
         nranks = self.mapping.tp_size
         m = residual.shape[0]
         topk = fc2_row = 0
+        lamport = False
         fc2_ptr = topw_ptr = perm_ptr = 0
+        assert not fc2_lamport or (
+            moe_fold is not None and not isinstance(moe_fold[0], torch.Tensor)
+        )
         if moe_fold is not None:
             routed, shared, gate = moe_fold
             if isinstance(routed, torch.Tensor):
@@ -372,6 +418,7 @@ class MnnvlAllReduceNorm:
                 fc2, topw, perm = routed
                 assert perm.shape[0] == m and self.moe_fold_supported(fc2, topw, perm, hidden)
                 topk, fc2_row = perm.shape[1], fc2.stride(0)
+                lamport = fc2_lamport
                 fc2_ptr, topw_ptr, perm_ptr = (
                     fc2.data_ptr(),
                     topw.contiguous().data_ptr(),
@@ -402,11 +449,19 @@ class MnnvlAllReduceNorm:
         )
         folds = moe_fold is not None
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        if m < TWO_SHOT_ROWS:
+        if m <= SLOT_MAX_ROWS:
             slot = self.slot
+            # from TWO_SHOT_ROWS on: the two-shot kernel's arithmetic for its CTA split at m (one token per CTA there)
+            ts = 0
+            if m >= TWO_SHOT_ROWS:
+                ts = _ctas_per_token(m, hidden, self._sms)
+                assert _tokens_per_cta(m, ts, self._sms) == 1, (
+                    f"two-shot arithmetic at {m} rows: one token per CTA"
+                )
+            l2pf, pf_ptr, pf_bytes, pf_per = _l2pf_args(l2_prefetch, m * self.SLOT_CTAS)
             fn = _compiled_slot(
                 hidden, float(eps), nranks, self.SLOT_CTAS, self._pdl, folds, norm_out,
-                scale is not None, topk, fc2_row, slot.region_bytes,
+                scale is not None, topk, fc2_row, slot.region_bytes, l2pf, lamport, ts,
             )  # fmt: skip
             fn(
                 *operands,
@@ -417,15 +472,27 @@ class MnnvlAllReduceNorm:
                 cutlass.Int64(topw_ptr),
                 cutlass.Int64(perm_ptr),
                 cutlass.Int32(self.mapping.tp_rank),
+                cutlass.Int64(pf_ptr),
+                cutlass.Int64(pf_bytes),
+                cutlass.Int64(pf_per),
                 stream,
             )
         else:
             # Two stages of max(scatter, broadcast) each.
             table = self.table(2 * ((m + nranks - 1) // nranks) * nranks * hidden * 2)
             ctas = _ctas_per_token(m, hidden, self._sms)
+            tpc = _tokens_per_cta(m, ctas, self._sms)
+            l2pf, pf_ptr, pf_bytes, pf_per = _l2pf_args(
+                l2_prefetch, -(-m // tpc) if tpc > 1 else m * ctas
+            )
+            if lamport and tpc != 1:
+                raise RuntimeError(
+                    f"Lamport FC2 rows: the two-shot fold is implemented for one token per CTA "
+                    f"({m} rows give {tpc})"
+                )
             fn = _compiled_two_shot(
-                hidden, float(eps), nranks, ctas, _tokens_per_cta(m, ctas, self._sms), self._pdl,
-                folds, norm_out, scale is not None, topk, fc2_row,
+                hidden, float(eps), nranks, ctas, tpc, self._pdl,
+                folds, norm_out, scale is not None, topk, fc2_row, l2pf, lamport,
             )  # fmt: skip
             fn(
                 *operands,
@@ -434,6 +501,9 @@ class MnnvlAllReduceNorm:
                 cutlass.Int64(topw_ptr),
                 cutlass.Int64(perm_ptr),
                 cutlass.Int32(self.mapping.tp_rank),
+                cutlass.Int64(pf_ptr),
+                cutlass.Int64(pf_bytes),
+                cutlass.Int64(pf_per),
                 stream,
             )
         if scale is None:
@@ -631,3 +701,73 @@ class GemmAllReduceNorm:
         if norm_out:
             return norm, quant, res_out
         return quant, res_out
+
+
+class GemmTwoShotAllReduceNorm:
+    """Row-parallel FP8 ``x @ W.T`` (tcgen05, E4M3 x) + two-shot all-reduce + residual + RMSNorm in one launch, for
+    the rows where the library all-reduce runs two-shot (above ``one_shot_threshold_bytes`` of BF16 message) up to
+    the kernel's MAX_ROWS."""
+
+    @staticmethod
+    def is_supported(mapping, dtype: torch.dtype, hidden_size: int) -> bool:
+        """As ``MnnvlAllReduceNorm``, and the kernel takes the hidden size and TP group (``supports_hidden``)."""
+        from ..kernels.blackwell import gemm_twoshot_allreduce_norm as kern
+
+        sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        return MnnvlAllReduceNorm.is_supported(
+            mapping, dtype, hidden_size
+        ) and kern.supports_hidden(hidden_size, mapping.tp_size, sms)
+
+    def __init__(
+        self, mapping, hidden_size: int, table: _LamportTable, one_shot_threshold_bytes: int
+    ):
+        from ..kernels.blackwell import gemm_twoshot_allreduce_norm as kern
+
+        self.mapping = mapping
+        self.hidden = hidden_size
+        self.table = table
+        self.min_rows = one_shot_threshold_bytes // (hidden_size * mapping.tp_size * 2) + 1
+        self.max_rows = kern.MAX_ROWS
+        self._sms = torch.cuda.get_device_properties(table.table.device).multi_processor_count
+
+    def supports(self, x: torch.Tensor, weight: torch.Tensor) -> bool:
+        from ..kernels.blackwell import gemm_twoshot_allreduce_norm as kern
+
+        return (
+            x.dim() == 2
+            and x.shape[0] <= self.max_rows
+            and kern.supports(
+                x, weight, self.hidden, self.mapping.tp_size, self._sms, self.min_rows
+            )
+        )
+
+    def takes(self, m: int, weight: torch.Tensor) -> bool:
+        """Whether a call of ``m`` rows with this weight fits, whatever its activation (checked before a BF16
+        input is quantized)."""
+        from ..kernels.blackwell import gemm_twoshot_allreduce_norm as kern
+
+        return m <= self.max_rows and kern.supports_problem(
+            m, weight, self.hidden, self.mapping.tp_size, self._sms, self.min_rows
+        )
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        scale: Optional[torch.Tensor] = None,
+        norm_out: bool = True,
+    ) -> Tuple[torch.Tensor, ...]:
+        """Outputs of ``MnnvlAllReduceNorm.__call__``."""
+        from ..kernels.blackwell import gemm_twoshot_allreduce_norm as kern
+
+        m = x.shape[0]
+        table = self.table(kern.workspace_bytes(m, self.hidden))
+        return kern.gemm_twoshot_allreduce_norm(
+            x, weight, weight_scale, input_scale, residual.contiguous(), norm_weight, eps, table,
+            self.mapping.tp_rank, self.mapping.tp_size, scale=scale, norm_out=norm_out,
+        )  # fmt: skip

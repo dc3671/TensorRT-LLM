@@ -56,6 +56,10 @@ FUSED_FRONT_MAX_TOKENS = 16
 # Largest step of the route front (route-only launch after the stock router GEMM): clusters of 8 up to 256
 # tokens, clusters of 16 (moe_route_front.ROUTE_CLUSTER_WIDE) above.
 ROUTE_FRONT_MAX_TOKENS = 1024
+# Router GEMM of the route front steps above ROUTER_MAX_TOKENS rows (DecodeFront's decode kernels): one tcgen05 launch
+# whose split-K partials are summed inside the cluster in a fixed order (kernels/blackwell/moe_router_gemm.py),
+# instead of the stock GEMM (cuBLAS + its split-K reduce). Not bitwise to it (BF16 rounding of some logits).
+ROUTER_GEMM_MAX_TOKENS = 128
 # Warps per program of the per-token route + tables kernel (one warp leaves the last program's table phase
 # serial).
 _ROUTE_WARPS = 4
@@ -64,16 +68,32 @@ SIGN_BIT = tl.constexpr(-2147483648)
 MIN_KEY = tl.constexpr(-2147483648)
 
 
-def route_front_steps(cuda_graph_batch_sizes, tokens_per_gen_step: int) -> frozenset:
+def route_front_steps(
+    cuda_graph_batch_sizes, tokens_per_gen_step: int, min_rows: int = ROUTER_MAX_TOKENS + 1
+) -> frozenset:
     """Token counts the route front takes: the CUDA-graph decode steps (``b`` draft and ``tokens_per_gen_step * b``
-    target rows per graph batch size ``b``) above the router GEMM's range. Other counts keep the stock path, so
-    the front compiles no kernel for shapes an eager step happens to have."""
+    target rows per graph batch size ``b``) from ``min_rows`` rows (default: above the router GEMM's range; a caller
+    may start right above the one-launch front's range, ``FUSED_FRONT_MAX_TOKENS + 1``). Other counts keep the stock
+    path, so the front compiles no kernel for shapes an eager step happens to have."""
     return frozenset(
         m
         for b in cuda_graph_batch_sizes
         for m in (b, tokens_per_gen_step * b)
-        if ROUTER_MAX_TOKENS < m <= ROUTE_FRONT_MAX_TOKENS
+        if min_rows <= m <= ROUTE_FRONT_MAX_TOKENS
     )
+
+
+def engine_route_steps(cuda_graph_batch_sizes, tokens_per_gen_step: int) -> frozenset:
+    """Token counts whose un-finalized MoE call the decode MoE engine routes (``DecodeFront``'s
+    ``engine_route_steps``): the CUDA-graph decode steps (``route_front_steps``) above ``ROUTER_MAX_TOKENS`` and
+    below the MoE-output all-reduce's ``TWO_SHOT_ROWS``, where the largest step (largest batch x
+    ``tokens_per_gen_step``) is below ``TWO_SHOT_ROWS`` too; none otherwise."""
+    from ....distributed.mnnvl_fused_allreduce import TWO_SHOT_ROWS
+
+    sizes = list(cuda_graph_batch_sizes)
+    if not sizes or max(sizes) * tokens_per_gen_step >= TWO_SHOT_ROWS:
+        return frozenset()
+    return frozenset(m for m in route_front_steps(sizes, tokens_per_gen_step) if m < TWO_SHOT_ROWS)
 
 
 @triton.jit
@@ -743,8 +763,9 @@ def _route_front_compile(
     top_k: int,
     a_stride: int,
     use_pdl: bool,
+    lean: bool = False,
 ):
-    key = (m, k, n, num_local, tile, top_k, a_stride, use_pdl)
+    key = (m, k, n, num_local, tile, top_k, a_stride, use_pdl, lean)
     if key in _ROUTE_FRONT_COMPILED:
         return _ROUTE_FRONT_COMPILED[key]  # None: the kernel does not take this shape
     if torch.cuda.is_current_stream_capturing():
@@ -756,26 +777,29 @@ def _route_front_compile(
     from ....kernels.blackwell.moe_route_front import (
         ROUTE_CLUSTER,
         ROUTE_CLUSTER_WIDE,
+        ROUTE_THREADS,
         MoeRouteFrontKernel,
     )
 
     wide = m > ROUTE_CLUSTER * 32  # above 256 tokens: clusters of 16
-    try:
-        kernel = MoeRouteFrontKernel(
-            num_rows=m,
-            k_extent=k,
-            num_experts=n,
-            top_k=top_k,
-            num_local=num_local,
-            tile=tile,
-            a_stride=a_stride,
-            use_pdl=use_pdl,
-            cluster=ROUTE_CLUSTER_WIDE if wide else ROUTE_CLUSTER,
-            quant_clusters=3 if wide else 7,
-        )
-    except ValueError:
+    lean = lean and not wide
+    config = dict(
+        num_rows=m,
+        k_extent=k,
+        num_experts=n,
+        top_k=top_k,
+        num_local=num_local,
+        tile=tile,
+        a_stride=a_stride,
+        cluster=ROUTE_CLUSTER_WIDE if wide else ROUTE_CLUSTER,
+        quant_clusters=3 if wide else 7,
+        threads=_route_front_threads(m, k, num_local) if lean else ROUTE_THREADS,
+        lean=lean,
+    )
+    if not MoeRouteFrontKernel.supports(**config):
         _ROUTE_FRONT_COMPILED[key] = None
         return None
+    kernel = MoeRouteFrontKernel(use_pdl=use_pdl, **config)
     z = cutlass.Int64(0)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn = (cute.compile(kernel, z, z, z, z, z, z, z, z, cutlass.Int32(0), stream), kernel.ctas)
@@ -783,9 +807,132 @@ def _route_front_compile(
     return fn
 
 
+def _route_front_threads(m: int, k: int, num_local: int) -> int:
+    """Threads per CTA of the lean route front: the fewest of 256 / 512 / 1024 that keep one token per routing warp,
+    one thread per local expert and one quantization pass at 7 quantization clusters (else 1024). Fewer threads need
+    fewer registers, so the CTAs fit beside the decode step's other kernels."""
+    tokens_per_cta = -(-m // 8)  # the lean kernel's routing cluster of 8 CTAs, one token per warp
+    for threads in (256, 512, 1024):
+        if (
+            32 * tokens_per_cta <= threads
+            and num_local <= threads
+            and m * (k // 16) <= 7 * 8 * threads
+        ):
+            return threads
+    return 1024
+
+
+_ROUTER_GEMM_COMPILED = {}
+
+
+def _router_gemm_compile(
+    m: int, k: int, n: int, a_stride: int, use_pdl: bool, engine_route: bool = False
+):
+    key = (m, k, n, a_stride, use_pdl, engine_route)
+    if key in _ROUTER_GEMM_COMPILED:
+        return _ROUTER_GEMM_COMPILED[key]  # None: the kernel does not take this shape
+    if torch.cuda.is_current_stream_capturing():
+        return None  # compile outside graph capture only (eager warmup precedes it)
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+
+    from ....kernels.blackwell.moe_router_gemm import MoeRouterGemmKernel, router_gemm_token_tile
+    from ....kernels.blackwell.utils import make_ptr
+
+    token_tile = router_gemm_token_tile(m)
+    if token_tile is None:
+        _ROUTER_GEMM_COMPILED[key] = None
+        return None
+    shape = dict(
+        num_rows=m,
+        k_extent=k,
+        num_experts=n,
+        a_stride=a_stride,
+        token_tile=token_tile,
+    )
+    if not MoeRouterGemmKernel.supports(**shape, quant=engine_route):
+        _ROUTER_GEMM_COMPILED[key] = None
+        return None
+    # engine_route: the epilogue the routing MoE engine reads, which it releases right after its own wait
+    options = dict(candidates=True, quant=True, early_release=True) if engine_route else {}
+    kernel = MoeRouterGemmKernel(use_pdl=use_pdl, **shape, **options)
+    dev = torch.device("cuda")
+    x = torch.empty((m, a_stride), dtype=torch.bfloat16, device=dev)
+    w = torch.empty((n, k), dtype=torch.bfloat16, device=dev)
+    xp = make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    wp = make_ptr(cutlass.BFloat16, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    epilogue = (cutlass.Int64(0),) * 4 if engine_route else ()
+    fn = cute.compile(kernel, xp, wp, cutlass.Int64(0), stream, *epilogue)
+    _ROUTER_GEMM_COMPILED[key] = fn
+    return fn
+
+
+class RouteFrontRouterGemm:
+    """Launcher of the route front steps' router GEMM: logits [m, E] bf16 = x @ weight.T, or None (the caller
+    then runs the stock GEMM).
+
+    ``engine_route``: the GEMM of the steps the decode MoE engine routes, which also returns each token's top
+    ``KERNEL_TOP_K`` keys per 128-expert tile (candidates [m, E / 128, KERNEL_TOP_K] int32) and the NVFP4
+    quantization of x with ``global_scale`` (xq [m, H / 2] u8, linear xsf [m, H / 16] u8)."""
+
+    engine_route: bool = False
+
+    def __init__(self, engine_route: bool = False):
+        self.engine_route = engine_route
+
+    def __call__(
+        self, x: torch.Tensor, weight: torch.Tensor, global_scale: Optional[torch.Tensor] = None
+    ):
+        m, k = x.shape
+        n = weight.shape[0]
+        if (
+            not ROUTER_MAX_TOKENS < m <= ROUTER_GEMM_MAX_TOKENS
+            or x.dtype != torch.bfloat16
+            or weight.dtype != torch.bfloat16
+            or weight.shape[1] != k
+            or not weight.is_contiguous()
+            or x.stride(1) != 1
+            or x.stride(0) % 8
+            or x.data_ptr() % 16
+            or weight.data_ptr() % 16
+        ):
+            return None
+        fn = _router_gemm_compile(m, k, n, x.stride(0), get_env_enable_pdl(), self.engine_route)
+        if fn is None:
+            return None
+        import cuda.bindings.driver as cuda
+        import cutlass
+        import cutlass.cute as cute
+
+        from ....kernels.blackwell.utils import make_ptr
+
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+        args = (
+            make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.BFloat16, weight.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            cutlass.Int64(out.data_ptr()),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
+        if not self.engine_route:
+            fn(*args)
+            return out
+        cand = torch.empty((m, n // 128, KERNEL_TOP_K), dtype=torch.int32, device=x.device)
+        xq = torch.empty((m, k // 2), dtype=torch.uint8, device=x.device)
+        xsf = torch.empty((m, k // 16), dtype=torch.uint8, device=x.device)
+        p64 = lambda t: cutlass.Int64(t.data_ptr())  # noqa: E731
+        fn(*args, p64(cand), p64(global_scale), p64(xq), p64(xsf))
+        return out, cand, xq, xsf
+
+
 class RouteFront:
     """Launcher of the route front: routing + pre-routed tables + NVFP4 x in one launch after the stock router
-    GEMM (no device state carried between launches)."""
+    GEMM (no device state carried between launches). ``lean``: up to 256 rows, the kernel's lean table build that
+    releases the MoE at the front's start (``MoeRouteFrontKernel``), bitwise to the default one."""
+
+    def __init__(self, lean: bool = False):
+        self.lean = lean
 
     def compiled(self, x: torch.Tensor, n: int, tile: int, num_local: int, top_k: int):
         """The compiled launch for this call, or None when the kernel does not take it (checked before the router
@@ -794,7 +941,7 @@ class RouteFront:
         if m > ROUTE_FRONT_MAX_TOKENS or x.stride(0) % 8 or x.data_ptr() % 16:
             return None
         return _route_front_compile(
-            m, k, n, num_local, tile, top_k, x.stride(0), get_env_enable_pdl()
+            m, k, n, num_local, tile, top_k, x.stride(0), get_env_enable_pdl(), self.lean
         )
 
     def __call__(
@@ -894,7 +1041,8 @@ class FrontRunner(TunableRunner):
     """The two ways a step of up to ``FUSED_FRONT_MAX_TOKENS`` tokens can produce the routed experts' inputs,
     timed whole by the AutoTuner (the experts after them are the same): tactic ``k_warps`` > 0 is the one-launch
     front with the router GEMM split over that many warps; tactic 0 (and the fallback -1) is the gate's own
-    projection (the low-M race's pick) followed by the route + tables launch.
+    projection (the low-M race's pick) followed by the route + tables launch. A ``fused_only`` front offers tactic
+    0 only where no warp split takes the step.
 
     Inputs: [x [m, H] bf16, NVFP4 global scale]. ``tile_of(m)``: the MoE tactic's tile for m tokens, or None."""
 
@@ -945,6 +1093,8 @@ class FrontRunner(TunableRunner):
                 and FusedFront.supports(x, w, self.num_local, tile, self.top_k, t)
             }
         )
+        if fused and self.front.fused_only:
+            return fused
         return [0, *fused]
 
     def forward(self, inputs, *, tactic=-1, do_preparation=False, **kwargs):
@@ -981,20 +1131,45 @@ class DecodeFront:
     ``route_steps``: token counts the route front takes after the stock router GEMM (``route_front_steps``);
     other counts up to ``ROUTER_MAX_TOKENS`` run the router GEMM in the front (power-of-two hidden sizes only,
     ``router_front_supports``), as one launch where the AutoTuner's race of the two (``FrontRunner``) picked it.
+    ``decode_kernels`` (declared by the model): the route front steps run the CuTe router GEMM above
+    ``ROUTER_MAX_TOKENS`` rows and the lean route front, and the steps the one-launch front takes run it
+    (``fused_only``: the race picks among its warp splits only).
+    ``engine_route_steps`` (``engine_route_steps``, within ``route_steps``): an un-finalized call of these token
+    counts whose MoE runs the decode engine (``decode_moe.engine_routes``) runs the router GEMM with each token's
+    per-tile candidates and NVFP4 x in its epilogue, and the engine routes (``PreroutedRouting.candidates``).
     """
 
-    def __init__(self, route_steps: frozenset):
+    fused_only: bool = False
+    engine_route_steps: frozenset = frozenset()
+    engine_router: Optional[RouteFrontRouterGemm] = None
+
+    def __init__(
+        self,
+        route_steps: frozenset,
+        decode_kernels: bool = False,
+        engine_route_steps: frozenset = frozenset(),
+    ):
         self.route_steps = route_steps
+        self.fused_only = decode_kernels
         self.route = RouteTables()
         self.router_gemm = RouterGemm()
         self.fused = FusedFront()
-        self.route_front = RouteFront()
+        self.route_front = RouteFront(lean=decode_kernels)
+        self.route_front_router = RouteFrontRouterGemm() if decode_kernels else None
+        self.engine_route_steps = engine_route_steps
+        if engine_route_steps:
+            self.engine_router = RouteFrontRouterGemm(engine_route=True)
         # Per token count: the MoE op's tactic, and per (token count, tile) the table buffer. A buffer first made
         # during CUDA-graph capture comes from the graph's pool and stays with the layer.
         self._tactics = {}
         self._tables = {}
         # Per token count: the FrontRunner tactic (k_warps of the one-launch front, 0 for the two launches).
         self._front_tactics = {}
+        # (ExpertL2Prefetch, layer index): un-finalized calls record their experts for the next step's prefetch.
+        self._expert_prefetch = None
+
+    def set_expert_prefetch(self, prefetch, layer_idx: int) -> None:
+        self._expert_prefetch = (prefetch, layer_idx)
 
     def _moe_tactic(self, backend, m: int) -> Optional[list]:
         tactic = self._tactics.get(m)
@@ -1003,6 +1178,15 @@ class DecodeFront:
             if tactic is not None:
                 self._tactics[m] = tactic
         return tactic
+
+    def _engine_routes(self, backend, m: int, top_k: int, num_experts: int, moe_kwargs) -> bool:
+        """Whether this call routes in the decode MoE engine: an ``engine_route_steps`` token count, un-finalized,
+        on a backend whose call takes the routing engine."""
+        if m not in self.engine_route_steps or moe_kwargs.get("do_finalize", True):
+            return False
+        from .decode_moe import engine_routes
+
+        return engine_routes(backend, m, top_k, num_experts)
 
     def _table_buffer(self, m: int, top_k: int, num_local: int, tile: int, device) -> torch.Tensor:
         flat = self._tables.get((m, tile))
@@ -1085,14 +1269,28 @@ class DecodeFront:
         local_start, num_local = backend.slot_start, backend.expert_size_per_partition
         flat = self._table_buffer(m, top_k, num_local, tile, x.device)
         gs = backend.fc31_input_scale
+        candidates = None
         if route_front:
-            fn = self.route_front.compiled(x, gate.weight.shape[0], tile, num_local, top_k)
-            if fn is None:
-                return None
-            logits = gate(x)
-            xq, xsf, ids, wts = self.route_front(
-                fn, logits, x, gs, flat, tile, local_start, num_local, top_k
-            )
+            routed = None
+            if self._engine_routes(backend, m, top_k, gate.weight.shape[0], moe_kwargs):
+                routed = self.engine_router(x, gate.weight, gs)
+            if routed is not None:
+                # the MoE engine writes ids, weights and tables from the candidates
+                logits, candidates, xq, xsf = routed
+                ids = torch.empty((m, top_k), dtype=torch.int32, device=x.device)
+                wts = torch.empty((m, top_k), dtype=torch.bfloat16, device=x.device)
+            else:
+                fn = self.route_front.compiled(x, gate.weight.shape[0], tile, num_local, top_k)
+                if fn is None:
+                    return None
+                logits = None
+                if self.route_front_router is not None:
+                    logits = self.route_front_router(x, gate.weight)
+                if logits is None:
+                    logits = gate(x)
+                xq, xsf, ids, wts = self.route_front(
+                    fn, logits, x, gs, flat, tile, local_start, num_local, top_k
+                )
         else:
             dispatcher = low_m_gemm_dispatcher(gate)
             fused = None
@@ -1117,13 +1315,18 @@ class DecodeFront:
                 logits, xq, xsf = self.router_gemm(x, gate.weight, gs)
                 ids, wts, *_ = self.route(logits, top_k, local_start, num_local, tile, flat=flat)
         x_in = Fp4QuantizedTensor(xq, xsf, is_sf_swizzled=False)
-        return moe(
+        out = moe(
             x_in,
             logits,
             output_dtype=x.dtype,
-            prerouted=PreroutedRouting(flat, tactic, ids, wts),
+            prerouted=PreroutedRouting(flat, tactic, ids, wts, candidates),
             **moe_kwargs,
         )
+        if self._expert_prefetch is not None and not moe_kwargs.get("do_finalize", True):
+            prefetch, layer_idx = self._expert_prefetch
+            _, _, batch, limit, nct, _ = prerouted_table_views(flat, m, top_k, num_local, tile)
+            prefetch.record(layer_idx, batch, limit, nct, tile, num_local, flat, rows=m)
+        return out
 
 
 __all__ = [
@@ -1132,7 +1335,9 @@ __all__ = [
     "KERNEL_NUM_EXPERTS",
     "KERNEL_TOP_K",
     "ROUTE_FRONT_MAX_TOKENS",
+    "ROUTER_GEMM_MAX_TOKENS",
     "ROUTER_MAX_TOKENS",
+    "engine_route_steps",
     "front_eligible",
     "nvfp4_quant_rows",
     "prerouted_table_sizes",

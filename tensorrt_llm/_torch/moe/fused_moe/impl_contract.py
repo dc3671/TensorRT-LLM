@@ -67,6 +67,34 @@ class MoEStaticCapability:
     supports_deep_ep_direct_metadata: bool = False
 
 
+#: ``ModelConfig.extra_attrs`` key of a model's MoEDecodeOptions.
+MOE_DECODE_OPTIONS = "moe_decode_options"
+
+
+@dataclass(frozen=True)
+class MoEDecodeOptions:
+    """MoE decode kernels a model declares at construction (``extra_attrs[MOE_DECODE_OPTIONS]``); the defaults are the
+    stock paths every other model keeps."""
+
+    # trtllm-gen FP4 op: decode-step tuning buckets and decode kernels (trtllm_gen.decode_moe.select).
+    tuning: bool = False
+    # Rows from which the decode engine releases its dependents right after its own wait (0: never).
+    early_release_rows: int = 0
+    # Rows from which the decode engine leaves SMs to a shared expert running beside it (0: never).
+    shared_expert_rows: int = 0
+    # CuTe DSL NVFP4 calls of up to this many rows load the FC2 weights evict-first (0: none).
+    fc2_weights_evict_first_rows: int = 0
+    # FlashInfer BF16: plain Renormalize routes inside the op from the router logits.
+    bf16_logits_routing: bool = False
+    # FlashInfer BF16: its logits-routed un-finalized SwiGLU runs take the BF16 decode MoE engine.
+    bf16_draft_engine: bool = False
+
+    @classmethod
+    def of(cls, extra_attrs: Dict) -> "MoEDecodeOptions":
+        """The options declared in a model config's ``extra_attrs``, else the defaults."""
+        return extra_attrs.get(MOE_DECODE_OPTIONS, cls())
+
+
 @dataclass(frozen=True)
 class MoEInputRequirement:
     """Caller-side inputs the scheduler must prepare; not a selection filter."""
@@ -709,12 +737,19 @@ class PreroutedRouting:
     (flat int32, layout of ``trtllm_gen.decode_front.prerouted_table_views``),
     the [tile, config] tactic they are built for, and the [num_tokens, top_k]
     expert ids (int32) and BF16 weights. The impl runs that tactic and skips
-    its routing kernel."""
+    its routing kernel.
+
+    ``candidates`` ([num_tokens, num_experts / 128, top_k] int32, the router
+    GEMM's per-tile top-k keys): the routing is still to be done, by the
+    decode MoE engine, which writes ``tables``, ``topk_ids`` and
+    ``topk_weights`` before it reads them
+    (``trtllm_gen.decode_moe.engine_routes``)."""
 
     tables: torch.Tensor
     tactic: List[int]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
+    candidates: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -805,6 +840,10 @@ class MoERunContext:
     # produced by a decode front end that routed the tokens itself; single
     # chunk, no communication (see PreroutedRouting)
     prerouted: Optional[PreroutedRouting] = None
+    # produced by a caller whose all-reduce polls the un-finalized FC2 rows
+    # (trtllm_gen.decode_moe.LamportFc2Buffer); one un-finalized chunk of a
+    # backend that declares ``takes_lamport_fc2_out``
+    lamport_fc2_out: Optional[torch.Tensor] = None
     # produced by per-layer dynamic EPLB; None for standard EPLB and OFF.
     replica_plan: Optional[MoEReplicaPlan] = None
     # produced by routing when the impl's ``try_route_with_sort`` routed this

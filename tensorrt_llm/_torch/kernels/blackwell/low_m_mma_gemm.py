@@ -334,8 +334,10 @@ class LowMMmaGemmKernel:
             raise ValueError(f"ksplit={ksplit} must be 1, 2, 4 or 8")
         if k_extent % (CHUNK * k_warps * ksplit):
             raise ValueError(f"K={k_extent} must be a multiple of {CHUNK * k_warps * ksplit}")
-        if not 1 <= num_rows <= 64:
-            raise ValueError(f"num_rows={num_rows} must be in [1, 64]")
+        # Up to 128 rows: loops, epilogue and shared memory scale with row_tiles. Tactics are filtered on shared memory
+        # (a launch limit); 4 x n_tiles x row_tiles FP32 accumulators per thread can only spill, which the race times.
+        if not 1 <= num_rows <= 128:
+            raise ValueError(f"num_rows={num_rows} must be in [1, 128]")
         for tiles in (n_tiles, n_tiles_bf16):
             if tiles not in (1, 2, 4):
                 raise ValueError(f"n_tiles={tiles} must be 1, 2 or 4")

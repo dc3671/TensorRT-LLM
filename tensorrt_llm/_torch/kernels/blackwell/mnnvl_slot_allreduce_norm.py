@@ -25,6 +25,12 @@ workspace without ``buffer_flags``:
   it writes regions ``n_b`` / ``n_b + 1`` only, never the one being cleared.
 * Cross-CTA norm sums use st.async onto a per-CTA mbarrier (no barrier.cluster).
 
+``ts_ctas`` > 0 (rows from ``TWO_SHOT_ROWS``): the same one-shot transport with the two-shot kernel's
+arithmetic for a two-shot launch of ``ts_ctas`` CTAs per token, so the outputs equal ``MnnvlAllReduceNormKernel``'s
+two-shot outputs bit for bit: the rank-order FP32 sum is packed to BF16 and sanitized before the residual add (the
+owner's broadcast word), the norm's sum of squares is the two-shot CTA butterfly over that CTA's warps, then summed in
+CTA order (the cluster exchange carries every warp's sum, not one per CTA), and the norm output is ``(w * x) * rstd``.
+
 Before ``griddepcontrol.wait`` only the norm weight and shared memory / cluster state are touched.
 """
 
@@ -67,10 +73,14 @@ from .mnnvl_allreduce_norm import (
     _st_shared_f32,
     _st_v2,
     _st_v4,
+    l2_prefetch_slice,
 )
 from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 SLOT_STATE_STRIDE = 128  # bytes between per-CTA state words (one L2 line each)
+#: The word FC2 never writes (0xFFFFFFFF: two BF16 0xFFFF; FC2's ``cvt.rn.satfinite.bf16x2.f32`` NaN is 0x7FFF):
+#: with ``fc2_lamport`` the MoE fold reads FC2's rows while FC2 still runs and waits per 16-byte vector for it to go.
+_FC2_SENT = -1
 
 
 @dsl_user_op
@@ -192,6 +202,9 @@ class MnnvlSlotAllReduceNormKernel:
         region_bytes: int,
         moe_topk: int = 0,
         fc2_row: int = 0,
+        l2pf: bool = False,
+        fc2_lamport: bool = False,
+        ts_ctas: int = 0,
     ):
         if hidden % (VEC * ctas) or (hidden // VEC // ctas) % 32 or hidden // VEC // ctas > 1024:
             raise ValueError(f"unsupported hidden size {hidden} for {ctas} CTAs per token")
@@ -199,6 +212,16 @@ class MnnvlSlotAllReduceNormKernel:
             raise ValueError("unsupported group / cluster size")
         if region_bytes <= 0:
             raise ValueError("the slot protocol needs region_bytes")
+        token_warps = hidden // VEC // 32
+        if ts_ctas and (
+            ts_ctas not in (1, 2, 4, 8)
+            or token_warps % ts_ctas
+            or not 1 <= token_warps // ts_ctas <= 32
+            or (token_warps // ts_ctas) & (token_warps // ts_ctas - 1)
+        ):
+            raise ValueError(f"unsupported two-shot CTA split {ts_ctas} for hidden size {hidden}")
+        # the two-shot kernel's arithmetic for its launch of ts_ctas CTAs per token (module docstring)
+        self.ts_ctas = ts_ctas
         self.hidden = hidden
         self.norm_eps = float(norm_eps)
         self.nranks = nranks
@@ -212,6 +235,16 @@ class MnnvlSlotAllReduceNormKernel:
         self.norm_out = norm_out
         self.quant = quant
         self.region_bytes = region_bytes
+        self.l2pf = l2pf  # prefetch pf_ptr's slice into L2 after this CTA's pushes
+        # fc2_lamport (moe_topk > 0): fc2 is a Lamport buffer (0xFFFFFFFF where FC2 has not written yet), polled
+        # instead of a dependency wait before the fold; FC2 is the PDL primary, the aux-stream inputs are fenced by
+        # the caller (MnnvlAllReduceNorm fc2_lamport). The vectors read are written back to 0xFFFFFFFF.
+        self.fc2_lamport = fc2_lamport
+        # fc2_lamport: outputs come from the caching allocator and may alias blocks FC2 still reads, so every store
+        # waits for the dependency (which also orders this kernel's end after FC2's).
+        self.store_wait = bool(use_pdl and fc2_lamport)
+        if fc2_lamport and not (se_fold and moe_topk > 0):
+            raise ValueError("fc2_lamport needs the in-kernel MoE finalize")
 
     @cute.jit
     def __call__(
@@ -233,6 +266,9 @@ class MnnvlSlotAllReduceNormKernel:
         topw_ptr: Int64,
         perm_ptr: Int64,
         rank: Int32,
+        pf_ptr: Int64,
+        pf_bytes: Int64,
+        pf_per: Int64,
         stream,
     ) -> None:
         m = cute.size(gRes, mode=[0])
@@ -254,6 +290,9 @@ class MnnvlSlotAllReduceNormKernel:
             topw_ptr,
             perm_ptr,
             rank,
+            pf_ptr,
+            pf_bytes,
+            pf_per,
         ).launch(
             grid=[m * self.ctas, 1, 1],
             block=[self.threads, 1, 1],
@@ -283,6 +322,9 @@ class MnnvlSlotAllReduceNormKernel:
         topw_ptr: Int64,
         perm_ptr: Int64,
         rank: Int32,
+        pf_ptr: Int64,
+        pf_bytes: Int64,
+        pf_per: Int64,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
@@ -298,9 +340,12 @@ class MnnvlSlotAllReduceNormKernel:
         lane = tidx % 32
         row_off = (Int64(tok) * Int64(vecs) + Int64(vi)) * Int64(16)
 
+        ts_ctas: cutlass.Constexpr = self.ts_ctas
+        # cluster exchange: one sum per CTA, or (ts_ctas) one per warp of the token, in global warp order
+        nsum: cutlass.Constexpr = ctas * num_warps if ts_ctas else ctas
         smem = cutlass.utils.SmemAllocator()
         red = smem.allocate_tensor(Float32, cute.make_layout((num_warps,)), byte_alignment=16)
-        csum = smem.allocate_tensor(Float32, cute.make_layout((ctas,)), byte_alignment=16)
+        csum = smem.allocate_tensor(Float32, cute.make_layout((nsum,)), byte_alignment=16)
         fl = smem.allocate_tensor(Int32, cute.make_layout((8,)), byte_alignment=16)
         red_addr = _smem_addr(red.iterator)
         csum_addr = _smem_addr(csum.iterator)
@@ -315,7 +360,7 @@ class MnnvlSlotAllReduceNormKernel:
                 _mbar_init(mbar_addr, Int32(1))
             _cluster_sync()
             if tidx == 0:
-                _mbar_expect_tx(mbar_addr, Int32(4 * ctas))
+                _mbar_expect_tx(mbar_addr, Int32(4 * nsum))
 
         # ---- before the dependency wait: only the norm weight ----
         w0, w1, w2, w3 = _ld_v4(Int64(gW.iterator.toint()) + Int64(vi) * Int64(16))
@@ -323,7 +368,7 @@ class MnnvlSlotAllReduceNormKernel:
         pk = cute.make_rmem_tensor((max(topk, 1),), Int32)
         wk = cute.make_rmem_tensor((max(topk, 1),), Int32)
 
-        if const_expr(self.use_pdl):
+        if const_expr(self.use_pdl and not self.fc2_lamport):
             griddepcontrol_wait()
 
         r0, r1, r2, r3 = _ld_v4(Int64(gRes.iterator.toint()) + row_off)
@@ -350,15 +395,47 @@ class MnnvlSlotAllReduceNormKernel:
             if const_expr(topk > 0):
                 ev = cute.make_rmem_tensor((topk * 4,), Int32)
                 for k in cutlass.range_constexpr(topk):
-                    e0, e1, e2, e3 = _ld_v4(
-                        fc2_ptr
-                        + (Int64(_max0(pk[k])) * Int64(self.fc2_row) + Int64(vi) * Int64(VEC))
-                        * Int64(2)
-                    )
+                    fa = fc2_ptr + (
+                        Int64(_max0(pk[k])) * Int64(self.fc2_row) + Int64(vi) * Int64(VEC)
+                    ) * Int64(2)
+                    if const_expr(self.fc2_lamport):
+                        # real rows only: a word has exactly one reader, which resets it (non-local k stay 0 and
+                        # are dropped by the select below)
+                        e0 = Int32(0)
+                        e1 = Int32(0)
+                        e2 = Int32(0)
+                        e3 = Int32(0)
+                        if pk[k] >= 0:
+                            e0, e1, e2, e3 = _ld_volatile_v4(fa)
+                    else:
+                        e0, e1, e2, e3 = _ld_v4(fa)
                     ev[4 * k + 0] = e0
                     ev[4 * k + 1] = e1
                     ev[4 * k + 2] = e2
                     ev[4 * k + 3] = e3
+                if const_expr(self.fc2_lamport):
+                    # Lamport: FC2 writes every word of a real row once and never the word 0xFFFFFFFF (its BF16 NaN
+                    # is 0x7FFF), so a local row's vector is complete once none of its words is that word. Non-local
+                    # k (perm < 0) read row 0 above and are dropped by the select below, as without Lamport.
+                    pending = Int32(1)
+                    while pending != 0:
+                        pending = Int32(0)
+                        for k in cutlass.range_constexpr(topk):
+                            if pk[k] >= 0:
+                                bad = Int32(0)
+                                for i in cutlass.range_constexpr(4):
+                                    if ev[4 * k + i] == Int32(_FC2_SENT):
+                                        bad = Int32(1)
+                                if bad != 0:
+                                    fb = fc2_ptr + (
+                                        Int64(pk[k]) * Int64(self.fc2_row) + Int64(vi) * Int64(VEC)
+                                    ) * Int64(2)
+                                    g0, g1, g2, g3 = _ld_volatile_v4(fb)
+                                    ev[4 * k + 0] = g0
+                                    ev[4 * k + 1] = g1
+                                    ev[4 * k + 2] = g2
+                                    ev[4 * k + 3] = g3
+                                    pending = Int32(1)
                 acc = cute.make_rmem_tensor((VEC,), Float32)
                 for e in cutlass.range_constexpr(VEC):
                     acc[e] = Float32(0.0)
@@ -375,6 +452,21 @@ class MnnvlSlotAllReduceNormKernel:
                 f1 = _pack_bf16(acc[2], acc[3])
                 f2 = _pack_bf16(acc[4], acc[5])
                 f3 = _pack_bf16(acc[6], acc[7])
+                if const_expr(self.fc2_lamport):
+                    # This thread is the only reader of these vectors: hand them back to the next FC2 (it writes
+                    # after kernel boundaries that follow this kernel's end).
+                    for k in cutlass.range_constexpr(topk):
+                        if pk[k] >= 0:
+                            fr = fc2_ptr + (
+                                Int64(pk[k]) * Int64(self.fc2_row) + Int64(vi) * Int64(VEC)
+                            ) * Int64(2)
+                            _st_v4(
+                                fr,
+                                Int32(_FC2_SENT),
+                                Int32(_FC2_SENT),
+                                Int32(_FC2_SENT),
+                                Int32(_FC2_SENT),
+                            )
             g = _lo(gw)
             s = _sigmoid_triton(g)
             x0 = _pack_bf16(_fma(s, _lo(h0), _lo(f0)), _fma(s, _hi(h0), _hi(f0)))
@@ -397,6 +489,12 @@ class MnnvlSlotAllReduceNormKernel:
             _sanitize(x3),
         )
         poll_base = own + data_off + Int64(tidx) * Int64(16)
+
+        if const_expr(self.l2pf):
+            # The next GEMM's weight into L2 after this thread's push, so the burst overlaps the poll / reduce /
+            # norm phase rather than the fold's gathers (one thread, not thread 0).
+            if tidx == self.threads - 1:
+                l2_prefetch_slice(pf_ptr, pf_bytes, pf_per, bid)
 
         # ---- PDL: release dependents once every recyclable input is consumed (a dependent's pre-wait write
         # into a recycled block must not race these reads) ----
@@ -449,16 +547,23 @@ class MnnvlSlotAllReduceNormKernel:
             for r in cutlass.range_constexpr(nranks):
                 lo = _add(lo, _lo(got[r * 4 + i]))
                 hi = _add(hi, _hi(got[r * 4 + i]))
-            res[2 * i] = _bf16r(_add(_bf16r(lo), _lo(rw[i])))
-            res[2 * i + 1] = _bf16r(_add(_bf16r(hi), _hi(rw[i])))
+            if const_expr(ts_ctas > 0):
+                # the two-shot owner's broadcast word: BF16 pair, each -0.0 as +0.0
+                sw = _sanitize(_pack_bf16(lo, hi))
+                res[2 * i] = _bf16r(_add(_lo(sw), _lo(rw[i])))
+                res[2 * i + 1] = _bf16r(_add(_hi(sw), _hi(rw[i])))
+            else:
+                res[2 * i] = _bf16r(_add(_bf16r(lo), _lo(rw[i])))
+                res[2 * i + 1] = _bf16r(_add(_bf16r(hi), _hi(rw[i])))
         out_off = Int64(gResOut.iterator.toint()) + row_off
-        _st_v4(
-            out_off,
-            _pack_bf16(res[0], res[1]),
-            _pack_bf16(res[2], res[3]),
-            _pack_bf16(res[4], res[5]),
-            _pack_bf16(res[6], res[7]),
-        )
+        if const_expr(not self.store_wait):
+            _st_v4(
+                out_off,
+                _pack_bf16(res[0], res[1]),
+                _pack_bf16(res[2], res[3]),
+                _pack_bf16(res[4], res[5]),
+                _pack_bf16(res[6], res[7]),
+            )
 
         # ---- RMSNorm: BF16 squares, per-thread sum in element order, warp / CTA / cluster sums ----
         tsum = Float32(0.0)
@@ -469,21 +574,61 @@ class MnnvlSlotAllReduceNormKernel:
         if lane == 0:
             _st_shared_f32(red_addr + Int32(4) * warp, tsum)
         cute.arch.sync_threads()
-        total = _tree_sum_smem(red_addr, num_warps)
-        if const_expr(ctas > 1):
-            if tidx < ctas:
-                _st_async_f32(csum_addr + Int32(4) * part, mbar_addr, Int32(tidx), total)
-            ready = _mbar_try_wait(mbar_addr, Int32(0))
-            while ready == 0:
+        if const_expr(ts_ctas > 0):
+            # Two-shot arithmetic: warp sums at their global warp index (part * num_warps + w), a butterfly per
+            # two-shot CTA q over warps q * wpc .., the CTA sums in order (lane 0 of a full XOR butterfly stands for
+            # every lane: commutative adds, zero lanes add +0.0 to non-negative sums).
+            wpc: cutlass.Constexpr = (ctas * num_warps) // ts_ctas
+            src = red_addr
+            if const_expr(ctas > 1):
+                src = csum_addr
+                if tidx < ctas * num_warps:
+                    _st_async_f32(
+                        csum_addr + Int32(4) * (part * Int32(num_warps) + tidx % Int32(num_warps)),
+                        mbar_addr,
+                        tidx // Int32(num_warps),
+                        _ld_shared_f32(red_addr + Int32(4) * (tidx % Int32(num_warps))),
+                    )
                 ready = _mbar_try_wait(mbar_addr, Int32(0))
-            total = Float32(0.0)
-            for p in cutlass.range_constexpr(ctas):
-                total = _add(total, _ld_shared_f32(csum_addr + Int32(4 * p)))
+                while ready == 0:
+                    ready = _mbar_try_wait(mbar_addr, Int32(0))
+            if const_expr(ts_ctas == 1):
+                total = _tree_sum_smem(src, wpc)
+            else:
+                total = Float32(0.0)
+                for q in cutlass.range_constexpr(ts_ctas):
+                    total = _add(total, _tree_sum_smem(src + Int32(4 * q * wpc), wpc))
+        else:
+            total = _tree_sum_smem(red_addr, num_warps)
+            if const_expr(ctas > 1):
+                if tidx < ctas:
+                    _st_async_f32(csum_addr + Int32(4) * part, mbar_addr, Int32(tidx), total)
+                ready = _mbar_try_wait(mbar_addr, Int32(0))
+                while ready == 0:
+                    ready = _mbar_try_wait(mbar_addr, Int32(0))
+                total = Float32(0.0)
+                for p in cutlass.range_constexpr(ctas):
+                    total = _add(total, _ld_shared_f32(csum_addr + Int32(4 * p)))
         rstd = _rsqrt(_add(_div_rn(total, Float32(float(self.hidden))), Float32(self.norm_eps)))
         y = cute.make_rmem_tensor((VEC,), Float32)
-        for i in cutlass.range_constexpr(4):  # (x * rstd) * w
-            y[2 * i] = _bf16r(_mul(_mul(res[2 * i], rstd), _lo(ww[i])))
-            y[2 * i + 1] = _bf16r(_mul(_mul(res[2 * i + 1], rstd), _hi(ww[i])))
+        if const_expr(ts_ctas > 0):
+            for i in cutlass.range_constexpr(4):  # the two-shot's (w * x) * rstd
+                y[2 * i] = _bf16r(_mul(_mul(_lo(ww[i]), res[2 * i]), rstd))
+                y[2 * i + 1] = _bf16r(_mul(_mul(_hi(ww[i]), res[2 * i + 1]), rstd))
+        else:
+            for i in cutlass.range_constexpr(4):  # (x * rstd) * w
+                y[2 * i] = _bf16r(_mul(_mul(res[2 * i], rstd), _lo(ww[i])))
+                y[2 * i + 1] = _bf16r(_mul(_mul(res[2 * i + 1], rstd), _hi(ww[i])))
+        if const_expr(self.store_wait):
+            # fc2_lamport: every store into allocator memory after the dependency wait (see __init__)
+            griddepcontrol_wait()
+            _st_v4(
+                out_off,
+                _pack_bf16(res[0], res[1]),
+                _pack_bf16(res[2], res[3]),
+                _pack_bf16(res[4], res[5]),
+                _pack_bf16(res[6], res[7]),
+            )
         if const_expr(self.norm_out):
             _st_v4(
                 Int64(gOut.iterator.toint()) + row_off,

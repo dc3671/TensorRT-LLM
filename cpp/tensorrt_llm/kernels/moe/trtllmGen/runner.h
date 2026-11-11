@@ -352,6 +352,10 @@ struct MoERunnerArgs
 
     // finalize
     bool do_finalize{true};
+
+    // Stop after FC1 (+ activation): the caller runs FC2 on workspace.gemm1_output / gemm1_output_scale with the
+    // routing tables. Requires do_finalize == false.
+    bool skip_gemm2{false};
 };
 
 struct MoEWorkspace
@@ -429,6 +433,9 @@ public:
     [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
         int32_t numLocalExperts, int32_t numTokens, int32_t validHiddenSize = -1,
         int32_t validIntermediateSize = -1) const;
+
+    // Kernel name of the FC2 (gemm2) cubin of MoE config configIndex.
+    [[nodiscard]] std::string getGemm2KernelName(int64_t configIndex) const;
 
 private:
     void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, moe::dev::convertsf::Data& convertSfData,

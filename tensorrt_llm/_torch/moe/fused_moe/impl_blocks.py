@@ -63,6 +63,10 @@ class MoEExecutionContractMixin:
     # backend has to handle a short final partition to claim it.
     _supports_non_divisible_ep: bool = False
 
+    # An un-finalized ``run_moe`` leaves its FC2 rows in
+    # ``MoERunContext.lamport_fc2_out``.
+    takes_lamport_fc2_out: bool = False
+
     def supports_moe_output_in_alltoall_workspace(self) -> bool:
         """Whether ``run_moe`` can write its output into the alltoall workspace.
 

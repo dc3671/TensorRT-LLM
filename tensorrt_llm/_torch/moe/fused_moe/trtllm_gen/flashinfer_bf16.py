@@ -16,9 +16,11 @@
 
 import torch
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.utils import ActivationType
 
 from ..impl_contract import (
+    MoEDecodeOptions,
     MoEDeployment,
     MoEEligibility,
     MoEProblem,
@@ -29,7 +31,7 @@ from ..impl_environment import MoEDep
 from ..impl_identity import register_moe_impl
 from ..interface import _reject
 from ..quantization import BF16TRTLLMGenFusedMoEMethod
-from ..routing import DeepSeekV3MoeRoutingMethod
+from ..routing import DeepSeekV3MoeRoutingMethod, RenormalizeMoeRoutingMethod, RoutingMethodType
 from .base import TrtllmGenFusedMoEBase
 from .eligibility import (
     check_flashinfer_shard_alignment,
@@ -39,6 +41,10 @@ from .eligibility import (
 )
 from .identity import PROVIDER_FLASHINFER, trtllm_gen_descriptor
 from .kernel_inputs import prepare_kernel_inputs, to_trtllm_gen_act_type
+
+# Largest expert count and top-k the in-op Renormalize routing was checked for (FlashInfer tier <512, 16>).
+_LOGITS_ROUTING_MAX_EXPERTS = 512
+_LOGITS_ROUTING_MAX_TOP_K = 16
 
 
 @register_moe_impl
@@ -57,12 +63,27 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         "FlashInfer's TRTLLM-Gen bf16 fused MoE, unquantized, SM100 family.",
     )
 
+    #: Declared by the model (``MoEDecodeOptions.bf16_logits_routing``): plain Renormalize routes inside the op from
+    #: the router logits (TopK -> Softmax), without the host-side top-k and pack launches.
+    routes_from_logits: bool = False
+    #: Declared by the model (``MoEDecodeOptions.bf16_draft_engine``): un-finalized logits-routed SwiGLU runs of up to
+    #: 32 rows take the one-launch BF16 decode MoE engine (decode_moe_bf16.py).
+    use_draft_engine: bool = False
+    #: The engine's call state, created with the weights (``cache_derived_state``).
+    _draft_engine_state: torch.Tensor | None = None
+
     #: What the FlashInfer bf16 kernels implement. Read from both sides here:
     #: the eligibility gate below and ``_check_configs``.
     _BF16_SUPPORTED_ACTIVATIONS = {
         ActivationType.Swiglu,
         ActivationType.Relu2,
     }
+
+    def __init__(self, *, model_config: ModelConfig = ModelConfig(), **kwargs):
+        super().__init__(model_config=model_config, **kwargs)
+        decode = MoEDecodeOptions.of(model_config.extra_attrs)
+        self.routes_from_logits = decode.bf16_logits_routing
+        self.use_draft_engine = self.routes_from_logits and decode.bf16_draft_engine
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
@@ -81,12 +102,35 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         The DeepSeekV3 exception stays a runtime test because routing is a
         per-layer argument, not part of the identity: that kernel's separated
         variant has accuracy issues, so its fused form is used instead.
+
+        With ``routes_from_logits`` plain Renormalize (no routing bias, up to
+        512 experts and top-16) also routes in the op, from the router logits.
         """
+        if self.routes_from_logits and self._routes_renormalize_from_logits():
+            return False
         return not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
+
+    def _routes_renormalize_from_logits(self) -> bool:
+        rm = self.routing_method
+        return (
+            rm.routing_method_type == RoutingMethodType.Renormalize
+            and not rm.requires_separated_routing
+            and isinstance(rm, RenormalizeMoeRoutingMethod)
+            and self.num_slots <= _LOGITS_ROUTING_MAX_EXPERTS
+            and 0 < rm.top_k <= _LOGITS_ROUTING_MAX_TOP_K
+        )
 
     def supports_unfinalized_output(self) -> bool:
         """``trtllm_bf16_moe`` honors ``do_finalize=False`` and returns the triple."""
         return True
+
+    def cache_derived_state(self) -> None:
+        """Also create the draft engine's call state once storage is bound (before any CUDA-graph capture)."""
+        super().cache_derived_state()
+        if self.use_draft_engine and self._draft_engine_state is None:
+            from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
+
+            self._draft_engine_state = new_state(self.w3_w1_weight.device)
 
     def _check_configs(self) -> None:
         """The unquantized kernels take no activation constants at all.
@@ -152,6 +196,12 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         del workspace  # TRTLLMGen kernels allocate their own intermediates.
         k = prepare_kernel_inputs(self, ctx)
 
+        if self._draft_engine_state is not None:
+            from . import decode_moe_bf16
+
+            if decode_moe_bf16.applies(self, k):
+                return self._unfinalized(decode_moe_bf16.run(self, k, self._draft_engine_state))
+
         result = self.op_backend.run_bf16_moe(
             router_logits=k.router_logits,
             routing_bias=k.routing_bias,
@@ -176,5 +226,7 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
             do_finalize=k.do_finalize,
         )
         if not k.do_finalize:
-            return self._unfinalized(result)
+            # The op returns the expanded -> permuted index flat; the un-finalized ABI has it [tokens, top_k].
+            out, weights, expanded_to_permuted = result
+            return self._unfinalized([out, weights, expanded_to_permuted.view(-1, k.top_k)])
         return result

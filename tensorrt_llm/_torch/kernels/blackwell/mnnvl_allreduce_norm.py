@@ -48,6 +48,9 @@ from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 VEC = 8  # BF16 per thread (one 16-byte vector)
 _NEG_ZERO = -2147483648  # 0x80000000: Lamport "not written" word (+0.0, -0.0 as BF16 pair)
+#: The word FC2 never writes (0xFFFFFFFF: two BF16 0xFFFF; FC2's ``cvt.rn.satfinite.bf16x2.f32`` NaN is 0x7FFF):
+#: with ``fc2_lamport`` the MoE fold reads FC2's rows while FC2 still runs and waits per 16-byte vector for it to go.
+_FC2_SENT = -1
 
 
 def _asm(
@@ -554,6 +557,50 @@ def _cluster_sync(*, loc=None, ip=None) -> None:
     )
 
 
+# ---- L2 prefetch of the next GEMM's weight (``l2pf``) ----
+L2PF_CHUNK = 65536
+L2PF_MAX_CHUNKS = 8  # per CTA: 512 KB
+
+
+@dsl_user_op
+def _min_s64(a: Int64, b: Int64, *, loc=None, ip=None) -> Int64:
+    return Int64(
+        _asm(
+            T.i64(),
+            [_v(Int64(a), loc, ip), _v(Int64(b), loc, ip)],
+            "min.s64 $0, $1, $2;",
+            "=l,l,l",
+            False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _prefetch_l2_bulk_if(addr: Int64, nbytes: Int64, *, loc=None, ip=None) -> None:
+    """``cp.async.bulk.prefetch.L2.global [addr], nbytes`` when nbytes > 0 (nothing to wait for)."""
+    _asm(
+        None,
+        [_v(Int64(addr), loc, ip), _v(Int64(nbytes), loc, ip)],
+        "{ .reg .pred p; .reg .b32 n; setp.gt.s64 p, $1, 0; cvt.u32.u64 n, $1; "
+        "@p cp.async.bulk.prefetch.L2.global [$0], n; }",
+        "l,l,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+
+
+def l2_prefetch_slice(pf_ptr: Int64, pf_bytes: Int64, pf_per: Int64, bid) -> None:
+    """CTA ``bid`` starts pulling bytes [bid * pf_per, min((bid + 1) * pf_per, pf_bytes)) of ``pf_ptr`` into L2
+    (``pf_per``: 16-byte multiple from the host). Straight-line: up to L2PF_MAX_CHUNKS predicated bulk prefetches."""
+    beg = Int64(bid) * pf_per
+    end = _min_s64(beg + pf_per, pf_bytes)
+    for c in range(L2PF_MAX_CHUNKS):
+        off = beg + Int64(c * L2PF_CHUNK)
+        _prefetch_l2_bulk_if(pf_ptr + off, _min_s64(end - off, Int64(L2PF_CHUNK)))
+
+
 class MnnvlAllReduceNormKernel:
     """MNNVL all-reduce + residual + RMSNorm for ``m`` tokens.
 
@@ -578,6 +625,8 @@ class MnnvlAllReduceNormKernel:
         moe_topk: int = 0,
         fc2_row: int = 0,
         tpc: int = 1,
+        l2pf: bool = False,
+        fc2_lamport: bool = False,
     ):
         if hidden % (VEC * ctas) or (hidden // VEC // ctas) % 32 or hidden // VEC // ctas > 1024:
             raise ValueError(f"unsupported hidden size {hidden} for {ctas} CTAs per token")
@@ -604,6 +653,18 @@ class MnnvlAllReduceNormKernel:
         self.norm_out = norm_out
         self.quant = quant
         self.row_bytes = hidden * 2
+        self.l2pf = l2pf  # prefetch pf_ptr's slice into L2 after this CTA's pushes
+        # fc2_lamport (moe_topk > 0): fc2 is a Lamport buffer (0xFFFFFFFF where FC2 has not written yet), polled
+        # instead of a dependency wait before the fold; FC2 is the PDL primary, the aux-stream inputs are fenced by
+        # the caller (MnnvlAllReduceNorm fc2_lamport). The vectors read are written back to 0xFFFFFFFF.
+        self.fc2_lamport = fc2_lamport
+        # fc2_lamport: outputs come from the caching allocator and may alias blocks FC2 still reads, so every store
+        # waits for the dependency (which also orders this kernel's end after FC2's).
+        self.store_wait = bool(use_pdl and fc2_lamport)
+        if fc2_lamport and not (se_fold and moe_topk > 0):
+            raise ValueError("fc2_lamport needs the in-kernel MoE finalize")
+        if fc2_lamport and tpc != 1:
+            raise ValueError("fc2_lamport is implemented for one token per CTA")
 
     @cute.jit
     def __call__(
@@ -623,6 +684,9 @@ class MnnvlAllReduceNormKernel:
         topw_ptr: Int64,
         perm_ptr: Int64,
         rank: Int32,
+        pf_ptr: Int64,
+        pf_bytes: Int64,
+        pf_per: Int64,
         stream,
     ) -> None:
         m = cute.size(gRes, mode=[0])
@@ -644,6 +708,9 @@ class MnnvlAllReduceNormKernel:
                 topw_ptr,
                 perm_ptr,
                 rank,
+                pf_ptr,
+                pf_bytes,
+                pf_per,
             ).launch(
                 grid=[(m + self.tpc - 1) // self.tpc, 1, 1],
                 block=[self.threads, 1, 1],
@@ -669,6 +736,9 @@ class MnnvlAllReduceNormKernel:
                 topw_ptr,
                 perm_ptr,
                 rank,
+                pf_ptr,
+                pf_bytes,
+                pf_per,
             ).launch(
                 grid=[m * self.ctas, 1, 1],
                 block=[self.threads, 1, 1],
@@ -697,6 +767,9 @@ class MnnvlAllReduceNormKernel:
         topw_ptr: Int64,
         perm_ptr: Int64,
         rank: Int32,
+        pf_ptr: Int64,
+        pf_bytes: Int64,
+        pf_per: Int64,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
@@ -733,7 +806,7 @@ class MnnvlAllReduceNormKernel:
         owner = tok % Int32(nranks)  # the rank that reduces this token
         peer = _ld_s64(Int64(tbl) + Int64(24) + Int64(owner) * Int64(8))
 
-        if const_expr(self.use_pdl):
+        if const_expr(self.use_pdl and not self.fc2_lamport):
             griddepcontrol_wait()
 
         # ---- this rank's inputs, issued ahead of the flag loads so the barrier below waits one latency ----
@@ -785,15 +858,47 @@ class MnnvlAllReduceNormKernel:
             if const_expr(self.moe_topk > 0):
                 ev = cute.make_rmem_tensor((topk * 4,), Int32)
                 for k in cutlass.range_constexpr(topk):
-                    e0, e1, e2, e3 = _ld_v4(
-                        fc2_ptr
-                        + (Int64(_max0(pk[k])) * Int64(self.fc2_row) + Int64(vi) * Int64(VEC))
-                        * Int64(2)
-                    )
+                    fa = fc2_ptr + (
+                        Int64(_max0(pk[k])) * Int64(self.fc2_row) + Int64(vi) * Int64(VEC)
+                    ) * Int64(2)
+                    if const_expr(self.fc2_lamport):
+                        # real rows only: a word has exactly one reader, which resets it (non-local k stay 0 and
+                        # are dropped by the select below)
+                        e0 = Int32(0)
+                        e1 = Int32(0)
+                        e2 = Int32(0)
+                        e3 = Int32(0)
+                        if pk[k] >= 0:
+                            e0, e1, e2, e3 = _ld_volatile_v4(fa)
+                    else:
+                        e0, e1, e2, e3 = _ld_v4(fa)
                     ev[4 * k + 0] = e0
                     ev[4 * k + 1] = e1
                     ev[4 * k + 2] = e2
                     ev[4 * k + 3] = e3
+                if const_expr(self.fc2_lamport):
+                    # Lamport: FC2 writes every word of a real row once and never the word 0xFFFFFFFF (its BF16 NaN
+                    # is 0x7FFF), so a local row's vector is complete once none of its words is that word. Non-local
+                    # k (perm < 0) read row 0 above and are dropped by the select below, as without Lamport.
+                    pending = Int32(1)
+                    while pending != 0:
+                        pending = Int32(0)
+                        for k in cutlass.range_constexpr(topk):
+                            if pk[k] >= 0:
+                                bad = Int32(0)
+                                for i in cutlass.range_constexpr(4):
+                                    if ev[4 * k + i] == Int32(_FC2_SENT):
+                                        bad = Int32(1)
+                                if bad != 0:
+                                    fb = fc2_ptr + (
+                                        Int64(pk[k]) * Int64(self.fc2_row) + Int64(vi) * Int64(VEC)
+                                    ) * Int64(2)
+                                    g0, g1, g2, g3 = _ld_volatile_v4(fb)
+                                    ev[4 * k + 0] = g0
+                                    ev[4 * k + 1] = g1
+                                    ev[4 * k + 2] = g2
+                                    ev[4 * k + 3] = g3
+                                    pending = Int32(1)
                 acc = cute.make_rmem_tensor((VEC,), Float32)
                 for e in cutlass.range_constexpr(VEC):
                     acc[e] = Float32(0.0)
@@ -810,6 +915,21 @@ class MnnvlAllReduceNormKernel:
                 f1 = _pack_bf16(acc[2], acc[3])
                 f2 = _pack_bf16(acc[4], acc[5])
                 f3 = _pack_bf16(acc[6], acc[7])
+                if const_expr(self.fc2_lamport):
+                    # This thread is the only reader of these vectors: hand them back to the next FC2 (it writes
+                    # after kernel boundaries that follow this kernel's end).
+                    for k in cutlass.range_constexpr(topk):
+                        if pk[k] >= 0:
+                            fr = fc2_ptr + (
+                                Int64(pk[k]) * Int64(self.fc2_row) + Int64(vi) * Int64(VEC)
+                            ) * Int64(2)
+                            _st_v4(
+                                fr,
+                                Int32(_FC2_SENT),
+                                Int32(_FC2_SENT),
+                                Int32(_FC2_SENT),
+                                Int32(_FC2_SENT),
+                            )
             g = _lo(gw)
             s = _sigmoid_triton(g)
             x0 = _pack_bf16(_fma(s, _lo(h0), _lo(f0)), _fma(s, _hi(h0), _hi(f0)))
@@ -831,6 +951,12 @@ class MnnvlAllReduceNormKernel:
             _sanitize(x2),
             _sanitize(x3),
         )
+
+        if const_expr(self.l2pf):
+            # The next GEMM's weight into L2 after this thread's push, so the burst overlaps the poll / reduce /
+            # norm phase rather than the fold's gathers (one thread, not thread 0).
+            if tidx == self.threads - 1:
+                l2_prefetch_slice(pf_ptr, pf_bytes, pf_per, bid)
 
         # ---- PDL: release dependents only after every allocator-recyclable input is consumed by the whole CTA
         # (a dependent's pre-wait write into a recycled block must not race these reads). After this only the
@@ -912,13 +1038,14 @@ class MnnvlAllReduceNormKernel:
             res[2 * i] = _bf16r(_add(_lo(got[i]), _lo(rw[i])))
             res[2 * i + 1] = _bf16r(_add(_hi(got[i]), _hi(rw[i])))
         out_off = Int64(gResOut.iterator.toint()) + row_off
-        _st_v4(
-            out_off,
-            _pack_bf16(res[0], res[1]),
-            _pack_bf16(res[2], res[3]),
-            _pack_bf16(res[4], res[5]),
-            _pack_bf16(res[6], res[7]),
-        )
+        if const_expr(not self.store_wait):
+            _st_v4(
+                out_off,
+                _pack_bf16(res[0], res[1]),
+                _pack_bf16(res[2], res[3]),
+                _pack_bf16(res[4], res[5]),
+                _pack_bf16(res[6], res[7]),
+            )
 
         # ---- RMSNorm: BF16 squares, per-thread sum in element order, warp / CTA / cluster sums ----
         tsum = Float32(0.0)
@@ -949,6 +1076,16 @@ class MnnvlAllReduceNormKernel:
         for i in cutlass.range_constexpr(4):
             y[2 * i] = _bf16r(_mul(_mul(_lo(ww[i]), res[2 * i]), rstd))
             y[2 * i + 1] = _bf16r(_mul(_mul(_hi(ww[i]), res[2 * i + 1]), rstd))
+        if const_expr(self.store_wait):
+            # fc2_lamport: every store into allocator memory after the dependency wait (see __init__)
+            griddepcontrol_wait()
+            _st_v4(
+                out_off,
+                _pack_bf16(res[0], res[1]),
+                _pack_bf16(res[2], res[3]),
+                _pack_bf16(res[4], res[5]),
+                _pack_bf16(res[6], res[7]),
+            )
         if const_expr(self.norm_out):
             _st_v4(
                 Int64(gOut.iterator.toint()) + row_off,
@@ -1078,6 +1215,9 @@ class MnnvlAllReduceNormKernel:
         topw_ptr: Int64,
         perm_ptr: Int64,
         rank: Int32,
+        pf_ptr: Int64,
+        pf_bytes: Int64,
+        pf_per: Int64,
     ) -> None:
         """BF16 two-shot, ``tpc`` consecutive tokens per CTA (module docstring); per token the ``kernel`` path's
         arithmetic (two-shot, BF16, ctas == 1)."""
@@ -1169,6 +1309,12 @@ class MnnvlAllReduceNormKernel:
                 _sanitize(x2),
                 _sanitize(x3),
             )
+
+        if const_expr(self.l2pf):
+            # The next GEMM's weight into L2 after this thread's push, so the burst overlaps the poll / reduce /
+            # norm phase rather than the fold's gathers (one thread, not thread 0).
+            if tidx == self.threads - 1:
+                l2_prefetch_slice(pf_ptr, pf_bytes, pf_per, bid)
 
         # ---- PDL: every input consumed (the residual words went to smem, x to the scatter) by every thread ----
         if const_expr(self.use_pdl):

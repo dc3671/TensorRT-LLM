@@ -14,7 +14,8 @@
 # limitations under the License.
 """The CuTe DSL all-reduce + residual + RMSNorm kernels of MNNVLAllReduce against an FP32 reference over
 all ranks' inputs: the slot (one-shot) and two-shot launches, the shared-expert gate fold (with or
-without the in-kernel MoE finalize), the FP8 output, and the FP8 GEMM + all-reduce + norm launch."""
+without the in-kernel MoE finalize), the FP8 output, the FP8 GEMM + all-reduce + norm launches (one-shot and
+two-shot), and the TP2 large-message all-reduce + norm (Tp2AllReduceNorm)."""
 
 import os
 import pickle
@@ -220,6 +221,54 @@ def _moe_fold_cases(tp, top_k=10):
         _check(res, ref_res, ("finalized fold residual", m))
 
 
+def _moe_fold_lamport_cases(tp, top_k=10):
+    """fc2 rows in a Lamport FC2 buffer (0xFFFFFFFF where not written; MoEAllReduceParams.fc2_lamport): the fold
+    polls them instead of waiting, gives the plain fold's outputs bit for bit and writes the rows it read back to
+    0xFFFFFFFF. Consecutive calls reuse the buffer, as consecutive MoE layers do."""
+    ar, rank = _mnnvl(tp)
+    norm_weight = _rand((H,), 4, 0.1) + 1
+    cap = 128 * top_k + 16
+    buf = torch.full((cap, H), -1, dtype=torch.int16, device="cuda").view(torch.bfloat16)
+    for m in (1, 7, 32, 63, 64, 96, 128):
+        assert ar.supports_moe_fold(m, H), m
+        s = 2000 * m + 10 * rank
+        g = torch.Generator(device="cuda").manual_seed(s + 1)
+        perm = torch.randperm(m * top_k + 16, generator=g, device="cuda")[: m * top_k]
+        perm = perm.view(m, top_k).to(torch.int32)
+        rows = perm.flatten().long()
+        fc2 = _rand((m * top_k + 16, H), s)
+        topw = torch.softmax(_rand((m, top_k), s + 2, dtype=torch.float32), -1).to(torch.bfloat16)
+        shared = _rand((m, H), s + 3)
+        gate = _rand((m, 1), s + 4)
+        residual = _rand((m, H), 9 * m)
+        outs = []
+        for lamport in (False, True):
+            src = fc2
+            if lamport:
+                buf[rows] = fc2[rows]
+                src = buf
+            params = MoEAllReduceParams(
+                expanded_idx_to_permuted_idx=perm,
+                expert_scale_factor=topw,
+                shared_expert_output=shared,
+                shared_expert_gate=gate,
+                residual=residual,
+                norm_weight=norm_weight,
+                eps=EPS,
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                fc2_lamport=lamport,
+            )
+            outs.append(ar(src, all_reduce_params=params))
+        torch.cuda.synchronize()
+        for plain, polled, tag in zip(outs[0], outs[1], ("norm", "residual")):
+            assert torch.equal(plain.view(torch.int16), polled.view(torch.int16)), (
+                "lamport",
+                tag,
+                m,
+            )
+        assert bool((buf.view(torch.int32) == -1).all()), ("lamport rows not reset", m)
+
+
 def _gemm_norm_cases(tp, k=1024):
     from tensorrt_llm._torch.modules.low_m_mma_gemm import default_tactic
 
@@ -256,6 +305,137 @@ def _gemm_norm_cases(tp, k=1024):
             norm, res = out
             _check(norm, ref_norm, ("gemm norm", m, fp8_payload))
             _check(res, ref_res, ("gemm residual", m, fp8_payload))
+
+
+def _gemm_twoshot_cases(tp, k=1024):
+    """The tcgen05 FP8 GEMM + two-shot all-reduce + norm launch (GemmTwoShotAllReduceNorm) over its rows, with and
+    without the FP8 output, and an E4M3 or BF16 input."""
+    ar, rank = _mnnvl(tp)
+    assert ar.gemm_twoshot is not None, "GEMM + two-shot all-reduce + norm kernel not built"
+    norm_weight = _rand((H,), 5, 0.1) + 1
+    weight_scale = torch.tensor([0.02], dtype=torch.float32, device="cuda")
+    input_scale = torch.tensor([4.0 / 448], dtype=torch.float32, device="cuda")
+    scale = torch.tensor([0.05], dtype=torch.float32, device="cuda")
+    probe = torch.empty((H, k), dtype=torch.float8_e4m3fn, device="cuda")
+    for m in (9, 17, 33, 56, 64, 65, 96, 128):
+        if not ar.gemm_twoshot.takes(m, probe):
+            continue
+        outs, args = [], None
+        for r in range(tp):
+            x = _rand((m, k), 91 * m + r)
+            w = _rand((H, k), 6000 + r, 4.0).to(torch.float8_e4m3fn)
+            xq = (x.float() / input_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+            outs.append((xq.float() @ w.float().t()) * input_scale * weight_scale)
+            if r == rank:
+                args = (x, xq, w)
+        residual = _rand((m, H), 13 * m)
+        ref_norm, ref_res = _ref_norm(sum(outs), residual, norm_weight)
+        x, xq, w = args
+        for inp in (xq, x):
+            params = AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual,
+                norm_weight=norm_weight,
+                eps=EPS,
+            )
+            out = ar.gemm_twoshot_allreduce_norm(inp, w, weight_scale, input_scale, params)
+            assert out is not None, ("GEMM + two-shot declined", m, inp.dtype)
+            norm, res = out
+            _check(norm, ref_norm, ("gemm two-shot norm", m, inp.dtype))
+            _check(res, ref_res, ("gemm two-shot residual", m, inp.dtype))
+        params = AllReduceParams(
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
+            residual=residual,
+            norm_weight=norm_weight,
+            eps=EPS,
+            scale=scale,
+        )
+        norm, fp8, res = ar.gemm_twoshot_allreduce_norm(xq, w, weight_scale, input_scale, params)
+        _check(norm, ref_norm, ("gemm two-shot norm with fp8", m))
+        _check(fp8.float() * scale, ref_norm.clamp(-448 * 0.05, 448 * 0.05), ("fp8", m), rtol=7e-2)
+
+
+def test_gemm_twoshot_rows() -> None:
+    """The two-shot GEMM kernel takes a call from the library's first two-shot row count (one more than the one-shot
+    message size holds: 17 at TP8 / H 4096) and only where every owner item has a thread: all of its rows at TP8 /
+    TP16, fewer at TP4 / TP2 (a rank owns more slices)."""
+    from tensorrt_llm._torch.distributed.ops import _MNNVL_ONE_SHOT_THRESHOLD_BYTES as one_shot
+    from tensorrt_llm._torch.kernels.blackwell import gemm_twoshot_allreduce_norm as kern
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    min_rows = {tp: one_shot // (H * tp * 2) + 1 for tp in (2, 4, 8, 16)}
+    for tp, m in min_rows.items():
+        assert (m - 1) * H * tp * 2 <= one_shot < m * H * tp * 2
+    if one_shot == 64 * 1024 * 8 * 2:
+        assert min_rows == {2: 65, 4: 33, 8: 17, 16: 9}
+    fits = {
+        tp: [
+            m
+            for m in range(1, kern.MAX_ROWS + 1)
+            if kern.supports_rows(m, H, tp, sms, min_rows[tp])
+        ]
+        for tp in (2, 4, 8, 16)
+    }
+    for tp in (8, 16):
+        assert fits[tp] == [
+            m for m in range(min_rows[tp], kern.MAX_ROWS + 1) if kern._replayable(m, H, sms)
+        ]
+    assert not fits[2] and all(m <= 64 for m in fits[4])
+    assert not kern.supports_hidden(2 * H, 8, sms)
+    assert not kern.supports_hidden(H // 2, 8, sms)
+
+
+def _tp2_cases(tp, max_tokens=4096):
+    """Tp2AllReduceNorm (TP2 without MNNVL, large messages): residual RMSNorm with and without the FP8 output, at
+    hidden sizes of 8 and 16 reference warps."""
+    from tensorrt_llm._torch.distributed.tp2_allreduce import Tp2AllReduceNorm
+
+    if tp != 2:
+        return
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
+    assert not Tp2AllReduceNorm.is_supported(mapping, H + 128, max_tokens)
+    assert not Tp2AllReduceNorm.is_supported(mapping, 4 * H, max_tokens)
+    for hidden in (H, H // 2):
+        _tp2_hidden_cases(tp, rank, mapping, hidden, max_tokens)
+
+
+def _tp2_hidden_cases(tp, rank, mapping, hidden, max_tokens):
+    from tensorrt_llm._torch.distributed.tp2_allreduce import Tp2AllReduceNorm
+
+    assert Tp2AllReduceNorm.is_supported(mapping, hidden, max_tokens)
+    ar = Tp2AllReduceNorm(mapping, hidden, max_tokens)
+    norm_weight = _rand((hidden,), 6, 0.1) + 1
+    scale = torch.tensor([0.05], dtype=torch.float32, device="cuda")
+    for m in (Tp2AllReduceNorm.MIN_TOKENS, 3001, max_tokens):
+        xs = [_rand((m, hidden), 300 * m + r) for r in range(tp)]
+        residual = _rand((m, hidden), 17 * m)
+        ref_norm, ref_res = _ref_norm(sum(x.float() for x in xs), residual, norm_weight)
+        op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+        assert ar.supports(xs[rank], op, residual, norm_weight)
+        assert not ar.supports(xs[rank], op, residual.float(), norm_weight)
+        assert not ar.supports(xs[rank], op, residual[:-1], norm_weight)
+        assert not ar.supports(xs[rank], op, residual, norm_weight.float())
+        norm, res = ar(
+            xs[rank], residual, norm_weight, EPS, AllReduceFusionOp.RESIDUAL_RMS_NORM, None
+        )
+        _check(norm, ref_norm, ("tp2 norm", m))
+        _check(res, ref_res, ("tp2 residual", m))
+        fp8, res = ar(
+            xs[rank],
+            residual,
+            norm_weight,
+            EPS,
+            AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+            scale,
+        )
+        _check(
+            fp8.float() * scale, ref_norm.clamp(-448 * 0.05, 448 * 0.05), ("tp2 fp8", m), rtol=7e-2
+        )
+        _check(res, ref_res, ("tp2 fp8 residual", m))
+    big = _rand((max_tokens + 1, hidden), 1)
+    assert not ar.supports(big, AllReduceFusionOp.RESIDUAL_RMS_NORM, big, norm_weight)
 
 
 def _meta_init_cases(tp):
@@ -308,7 +488,10 @@ CASES = {
     "norm": _norm_cases,
     "large_hidden_norm": _large_hidden_norm_cases,
     "moe_fold": _moe_fold_cases,
+    "moe_fold_lamport": _moe_fold_lamport_cases,
     "gemm_norm": _gemm_norm_cases,
+    "gemm_twoshot": _gemm_twoshot_cases,
+    "tp2": _tp2_cases,
     "meta_init": _meta_init_cases,
     "opt_in": _opt_in_cases,
 }

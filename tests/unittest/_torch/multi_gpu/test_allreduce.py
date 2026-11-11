@@ -328,6 +328,54 @@ def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
         assert r is True
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("seq_len", [1, 7, 300], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("hidden_size", [128, 4096, 7168],
+                         ids=lambda x: f"hidden:{x}")
+@pytest.mark.parametrize("fusion_op", [
+    pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+                 id="residual_rms_norm_quant_fp8"),
+    pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
+                 id="residual_rms_norm_out_quant_fp8"),
+])
+@torch.inference_mode()
+def test_nccl_residual_rms_norm_quant_fp8_bitwise(seq_len, hidden_size,
+                                                  fusion_op):
+    """The NCCL fallback's fused residual + RMSNorm + FP8 quantize (one kernel where the hidden size allows it) is
+    bit for bit RESIDUAL_RMS_NORM followed by the static per-tensor quantize (one-rank group: the same post-reduce
+    path)."""
+    torch.manual_seed(0)
+    x = torch.randn((seq_len, hidden_size), dtype=torch.bfloat16, device="cuda")
+    residual = torch.randn_like(x)
+    norm_weight = torch.randn((hidden_size, ),
+                              dtype=torch.bfloat16,
+                              device="cuda")
+    scale = torch.tensor(0.37, dtype=torch.float32, device="cuda")
+
+    def run(op):
+        return torch.ops.trtllm.allreduce(input=x,
+                                          residual=residual,
+                                          norm_weight=norm_weight,
+                                          scale=scale,
+                                          bias=None,
+                                          workspace=None,
+                                          group=[0],
+                                          strategy=AllReduceStrategy.NCCL,
+                                          op=op,
+                                          eps=1e-5,
+                                          trigger_completion_at_end=True)
+
+    norm, residual_out = run(AllReduceFusionOp.RESIDUAL_RMS_NORM)
+    ref_quant, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+        norm, scale)
+    outputs = run(fusion_op)
+    if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
+        assert torch.equal(outputs[0], norm)
+    assert torch.equal(outputs[-2].view(torch.uint8),
+                       ref_quant.view(torch.uint8))
+    assert torch.equal(outputs[-1], residual_out)
+
+
 @torch.inference_mode()
 def run_moe_allreduce_op(token_input: torch.Tensor, residual: torch.Tensor,
                          active_experts_token_input: torch.Tensor,

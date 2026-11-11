@@ -68,6 +68,10 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
     #: pre-routed entry point).
     supports_prerouted_routing: bool = False
 
+    #: The decode MoE engine's call state where the model declares its decode kernels (``decode_tuning``),
+    #: created with the weights (``cache_derived_state``).
+    decode_engine_state: torch.Tensor | None = None
+
     def _intermediate_size_padded(self) -> int:
         act_type = to_trtllm_gen_act_type(self.activation_type)
         factor = 1 if act_type in [ActType_TrtllmGen.Relu2, ActType_TrtllmGen.Silu] else 2
@@ -167,7 +171,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
                 )
 
     def cache_derived_state(self) -> None:
-        """Refill the SiTu soft-caps after meta-device materialization.
+        """Create the decode engine's call state; refill the SiTu soft-caps after meta-device materialization.
 
         The model loader calls this on every module once storage is bound,
         because materialization wipes anything that is not a checkpoint tensor,
@@ -177,6 +181,10 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         meta at that point, so a snapshot would carry no values.
         """
         super().cache_derived_state()
+        if self.decode_tuning and self.decode_engine_state is None:
+            from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
+
+            self.decode_engine_state = new_state(self.w3_w1_weight.device)
         if not self.is_situ_activation:
             return
         params = materialize_activation_params(
@@ -200,6 +208,8 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         prerouted = ctx.prerouted
         if prerouted is not None and not self.supports_prerouted_routing:
             raise ValueError(f"{type(self).__name__} does not take prerouted routing")
+        if ctx.lamport_fc2_out is not None and not self.takes_lamport_fc2_out:
+            raise ValueError(f"{type(self).__name__} does not take a Lamport FC2 output")
 
         act_type = to_trtllm_gen_act_type(self.activation_type)
         intermediate_size_per_partition_padded = self._intermediate_size_padded()
@@ -251,6 +261,10 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             use_dp=self.use_dp,
             prerouted=prerouted,
             decode_tuning=self.decode_tuning,
+            decode_engine_state=self.decode_engine_state,
+            lamport_fc2_out=ctx.lamport_fc2_out,
+            decode_early_release_rows=self.decode_early_release_rows,
+            decode_shared_expert_rows=self.decode_shared_expert_rows,
         )
 
         if not k.do_finalize:

@@ -176,10 +176,17 @@ class MoEOpBackend:
         use_dp: bool = False,
         prerouted: Optional[PreroutedRouting] = None,
         decode_tuning: bool = False,
+        decode_engine_state: Optional[torch.Tensor] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
+        decode_early_release_rows: int = 0,
+        decode_shared_expert_rows: int = 0,
     ) -> List[torch.Tensor]:
         """Run FP4 block scale MoE computation. ``prerouted``: routing the caller
         computed (native op backend only). ``decode_tuning``: the native NVFP4 op
-        tunes for the model's decode steps (``FP4BlockScaleMoERunner``)."""
+        tunes for the model's decode steps and runs its decode kernels
+        (``FP4BlockScaleMoERunner``); ``decode_engine_state`` /
+        ``lamport_fc2_out`` / ``decode_early_release_rows`` /
+        ``decode_shared_expert_rows``: see ``fp4_block_scale_moe_runner``."""
         raise NotImplementedError
 
     def run_bf16_moe(
@@ -348,6 +355,10 @@ class TRTLLMOpBackend(MoEOpBackend):
         use_dp=False,
         prerouted=None,
         decode_tuning=False,
+        decode_engine_state=None,
+        lamport_fc2_out=None,
+        decode_early_release_rows=0,
+        decode_shared_expert_rows=0,
     ):
         # The native runners take the block scales as one flat linear-layout
         # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
@@ -462,9 +473,16 @@ class TRTLLMOpBackend(MoEOpBackend):
                     prerouted_ids=None if prerouted is None else prerouted.topk_ids,
                     prerouted_weights=None if prerouted is None else prerouted.topk_weights,
                     prerouted_tactic=None if prerouted is None else prerouted.tactic,
+                    prerouted_candidates=None if prerouted is None else prerouted.candidates,
                     decode_tuning=decode_tuning,
+                    decode_engine_state=decode_engine_state,
+                    lamport_fc2_out=lamport_fc2_out,
+                    decode_early_release_rows=decode_early_release_rows,
+                    decode_shared_expert_rows=decode_shared_expert_rows,
                 )
                 if not do_finalize:
+                    if lamport_fc2_out is not None:
+                        outputs = [lamport_fc2_out, *outputs[1:]]
                     if prerouted is not None:
                         # The op returns the FC2 rows; the top-k weights and the
                         # expanded -> permuted index (head of the tables) are ours.
@@ -697,9 +715,10 @@ class FlashinferOpBackend(MoEOpBackend):
                 activation_type=activation_type,
             )
         else:
-            packed_topk_ids = (topk_ids.to(torch.int32) << 16) | topk_weights.to(
-                torch.bfloat16
-            ).contiguous().view(torch.int16).to(torch.int32)
+            # One launch, bit-identical to the four elementwise ops of the torch expression.
+            from .trtllm_gen.topk_pack import pack_topk_bf16
+
+            packed_topk_ids = pack_topk_bf16(topk_ids, topk_weights)
             result = self._fused_moe.trtllm_bf16_routed_moe(
                 packed_topk_ids,
                 hidden_states,

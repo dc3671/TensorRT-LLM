@@ -256,6 +256,36 @@ def test_shared_expert_module_path(inter, monkeypatch, m=7):
     assert looked_up == plain_fp8_input
 
 
+@pytest.mark.parametrize("inter", [512, 64])  # TP2 / TP16 shards of a 1024-wide shared expert
+def test_shared_expert_race_candidates_launch(inter, m=128):
+    """Every tactic the shared expert's two races offer at the row ceiling fits the shard and the kernel's shared
+    memory, and launches with the output of the heuristic tactic."""
+    k = 4096
+    w_gu, s_gu = _fp8_weight(2 * inter, k, 50)
+    w_dn, s_dn = _fp8_weight(k, inter, 51)
+    gate_w = torch.zeros(8, k, dtype=torch.bfloat16, device="cuda")
+    gate_w[:1] = _bf16_weight(1, k, 52)
+    x = _act(m, k, 53)
+    s_dn_in = torch.tensor(0.05, device="cuda")
+    up_inputs = [x, L.swiglu_pairs(w_gu), gate_w, s_gu, _scale(x), s_dn_in]
+    up = L._SharedExpertLaunchRunner(swiglu=True)
+    ref_h8, ref_gate = up(up_inputs, tactic=-1)
+    tactics = up.get_valid_tactics(up_inputs, None)
+    assert tactics
+    for tactic in tactics:
+        h8, gate = up(up_inputs, tactic=tactic)
+        codes = (h8.view(torch.uint8).int() - ref_h8.view(torch.uint8).int()).abs()
+        assert codes.max().item() <= 1, tactic
+        _assert_close(gate, ref_gate)
+    down_inputs = [ref_h8, w_dn, s_dn, s_dn_in]
+    down = L._SharedExpertLaunchRunner(swiglu=False)
+    ref = down(down_inputs, tactic=-1)
+    tactics = down.get_valid_tactics(down_inputs, None)
+    assert tactics
+    for tactic in tactics:
+        _assert_close(down(down_inputs, tactic=tactic), ref)
+
+
 @pytest.mark.parametrize("tp16,n,pad", [(False, 1, False), (True, 4, False), (False, 2, True)])
 def test_gdn_conv_epilogue_bitwise(tp16, n, pad):
     """The conv epilogue equals the plain launch + Triton causal_conv1d_update bitwise (conv outputs, raw z / ba

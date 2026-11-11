@@ -3281,7 +3281,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      tile_size: int,
                      output_dtype: torch.dtype,
                      scaling_vector_size: int = 16,
-                     use_expert_counts: bool = False):
+                     use_expert_counts: bool = False,
+                     weights_evict_first: bool = False):
             super().__init__()
             self.num_experts = num_experts
             self.top_k = top_k
@@ -3298,6 +3299,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raise ValueError("Expert-count scheduling requires top_k=1")
             self.fc2_n_tile_size_override = (
                 _get_cutedsl_fc2_n_tile_size_override())
+            self.weights_evict_first = weights_evict_first
 
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -3325,6 +3327,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     "fc2_n_tile_size_override",
                     self.fc2_n_tile_size_override,
                 )
+            if self.weights_evict_first:
+                runner_id += ("weights_evict_first", )
             return runner_id
 
         def _get_default_tactic(
@@ -3538,7 +3542,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             cache_key = (self.scaling_vector_size, self.tile_size, mma_tiler_mn,
                          cluster_shape_mn, raster_along_m,
-                         self.use_expert_counts, self.num_local_experts)
+                         self.use_expert_counts, self.num_local_experts,
+                         self.weights_evict_first)
             if cache_key not in self.__class__.kernel_cache:
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
@@ -3547,6 +3552,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raster_along_m=raster_along_m,
                     use_expert_counts=self.use_expert_counts,
                     num_local_experts=self.num_local_experts,
+                    weights_evict_first=self.weights_evict_first,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -3634,7 +3640,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
+        weights_evict_first: bool = False,
     ) -> None:
+        """``weights_evict_first``: load the expert weights (B / SFB) with an L2 evict_first policy (same math)."""
         tuner = AutoTuner.get()
         if expert_counts is None and expert_capacity != 0:
             raise ValueError(
@@ -3656,7 +3664,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size,
             output_dtype,
             scaling_vector_size,
-            use_expert_counts=expert_counts is not None)
+            use_expert_counts=expert_counts is not None,
+            weights_evict_first=weights_evict_first)
 
         inputs = [
             input, weight, input_scale, weight_scale, alpha, output,
@@ -3696,6 +3705,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         scaling_vector_size: int = 16,
         expert_counts: Optional[torch.Tensor] = None,
         expert_capacity: int = 0,
+        weights_evict_first: bool = False,
     ) -> None:
         num_tokens = token_final_scales.size(0)
         n = weight.size(1)

@@ -628,6 +628,12 @@ def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
         assert set(spec.gen_tuning_buckets) & set(range(1, 129)) == set(pow2)
         assert [spec.map_to_tuning_buckets(m) for m in (7, 14, 28, 130)] == [4, 8, 16, 128]
 
+    # Only the declaring model's tuning cache key carries the flag.
+    runner = FP4BlockScaleMoERunner(
+        512, 10, None, None, 512, 0, 64, None, 1, False, 0, decode_tuning=decode_tuning
+    )
+    assert runner.unique_id() == (10, 512, 64, 0) + ((True,) if decode_tuning else ())
+
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
@@ -6888,6 +6894,26 @@ def _chunking_moe(backend, num_chunks: int) -> SimpleNamespace:
         _load_balancer_done_set_cpu_stage=no_op,
         _maybe_get_perfect_router_expert_ids=lambda token_selected_experts: token_selected_experts,
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "comm,dp_padding", [(object(), False), (None, True)], ids=["comm", "dp_padding"]
+)
+def test_lamport_fc2_out_rejects_communication_and_padding(comm, dp_padding):
+    """The MoE-output all-reduce polls the Lamport FC2 rows of this rank's tokens only, as prerouted routing."""
+    moe = _chunking_moe(SimpleNamespace(takes_lamport_fc2_out=True), num_chunks=1)
+    moe.comm = comm
+    with pytest.raises(ValueError, match="without communication or padding"):
+        ExternalCommMoEScheduler(moe).forward(
+            torch.zeros((4, 8), dtype=torch.bfloat16),
+            torch.zeros((4, 4)),
+            do_finalize=False,
+            output_dtype=torch.bfloat16,
+            all_rank_num_tokens=None,
+            use_dp_padding=dp_padding,
+            lamport_fc2_out=torch.empty((8, 8), dtype=torch.bfloat16),
+        )
 
 
 def _forward_in_two_chunks(backend) -> Tuple[torch.Tensor, torch.Tensor]:

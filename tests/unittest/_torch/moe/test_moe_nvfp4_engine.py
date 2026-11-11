@@ -1,0 +1,973 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""The NVFP4 decode MoE engine (one persistent launch: FC1 -> SwiGLU -> NVFP4 -> FC2) against the trtllm-gen FP4 MoE
+runner's pre-routed un-finalized run on the same routing: every (token, k) gemm2 row bit for bit.
+
+One TEP8 rank's shapes: 128 local experts of 512, hidden 4096, intermediate 512 per rank, top-10. Random
+checkpoint-format NVFP4 experts through the loader's own shuffle; block scales over 2^-6..2^6 so FP32 sums round."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from tensorrt_llm._utils import is_blackwell_datacenter
+
+pytestmark = pytest.mark.skipif(not is_blackwell_datacenter(), reason="needs SM 10.0 / 10.3")
+
+H, INTER, E, E_LOCAL, TOPK = 4096, 512, 512, 128, 10
+LAMPORT_MAX_ROWS = 128  # the model's (the slot all-reduce's rows)
+
+
+def _experts(seed=20261106, w2_identity=False):
+    from tensorrt_llm._torch.moe.fused_moe.quantization import NVFP4TRTLLMGenFusedMoEMethod
+
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+
+    def sf(*shape):
+        return torch.randint(
+            0x08, 0x70, shape, dtype=torch.uint8, device="cuda", generator=gen
+        ).view(torch.float8_e4m3fn)
+
+    w31 = torch.randint(
+        0, 256, (E_LOCAL, 2 * INTER, H // 2), dtype=torch.uint8, device="cuda", generator=gen
+    )
+    w31s = sf(E_LOCAL, 2 * INTER, H // 16)
+    if w2_identity:
+        w2 = torch.zeros((E_LOCAL, H, INTER // 2), dtype=torch.uint8, device="cuda")
+        n = torch.arange(INTER, device="cuda")
+        w2[:, n, n // 2] = torch.where(n % 2 == 0, 0x02, 0x20).to(torch.uint8)
+        w2s = torch.full((E_LOCAL, H, INTER // 16), 0x38, dtype=torch.uint8, device="cuda").view(
+            torch.float8_e4m3fn
+        )
+    else:
+        w2 = torch.randint(
+            0, 256, (E_LOCAL, H, INTER // 2), dtype=torch.uint8, device="cuda", generator=gen
+        )
+        w2s = sf(E_LOCAL, H, INTER // 16)
+    module = SimpleNamespace(
+        w3_w1_weight=w31,
+        w2_weight=w2,
+        w3_w1_weight_scale=w31s,
+        w2_weight_scale=w2s,
+        is_gated_activation=True,
+        bias=False,
+    )
+    NVFP4TRTLLMGenFusedMoEMethod()._shuffle_all_experts(module)
+    x_scale, h_scale = 448.0 * 6.0 / 8.0, 448.0 * 6.0 / 24.0
+    a = (
+        1.5
+        / (x_scale * 2.93 * 1.3 * H**0.5)
+        * (0.8 + 0.4 * torch.rand(E_LOCAL, device="cuda", generator=gen))
+    )
+    a2 = (
+        torch.ones(E_LOCAL, device="cuda")
+        if w2_identity
+        else (
+            (0.8 + 0.4 * torch.rand(E_LOCAL, device="cuda", generator=gen))
+            / (h_scale * 2.93 * 1.3 * INTER**0.5)
+        )
+    )
+    return SimpleNamespace(
+        w31=w31,
+        w31s=w31s,
+        w2=w2,
+        w2s=w2s,
+        scale_c=(h_scale * a).float().contiguous(),
+        alpha1=a.float().contiguous(),
+        alpha2=a2.float().contiguous(),
+        x_scale=x_scale,
+    )
+
+
+def _inputs(m, ex, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(m, H, device="cuda", generator=gen).to(torch.bfloat16)
+    xq, xsf = torch.ops.trtllm.fp4_quantize(
+        x, torch.tensor([ex.x_scale], device="cuda"), 16, False, False
+    )
+    w = torch.full((E,), 0.5 / (E - E_LOCAL), device="cuda")
+    w[:E_LOCAL] = 0.5 / E_LOCAL
+    ids = (
+        torch.multinomial(w.unsqueeze(0).repeat(m, 1), TOPK, replacement=False, generator=gen)
+        .int()
+        .contiguous()
+    )
+    wts = torch.softmax(torch.randn(m, TOPK, device="cuda", generator=gen), -1).to(torch.bfloat16)
+    return xq, xsf.view(torch.uint8).reshape(m, -1), ids, wts
+
+
+def _tables(ids, tile):
+    """trtllm-gen's routing tables (decode_front.prerouted_table_sizes order) built on the host."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_front import (
+        max_num_tiles,
+        prerouted_table_sizes,
+    )
+
+    m, k = ids.shape
+    lid = ids.flatten().cpu().long()
+    local = (lid >= 0) & (lid < E_LOCAL)
+    counts = torch.bincount(lid[local], minlength=E_LOCAL)
+    ncta = (counts + tile - 1) // tile
+    offs = torch.cumsum(ncta, 0) - ncta
+    sizes = prerouted_table_sizes(m, k, E_LOCAL, tile)
+    flat = torch.zeros(sum(sizes), dtype=torch.int32)
+    e2p, p2t, batch, limit, nct, npad = torch.split(flat, sizes)
+    for e in range(E_LOCAL):
+        for c in range(int(ncta[e])):
+            cta = int(offs[e]) + c
+            batch[cta] = e
+            limit[cta] = min((cta + 1) * tile, int(offs[e]) * tile + int(counts[e]))
+    rank = torch.zeros(E_LOCAL, dtype=torch.long)
+    e2p.fill_(-1)
+    for i in range(m * k):
+        if local[i]:
+            e = int(lid[i])
+            p = int(offs[e]) * tile + int(rank[e])
+            rank[e] += 1
+            e2p[i] = p
+            p2t[p] = i // k
+    nct[0] = int(ncta.sum())
+    npad[0] = int(ncta.sum()) * tile
+    return list(torch.split(flat.cuda(), sizes)), max_num_tiles(m, k, E_LOCAL, tile) * tile
+
+
+def _stock(ex, xq, xsf, ids, wts):
+    from tensorrt_llm._torch.custom_ops import trtllm_gen_custom_ops as G
+
+    m = xq.shape[0]
+    r = G.FP4BlockScaleMoERunner(
+        E, TOPK, None, None, INTER, 0, E_LOCAL, None, 1, False, G.ActType_TrtllmGen.SwiGlu.value
+    )
+    tactics = [
+        list(map(int, t)) for t in r.get_runner().get_valid_configs(TOPK, H, INTER, E_LOCAL, m)
+    ]
+    tile = min(t[0] for t in tactics)
+    tac = next(t for t in tactics if t[0] == tile)
+    views, _ = _tables(ids, tile)
+    inputs = [
+        None,
+        None,
+        xq,
+        xsf.view(torch.float8_e4m3fn).flatten(),
+        ex.w31,
+        ex.w31s,
+        None,
+        None,
+        None,
+        None,
+        ex.w2,
+        ex.w2s,
+        None,
+        ex.scale_c,
+        ex.alpha1,
+        ex.alpha2,
+        wts,
+        ids,
+    ]
+    out = r.forward(inputs, tactic=tac, prerouted=(views, ids, wts))
+    e2p = views[0]
+    valid = e2p >= 0
+    return out[0][e2p[valid].long()], valid
+
+
+def _engine(
+    ex,
+    xq,
+    xsf,
+    ids,
+    tile,
+    n_max,
+    state,
+    out=None,
+    tile_k=256,
+    release_after_wait=False,
+    spare_sms=0,
+):
+    from tensorrt_llm._torch.kernels.blackwell.moe_nvfp4_engine import moe_nvfp4_engine
+
+    views, cap = _tables(ids, tile)
+    e2p, p2t, batch, limit, nct, _ = views
+    h = torch.zeros((cap, INTER // 2), dtype=torch.uint8, device="cuda")
+    hsf = torch.zeros((cap * INTER // 16,), dtype=torch.uint8, device="cuda")
+    if out is None:
+        out = torch.zeros((cap, H), dtype=torch.bfloat16, device="cuda")
+    moe_nvfp4_engine(
+        xq,
+        xsf,
+        p2t,
+        batch,
+        limit,
+        nct,
+        ex.w31,
+        ex.w31s.view(torch.uint8),
+        ex.w2,
+        ex.w2s.view(torch.uint8),
+        ex.scale_c,
+        ex.alpha1,
+        ex.alpha2,
+        h,
+        hsf,
+        out,
+        state,
+        tile=tile,
+        n_max=n_max,
+        tile_k=tile_k,
+        release_after_wait=release_after_wait,
+        spare_sms=spare_sms,
+    )
+    torch.cuda.synchronize()
+    return out, h, hsf, e2p
+
+
+@pytest.fixture(scope="module")
+def state():
+    from tensorrt_llm._torch.kernels.blackwell.moe_nvfp4_engine import new_state
+
+    return new_state(torch.device("cuda"))
+
+
+@pytest.mark.parametrize(
+    "m,n_max,tile",
+    [
+        (8, 16, 8),
+        (56, 64, 8),
+        (112, 64, 8),
+        (224, 64, 8),
+        (224, 16, 16),
+        (896, 64, 8),
+        (896, 32, 64),
+    ],
+)
+def test_engine_rows_are_trtllm_gen_bit_for_bit(m, n_max, tile, state):
+    import tensorrt_llm  # noqa: F401
+
+    ex = _experts()
+    xq, xsf, ids, wts = _inputs(m, ex, seed=11 + m)
+    ref, valid = _stock(ex, xq, xsf, ids, wts)
+    out, _, _, e2p = _engine(ex, xq, xsf, ids, tile, n_max, state)
+    got = out[e2p[valid].long()]
+    assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
+    again, _, _, _ = _engine(ex, xq, xsf, ids, tile, n_max, state)
+    assert torch.equal(again[e2p[valid].long()].view(torch.int16), got.view(torch.int16))
+
+
+@pytest.mark.parametrize("release_after_wait", [False, True])
+@pytest.mark.parametrize("m", [56, 63, 64, 112])
+def test_engine_hook_tiles_bit_for_bit(m, release_after_wait, state):
+    """The hook's n_max / K tile per row count, with either PDL release point, leave the rows unchanged."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import n_max_for, tile_k_for
+
+    ex = _experts()
+    xq, xsf, ids, wts = _inputs(m, ex, seed=13 + m)
+    ref, valid = _stock(ex, xq, xsf, ids, wts)
+    n_max = n_max_for(m)
+    out, _, _, e2p = _engine(
+        ex,
+        xq,
+        xsf,
+        ids,
+        8,
+        n_max,
+        state,
+        tile_k=tile_k_for(n_max, H, INTER),
+        release_after_wait=release_after_wait,
+    )
+    assert torch.equal(out[e2p[valid].long()].view(torch.int16), ref.view(torch.int16))
+
+
+@pytest.mark.parametrize("m", [448, 896])
+def test_engine_rows_do_not_depend_on_the_grid(m, state):
+    """Beside a shared expert the engine leaves SMs free (decode_moe.ENGINE_SPARE_SMS): its rows are the full grid's,
+    bit for bit (the FC1 units balance over the grid, the FC2 units are claimed as tickets)."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import (
+        ENGINE_SPARE_SMS,
+        n_max_for,
+        tile_k_for,
+    )
+
+    ex = _experts()
+    xq, xsf, ids, _ = _inputs(m, ex, seed=29 + m)
+    n_max = n_max_for(m)
+    opts = dict(tile_k=tile_k_for(n_max, H, INTER), release_after_wait=True)
+    full, _, _, e2p = _engine(ex, xq, xsf, ids, 8, n_max, state, **opts)
+    valid = e2p[e2p >= 0].long()
+    for spare in (ENGINE_SPARE_SMS, 2 * ENGINE_SPARE_SMS):
+        out, _, _, _ = _engine(ex, xq, xsf, ids, 8, n_max, state, spare_sms=spare, **opts)
+        assert torch.equal(out[valid].view(torch.int16), full[valid].view(torch.int16)), spare
+
+
+@pytest.mark.parametrize(
+    "m,tile,release_after_wait",
+    [
+        (7, 8, False),
+        (28, 8, False),
+        (56, 8, False),
+        (63, 16, False),
+        (64, 8, True),
+        (112, 16, True),
+    ],
+)
+def test_engine_writes_only_real_rows_of_a_sentinel_buffer(m, tile, release_after_wait, state):
+    """Lamport FC2 (decode_moe.LamportFc2Buffer) hands the engine a persistent buffer that holds 0xFFFFFFFF
+    wherever no row is written; the MoE-output all-reduce's fold polls each word of the e2p-valid rows until it is not
+    0xFFFFFFFF, then writes it back. So the engine must write exactly those rows, bit for bit its default output and
+    never a 0xFFFFFFFF word, and leave every other word alone (padded rows, rows past the call's). Two calls in a row
+    with the fold's reset between them, as consecutive layers share the buffer; the hook's n_max and tile_k."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_front import max_num_tiles
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import n_max_for, tile_k_for
+
+    ex = _experts()
+    n_max = n_max_for(m)
+    opts = dict(tile_k=tile_k_for(n_max, H, INTER), release_after_wait=release_after_wait)
+    cap = max_num_tiles(m, TOPK, E_LOCAL, tile) * tile
+    buf = torch.full((cap + 64, H), -1, dtype=torch.int16, device="cuda")
+    for seed in (19 + m, 23 + m):
+        xq, xsf, ids, _ = _inputs(m, ex, seed=seed)
+        ref, _, _, e2p = _engine(ex, xq, xsf, ids, tile, n_max, state, **opts)
+        rows = e2p[e2p >= 0].long()
+        _engine(ex, xq, xsf, ids, tile, n_max, state, out=buf[:cap].view(torch.bfloat16), **opts)
+        assert torch.equal(buf[rows], ref.view(torch.int16)[rows])
+        assert not (buf[rows].view(torch.int32) == -1).any()
+        rest = torch.ones(buf.shape[0], dtype=torch.bool, device="cuda")
+        rest[rows] = False
+        assert (buf[rest] == -1).all()
+        buf[rows] = -1  # the fold's write-back
+
+
+def _op_inputs(ex, xq, xsf):
+    """The FP4 runner's inputs without router logits / top-k (FP4BlockScaleMoEInputs order)."""
+    return [
+        None,
+        None,
+        xq,
+        xsf.view(torch.float8_e4m3fn).flatten(),
+        ex.w31,
+        ex.w31s,
+        None,
+        None,
+        None,
+        None,
+        ex.w2,
+        ex.w2s,
+        None,
+        ex.scale_c,
+        ex.alpha1,
+        ex.alpha2,
+        None,
+        None,
+    ]
+
+
+def _decode_runner(decode_tuning=True, decode_shared_expert_rows=0):
+    from tensorrt_llm._torch.custom_ops import trtllm_gen_custom_ops as G
+
+    return G.FP4BlockScaleMoERunner(
+        E,
+        TOPK,
+        None,
+        None,
+        INTER,
+        0,
+        E_LOCAL,
+        None,
+        1,
+        False,
+        G.ActType_TrtllmGen.SwiGlu.value,
+        decode_tuning=decode_tuning,
+        decode_shared_expert_rows=decode_shared_expert_rows,
+    )
+
+
+def _tile8_tactics(runner, m):
+    """(a tile-8 tactic, a tile-8 tactic whose FC2 cubin the CuTe FC2 reproduces); the runner offers one."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import cute_fc2_reproduces
+
+    cr = runner.get_runner()
+    tactics = [list(map(int, t)) for t in cr.get_valid_configs(TOPK, H, INTER, E_LOCAL, m)]
+    tile8 = [t for t in tactics if t[0] == 8]
+    bitwise = [t for t in tile8 if cute_fc2_reproduces(cr.get_gemm2_kernel_name(t[0], t[1]))]
+    assert bitwise, [cr.get_gemm2_kernel_name(t[0], t[1]) for t in tile8]
+    return tile8[0], bitwise[0]
+
+
+def _spy_select(monkeypatch):
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe
+
+    picked, orig = [], decode_moe.select
+
+    def spy(*args, **kwargs):
+        picked.append(orig(*args, **kwargs))
+        return picked[-1]
+
+    monkeypatch.setattr(decode_moe, "select", spy)
+    return picked
+
+
+def test_decode_kernels_select_the_engine_with_the_runner_abi(monkeypatch):
+    """A pre-routed un-finalized call of a runner that declares the decode kernels takes the engine when its backend
+    hands in the engine state, and otherwise the FC1-only runner + CuTe FC2 or the cubins; the rows reached through
+    the expanded -> permuted index are the stock runner's bit for bit either way, and the (rows, weights [m, k],
+    index [m, k] int32) triple is what the MoE-output all-reduce's in-kernel finalize accepts."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.distributed.mnnvl_fused_allreduce import MnnvlAllReduceNorm
+    from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import DecodeKernel
+
+    ex = _experts()
+    m = 56
+    xq, xsf, ids, wts = _inputs(m, ex, seed=17)
+    ref, valid = _stock(ex, xq, xsf, ids, wts)
+    runner = _decode_runner()
+    any8, bitwise8 = _tile8_tactics(runner, m)
+    views, _ = _tables(ids, 8)
+    e2p = views[0].view(m, TOPK)
+    state = new_state(torch.device("cuda"))
+    picked = _spy_select(monkeypatch)
+    cases = [
+        (any8, state, DecodeKernel.ENGINE),
+        (any8, None, None),
+        (bitwise8, None, DecodeKernel.CUTE_FC2),
+    ]
+    for tactic, engine_state, expect in cases:
+        picked.clear()
+        out = runner.forward(
+            _op_inputs(ex, xq, xsf),
+            tactic=tactic,
+            prerouted=(views, ids, wts),
+            engine_state=engine_state,
+        )[0]
+        torch.cuda.synchronize()
+        assert len(picked) == 1, picked
+        if expect is None:
+            assert picked[0] != DecodeKernel.ENGINE, picked
+        else:
+            assert picked[0] == expect, (picked, expect)
+        assert MnnvlAllReduceNorm.moe_fold_supported(out, wts.view(m, TOPK), e2p, H)
+        got = out[e2p.flatten()[valid].long()]
+        assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), (tactic, picked)
+    picked.clear()
+    _decode_runner(decode_tuning=False).forward(
+        _op_inputs(ex, xq, xsf), tactic=any8, prerouted=(views, ids, wts), engine_state=state
+    )
+    assert not picked
+
+
+def test_engine_leaves_sms_to_the_shared_expert_from_the_declared_rows(monkeypatch):
+    """The runner hands the engine ``beside_shared_expert`` from its ``decode_shared_expert_rows`` rows on (0:
+    never); the rows stay the stock runner's."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe
+
+    ex = _experts()
+    m = 56
+    xq, xsf, ids, wts = _inputs(m, ex, seed=31)
+    ref, valid = _stock(ex, xq, xsf, ids, wts)
+    views, _ = _tables(ids, 8)
+    e2p = views[0].view(m, TOPK)
+    state = new_state(torch.device("cuda"))
+    seen, orig = [], decode_moe.run_engine
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs["beside_shared_expert"])
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(decode_moe, "run_engine", spy)
+    for rows, expect in ((0, False), (m + 1, False), (m, True)):
+        runner = _decode_runner(decode_shared_expert_rows=rows)
+        any8, _ = _tile8_tactics(runner, m)
+        seen.clear()
+        out = runner.forward(
+            _op_inputs(ex, xq, xsf), tactic=any8, prerouted=(views, ids, wts), engine_state=state
+        )[0]
+        torch.cuda.synchronize()
+        assert seen == [expect], (rows, seen)
+        got = out[e2p.flatten()[valid].long()]
+        assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), rows
+
+
+def test_lamport_out_takes_the_decode_kernels_rows(monkeypatch):
+    """With a Lamport FC2 buffer the engine and the CuTe FC2 write their rows there, and a call of the cubins copies
+    its real rows there, bit for bit the plain call's, leaving the rest of the buffer sentinel. Through the custom op
+    the rows always come back as an empty placeholder (an op output may not alias an input) that the op backend
+    replaces with the buffer."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import PreroutedRouting
+    from tensorrt_llm._torch.moe.fused_moe.moe_op_backend import TRTLLMOpBackend
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import (
+        DecodeKernel,
+        LamportFc2Buffer,
+    )
+    from tensorrt_llm._torch.utils import ActType_TrtllmGen
+
+    ex = _experts()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    lamport = LamportFc2Buffer(LAMPORT_MAX_ROWS).get(H, INTER, TOPK, E_LOCAL, dev)
+    words = lamport.view(torch.int16)
+    assert (words == -1).all()
+    state = new_state(dev)
+    picked = _spy_select(monkeypatch)
+    m = 56
+    xq, xsf, ids, wts = _inputs(m, ex, seed=29)
+    runner = _decode_runner()
+    any8, bitwise8 = _tile8_tactics(runner, m)
+    views, _ = _tables(ids, 8)
+    rows = views[0][views[0] >= 0].long()
+    rest = torch.ones(words.shape[0], dtype=torch.bool, device="cuda")
+    rest[rows] = False
+    cases = [
+        (runner, any8, state, DecodeKernel.ENGINE),
+        (runner, bitwise8, None, DecodeKernel.CUTE_FC2),
+        (_decode_runner(decode_tuning=False), any8, state, None),
+    ]
+    for op_runner, tactic, engine_state, expect in cases:
+        kw = dict(tactic=tactic, prerouted=(views, ids, wts), engine_state=engine_state)
+        plain = op_runner.forward(_op_inputs(ex, xq, xsf), **kw)[0]
+        picked.clear()
+        out = op_runner.forward(_op_inputs(ex, xq, xsf), lamport_out=lamport, **kw)[0]
+        torch.cuda.synchronize()
+        assert (
+            picked == ([] if expect is None else [expect]) and out.data_ptr() == lamport.data_ptr()
+        )
+        assert torch.equal(out[rows].view(torch.int16), plain[rows].view(torch.int16))
+        assert not (words[rows].view(torch.int32) == -1).any()
+        assert (words[rest] == -1).all()
+        words[rows] = -1  # the fold's write-back
+    backend = TRTLLMOpBackend()
+
+    def run(lamport_fc2_out, decode_tuning=True):
+        return backend.run_fp4_block_scale_moe(
+            None,
+            None,
+            xq,
+            xsf,
+            ex.w31,
+            ex.w31s,
+            None,
+            None,
+            None,
+            None,
+            ex.w2,
+            ex.w2s,
+            None,
+            ex.scale_c,
+            ex.alpha1,
+            ex.alpha2,
+            E,
+            TOPK,
+            None,
+            None,
+            INTER,
+            0,
+            E_LOCAL,
+            None,
+            1,
+            do_finalize=False,
+            topk_weights=None,
+            topk_ids=None,
+            gated_act_type=int(ActType_TrtllmGen.SwiGlu),
+            prerouted=PreroutedRouting(torch.cat(views), any8, ids, wts),
+            decode_tuning=decode_tuning,
+            decode_engine_state=state,
+            lamport_fc2_out=lamport_fc2_out,
+        )
+
+    plain = run(None)
+    out = run(lamport)
+    torch.cuda.synchronize()
+    assert out[0] is lamport
+    assert torch.equal(out[0][rows].view(torch.int16), plain[0][rows].view(torch.int16))
+    words[rows] = -1
+    out = run(lamport, decode_tuning=False)
+    torch.cuda.synchronize()
+    assert out[0] is lamport
+    assert torch.equal(out[0][rows].view(torch.int16), plain[0][rows].view(torch.int16))
+    assert (words[rest] == -1).all()
+
+
+def test_lamport_buffer_holds_every_tile_the_runner_can_tune():
+    """One Lamport buffer serves every Lamport call of the model: every token count up to its max rows at every tile
+    the FP4 runner offers for it, which bounds the engine's rows and the FC1-only runner's gemm2 rows (at least
+    128 KiB of them) the CuTe FC2 writes."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe as dm
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_front import max_num_tiles
+    from tensorrt_llm._torch.utils import ActType_TrtllmGen
+
+    runner = torch.classes.trtllm.FP4BlockScaleMoERunner(int(ActType_TrtllmGen.SwiGlu))
+    calls = []
+    for m in range(1, LAMPORT_MAX_ROWS + 1):
+        tiles = {int(t[0]) for t in runner.get_valid_configs(TOPK, H, INTER, E_LOCAL, m)}
+        assert tiles
+        calls += [max(max_num_tiles(m, TOPK, E_LOCAL, t) * t, 128 * 1024 // (H * 2)) for t in tiles]
+    rows = dm.lamport_rows(runner, LAMPORT_MAX_ROWS, H, INTER, TOPK, E_LOCAL)
+    assert max(calls) <= rows
+    dev = torch.device("cuda", torch.cuda.current_device())
+    owner = dm.LamportFc2Buffer(LAMPORT_MAX_ROWS)
+    buf = owner.get(H, INTER, TOPK, E_LOCAL, dev)
+    assert buf.shape == (rows, H) and buf.dtype == torch.bfloat16
+    assert (buf.view(torch.int16) == -1).all()
+    assert owner.get(H, INTER, TOPK, E_LOCAL, dev).data_ptr() == buf.data_ptr()
+
+
+def test_fc1_intermediate_matches_identity_w2(state):
+    """With W2[n][n] = 1 (scales 1, alpha2 1) the runner's gemm2 columns < I are the dequantized FC1 intermediate."""
+    import tensorrt_llm  # noqa: F401
+
+    ex = _experts(w2_identity=True)
+    m = 224
+    xq, xsf, ids, wts = _inputs(m, ex, seed=5)
+    ref, valid = _stock(ex, xq, xsf, ids, wts)
+    _, h, hsf, e2p = _engine(ex, xq, xsf, ids, 8, 64, state)
+    rows = e2p[valid].long()
+    lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        device="cuda",
+    )
+    hb = h[rows].long()
+    vals = torch.stack((lut[hb & 0xF], lut[hb >> 4]), dim=-1).flatten(-2)
+    r = rows.view(-1, 1)
+    b = torch.arange(INTER // 16, device="cuda").view(1, -1)
+    sf = hsf.view(torch.float8_e4m3fn)[
+        ((r // 8) * (INTER // 64) + b // 4) * 32 + (r % 8) * 4 + b % 4
+    ].float()
+    got = vals * sf.repeat_interleave(16, dim=1)
+    assert torch.equal(got, ref[:, :INTER].float())
+
+
+@pytest.mark.parametrize("inter", [256, 512, 768, 1024])
+@pytest.mark.parametrize("m", [7, 16, 17, 224, 225, 896])
+def test_engine_gate_matches_the_engine_shapes(m, inter):
+    """``select``'s engine gate holds exactly where the engine compiles for the K tile ``run_engine`` passes (e.g.
+    MoE TP4's intermediate 256 per rank takes K tiles of 256 at every row count)."""
+    from tensorrt_llm._torch.kernels.blackwell.moe_nvfp4_engine import MoeNvfp4Engine
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe as dm
+    from tensorrt_llm._torch.utils import ActType_TrtllmGen
+
+    def t(*shape):
+        return torch.empty(shape, dtype=torch.uint8, device="meta")
+
+    args = SimpleNamespace(
+        hidden_states=t(m, H // 2),
+        hidden_states_scale=t(m, H // 16),
+        gemm1_weights=t(E_LOCAL, 2 * inter, H // 2),
+        gemm2_weights=t(E_LOCAL, H, inter // 2),
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        output1_scale_scalar=t(E_LOCAL),
+        output1_scale_gate_scalar=t(E_LOCAL),
+        output2_scale_scalar=t(E_LOCAL),
+    )
+    assert dm._engine_fits(args, ActType_TrtllmGen.SwiGlu, TOPK)
+    n_max = dm.n_max_for(m)
+    tile_k = dm.tile_k_for(n_max, H, inter)
+    MoeNvfp4Engine(H, inter, n_max, 4, 8, tile_k, False)  # asserts the shapes it compiles for
+    assert tile_k == (256 if inter % 512 or n_max > 32 else 512)
+
+
+@pytest.mark.parametrize("m,top_k,fits", [(1024, TOPK, True), (1024, 32, False), (64, 32, True)])
+def test_engine_gate_bounds_the_segment_table(m, top_k, fits):
+    """The engine gate refuses a call whose worst-case (expert, row chunk) segment count exceeds ``SEG_CAP``."""
+    from tensorrt_llm._torch.kernels.blackwell.moe_nvfp4_engine import SEG_CAP
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe as dm
+    from tensorrt_llm._torch.utils import ActType_TrtllmGen
+
+    def t(*shape):
+        return torch.empty(shape, dtype=torch.uint8, device="meta")
+
+    args = SimpleNamespace(
+        hidden_states=t(m, H // 2),
+        hidden_states_scale=t(m, H // 16),
+        gemm1_weights=t(E_LOCAL, 2 * INTER, H // 2),
+        gemm2_weights=t(E_LOCAL, H, INTER // 2),
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        output1_scale_scalar=t(E_LOCAL),
+        output1_scale_gate_scalar=t(E_LOCAL),
+        output2_scale_scalar=t(E_LOCAL),
+    )
+    assert (E_LOCAL + -(-m * top_k // dm.n_max_for(m)) <= SEG_CAP) == fits
+    assert dm._engine_fits(args, ActType_TrtllmGen.SwiGlu, top_k) == fits
+
+
+def test_fine_grained_sync_keeps_the_runner_fc2():
+    """With the runner's fine-grained-sync pair preferred, a call keeps its own FC2: the FC1-only entry points
+    refuse fine-grained sync."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe as dm
+    from tensorrt_llm._torch.utils import ActType_TrtllmGen
+
+    name = "bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x256_s4_et128x8_m128x8x64_c1x1x1_rM_TN_transOut_dynB"
+    runner = SimpleNamespace(get_gemm2_kernel_name=lambda tile, config: name)
+    args = SimpleNamespace(
+        hidden_states=torch.empty((7, H // 2), dtype=torch.uint8, device="meta"),
+        gemm2_weights=torch.empty((E_LOCAL, H, INTER // 2), dtype=torch.uint8, device="meta"),
+        gemm2_weights_scale=torch.empty(
+            (E_LOCAL, H, INTER // 16), dtype=torch.uint8, device="meta"
+        ),
+        gemm2_bias=None,
+    )
+    kw = dict(
+        top_k=TOPK,
+        do_finalize=False,
+        output=None,
+        intermediate_size=INTER,
+        prerouted=False,
+        engine_state=None,
+    )
+    act = int(ActType_TrtllmGen.SwiGlu)
+    assert dm.cute_fc2_reproduces(name)
+    assert (
+        dm.select(runner, act, [8, 0], args, fine_grained_sync=False, **kw)
+        == dm.DecodeKernel.CUTE_FC2
+    )
+    assert (
+        dm.select(runner, act, [8, 0], args, fine_grained_sync=True, **kw) == dm.DecodeKernel.CUBIN
+    )
+
+
+def _router_inputs(m, ex, seed, dup=False):
+    """x [m, H] bf16, a router weight [E, H] bf16 (``dup``: identical row pairs, exact logit ties) and the experts'
+    NVFP4 global scale."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(m, H, device="cuda", generator=gen).to(torch.bfloat16)
+    w = (torch.randn(E, H, device="cuda", generator=gen) * 0.02).to(torch.bfloat16)
+    if dup:
+        w[1::2] = w[0::2]
+    return x, w, torch.tensor([ex.x_scale], dtype=torch.float32, device="cuda")
+
+
+def _poisoned_routing(m, tile, poison):
+    """(flat tables, ids, weights) filled with ``poison``, the outputs of a routing engine."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_front import prerouted_table_sizes
+
+    size = sum(prerouted_table_sizes(m, TOPK, E_LOCAL, tile))
+    flat = torch.full((size,), poison, dtype=torch.int32, device="cuda")
+    ids = torch.full((m, TOPK), poison, dtype=torch.int32, device="cuda")
+    wts = torch.full((m, TOPK), poison, dtype=torch.int16, device="cuda").view(torch.bfloat16)
+    return flat, ids, wts
+
+
+def _engine_on(ex, xq, xsf, views, tile, state, poison, **route):
+    """The engine with the decode hook's n_max / K tile on tables ``views`` (``prerouted_table_views``); with
+    ``route`` (candidates, ids, weights, local start) it writes them itself."""
+    from tensorrt_llm._torch.kernels.blackwell.moe_nvfp4_engine import moe_nvfp4_engine
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_front import max_num_tiles
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import n_max_for, tile_k_for
+
+    m = xq.shape[0]
+    e2p, p2t, batch, limit, nct, npad = views
+    cap = max_num_tiles(m, TOPK, E_LOCAL, tile) * tile
+    h = torch.full((cap, INTER // 2), poison & 0xFF, dtype=torch.uint8, device="cuda")
+    hsf = torch.full((cap * INTER // 16,), poison & 0xFF, dtype=torch.uint8, device="cuda")
+    out = torch.full((cap, H), poison, dtype=torch.int16, device="cuda").view(torch.bfloat16)
+    if route:
+        route = dict(route, e2p=e2p, num_padded=npad)
+    n_max = n_max_for(m)
+    moe_nvfp4_engine(
+        xq,
+        xsf,
+        p2t,
+        batch,
+        limit,
+        nct,
+        ex.w31,
+        ex.w31s.view(torch.uint8),
+        ex.w2,
+        ex.w2s.view(torch.uint8),
+        ex.scale_c,
+        ex.alpha1,
+        ex.alpha2,
+        h,
+        hsf,
+        out,
+        state,
+        tile=tile,
+        n_max=n_max,
+        tile_k=tile_k_for(n_max, H, INTER),
+        **route,
+    )
+    torch.cuda.synchronize()
+    return out
+
+
+def _route_front_chain(ex, x, w, gs, ls, tile, state, poison):
+    """Today's chain for the same step: the route front steps' CuTe router GEMM, the lean route front (tables in
+    ``poison``-filled buffers), the engine on its tables. Returns (xq, xsf, ids, weights, table views, gemm2 rows)."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_front import (
+        RouteFront,
+        RouteFrontRouterGemm,
+        prerouted_table_views,
+    )
+
+    m = x.shape[0]
+    logits = RouteFrontRouterGemm()(x, w)
+    front = RouteFront(lean=True)
+    fn = front.compiled(x, E, tile, E_LOCAL, TOPK)
+    assert logits is not None and fn is not None
+    flat, _, _ = _poisoned_routing(m, tile, poison)
+    xq, xsf, ids, wts = front(fn, logits, x, gs, flat, tile, ls, E_LOCAL, TOPK)
+    views = prerouted_table_views(flat, m, TOPK, E_LOCAL, tile)
+    return xq, xsf, ids, wts, views, _engine_on(ex, xq, xsf, views, tile, state, poison)
+
+
+def _check_routed(got, ref, tag):
+    """ids, weights, every table word (both started from the same poison) and the gemm2 rows of the real (token,
+    expert) pairs, bitwise."""
+    ids, wts, views, out = got
+    r_ids, r_wts, r_views, r_out = ref
+    assert torch.equal(ids, r_ids), (tag, "ids")
+    assert torch.equal(wts.view(torch.int16), r_wts.view(torch.int16)), (tag, "weights")
+    names = ("e2p", "p2t", "cta_batch", "cta_limit", "num_ctas", "num_padded")
+    for name, a, b in zip(names, views, r_views):
+        assert torch.equal(a, b), (tag, name)
+    rows = r_views[0][r_views[0] >= 0].long()
+    assert torch.equal(out[rows].view(torch.int16), r_out[rows].view(torch.int16)), (tag, "rows")
+
+
+# The steps the engine routes (33..63 rows); local experts [ls, ls + 128) of 512; dup: exact logit ties.
+@pytest.mark.parametrize(
+    "m,ls,tile,dup",
+    [
+        (33, 0, 8, False),
+        (35, 0, 8, False),
+        (42, 0, 8, True),
+        (49, 384, 8, False),
+        (56, 0, 16, False),
+        (63, 128, 8, False),
+    ],
+)
+def test_engine_routes_bit_for_bit(m, ls, tile, dup, state):
+    """``route``: the engine on the epilogue router GEMM's per-tile candidates writes the ids, weights, e2p, p2t,
+    tile tables and counts of today's chain (router GEMM, lean route front) bit for bit and the same gemm2 rows;
+    every output starts from poison, twice with different poison."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_front import (
+        RouteFrontRouterGemm,
+        prerouted_table_views,
+    )
+
+    ex = _experts()
+    x, w, gs = _router_inputs(m, ex, seed=41 + m, dup=dup)
+    _, cand, xq, xsf = RouteFrontRouterGemm(engine_route=True)(x, w, gs)
+    for poison in (-7, 0x2AAA):
+        ref = _route_front_chain(ex, x, w, gs, ls, tile, state, poison)
+        tag = (m, ls, tile, dup, poison)
+        assert torch.equal(xq, ref[0]) and torch.equal(xsf, ref[1]), (tag, "x quant")
+        flat, ids, wts = _poisoned_routing(m, tile, poison)
+        views = prerouted_table_views(flat, m, TOPK, E_LOCAL, tile)
+        out = _engine_on(
+            ex,
+            xq,
+            xsf,
+            views,
+            tile,
+            state,
+            poison,
+            candidates=cand,
+            topk_ids=ids,
+            topk_weights=wts,
+            local_start=ls,
+        )
+        _check_routed((ids, wts, views, out), ref[2:], tag)
+
+
+def test_runner_routes_in_the_engine(monkeypatch):
+    """A pre-routed un-finalized call with ``candidates`` takes the engine, which writes the routing today's chain
+    would, also through the op backend (``PreroutedRouting.candidates``); a call that would not take the engine
+    refuses them."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import PreroutedRouting
+    from tensorrt_llm._torch.moe.fused_moe.moe_op_backend import TRTLLMOpBackend
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_front import (
+        RouteFrontRouterGemm,
+        prerouted_table_views,
+    )
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import DecodeKernel
+    from tensorrt_llm._torch.utils import ActType_TrtllmGen
+
+    ex = _experts()
+    m, tile = 42, 8
+    state = new_state(torch.device("cuda"))
+    x, w, gs = _router_inputs(m, ex, seed=43)
+    ref = _route_front_chain(ex, x, w, gs, 0, tile, state, -7)[2:]
+    _, cand, xq, xsf = RouteFrontRouterGemm(engine_route=True)(x, w, gs)
+    runner = _decode_runner()
+    any8, _ = _tile8_tactics(runner, m)
+    picked = _spy_select(monkeypatch)
+    flat, ids, wts = _poisoned_routing(m, tile, -7)
+    views = prerouted_table_views(flat, m, TOPK, E_LOCAL, tile)
+    kw = dict(tactic=any8, prerouted=(views, ids, wts), candidates=cand)
+    out = runner.forward(_op_inputs(ex, xq, xsf), engine_state=state, **kw)[0]
+    torch.cuda.synchronize()
+    assert picked == [DecodeKernel.ENGINE], picked
+    _check_routed((ids, wts, views, out), ref, "runner")
+    with pytest.raises(ValueError, match="candidates"):
+        runner.forward(_op_inputs(ex, xq, xsf), engine_state=None, **kw)
+    flat, ids, wts = _poisoned_routing(m, tile, -7)
+    rows, weights, e2p = TRTLLMOpBackend().run_fp4_block_scale_moe(
+        None,
+        None,
+        xq,
+        xsf,
+        ex.w31,
+        ex.w31s,
+        None,
+        None,
+        None,
+        None,
+        ex.w2,
+        ex.w2s,
+        None,
+        ex.scale_c,
+        ex.alpha1,
+        ex.alpha2,
+        E,
+        TOPK,
+        None,
+        None,
+        INTER,
+        0,
+        E_LOCAL,
+        None,
+        1,
+        do_finalize=False,
+        topk_weights=None,
+        topk_ids=None,
+        gated_act_type=int(ActType_TrtllmGen.SwiGlu),
+        prerouted=PreroutedRouting(flat, any8, ids, wts, cand),
+        decode_tuning=True,
+        decode_engine_state=state,
+    )
+    torch.cuda.synchronize()
+    views = prerouted_table_views(flat, m, TOPK, E_LOCAL, tile)
+    _check_routed((ids, wts, views, rows), ref, "op backend")
+    assert weights is wts and torch.equal(e2p.flatten(), views[0])
+
+
+def test_ring_budget_keeps_the_tuned_stage_counts():
+    """On the SM 10.x parts the ring takes 200 KiB of the 227 KiB opt-in shared memory, the budget whose stage counts
+    (NVFP4 engine: 4 at N 16 / 32 with K tile 512, 7 at N 64 with 256) the engines were measured with."""
+    from tensorrt_llm._torch.kernels.blackwell.moe_bf16_engine import stages_for
+    from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import ring_smem_bytes
+
+    budget = ring_smem_bytes(torch.device("cuda"))
+    assert budget == 200 * 1024
+    per_stage = {
+        (n, k): (128 + n) * k // 2 + 2 * 128 * k // 16 for n in (16, 32, 64) for k in (256, 512)
+    }
+    assert [min(10, budget // per_stage[nk]) for nk in ((16, 512), (32, 512), (64, 256))] == [
+        4,
+        4,
+        7,
+    ]
+    assert [stages_for(n, budget) for n in (16, 32)] == [5, 5]
