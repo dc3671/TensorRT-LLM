@@ -1571,8 +1571,7 @@
     {
       "allowed_values": [
         "fcfs",
-        "priority",
-        "shortest_decode_first"
+        "priority"
       ],
       "capture_policy": "enum[WaitingQueuePolicy]",
       "kind": "categorical",

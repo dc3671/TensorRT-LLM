@@ -296,7 +296,7 @@ def _cross_field_rules(definitions: dict) -> None:
             {
                 "not": _set(
                     "waiting_queue_policy",
-                    {"const": WaitingQueuePolicy.SHORTEST_DECODE_FIRST.value},
+                    {"const": WaitingQueuePolicy.PRIORITY.value},
                 )
             },
             {

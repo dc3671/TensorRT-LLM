@@ -1441,7 +1441,7 @@ class PyExecutor:
 
         self._gen_admission = GenAdmissionConfig.from_env()
         waiting_queue_max_wait_s = None
-        if waiting_queue_policy == WaitingQueuePolicy.SHORTEST_DECODE_FIRST:
+        if waiting_queue_policy == WaitingQueuePolicy.PRIORITY:
             waiting_queue_max_wait_s = (
                 self.llm_args.scheduler_config.waiting_queue_max_wait_s)
         # The wait cap ages requests by rank 0's arrival stamps on rank 0's

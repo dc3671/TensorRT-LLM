@@ -320,36 +320,37 @@ def _heap_smallest(heap: list, k: int, keep: Callable[[tuple], bool]) -> list:
     return out
 
 
-class ShortestDecodeFirstWaitingQueue(WaitingQueue):
-    """Serves the request with the fewest ``max_tokens`` first; ties go in arrival order.
+class AgingPriorityWaitingQueue(WaitingQueue):
+    """``PriorityWaitingQueue`` with a wait cap.
 
-    With ``max_wait_s``, a request that has waited that long since it reached the
-    server (``admit_orig_arrival`` in disaggregated serving, else ``admit_arrival``)
-    goes ahead of every request that has not, oldest first.
+    Serves the highest ``request.priority`` first; ties go in arrival order. A request
+    that has waited ``max_wait_s`` since it reached the server (``admit_orig_arrival`` in
+    disaggregated serving, else ``admit_arrival``) goes ahead of every request that has
+    not, oldest first.
 
-    Every rank pops the same order: the keys are the broadcast request's ``max_tokens``,
-    the arrival order and, for the cap, rank 0's arrival stamps against rank 0's clock
-    (``set_now``). A request put back keeps its arrival sequence.
+    Every rank pops the same order: the keys are the broadcast request's priority, the
+    arrival order and rank 0's arrival stamps against rank 0's clock (``set_now``). A
+    request put back keeps its arrival sequence.
 
-    Waiting requests sit in a ``(max_tokens, seq)`` heap and, with the cap, an
-    ``(arrival, seq)`` heap; ``set_now`` moves the newly aged ones into an aged
-    ``(arrival, seq)`` heap that is served first. Entries an aged or popped request
-    leaves behind in the first two heaps are skipped when reached.
+    Waiting requests sit in a ``(-priority, seq)`` heap and an ``(arrival, seq)`` heap;
+    ``set_now`` moves the newly aged ones into an aged ``(arrival, seq)`` heap that is
+    served first. Entries an aged or popped request leaves behind in the first two heaps
+    are skipped when reached.
     """
 
-    def __init__(self, max_wait_s: Optional[float] = None) -> None:
-        if max_wait_s is not None and not (math.isfinite(max_wait_s) and max_wait_s > 0.0):
-            raise ValueError(f"max_wait_s={max_wait_s!r} must be a positive number or None")
+    def __init__(self, max_wait_s: float) -> None:
+        if not (math.isfinite(max_wait_s) and max_wait_s > 0.0):
+            raise ValueError(f"max_wait_s={max_wait_s!r} must be a positive number")
         self.max_wait_s = max_wait_s
         self._now: Optional[float] = None
         # Arrival sequence -> queued request.
         self._items: dict[int, RequestQueueItem] = {}
         # Arrival sequences of the queued requests in _aged_heap.
         self._aged: set[int] = set()
-        self._shortest_heap: list[tuple[int, int]] = []
+        self._priority_heap: list[tuple[float, int]] = []
         self._arrival_heap: list[tuple[float, int]] = []
         self._aged_heap: list[tuple[float, int]] = []
-        # Arrival sequences with an entry in _arrival_heap. A pop from _shortest_heap leaves the
+        # Arrival sequences with an entry in _arrival_heap. A pop from _priority_heap leaves the
         # arrival entry in place, so a request put back reuses it rather than adding another.
         self._in_arrival_heap: set[int] = set()
         self._counter = itertools.count()
@@ -357,15 +358,12 @@ class ShortestDecodeFirstWaitingQueue(WaitingQueue):
         self._prepend_counter = itertools.count(-1, -1)
         # Request id -> arrival sequence, while queued or popped and not yet admitted.
         self._seq: dict[int, int] = {}
-        self._warned_priority = False
 
     def set_now(self, now: Optional[float]) -> None:
         """Rank 0's clock, set once per iteration before the pops; None keeps the last value."""
         if now is None:
             return
         self._now = now
-        if self.max_wait_s is None:
-            return
         heap = self._arrival_heap
         while heap and now - heap[0][0] >= self.max_wait_s:
             arrival, seq = heapq.heappop(heap)
@@ -380,6 +378,12 @@ class ShortestDecodeFirstWaitingQueue(WaitingQueue):
             return item.admit_orig_arrival
         return item.admit_arrival
 
+    @staticmethod
+    def _priority_of(item: RequestQueueItem) -> float:
+        if item.request is not None:
+            return item.request.priority
+        return DEFAULT_REQUEST_PRIORITY
+
     def _waiting(self, entry: tuple) -> bool:
         """Whether a heap entry ``(key, seq)`` is a queued request that has not aged."""
         seq = entry[1]
@@ -388,40 +392,34 @@ class ShortestDecodeFirstWaitingQueue(WaitingQueue):
     def _push(self, item: RequestQueueItem, seq: int) -> None:
         self._items[seq] = item
         self._seq[item.id] = seq
-        arrival = self._arrival_of(item) if self.max_wait_s is not None else None
+        arrival = self._arrival_of(item)
         if arrival is not None and self._now is not None and self._now - arrival >= self.max_wait_s:
             self._aged.add(seq)
             heapq.heappush(self._aged_heap, (arrival, seq))
             return
-        heapq.heappush(self._shortest_heap, (item.request.max_tokens, seq))
+        heapq.heappush(self._priority_heap, (-self._priority_of(item), seq))
         if arrival is not None and seq not in self._in_arrival_heap:
             self._in_arrival_heap.add(seq)
             heapq.heappush(self._arrival_heap, (arrival, seq))
-        if len(self._shortest_heap) + len(self._arrival_heap) > 4 * len(self._items) + 64:
+        if len(self._priority_heap) + len(self._arrival_heap) > 4 * len(self._items) + 64:
             self._compact()
 
     def _compact(self) -> None:
         """Drop the entries of requests that aged or left the queue."""
-        self._shortest_heap = [e for e in self._shortest_heap if self._waiting(e)]
+        self._priority_heap = [e for e in self._priority_heap if self._waiting(e)]
         self._arrival_heap = [e for e in self._arrival_heap if self._waiting(e)]
         self._in_arrival_heap = {seq for _, seq in self._arrival_heap}
         self._aged_heap = [e for e in self._aged_heap if e[1] in self._items]
-        for heap in (self._shortest_heap, self._arrival_heap, self._aged_heap):
+        for heap in (self._priority_heap, self._arrival_heap, self._aged_heap):
             heapq.heapify(heap)
 
-    def _shortest_head(self) -> tuple[int, int]:
-        heap = self._shortest_heap
+    def _priority_head(self) -> tuple[float, int]:
+        heap = self._priority_heap
         while not self._waiting(heap[0]):
             heapq.heappop(heap)
         return heap[0]
 
     def add_request(self, request: RequestQueueItem) -> None:
-        if not self._warned_priority and request.request.priority != DEFAULT_REQUEST_PRIORITY:
-            self._warned_priority = True
-            logger.warning(
-                "A request has a non-default priority but the shortest_decode_first "
-                "waiting queue is in use; priorities are ignored."
-            )
         self._push(request, next(self._counter))
 
     def add_requests(self, requests: Iterable[RequestQueueItem]) -> None:
@@ -431,16 +429,14 @@ class ShortestDecodeFirstWaitingQueue(WaitingQueue):
     def pop_request(self) -> RequestQueueItem:
         if not self._items:
             raise IndexError("pop from an empty queue")
-        if self.max_wait_s is not None and self._now is None:
-            raise RuntimeError(
-                "ShortestDecodeFirstWaitingQueue with a wait cap needs set_now() before the first pop"
-            )
+        if self._now is None:
+            raise RuntimeError("AgingPriorityWaitingQueue needs set_now() before the first pop")
         if self._aged_heap:
             _, seq = heapq.heappop(self._aged_heap)
             self._aged.discard(seq)
         else:
-            _, seq = self._shortest_head()
-            heapq.heappop(self._shortest_heap)
+            _, seq = self._priority_head()
+            heapq.heappop(self._priority_heap)
         return self._items.pop(seq)
 
     def peek_request(self) -> RequestQueueItem:
@@ -448,22 +444,26 @@ class ShortestDecodeFirstWaitingQueue(WaitingQueue):
             raise IndexError("peek from an empty queue")
         if self._aged_heap:
             return self._items[self._aged_heap[0][1]]
-        return self._items[self._shortest_head()[1]]
+        return self._items[self._priority_head()[1]]
 
     def peek_requests(self, k: int) -> list[RequestQueueItem]:
         """Up to ``k`` requests in pop order, O(k log k) plus skipped entries."""
         aged = _heap_smallest(self._aged_heap, k, lambda entry: True)
-        rest = _heap_smallest(self._shortest_heap, k - len(aged), self._waiting)
+        rest = _heap_smallest(self._priority_heap, k - len(aged), self._waiting)
         return [self._items[entry[1]] for entry in aged + rest]
 
     def admission_groups(self, requests: list[RequestQueueItem]) -> list[int]:
-        """One group per aged request, in pop order, then one for the rest."""
+        """One group per aged request, in pop order, then one per priority (as ``PriorityWaitingQueue``)."""
         groups = []
+        group = -1
         num_aged = 0
-        for request in requests:
-            if num_aged == len(groups) and self._seq.get(request.id) in self._aged:
+        for i, request in enumerate(requests):
+            if num_aged == i and self._seq.get(request.id) in self._aged:
                 num_aged += 1
-            groups.append(min(len(groups), num_aged))
+                group += 1
+            elif i == num_aged or self._priority_of(request) != self._priority_of(requests[i - 1]):
+                group += 1
+            groups.append(group)
         return groups
 
     def prepend_request(self, request: RequestQueueItem) -> None:
@@ -495,7 +495,7 @@ class ShortestDecodeFirstWaitingQueue(WaitingQueue):
     def __iter__(self) -> Iterator[RequestQueueItem]:
         """Requests in pop order, over a snapshot taken at call time (O(n log n))."""
         aged = sorted(self._aged_heap)
-        rest = sorted(e for e in self._shortest_heap if self._waiting(e))
+        rest = sorted(e for e in self._priority_heap if self._waiting(e))
         return iter([self._items[entry[1]] for entry in aged + rest])
 
 
@@ -509,18 +509,20 @@ def create_waiting_queue(
     Args:
         policy: The scheduling policy to use.
         gen_admission: Optional ``GenAdmissionConfig``; overrides ``policy`` when enabled.
-        max_wait_s: The wait cap of ``WaitingQueuePolicy.SHORTEST_DECODE_FIRST``; None: no cap.
+        max_wait_s: The wait cap of ``WaitingQueuePolicy.PRIORITY``; None: no cap.
 
     Returns:
         A WaitingQueue instance.
     """
-    if policy == WaitingQueuePolicy.SHORTEST_DECODE_FIRST:
+    if max_wait_s is not None:
+        if policy != WaitingQueuePolicy.PRIORITY:
+            raise ValueError(f"max_wait_s needs waiting_queue_policy=priority, not {policy}")
         if gen_admission is not None and gen_admission.enabled:
             raise ValueError(
-                f"waiting_queue_policy={policy} cannot be combined with GEN admission by original "
+                f"waiting_queue_max_wait_s cannot be combined with GEN admission by original "
                 f"arrival ({gen_admission.describe()})"
             )
-        return ShortestDecodeFirstWaitingQueue(max_wait_s)
+        return AgingPriorityWaitingQueue(max_wait_s)
     if gen_admission is not None and gen_admission.enabled:
         from .gen_admission_queue import GenAdmissionWaitingQueue
 

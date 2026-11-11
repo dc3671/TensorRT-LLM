@@ -763,19 +763,19 @@ _GIB = 1 << 30
         # SchedulerConfig
         (
             "scheduler_config",
-            {"waiting_queue_policy": "shortest_decode_first", "waiting_queue_max_wait_s": 30},
+            {"waiting_queue_policy": "priority", "waiting_queue_max_wait_s": 30},
             True,
         ),
-        (
-            "scheduler_config",
-            {"waiting_queue_policy": "shortest_decode_first", "waiting_queue_max_wait_s": None},
-            True,
-        ),
-        ("scheduler_config", {"waiting_queue_max_wait_s": 60}, True),
-        ("scheduler_config", {"waiting_queue_max_wait_s": 30}, False),
         (
             "scheduler_config",
             {"waiting_queue_policy": "priority", "waiting_queue_max_wait_s": None},
+            True,
+        ),
+        ("scheduler_config", {"waiting_queue_max_wait_s": None}, True),
+        ("scheduler_config", {"waiting_queue_max_wait_s": 30}, False),
+        (
+            "scheduler_config",
+            {"waiting_queue_policy": "fcfs", "waiting_queue_max_wait_s": 60},
             False,
         ),
     ],

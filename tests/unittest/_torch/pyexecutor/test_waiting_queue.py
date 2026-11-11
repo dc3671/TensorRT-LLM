@@ -18,7 +18,7 @@
 This module tests the waiting queue functionality including:
 - FCFSWaitingQueue operations
 - PriorityWaitingQueue operations
-- ShortestDecodeFirstWaitingQueue operations
+- AgingPriorityWaitingQueue operations
 - WaitingQueue abstract interface
 - create_waiting_queue factory function
 """
@@ -35,8 +35,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     create_waiting_queue,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import (
+    AgingPriorityWaitingQueue,
     PriorityWaitingQueue,
-    ShortestDecodeFirstWaitingQueue,
 )
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm_args import (
@@ -602,30 +602,34 @@ class TestPriorityWaitingQueue:
         assert isinstance(PriorityWaitingQueue(), WaitingQueue)
 
 
-def create_decode_request_item(
-    request_id: int, max_tokens: int, arrival=None, orig_arrival=None
+def create_aging_request_item(
+    request_id: int, priority: float, arrival=None, orig_arrival=None
 ) -> RequestQueueItem:
-    """Create a mock RequestQueueItem with max_tokens and rank 0's arrival stamps."""
+    """Create a mock RequestQueueItem with a priority and rank 0's arrival stamps."""
     mock_request = Mock()
-    mock_request.max_tokens = max_tokens
-    mock_request.priority = DEFAULT_REQUEST_PRIORITY
+    mock_request.priority = priority
     item = RequestQueueItem(request_id, mock_request)
     item.admit_arrival = arrival
     item.admit_orig_arrival = orig_arrival
     return item
 
 
-class TestShortestDecodeFirstWaitingQueue:
-    """Tests for ShortestDecodeFirstWaitingQueue."""
+def _started(queue: AgingPriorityWaitingQueue, now: float = 0.0) -> AgingPriorityWaitingQueue:
+    queue.set_now(now)
+    return queue
 
-    def test_fewest_max_tokens_first_ties_in_arrival_order(self):
-        queue = ShortestDecodeFirstWaitingQueue()
+
+class TestAgingPriorityWaitingQueue:
+    """Tests for AgingPriorityWaitingQueue (waiting_queue_policy=priority with a wait cap)."""
+
+    def test_highest_priority_first_ties_in_arrival_order(self):
+        queue = _started(AgingPriorityWaitingQueue(max_wait_s=60.0))
         queue.add_requests(
             [
-                create_decode_request_item(1, 300),
-                create_decode_request_item(2, 100),
-                create_decode_request_item(3, 500),
-                create_decode_request_item(4, 100),
+                create_aging_request_item(1, 0.3, 0.0),
+                create_aging_request_item(2, 0.9, 0.0),
+                create_aging_request_item(3, 0.1, 0.0),
+                create_aging_request_item(4, 0.9, 0.0),
             ]
         )
         assert [item.id for item in queue] == [2, 4, 1, 3]
@@ -633,19 +637,36 @@ class TestShortestDecodeFirstWaitingQueue:
         assert queue.peek_request().id == 2
         assert [queue.pop_request().id for _ in range(4)] == [2, 4, 1, 3]
 
+    def test_same_order_as_priority_queue_until_a_request_ages(self):
+        """Below the cap the order is PriorityWaitingQueue's, including its admission groups."""
+        priorities = [0.5, 0.2, 0.9, 0.2, 0.7, 0.9, 0.5]
+        aging = _started(AgingPriorityWaitingQueue(max_wait_s=60.0))
+        stock = PriorityWaitingQueue()
+        for i, p in enumerate(priorities):
+            aging.add_request(create_aging_request_item(i, p, 0.0))
+            stock.add_request(create_aging_request_item(i, p, 0.0))
+        assert [item.id for item in aging] == [item.id for item in stock]
+        window = aging.peek_requests(len(priorities))
+        assert aging.admission_groups(window) == stock.admission_groups(stock.peek_requests(7))
+        assert [aging.pop_request().id for _ in priorities] == [
+            stock.pop_request().id for _ in priorities
+        ]
+
     def test_put_back_keeps_arrival_order(self):
-        queue = ShortestDecodeFirstWaitingQueue()
-        queue.add_requests([create_decode_request_item(1, 100), create_decode_request_item(2, 100)])
+        queue = _started(AgingPriorityWaitingQueue(max_wait_s=60.0))
+        queue.add_requests(
+            [create_aging_request_item(1, 0.5, 0.0), create_aging_request_item(2, 0.5, 0.0)]
+        )
         first = queue.pop_request()
-        queue.add_request(create_decode_request_item(3, 100))
+        queue.add_request(create_aging_request_item(3, 0.5, 0.0))
         queue.prepend_request(first)
         assert [item.id for item in queue] == [1, 2, 3]
 
     @pytest.mark.parametrize("now, first", [(59.0, 2), (60.0, 1)])
     def test_wait_cap_goes_ahead_oldest_first(self, now, first):
-        queue = ShortestDecodeFirstWaitingQueue(max_wait_s=60.0)
+        queue = _started(AgingPriorityWaitingQueue(max_wait_s=60.0))
         queue.add_requests(
-            [create_decode_request_item(1, 8000, 0.0), create_decode_request_item(2, 100, 30.0)]
+            [create_aging_request_item(1, 0.1, 0.0), create_aging_request_item(2, 0.9, 30.0)]
         )
         queue.set_now(now)
         assert queue.pop_request().id == first
@@ -653,13 +674,13 @@ class TestShortestDecodeFirstWaitingQueue:
     def test_wait_cap_ages_from_the_original_arrival(self):
         """In disaggregated serving the cap counts from the orchestrator's arrival, which the
         context server's KV transfer timeout follows."""
-        queue = ShortestDecodeFirstWaitingQueue(max_wait_s=60.0)
+        queue = AgingPriorityWaitingQueue(max_wait_s=60.0)
         queue.set_now(50.0)
         queue.add_requests(
             [
-                create_decode_request_item(1, 8000, arrival=50.0, orig_arrival=0.0),
-                create_decode_request_item(2, 9000, arrival=40.0, orig_arrival=-5.0),
-                create_decode_request_item(3, 100, arrival=50.0, orig_arrival=45.0),
+                create_aging_request_item(1, 0.2, arrival=50.0, orig_arrival=0.0),
+                create_aging_request_item(2, 0.1, arrival=40.0, orig_arrival=-5.0),
+                create_aging_request_item(3, 0.9, arrival=50.0, orig_arrival=45.0),
             ]
         )
         assert queue.peek_request().id == 3
@@ -669,55 +690,51 @@ class TestShortestDecodeFirstWaitingQueue:
         assert [queue.pop_request().id for _ in range(3)] == [2, 1, 3]
 
     def test_request_aged_when_added_or_put_back(self):
-        queue = ShortestDecodeFirstWaitingQueue(max_wait_s=60.0)
-        queue.set_now(100.0)
+        queue = _started(AgingPriorityWaitingQueue(max_wait_s=60.0), 100.0)
         queue.add_requests(
-            [create_decode_request_item(1, 100, 90.0), create_decode_request_item(2, 8000, 0.0)]
+            [create_aging_request_item(1, 0.9, 90.0), create_aging_request_item(2, 0.1, 0.0)]
         )
         aged = queue.pop_request()
         assert aged.id == 2
         queue.prepend_request(aged)
         assert [item.id for item in queue] == [2, 1]
 
-    def test_no_cap_never_ages(self):
-        queue = ShortestDecodeFirstWaitingQueue()
-        queue.add_requests(
-            [create_decode_request_item(1, 8000, 0.0), create_decode_request_item(2, 100, 30.0)]
-        )
-        queue.set_now(1.0e6)
-        assert queue.pop_request().id == 2
-
     def test_cap_needs_clock(self):
-        queue = ShortestDecodeFirstWaitingQueue(max_wait_s=60.0)
-        queue.add_request(create_decode_request_item(1, 100, 0.0))
+        queue = AgingPriorityWaitingQueue(max_wait_s=60.0)
+        queue.add_request(create_aging_request_item(1, 0.5, 0.0))
         with pytest.raises(RuntimeError):
             queue.pop_request()
 
+    @pytest.mark.parametrize("bad", [None, 0.0, -1.0, float("inf"), float("nan")])
+    def test_cap_must_be_positive_and_finite(self, bad):
+        with pytest.raises((ValueError, TypeError)):
+            AgingPriorityWaitingQueue(max_wait_s=bad)
+
     def test_admission_groups_keep_aged_requests_in_order(self):
-        """Out-of-order admission may reorder only the requests that have not aged."""
-        queue = ShortestDecodeFirstWaitingQueue(max_wait_s=60.0)
-        queue.set_now(0.0)
+        """Out-of-order admission may reorder only requests that have not aged and share a priority."""
+        queue = _started(AgingPriorityWaitingQueue(max_wait_s=60.0))
         queue.add_requests(
             [
-                create_decode_request_item(1, 9000, 0.0),
-                create_decode_request_item(2, 8000, 1.0),
-                create_decode_request_item(3, 100, 50.0),
-                create_decode_request_item(4, 200, 50.0),
+                create_aging_request_item(1, 0.1, 0.0),
+                create_aging_request_item(2, 0.2, 1.0),
+                create_aging_request_item(3, 0.9, 50.0),
+                create_aging_request_item(4, 0.9, 50.0),
+                create_aging_request_item(5, 0.5, 50.0),
             ]
         )
         queue.set_now(61.0)
-        window = queue.peek_requests(4)
-        assert [item.id for item in window] == [1, 2, 3, 4]
-        assert queue.admission_groups(window) == [0, 1, 2, 2]
-        assert queue.admission_groups(window[2:]) == [0, 0]
+        window = queue.peek_requests(5)
+        assert [item.id for item in window] == [1, 2, 3, 4, 5]
+        assert queue.admission_groups(window) == [0, 1, 2, 2, 3]
+        assert queue.admission_groups(window[2:]) == [0, 0, 1]
 
     def test_unadmitted_request_keeps_its_arrival_order(self):
         """A popped request put back after a later admission step keeps its place."""
-        queue = ShortestDecodeFirstWaitingQueue()
-        queue.add_requests([create_decode_request_item(i, 100) for i in range(1, 4)])
+        queue = _started(AgingPriorityWaitingQueue(max_wait_s=60.0))
+        queue.add_requests([create_aging_request_item(i, 0.5, 0.0) for i in range(1, 4)])
         popped = [queue.pop_request() for _ in range(2)]
         queue.mark_admitted(popped[:1])
-        queue.add_request(create_decode_request_item(4, 100))
+        queue.add_request(create_aging_request_item(4, 0.5, 0.0))
         queue.prepend_requests(popped[1:])
         assert [item.id for item in queue] == [2, 3, 4]
 
@@ -725,13 +742,14 @@ class TestShortestDecodeFirstWaitingQueue:
         """Requests that admission rejects and puts back every iteration (strict-rank attention
         DP) reuse their heap entries, so the heaps stay bounded without compaction and the
         requests still age once, oldest first."""
-        queue = ShortestDecodeFirstWaitingQueue(max_wait_s=60.0)
-        queue.set_now(0.0)
-        queue.add_requests([create_decode_request_item(i, 100 + i, float(3 - i)) for i in range(4)])
+        queue = _started(AgingPriorityWaitingQueue(max_wait_s=60.0))
+        queue.add_requests(
+            [create_aging_request_item(i, 0.9 - 0.1 * i, float(3 - i)) for i in range(4)]
+        )
         compactions = []
-        compact = ShortestDecodeFirstWaitingQueue._compact
+        compact = AgingPriorityWaitingQueue._compact
         monkeypatch.setattr(
-            ShortestDecodeFirstWaitingQueue,
+            AgingPriorityWaitingQueue,
             "_compact",
             lambda self: compactions.append(len(self)) or compact(self),
         )
@@ -740,7 +758,7 @@ class TestShortestDecodeFirstWaitingQueue:
             popped = [queue.pop_request() for _ in range(4)]
             assert [item.id for item in popped] == [0, 1, 2, 3]
             queue.prepend_requests(popped)
-        assert len(queue._shortest_heap) == 4
+        assert len(queue._priority_heap) == 4
         assert len(queue._arrival_heap) == 4
         assert compactions == []
         queue.set_now(63.0)
@@ -748,34 +766,39 @@ class TestShortestDecodeFirstWaitingQueue:
         assert [queue.pop_request().id for _ in range(4)] == [3, 2, 1, 0]
 
     def test_peek_requests_does_not_sort_the_queue(self, monkeypatch):
-        queue = ShortestDecodeFirstWaitingQueue(max_wait_s=60.0)
-        queue.set_now(0.0)
-        queue.add_requests([create_decode_request_item(i, 1000 - i, float(i)) for i in range(1000)])
+        queue = _started(AgingPriorityWaitingQueue(max_wait_s=60.0))
+        queue.add_requests(
+            [create_aging_request_item(i, 1.0 - i / 1000.0, float(i)) for i in range(1000)]
+        )
         queue.set_now(62.0)
 
         def _no_full_sort(self):
             raise AssertionError("peek_requests must not sort the whole queue")
 
-        monkeypatch.setattr(ShortestDecodeFirstWaitingQueue, "__iter__", _no_full_sort)
-        assert [item.id for item in queue.peek_requests(5)] == [0, 1, 2, 999, 998]
+        monkeypatch.setattr(AgingPriorityWaitingQueue, "__iter__", _no_full_sort)
+        assert [item.id for item in queue.peek_requests(5)] == [0, 1, 2, 3, 4]
 
-    def test_priority_is_ignored_with_one_warning(self, monkeypatch):
-        from tensorrt_llm._torch.pyexecutor.scheduler import waiting_queue
+    def test_never_reads_max_tokens(self):
+        """The order comes from the priority alone (the orchestrator's predicted output length)."""
 
-        warnings = []
-        monkeypatch.setattr(waiting_queue.logger, "warning", warnings.append)
-        queue = ShortestDecodeFirstWaitingQueue()
-        for i, max_tokens in enumerate((300, 100)):
-            item = create_decode_request_item(i, max_tokens)
-            item.request.priority = 1.0
+        class NoMaxTokens:
+            priority = 0.5
+
+            @property
+            def max_tokens(self):
+                raise AssertionError("max_tokens must not be read")
+
+        queue = _started(AgingPriorityWaitingQueue(max_wait_s=60.0))
+        for i in range(3):
+            item = RequestQueueItem(i, NoMaxTokens())
+            item.admit_arrival = 0.0
             queue.add_request(item)
-        assert [item.id for item in queue] == [1, 0]
-        assert len(warnings) == 1
+        queue.set_now(100.0)
+        assert [queue.pop_request().id for _ in range(3)] == [0, 1, 2]
 
     def test_remove_by_ids(self):
-        queue = ShortestDecodeFirstWaitingQueue(max_wait_s=60.0)
-        queue.set_now(0.0)
-        queue.add_requests([create_decode_request_item(i, 10 * i, 0.0) for i in range(1, 5)])
+        queue = _started(AgingPriorityWaitingQueue(max_wait_s=60.0))
+        queue.add_requests([create_aging_request_item(i, 1.0 / i, 0.0) for i in range(1, 5)])
         queue.set_now(60.0)
         queue.remove_by_ids({2, 3})
         assert len(queue) == 2 and [item.id for item in queue] == [1, 4]
@@ -783,28 +806,38 @@ class TestShortestDecodeFirstWaitingQueue:
         assert not queue
 
     def test_factory(self):
-        queue = create_waiting_queue(WaitingQueuePolicy.SHORTEST_DECODE_FIRST, max_wait_s=120.0)
-        assert isinstance(queue, ShortestDecodeFirstWaitingQueue)
+        queue = create_waiting_queue(WaitingQueuePolicy.PRIORITY, max_wait_s=120.0)
+        assert isinstance(queue, AgingPriorityWaitingQueue)
         assert queue.max_wait_s == 120.0
+        # Without a cap the policy keeps the stock queue.
+        assert type(create_waiting_queue(WaitingQueuePolicy.PRIORITY)) is PriorityWaitingQueue
+        with pytest.raises(ValueError, match="priority"):
+            create_waiting_queue(WaitingQueuePolicy.FCFS, max_wait_s=60.0)
+
+    def test_factory_refuses_cap_with_gen_admission(self):
+        gen_admission = Mock(enabled=True)
+        gen_admission.describe.return_value = "p90"
+        with pytest.raises(ValueError, match="GEN admission"):
+            create_waiting_queue(
+                WaitingQueuePolicy.PRIORITY, gen_admission=gen_admission, max_wait_s=60.0
+            )
 
     def test_scheduler_config_max_wait(self):
-        sdf = WaitingQueuePolicy.SHORTEST_DECODE_FIRST
-        assert SchedulerConfig().waiting_queue_max_wait_s == 60.0
-        config = SchedulerConfig(waiting_queue_policy=sdf, waiting_queue_max_wait_s=120.0)
+        priority = WaitingQueuePolicy.PRIORITY
+        assert SchedulerConfig().waiting_queue_max_wait_s is None
+        config = SchedulerConfig(waiting_queue_policy=priority, waiting_queue_max_wait_s=120.0)
         assert config.waiting_queue_max_wait_s == 120.0
         SchedulerConfig(**config.model_dump())
-        # Other policies accept only the default, so a dumped default config validates again.
         SchedulerConfig(**SchedulerConfig().model_dump())
-        for policy in (WaitingQueuePolicy.FCFS, WaitingQueuePolicy.PRIORITY):
-            for value in (120.0, None):
-                with pytest.raises(ValueError, match="shortest_decode_first"):
-                    SchedulerConfig(waiting_queue_policy=policy, waiting_queue_max_wait_s=value)
-        # The queue needs a finite cap; None disables it.
-        config = SchedulerConfig(waiting_queue_policy=sdf, waiting_queue_max_wait_s=None)
-        assert config.waiting_queue_max_wait_s is None
+        with pytest.raises(ValueError, match="priority"):
+            SchedulerConfig(
+                waiting_queue_policy=WaitingQueuePolicy.FCFS, waiting_queue_max_wait_s=60.0
+            )
+        with pytest.raises(ValueError):
+            SchedulerConfig(waiting_queue_policy="shortest_decode_first")
         for bad in (float("inf"), float("nan"), 0.0):
             with pytest.raises(ValueError):
-                SchedulerConfig(waiting_queue_policy=sdf, waiting_queue_max_wait_s=bad)
+                SchedulerConfig(waiting_queue_policy=priority, waiting_queue_max_wait_s=bad)
 
     @pytest.mark.parametrize(
         "max_wait_s, timeout_ms, warns",
@@ -818,7 +851,7 @@ class TestShortestDecodeFirstWaitingQueue:
                 model=tmp_path,
                 gpus_per_node=1,
                 scheduler_config=SchedulerConfig(
-                    waiting_queue_policy=WaitingQueuePolicy.SHORTEST_DECODE_FIRST,
+                    waiting_queue_policy=WaitingQueuePolicy.PRIORITY,
                     waiting_queue_max_wait_s=max_wait_s,
                 ),
                 cache_transceiver_config=CacheTransceiverConfig(

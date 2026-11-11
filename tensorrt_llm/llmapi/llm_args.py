@@ -4607,8 +4607,6 @@ class WaitingQueuePolicy(StrEnum):
 
     FCFS = "fcfs"  # First-Come-First-Served
     PRIORITY = "priority"  # Higher request.priority value is served first; ties broken by FCFS
-    # Fewest max_tokens first (ties in arrival order); request priorities are ignored
-    SHORTEST_DECODE_FIRST = "shortest_decode_first"
 
 
 class ContextSchedulingPolicy(StrEnum):
@@ -4709,16 +4707,14 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
         description="The waiting queue scheduling policy")
 
     waiting_queue_max_wait_s: Optional[_PositiveFiniteFloat] = Field(
-        default=60.0,
+        default=None,
         description=(
-            "With waiting_queue_policy='shortest_decode_first': a request "
-            "that has waited this many seconds since it reached the server "
-            "(in disaggregated serving, the orchestrator) goes ahead of every "
-            "request that has not, oldest first. None disables the cap. Keep "
-            "it at or below the context servers' "
-            "cache_transceiver_config.kv_transfer_timeout_ms, whose clock "
-            "starts later (after prefill). Other policies "
-            "accept only the default."),
+            "With waiting_queue_policy='priority': a request that has waited "
+            "this many seconds since it reached the server (in disaggregated "
+            "serving, the orchestrator) goes ahead of every request that has "
+            "not, oldest first. None: no cap. Keep it at or below the context "
+            "servers' cache_transceiver_config.kv_transfer_timeout_ms, whose "
+            "clock starts later (after prefill)."),
         status="prototype")
 
     use_python_scheduler: bool = Field(
@@ -4760,14 +4756,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
 
     @model_validator(mode="after")
     def validate_waiting_queue_max_wait_s(self) -> 'SchedulerConfig':
-        # Compared with the default, so that a dumped config validates again.
-        default = type(self).model_fields["waiting_queue_max_wait_s"].default
-        if (self.waiting_queue_max_wait_s != default
-                and self.waiting_queue_policy
-                != WaitingQueuePolicy.SHORTEST_DECODE_FIRST):
-            raise ValueError(
-                "scheduler_config.waiting_queue_max_wait_s requires "
-                "waiting_queue_policy='shortest_decode_first'")
+        if (self.waiting_queue_max_wait_s is not None
+                and self.waiting_queue_policy != WaitingQueuePolicy.PRIORITY):
+            raise ValueError("scheduler_config.waiting_queue_max_wait_s "
+                             "requires waiting_queue_policy='priority'")
         return self
 
     @model_validator(mode="after")
@@ -8103,9 +8095,7 @@ class TorchLlmArgs(BaseLlmArgs):
     def warn_waiting_queue_max_wait_s(self) -> 'TorchLlmArgs':
         scheduler = self.scheduler_config
         transceiver = self.cache_transceiver_config
-        if (scheduler.waiting_queue_policy
-                == WaitingQueuePolicy.SHORTEST_DECODE_FIRST
-                and scheduler.waiting_queue_max_wait_s is not None
+        if (scheduler.waiting_queue_max_wait_s is not None
                 and transceiver is not None
                 and transceiver.kv_transfer_timeout_ms is not None
                 and scheduler.waiting_queue_max_wait_s * 1000
