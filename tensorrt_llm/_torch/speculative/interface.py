@@ -778,10 +778,6 @@ class SpecMetadata:
     # consume rows rather than requests.
     seeds: Optional[torch.Tensor] = None
     offsets: Optional[torch.Tensor] = None
-    # The Philox state the last populate call left for the steady MTP stager
-    # (defer_rng_rows): (request_seeds, request_offsets) in batch order; None
-    # when it uploaded the four buffers (or skipped them) itself.
-    deferred_rng_state: Optional[tuple] = field(default=None, repr=False)
     # Whether to use sampling parameters when sampling draft tokens.
     use_sampling_params_for_draft_tokens: bool = False
     # Vocab size used for draft_probs buffer allocation.
@@ -905,14 +901,12 @@ class SpecMetadata:
             offsets.append(base + step * window)
         return offsets
 
-    def _populate_request_rng_state(self,
-                                    requests: list["LlmRequest"],
-                                    per_request_normalized: list[tuple[float,
-                                                                       int,
-                                                                       float,
-                                                                       float,
-                                                                       int]],
-                                    defer_rows: Optional[int] = None) -> None:
+    def _populate_request_rng_state(
+        self,
+        requests: list["LlmRequest"],
+        per_request_normalized: list[tuple[float, int, float, float, int]],
+        defer_rows: Optional[int] = None
+    ) -> Optional[tuple[list[int], list[int]]]:
         """Fill the Philox seed/offset buffers for this batch.
 
         A request's seed is fixed for its lifetime, so the offset is what has
@@ -946,7 +940,6 @@ class SpecMetadata:
             requests, [seed is not None for seed in user_seeds])
         num_tokens_per_request = [n for *_, n in per_request_normalized]
         total_rows = sum(num_tokens_per_request)
-        self.deferred_rng_state = None
 
         # A batch wider than the buffers would silently truncate the copies
         # below, so assert rather than grow: CUDA graph batch sizes are already
@@ -993,14 +986,13 @@ class SpecMetadata:
         # still uploads: a target head the worker cannot shard (vocab padding)
         # samples it on the stock path, which reads them.
         if self.is_all_greedy_sample:
-            return
+            return None
         if (defer_rows is not None and num_tokens_per_request
                 and all(n == defer_rows for n in num_tokens_per_request)):
             # The steady MTP stager writes the four buffers from these values in
             # its one kernel: request_* as given, and row j of request r as
             # (seed_r, offset_r + j * _RNG_SLOT_SPAN), the expansion below.
-            self.deferred_rng_state = (request_seeds, request_offsets)
-            return
+            return request_seeds, request_offsets
 
         flat_seeds: list[int] = []
         flat_offsets: list[int] = []
@@ -1569,9 +1561,10 @@ class SpecMetadata:
         self._scan_one_model_sampling(requests)
 
     def populate_sampling_params_for_one_model(
-            self,
-            requests: list["LlmRequest"],
-            defer_rng_rows: Optional[int] = None) -> None:
+        self,
+        requests: list["LlmRequest"],
+        defer_rng_rows: Optional[int] = None
+    ) -> Optional[tuple[list[int], list[int]]]:
         """
         Set up topp/topk/temperatures for 1-model sampler.
 
@@ -1583,11 +1576,15 @@ class SpecMetadata:
             requests: The batch's requests.
             defer_rng_rows: The logits rows per request of a caller that writes
                 the Philox buffers itself (the steady MTP stager). When every
-                request has that many rows, their values are left in
-                ``deferred_rng_state`` instead of uploaded.
+                request has that many rows, their values are returned instead
+                of uploaded.
+
+        Returns:
+            The deferred Philox state, (request_seeds, request_offsets) in batch
+            order, or None when the buffers were uploaded or not needed.
         """
         if not self.spec_dec_mode.use_one_engine():
-            return
+            return None
 
         # Allocate the rejection buffers before copying py_seq_slot values into
         # batch_slot_ids below; this runs earlier than prepare() in the
@@ -1645,8 +1642,8 @@ class SpecMetadata:
                                               dtype=torch.float32,
                                               device='cuda')
 
-        self._populate_request_rng_state(requests, per_request_normalized,
-                                         defer_rng_rows)
+        deferred_rng_state = self._populate_request_rng_state(
+            requests, per_request_normalized, defer_rng_rows)
 
         # Always-populate the per-request slot id table when rejection sampling
         # is configured: it's tiny (max_num_requests longs) and needed at
@@ -1672,7 +1669,7 @@ class SpecMetadata:
         # is also bypassed for all-greedy), so the per-token buffers are never
         # read. Skip the heavier H->D copies.
         if self.is_all_greedy_sample:
-            return
+            return deferred_rng_state
 
         # Phase 2: build per-token / per-request lists and copy to GPU.
         #
@@ -1685,7 +1682,7 @@ class SpecMetadata:
         fill_min_p = self.advanced_sampling_mode.is_fused
         if not (need_update_sampler_param
                 or need_update_expanded_sampler_param):
-            return
+            return deferred_rng_state
 
         if need_update_sampler_param:
             request_temperatures: list[float] = []
@@ -1759,6 +1756,7 @@ class SpecMetadata:
                 self.min_ps[:len(min_ps)].copy_(torch.tensor(
                     min_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                                 non_blocking=True)
+        return deferred_rng_state
 
     def _sampling_params_buffers_need_update(
         self, per_request_normalized: list[tuple[float, int, float, float, int]]
@@ -3320,9 +3318,9 @@ class SpecWorkerBase(nn.Module, ABC):
         gathered full-vocab draft head. Returns tokens in draft-vocab space (the
         caller applies d2t). Expects 2D ``[num_tokens, vocab_shard]`` logits.
 
-        ``tokens_out`` (int32 ``[num_tokens]``, optional): the tokens are
-        written there and it is returned (the one-launch LL exchange writes it
-        directly).
+        ``tokens_out`` (int32 ``[num_tokens]``, optional, not with
+        ``mapping_lm_head_tp``): the tokens are written there and it is
+        returned (the one-launch LL exchange writes it directly).
 
         Under ADP + LM-head TP (``mapping_lm_head_tp`` given) the logits are the
         LM-head-TP group's row-stacked batch (``tp_size`` segments of
@@ -3342,8 +3340,7 @@ class SpecWorkerBase(nn.Module, ABC):
             local_rows = logits.shape[0] // group_size
             own_segment = gathered.view(group_size, local_rows,
                                         -1)[mapping_lm_head_tp.tp_rank]
-            return self._tokens_into(
-                self._get_draft_tokens_from_gathered(own_segment), tokens_out)
+            return self._get_draft_tokens_from_gathered(own_segment)
         mapping = self.mapping
         sharded = self._draft_logits_are_sharded(logits, spec_metadata)
         if (sharded and mapping is not None

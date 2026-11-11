@@ -810,9 +810,7 @@ class DecoderInputPreparer:
             and self._steady_gen_cache_supported
             and not self.mapping.has_cp_helix()
         ):
-            stage_rng = False
-            if self.runtime_hooks.pack_spec_rng_uploads:
-                stage_rng = True
+            stage_rng = self.runtime_hooks.pack_spec_rng_uploads
             self._steady_mtp = SteadyMtpPrepare(
                 max_batch_size=self._config.max_batch_size,
                 max_num_tokens=self._config.max_num_tokens,
@@ -885,12 +883,10 @@ class DecoderInputPreparer:
         if rng_rows is not None and scheduled_requests.num_context_requests == 0:
             # Populate the sampling parameters before staging, so that the staging kernel writes this step's
             # Philox state from the host's values instead of four uploads on the stream after it.
-            spec_metadata.populate_sampling_params_for_one_model(
+            rng_state = spec_metadata.populate_sampling_params_for_one_model(
                 scheduled_requests.all_requests(), defer_rng_rows=rng_rows
             )
             sampling_populated = True
-            rng_state = spec_metadata.deferred_rng_state
-            spec_metadata.deferred_rng_state = None
         num_cached_tokens_per_seq, kv_lens, static_inputs_staged = steady_mtp.stage(
             requests,
             new_tensors_device,

@@ -184,7 +184,6 @@ def _rng_meta():
         offsets=None,
         temperatures=None,
         pack_rng_uploads=False,
-        deferred_rng_state=None,
         _rng_window_counter={},
         _rng_slot_owner={},
         rng_accept_slot=3,
@@ -218,10 +217,12 @@ def test_populate_before_stage_matches_the_upload(uniform):
     dev = _device_tensors(torch.Generator().manual_seed(3))
     slab = torch.tensor([0, 1, 2, 3] + list(range(b * t)), dtype=torch.int32, device="cuda")
     for step in range(3):
-        SpecMetadata._populate_request_rng_state(staged, requests, normalized, defer_rows=t)
-        SpecMetadata._populate_request_rng_state(uploaded, requests, normalized)
+        deferred = SpecMetadata._populate_request_rng_state(
+            staged, requests, normalized, defer_rows=t
+        )
+        assert SpecMetadata._populate_request_rng_state(uploaded, requests, normalized) is None
         if uniform:
-            request_seeds, request_offsets = staged.deferred_rng_state
+            request_seeds, request_offsets = deferred
             stage_steady_inputs(
                 slab,
                 b,
@@ -245,7 +246,7 @@ def test_populate_before_stage_matches_the_upload(uniform):
                 rng_span=_RNG_SLOT_SPAN,
             )
         else:
-            assert staged.deferred_rng_state is None
+            assert deferred is None
         torch.cuda.synchronize()
         for name, n in (
             ("request_seeds", b),

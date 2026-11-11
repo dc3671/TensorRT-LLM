@@ -548,8 +548,9 @@ class SteadyMtpPrepare:
             new_tensors_device: The previous step's device sampler tensors.
             buffers: The preparer's DecoderInputBuffers.
             attn_metadata: The recorded attention metadata.
-            rng_state: ``SpecMetadata.deferred_rng_state`` (each request's Philox seed and offset-window
-                base, in batch order), or None. Written only when this stager has the Philox ring.
+            rng_state: What ``SpecMetadata.populate_sampling_params_for_one_model`` returns (each request's Philox
+                seed and offset-window base, in batch order), or None. Written only when this stager has the Philox
+                ring.
             rng_buffers: ``SpecMetadata``'s (request_seeds, request_offsets, seeds, offsets).
 
         Returns:
