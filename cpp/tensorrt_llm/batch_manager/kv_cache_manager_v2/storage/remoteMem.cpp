@@ -546,7 +546,9 @@ RemoteChunk RemoteMemClient::acquireChunk(size_t minBytes)
         {
             throw RemoteMemError("KVCM2 remote level: no lender in " + mOptions.directory + " has a free chunk of "
                 + std::to_string(minBytes) + " B or more "
-                + (allReported ? "and all " + std::to_string(mOptions.expectedLenders) + " expected lenders reported"
+                + (allReported ? "and all " + std::to_string(mOptions.expectedLenders)
+                            + " expected lenders reported (each layer group of a rank claims whole chunks, so the lend "
+                              "must exceed the summed cache_size by up to one chunk per layer group per rank)"
                                : "after " + std::to_string(mOptions.waitTimeoutMs) + " ms")
                 + "; this process holds " + std::to_string(mClaimedBytes) + " B of " + std::to_string(mLenders.size())
                 + " lender(s)" + (mLastClaimError.empty() ? "" : "; last lender withdrawn: " + mLastClaimError));
