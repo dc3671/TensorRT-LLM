@@ -3545,6 +3545,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          self.use_expert_counts, self.num_local_experts,
                          self.weights_evict_first)
             if cache_key not in self.__class__.kernel_cache:
+                # Passed only when set: subclass runners may bind a
+                # kernel_class without this parameter.
+                evict_kwargs = ({
+                    "weights_evict_first": True
+                } if self.weights_evict_first else {})
                 gemm = self.__class__.kernel_class(
                     sf_vec_size=self.scaling_vector_size,
                     mma_tiler_mn=mma_tiler_mn,
@@ -3552,7 +3557,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raster_along_m=raster_along_m,
                     use_expert_counts=self.use_expert_counts,
                     num_local_experts=self.num_local_experts,
-                    weights_evict_first=self.weights_evict_first,
+                    **evict_kwargs,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
