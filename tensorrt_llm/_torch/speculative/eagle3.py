@@ -1477,9 +1477,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         input_ids_gen = accepted_tokens[
             num_contexts:, :spec_metadata.runtime_draft_len + 1].flatten()
 
-        # get draft inputs; a generation-only batch reads the accepted tokens
-        # in place where the model declares it (the loop never writes them).
-        if self.fused_sample_accept and input_ids_ctx.numel() == 0:
+        # get draft inputs; on the fast paths a generation-only batch reads the
+        # accepted tokens in place (the loop never writes them).
+        if self.spec_decode_fast_paths and input_ids_ctx.numel() == 0:
             input_ids = input_ids_gen
         else:
             input_ids = torch.concat([input_ids_ctx, input_ids_gen], dim=0)
