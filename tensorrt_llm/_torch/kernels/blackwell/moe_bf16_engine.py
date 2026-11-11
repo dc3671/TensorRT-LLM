@@ -11,6 +11,8 @@ Scheduling: ``moe_persistent_engine``.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Tuple
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -27,6 +29,9 @@ from cutlass.pipeline import (
     pipeline_init_arrive,
     pipeline_init_wait,
 )
+
+if TYPE_CHECKING:
+    import torch
 
 from .moe_decode_front import (
     _add,
@@ -941,7 +946,20 @@ def stages_for(n_max: int, budget: int) -> int:
     return min(10, budget // ((128 + n_max) * TILE_K * 2))
 
 
-def moe_bf16_engine(x, logits, w31, w2, h, out, wts, e2p, state, *, top_k: int, local_start: int):
+def moe_bf16_engine(
+    x: torch.Tensor,
+    logits: torch.Tensor,
+    w31: torch.Tensor,
+    w2: torch.Tensor,
+    h: torch.Tensor,
+    out: torch.Tensor,
+    wts: torch.Tensor,
+    e2p: torch.Tensor,
+    state: torch.Tensor,
+    *,
+    top_k: int,
+    local_start: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Route and run the experts. ``x`` [m, H] bf16 (unit column stride), ``logits`` [m, E] bf16 (contiguous),
     m <= M_MAX; ``w31`` [L, H/64, 2I, 64] / ``w2`` [L, I/64, H, 64] bf16 (BlockMajorK, trtllm-gen row shuffle),
     local experts [local_start, local_start + L); ``h`` [>= m top_k, I] bf16 (scratch), ``out`` [>= m top_k, H]

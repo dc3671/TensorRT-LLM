@@ -117,7 +117,7 @@ def default_tactic(m: int, n: int, k: int, fp8: bool = True, even_tiles: bool = 
     return best[1]
 
 
-def tactic_fits(n: int, k: int, tactic, even_tiles: bool = False, m: int = 1) -> bool:
+def tactic_fits(n: int, k: int, tactic: Tactic, even_tiles: bool = False, m: int = 1) -> bool:
     """Whether ``tactic`` (k_warps, n_tiles[, ksplit[, ...]]) tiles an ``m x n x k`` launch (n = weight rows): K in
     whole 64-wide chunks per warp and split (the kernel's K check), N in whole 8-row tiles per CTA, an even n_tiles for
     a SwiGLU segment, and the shared memory of ``m`` rows within a block's."""
@@ -639,10 +639,10 @@ class _SharedExpertLaunchRunner(TunableRunner):
     paired gate_up weight, gate rows, weight scale, input scale, down's input scale]) or the down launch (inputs
     [E4M3 hidden [M, I], weight, weight scale, input scale]). Tactics: ``_shared_expert_tactics``."""
 
-    def __init__(self, swiglu: bool):
+    def __init__(self, swiglu: bool) -> None:
         self.swiglu = swiglu
 
-    def unique_id(self):
+    def unique_id(self) -> Tuple[str]:
         return ("shared_expert_swiglu" if self.swiglu else "shared_expert_down",)
 
     def get_valid_tactics(
@@ -662,7 +662,7 @@ class _SharedExpertLaunchRunner(TunableRunner):
         tactic: Any = -1,
         do_preparation: bool = False,
         **kwargs: Any,
-    ):
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         x, w = inputs[0], inputs[1]
         m, k = int(x.shape[0]), int(x.shape[1])
         if tactic == -1:

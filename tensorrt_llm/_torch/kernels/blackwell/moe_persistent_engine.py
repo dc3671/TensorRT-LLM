@@ -204,7 +204,7 @@ class PersistentMoeEngine:
     # Launched as a programmatic dependent (TRTLLM_ENABLE_PDL); set by launch() before compiling.
     use_pdl: bool = True
 
-    def __init__(self, hidden: int, inter: int, n_max: int, num_stages: int, tile_k: int):
+    def __init__(self, hidden: int, inter: int, n_max: int, num_stages: int, tile_k: int) -> None:
         assert hidden % tile_k == 0 and inter % tile_k == 0
         assert (2 * inter) % TILE_M == 0 and hidden % TILE_M == 0
         self.hidden, self.inter = hidden, inter
@@ -430,7 +430,7 @@ def new_state(device) -> torch.Tensor:
     return torch.zeros(_CNT_OFFSET // 4 + 2 * CNT_CAP, dtype=torch.int32, device=device)
 
 
-def gmem_ptr(dtype, t: torch.Tensor, align: int):
+def gmem_ptr(dtype: type, t: torch.Tensor, align: int) -> cute.Pointer:
     from cutlass.cute.runtime import make_ptr
 
     return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)

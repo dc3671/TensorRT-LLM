@@ -37,6 +37,7 @@ from typing import Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import is_blackwell_datacenter
+from tensorrt_llm.mapping import Mapping
 
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, graph_safe_cute_tensor
 from ..flashinfer_utils import get_env_enable_pdl
@@ -207,7 +208,7 @@ def _compiled_slot(
     )
 
 
-def _l2pf_args(weight: Optional[torch.Tensor], nblk: int):
+def _l2pf_args(weight: Optional[torch.Tensor], nblk: int) -> Tuple[bool, int, int, int]:
     """(l2pf, ptr, bytes, bytes per CTA) for a launch of ``nblk`` CTAs that prefetches ``weight`` into L2, a
     16-byte aligned slice per CTA; no prefetch without a weight."""
     if weight is None or nblk <= 0:
@@ -713,7 +714,7 @@ class GemmTwoShotAllReduceNorm:
     the kernel's MAX_ROWS."""
 
     @staticmethod
-    def is_supported(mapping, dtype: torch.dtype, hidden_size: int) -> bool:
+    def is_supported(mapping: Mapping, dtype: torch.dtype, hidden_size: int) -> bool:
         """As ``MnnvlAllReduceNorm``, and the kernel takes the hidden size and TP group (``supports_hidden``)."""
         from ..kernels.blackwell import gemm_twoshot_allreduce_norm as kern
 
@@ -723,8 +724,12 @@ class GemmTwoShotAllReduceNorm:
         ) and kern.supports_hidden(hidden_size, mapping.tp_size, sms)
 
     def __init__(
-        self, mapping, hidden_size: int, table: _LamportTable, one_shot_threshold_bytes: int
-    ):
+        self,
+        mapping: Mapping,
+        hidden_size: int,
+        table: _LamportTable,
+        one_shot_threshold_bytes: int,
+    ) -> None:
         from ..kernels.blackwell import gemm_twoshot_allreduce_norm as kern
 
         self.mapping = mapping

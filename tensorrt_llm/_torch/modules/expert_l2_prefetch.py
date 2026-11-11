@@ -143,7 +143,7 @@ def _prefetch_kernel(
 
 
 class _DeviceState:
-    def __init__(self, device: torch.device, num_layers: int, num_experts: int):
+    def __init__(self, device: torch.device, num_layers: int, num_experts: int) -> None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "the expert prefetch state must exist before CUDA-graph capture (run one eager "

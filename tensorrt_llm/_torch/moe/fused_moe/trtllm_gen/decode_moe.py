@@ -19,11 +19,15 @@ import enum
 import functools
 import re
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import torch
 
 from .decode_front import max_num_tiles
+
+if TYPE_CHECKING:
+    from ....custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoEInputs
+    from .fp4_block_scale import TRTLLMGenFp4BlockScaleBase
 
 #: Most tokens of a CuTe FC2 call (the kernel walks the runner's tile tables and has no token bound of its own).
 MAX_TOKENS = 128
@@ -66,7 +70,12 @@ class DecodeKernel(enum.Enum):
     ENGINE = 2
 
 
-def _cute_fc2_fits(kernel_runner, tactic: List[int], args, intermediate_size: int) -> bool:
+def _cute_fc2_fits(
+    kernel_runner: torch.ScriptObject,
+    tactic: List[int],
+    args: "FP4BlockScaleMoEInputs",
+    intermediate_size: int,
+) -> bool:
     if len(tactic) != 2 or tactic[0] != TILE_N or tactic[1] < 0:
         return False
     w2, w2_sf = args.gemm2_weights, args.gemm2_weights_scale
@@ -77,7 +86,7 @@ def _cute_fc2_fits(kernel_runner, tactic: List[int], args, intermediate_size: in
     return cute_fc2_reproduces(kernel_runner.get_gemm2_kernel_name(int(tactic[0]), int(tactic[1])))
 
 
-def _engine_fits(args, act_type: int, top_k: int) -> bool:
+def _engine_fits(args: "FP4BlockScaleMoEInputs", act_type: int, top_k: int) -> bool:
     """The engine's operands and shapes, with the K tile :func:`tile_k_for` picks for this call dividing both GEMMs'
     K and the call's (expert, row chunk) segments within the engine's segment table."""
     from tensorrt_llm._torch.utils import ActType_TrtllmGen
@@ -114,7 +123,7 @@ def _engine_fits(args, act_type: int, top_k: int) -> bool:
 
 
 def takes_engine(
-    args,
+    args: "FP4BlockScaleMoEInputs",
     act_type: int,
     *,
     top_k: int,
@@ -134,7 +143,9 @@ def takes_engine(
     )
 
 
-def engine_routes(backend, num_rows: int, top_k: int, num_experts: int) -> bool:
+def engine_routes(
+    backend: "TRTLLMGenFp4BlockScaleBase", num_rows: int, top_k: int, num_experts: int
+) -> bool:
     """Whether ``backend``'s (``TRTLLMGenFp4BlockScaleBase``) un-finalized pre-routed call of ``num_rows`` NVFP4
     tokens over ``num_experts`` experts runs ``ENGINE`` with the routing in the engine (``moe_nvfp4_engine``'s
     ``route``): :func:`takes_engine` on the operands its ``run_moe`` passes, within the routing's bounds."""
@@ -181,10 +192,10 @@ def engine_routes(backend, num_rows: int, top_k: int, num_experts: int) -> bool:
 
 
 def select(
-    kernel_runner,
+    kernel_runner: torch.ScriptObject,
     act_type: int,
     tactic: List[int],
-    args,
+    args: "FP4BlockScaleMoEInputs",
     *,
     top_k: int,
     do_finalize: bool,
@@ -235,7 +246,7 @@ def tile_k_for(n_max: int, hidden: int, inter: int) -> int:
 
 
 def run_engine(
-    args,
+    args: "FP4BlockScaleMoEInputs",
     tables: List[torch.Tensor],
     tile: int,
     top_k: int,
@@ -304,7 +315,7 @@ def run_engine(
     return [out]
 
 
-def fc1_only_args(run_args) -> tuple:
+def fc1_only_args(run_args: Sequence) -> tuple:
     """The runner's ``run_moe`` / ``run_moe_prerouted`` arguments as its FC1-only entries take them: without
     ``gemm2_bias``, ``do_finalize`` and ``output``, which must be None, False and None."""
     run_args = tuple(run_args)
@@ -315,7 +326,9 @@ def fc1_only_args(run_args) -> tuple:
 
 
 def run_cute_fc2(
-    fc1_outputs: List[torch.Tensor], args, lamport_out: Optional[torch.Tensor]
+    fc1_outputs: List[torch.Tensor],
+    args: "FP4BlockScaleMoEInputs",
+    lamport_out: Optional[torch.Tensor],
 ) -> List[torch.Tensor]:
     """``CUTE_FC2`` on the FC1-only runner's outputs; returns the runner's ``do_finalize=False`` triple."""
     from tensorrt_llm._torch.kernels.blackwell.moe_lowm_fc2 import moe_lowm_fc2
@@ -371,7 +384,12 @@ def _lamport_rows(lamport_out: torch.Tensor, rows: int, hidden: int) -> torch.Te
 
 
 def lamport_rows(
-    runner, max_rows: int, hidden: int, inter: int, top_k: int, local_experts: int
+    runner: torch.ScriptObject,
+    max_rows: int,
+    hidden: int,
+    inter: int,
+    top_k: int,
+    local_experts: int,
 ) -> int:
     """Rows of the largest Lamport call of up to ``max_rows`` tokens: at the largest tile the FP4 MoE ``runner``
     (``torch.classes.trtllm.FP4BlockScaleMoERunner``) offers for ``max_rows`` tokens (the tile-padded row count grows

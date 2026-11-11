@@ -931,7 +931,7 @@ class RouteFront:
     GEMM (no device state carried between launches). ``lean``: up to 256 rows, the kernel's lean table build that
     releases the MoE at the front's start (``MoeRouteFrontKernel``), bitwise to the default one."""
 
-    def __init__(self, lean: bool = False):
+    def __init__(self, lean: bool = False) -> None:
         self.lean = lean
 
     def compiled(self, x: torch.Tensor, n: int, tile: int, num_local: int, top_k: int):

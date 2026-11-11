@@ -19,6 +19,7 @@ import torch
 
 from tensorrt_llm.functional import AllReduceFusionOp
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 # Fusion op -> (quantized output, normalized output), as MNNVLAllReduce._FUSED_NORM_OUTPUTS.
 _OUTPUTS = {
@@ -36,7 +37,7 @@ class Tp2AllReduceNorm:
     MIN_TOKENS = 2048
 
     @classmethod
-    def is_supported(cls, mapping, hidden: int, max_tokens: int) -> bool:
+    def is_supported(cls, mapping: Mapping, hidden: int, max_tokens: int) -> bool:
         """CuTe DSL, a TP2 mapping, calls that reach MIN_TOKENS, and a row the kernel's reduction tree spans."""
         from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
@@ -46,7 +47,7 @@ class Tp2AllReduceNorm:
 
         return Tp2WarpAllReduceNormKernel.supports_hidden(hidden)
 
-    def __init__(self, mapping, hidden: int, max_tokens: int):
+    def __init__(self, mapping: Mapping, hidden: int, max_tokens: int) -> None:
         from .ops import (
             _get_mnnvl_workspace_comm,
             _make_mnnvl_mcast_buffer,
@@ -106,7 +107,11 @@ class Tp2AllReduceNorm:
         )
 
     def supports(
-        self, input: torch.Tensor, fusion_op, residual: torch.Tensor, norm_weight: torch.Tensor
+        self,
+        input: torch.Tensor,
+        fusion_op: AllReduceFusionOp,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
     ) -> bool:
         """BF16 input, residual and norm weight of the kernel's shapes, for one of its fusions."""
         return (

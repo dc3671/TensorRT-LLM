@@ -19,6 +19,8 @@ warps 4-7 scale, convert and store.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Optional
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -38,6 +40,9 @@ from cutlass.pipeline import (
 )
 
 from ...flashinfer_utils import get_env_enable_pdl
+
+if TYPE_CHECKING:
+    import torch
 from .moe_decode_front import _st_shared
 from .moe_persistent_engine import _ld_nc_f32, _ld_s32, _scale_pack_bf16x2, _st_global_b32
 
@@ -813,13 +818,23 @@ def _ptr(dtype, t, align):
     return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
 
 
-def num_sms(device=None) -> int:
+def num_sms(device: Optional[torch.device] = None) -> int:
     import torch
 
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-def moe_lowm_fc2(act, act_sf, w2, w2_sf, scale, cta_batch, cta_limit, num_non_exiting, out):
+def moe_lowm_fc2(
+    act: torch.Tensor,
+    act_sf: torch.Tensor,
+    w2: torch.Tensor,
+    w2_sf: torch.Tensor,
+    scale: torch.Tensor,
+    cta_batch: torch.Tensor,
+    cta_limit: torch.Tensor,
+    num_non_exiting: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
     """FC2 of the trtllm-gen MoE path. ``act`` [rows, I/2] uint8 (E2M1 x2), ``act_sf`` 8x4 E4M3 (uint8),
     ``w2`` [E, H, I/2] uint8, ``w2_sf`` [E, H, I/16] (128x4), ``scale`` [E] fp32, tables int32 (``cta_batch`` /
     ``cta_limit`` per token tile, ``num_non_exiting`` [1]), ``out`` [padded rows, H] bf16 with at least the total padded
