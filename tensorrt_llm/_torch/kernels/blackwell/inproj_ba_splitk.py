@@ -139,6 +139,8 @@ def _kernel(
     if warp_idx == 1:
         prims.tcgen05_alloc(tmem_i32, 32)
     prims.barrier_cta_sync(0)
+    # Every CTA of the cluster has started before a peer stores into the leader's shared memory (waited below).
+    prims.barrier_cluster_arrive_relaxed()
     tmem_raw = tmem_i32.load()
     tmem_ptr = cutlass.inttoptr(tmem_raw, 6, Float32)
     if warp_idx == 1:
@@ -205,6 +207,7 @@ def _kernel(
         if prims.elect_sync():
             prims.tcgen05_commit(acc_bar)
 
+    prims.barrier_cluster_wait()
     # ---- partial: lanes 0..N-1 of sub-partition 0 hold the N features x 32 tokens; push them into the leader ----
     if warp_idx == 0:
         while not prims.mbarrier_try_wait_parity(acc_bar, 0, time_limit=10_000_000):

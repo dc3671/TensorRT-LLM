@@ -47,7 +47,6 @@ from .moe_persistent_engine import _pack_bf16x2_rn
 from .moe_route_front import (
     _bulk_commit,
     _bulk_push,
-    _bulk_wait_read,
     _cluster_arrive_release,
     _cluster_wait_acquire,
     _keys2,
@@ -548,6 +547,7 @@ class MoeRouterGemmKernel:
                     sB, full_mbar, gs_ptr, xq_ptr, xsf_ptr, s, e_tile, t_tile, tidx, phase
                 )
         cute.arch.mbarrier_wait(recv_mbar, 0)
+        _cluster_arrive_release()  # this CTA's slices have arrived (waited at the end)
 
         # Reduce this CTA's slice (tokens [s tps, (s + 1) tps) of the tile, all 128 experts) in split order.
         lane = tidx % Int32(32)
@@ -574,9 +574,9 @@ class MoeRouterGemmKernel:
                     _st_v2(dst, p01, p23)
                     if const_expr(self.candidates):
                         self._tile_candidates(cand_ptr, row, e_tile, e4, lane, p01, p23)
-        if warp == 0:
-            with cute.arch.elect_one():
-                _bulk_wait_read()  # the staging tile may not go away under an outgoing copy
+        # Every peer received its slices, so no outgoing copy still reads the staging tile (the bulk wait_group does
+        # not track copies that complete on an mbarrier).
+        _cluster_wait_acquire()
         cute.arch.sync_threads()
         if warp == 1:
             cute.arch.relinquish_tmem_alloc_permit()

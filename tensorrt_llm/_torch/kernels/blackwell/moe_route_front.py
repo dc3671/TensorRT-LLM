@@ -132,11 +132,6 @@ def _bulk_commit(*, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def _bulk_wait_read(*, loc=None, ip=None) -> None:
-    _asm(None, [], "cp.async.bulk.wait_group.read 0;", "~{memory}", loc=loc, ip=ip)
-
-
-@dsl_user_op
 def _ld_dsmem_b32(addr: Int32, rank: Int32, *, loc=None, ip=None) -> Int32:
     """The word at shared-memory address ``addr`` of cluster CTA ``rank``."""
     return Int32(
@@ -717,6 +712,7 @@ class MoeRouteFrontKernel:
                 _st_b32(ids_ptr + o * Int64(4), my_sel)
                 _st_b16(wts_ptr + o * Int64(2), my_w)
         cute.arch.mbarrier_wait(mbar_ptr, 0)
+        _cluster_arrive_release()  # this CTA's counts have arrived (waited at the end)
         tot = Int32(0)
         nct = Int32(0)
         e = tidx
@@ -779,9 +775,9 @@ class MoeRouteFrontKernel:
                 _st_b32(
                     tab_ptr + (Int64(tok) * Int64(top_k) + Int64(i - tl * top_k)) * Int64(4), perm
                 )
-        if warp == 0:
-            with cute.arch.elect_one():
-                _bulk_wait_read()  # the outgoing copies have read this CTA's counts
+        # Every peer received this CTA's counts, so no outgoing copy still reads them (the bulk wait_group does not
+        # track copies that complete on an mbarrier).
+        _cluster_wait_acquire()
         cute.arch.sync_threads()
         if const_expr(self.use_pdl):
             _gdc_launch()
