@@ -4,11 +4,11 @@
 (``kernels/blackwell/tp2_allreduce_norm.py``), one per TP2 mapping.
 
 ``AllReduce`` builds it (one per mapping, ``AllReduce.tp2_fused_norm_kernels``) when the model declares
-``allreduce_tp2_fused_norm``, the strategy is AUTO and the TP2 group has no MNNVL all-reduce; ``AllReduce.forward``
-routes the residual RMSNorm fusions of BF16 calls of ``MIN_TOKENS`` to ``max_tokens`` tokens here. The workspace (each
-rank's two landing buffers of max_tokens / 2 rows and its flags: max_tokens x hidden x 2 bytes, e.g. 128 MiB for
-16384 tokens at hidden 4096) is a McastGPUBuffer allocated when the first AllReduce of the mapping is built, before
-the KV cache is sized and any CUDA graph is captured.
+``allreduce_tp2_fused_norm``, the strategy is AUTO or TWOSHOT and the TP2 group has no MNNVL all-reduce;
+``AllReduce.forward`` routes the residual RMSNorm fusions of BF16 calls of ``MIN_TOKENS`` to ``max_tokens`` tokens
+here. The workspace (each rank's two landing buffers of max_tokens / 2 rows and its flags: max_tokens x hidden x 2
+bytes, e.g. 128 MiB for 16384 tokens at hidden 4096) is a McastGPUBuffer allocated when the first AllReduce of the
+mapping is built, before the KV cache is sized and any CUDA graph is captured.
 """
 
 from __future__ import annotations

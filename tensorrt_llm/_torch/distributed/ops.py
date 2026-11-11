@@ -1498,8 +1498,9 @@ class AllReduce(nn.Module):
                     )
                     self.mnnvl_allreduce = None
 
-            # Only under AUTO: an explicitly chosen strategy runs as chosen.
-            if (tp2_fused_norm and self.strategy == AllReduceStrategy.AUTO
+            # AUTO, or TWOSHOT (the kernel is a reduce-scatter + all-gather); other strategies run as chosen.
+            if (tp2_fused_norm and self.strategy in (AllReduceStrategy.AUTO,
+                                                     AllReduceStrategy.TWOSHOT)
                     and self.mapping.tp_size == 2 and not self._disable_mpi
                     and self.mnnvl_allreduce is None
                     and dtype in (None, torch.bfloat16)
