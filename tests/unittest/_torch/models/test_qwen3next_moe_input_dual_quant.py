@@ -21,6 +21,8 @@ from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm.nvfp4 import (
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_base import MoEImplBase
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _bare(cls):
     module = cls.__new__(cls)

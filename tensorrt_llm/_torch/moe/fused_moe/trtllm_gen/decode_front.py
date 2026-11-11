@@ -1074,7 +1074,7 @@ class FrontRunner(TunableRunner):
         self.tile_of = tile_of
 
     def unique_id(self):
-        return (tuple(self.gate.weight.shape), self.num_local, self.top_k)
+        return (tuple(self.gate.weight.shape), self.num_local, self.top_k, self.front.fused_only)
 
     def get_valid_tactics(self, inputs, profile, **kwargs):
         x = inputs[0]

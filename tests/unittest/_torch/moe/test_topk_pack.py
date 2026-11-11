@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""pack_topk_bf16 (one launch) against the torch expression it replaces in FlashinferOpBackend.run_bf16_moe."""
+"""pack_topk_bf16 (one launch) against the torch expression of the same packed words."""
 
 import pytest
 import torch

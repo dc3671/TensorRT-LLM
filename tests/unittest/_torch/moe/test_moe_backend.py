@@ -606,6 +606,7 @@ def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens(
     assert legacy_dynamic_spec.map_to_tuning_buckets(expert_capacity_rows) == 512
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("decode_tuning", [False, True])
 def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
     """Only a model that declares decode tuning gets the decode-step buckets and rank 0's tactic on every
@@ -628,11 +629,36 @@ def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
         assert set(spec.gen_tuning_buckets) & set(range(1, 129)) == set(pow2)
         assert [spec.map_to_tuning_buckets(m) for m in (7, 14, 28, 130)] == [4, 8, 16, 128]
 
-    # Only the declaring model's tuning cache key carries the flag.
-    runner = FP4BlockScaleMoERunner(
-        512, 10, None, None, 512, 0, 64, None, 1, False, 0, decode_tuning=decode_tuning
-    )
-    assert runner.unique_id() == (10, 512, 64, 0) + ((True,) if decode_tuning else ())
+    # Only the declaring model's tuning cache key carries the flag, and with it do_finalize (finalized and
+    # un-finalized calls run different kernels).
+    for do_finalize in (False, True):
+        runner = FP4BlockScaleMoERunner(
+            512, 10, None, None, 512, 0, 64, None, 1, do_finalize, 0, decode_tuning=decode_tuning
+        )
+        assert runner.unique_id() == (10, 512, 64, 0) + (
+            (True, do_finalize) if decode_tuning else ()
+        )
+
+
+@pytest.mark.cpu_only
+def test_fp4_block_scale_moe_op_mutability() -> None:
+    """The NVFP4 MoE op every model reaches is functional (torch.compile can trace it); the decode kernels' op
+    declares the buffers its engine writes."""
+    import tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops  # noqa: F401
+
+    def written(op):
+        return {
+            a.name for a in op.default._schema.arguments if a.alias_info and a.alias_info.is_write
+        }
+
+    assert written(torch.ops.trtllm.fp4_block_scale_moe_runner) == set()
+    assert written(torch.ops.trtllm.fp4_block_scale_moe_decode_runner) == {
+        "decode_engine_state",
+        "lamport_fc2_out",
+        "prerouted_tables",
+        "prerouted_ids",
+        "prerouted_weights",
+    }
 
 
 @pytest.mark.cpu_only

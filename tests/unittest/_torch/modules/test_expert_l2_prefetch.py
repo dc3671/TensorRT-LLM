@@ -105,8 +105,10 @@ def test_prefetch_changes_no_tensor_and_joins(budget_ns) -> None:
     tiles = torch.arange(NUM_LOCAL, dtype=torch.int32, device="cuda")
     limit = torch.arange(1, NUM_LOCAL + 1, dtype=torch.int32, device="cuda") * 8
     prefetch.record(0, tiles, limit, tiles.new_tensor([NUM_LOCAL]), 8, NUM_LOCAL, tiles, rows=8)
+    prefetch.join()
+    assert not prefetch._forked
     prefetch.prefetch(0, rows=8)
-    assert prefetch._forked
+    assert prefetch._forked  # forked by prefetch() itself
     prefetch.join()
     assert not prefetch._forked
     torch.cuda.synchronize()
