@@ -37,6 +37,7 @@ from cutlass.pipeline import (
     pipeline_init_wait,
 )
 
+from ...flashinfer_utils import get_env_enable_pdl
 from .moe_decode_front import _st_shared
 from .moe_persistent_engine import _ld_nc_f32, _ld_s32, _scale_pack_bf16x2, _st_global_b32
 
@@ -84,7 +85,8 @@ def _prefetch_bulk_l2(addr: Int64, nbytes: Int32) -> None:
 class MoeLowMFc2Nvfp4:
     """Routed NVFP4 FC2, tile 128 (hidden) x 8 (rows) x 256 (K), ``NUM_STAGES`` K stages per CTA."""
 
-    def __init__(self, k_tiles: int, k_groups: int):
+    def __init__(self, k_tiles: int, k_groups: int, use_pdl: bool = True):
+        self.use_pdl = use_pdl
         self.k_tiles = k_tiles
         self.k_groups = k_groups  # 4-scale groups per activation row (I / 64)
         self.tile_k = TILE_K
@@ -244,7 +246,7 @@ class MoeLowMFc2Nvfp4:
             block=[self.threads_per_cta, 1, 1],
             cluster=(1, 1, 1),
             stream=stream,
-            use_pdl=True,
+            use_pdl=self.use_pdl,
             min_blocks_per_mp=CTAS_PER_SM,
         )
 
@@ -853,12 +855,13 @@ def moe_lowm_fc2(act, act_sf, w2, w2_sf, scale, cta_batch, cta_limit, num_non_ex
     )
     problem = (Int32(h), Int32(k), Int32(e), Int32(rows))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    fn = _COMPILED.get(k)
+    use_pdl = get_env_enable_pdl()
+    fn = _COMPILED.get((k, use_pdl))
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("compile the low-M MoE FC2 before CUDA graph capture")
-        kern = MoeLowMFc2Nvfp4(-(-k // TILE_K), k // (4 * SF_VEC))
+        kern = MoeLowMFc2Nvfp4(-(-k // TILE_K), k // (4 * SF_VEC), use_pdl)
         fn = cute.compile(kern, *ptrs, *addrs, problem, Int32(grid_ctas), stream)
-        _COMPILED[k] = fn
+        _COMPILED[(k, use_pdl)] = fn
     fn(*ptrs, *addrs, problem, Int32(grid_ctas), stream)
     return out

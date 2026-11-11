@@ -296,7 +296,7 @@ class MoeBf16Engine(PersistentMoeEngine):
             block=[THREADS, 1, 1],
             cluster=(1, 1, 1),
             stream=stream,
-            use_pdl=True,
+            use_pdl=self.use_pdl,
             min_blocks_per_mp=1,
         )
 

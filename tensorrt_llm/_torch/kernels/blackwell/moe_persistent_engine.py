@@ -201,6 +201,8 @@ class PersistentMoeEngine:
 
     fc2_wait_in_scheduler: bool = True
     release: Release = Release.END
+    # Launched as a programmatic dependent (TRTLLM_ENABLE_PDL); set by launch() before compiling.
+    use_pdl: bool = True
 
     def __init__(self, hidden: int, inter: int, n_max: int, num_stages: int, tile_k: int):
         assert hidden % tile_k == 0 and inter % tile_k == 0
@@ -428,10 +430,14 @@ def gmem_ptr(dtype, t: torch.Tensor, align: int):
 def launch(
     make_engine, key, args, device: torch.device, spare_sms: int = 0, tail_args: tuple = ()
 ) -> None:
-    """Compile ``make_engine()`` once per ``key`` (the engine class and its compile-time configuration) and launch
-    it with ``args`` on the current stream, one CTA per SM of ``device`` but ``spare_sms`` (the grid size is a launch
-    argument; the units balance over any grid). ``tail_args`` follow the stream (an engine option's parameters). The
-    first call of a key must precede CUDA graph capture."""
+    """Compile ``make_engine()`` once per ``key`` (the engine class and its compile-time configuration) and the PDL
+    setting, and launch it with ``args`` on the current stream, one CTA per SM of ``device`` but ``spare_sms`` (the
+    grid size is a launch argument; the units balance over any grid). ``tail_args`` follow the stream (an engine
+    option's parameters). The first call of a key must precede CUDA graph capture."""
+    from ...flashinfer_utils import get_env_enable_pdl
+
+    use_pdl = get_env_enable_pdl()
+    key = (*key, use_pdl)
     grid_ctas = Int32(torch.cuda.get_device_properties(device).multi_processor_count - spare_sms)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn = _COMPILED.get(key)
@@ -440,7 +446,9 @@ def launch(
             raise RuntimeError(
                 f"compile the MoE engine {key[0].__name__} before CUDA graph capture"
             )
-        fn = _COMPILED[key] = cute.compile(make_engine(), *args, grid_ctas, stream, *tail_args)
+        engine = make_engine()
+        engine.use_pdl = use_pdl
+        fn = _COMPILED[key] = cute.compile(engine, *args, grid_ctas, stream, *tail_args)
     fn(*args, grid_ctas, stream, *tail_args)
 
 
