@@ -38,7 +38,8 @@ def generation_only_on_every_rank(
     return all_rank_num_gens is not None and list(all_rank_num_gens) == list(all_rank_num_seqs)
 
 
-@triton.jit
+# Batch counts and strides are not specialized: eager steps at new batch sizes reuse the compiled kernels.
+@triton.jit(do_not_specialize=["num_contexts", "num_gens", "num_ctx_tokens"])
 def _kept_row_ids_kernel(
     seq_lens_ptr,
     batch_idx_ptr,
@@ -91,7 +92,7 @@ def kept_row_ids(
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["a_stride", "b_stride"])
 def _gather_rows2_kernel(
     a_ptr,
     b_ptr,
