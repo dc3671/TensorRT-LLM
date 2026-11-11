@@ -679,7 +679,8 @@ class Attention(nn.Module):
                 kv_replicas=kv_replicas,
                 mapping=self.mapping,
                 tokens_per_gen_step=(config.spec_config.tokens_per_gen_step
-                                     if config.spec_config is not None else 1))
+                                     if config.spec_config is not None else 1),
+                max_graph_batch=max(config.cuda_graph_batch_sizes, default=0))
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 

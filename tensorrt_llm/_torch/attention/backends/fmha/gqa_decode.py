@@ -107,6 +107,8 @@ class GqaDecodeSetup:
     mapping: Optional[Mapping] = None
     # Largest q_len of a generation call (1 + draft tokens).
     tokens_per_gen_step: int = 1
+    # Largest CUDA-graph decode batch (requests per rank); 0 without generation CUDA graphs.
+    max_graph_batch: int = 0
 
 
 @dataclass
@@ -179,17 +181,24 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
     _decode_module_loaded = False
     # Minimum KV splits per sequence of a trtllm-gen decode call; 0: FlashInfer's heuristic.
     _min_kv_splits: int = 0
-    # Largest decode batch of this layer, which sizes the min-KV-split scratch.
+    # Largest decode batch that takes the minimum (the largest CUDA-graph decode batch); sizes its scratch.
     _min_kv_split_batch: int = 0
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
         self._counter_buffer: Optional[torch.Tensor] = None
-        mapping = attn.gqa_decode.mapping
-        if mapping is not None and mapping.enable_attention_dp:
+        setup = attn.gqa_decode
+        if (
+            setup.mapping is not None
+            and setup.mapping.enable_attention_dp
+            and setup.max_graph_batch > 0
+        ):
+            # Bounded by the largest CUDA-graph batch: graph warmup allocates the scratch before KV-cache sizing,
+            # and larger eager batches keep FlashInfer's heuristic.
             self._min_kv_splits = self._min_kv_splits_for(
-                attn.num_heads, attn.num_kv_heads, attn.gqa_decode.tokens_per_gen_step
+                attn.num_heads, attn.num_kv_heads, setup.tokens_per_gen_step
             )
+            self._min_kv_split_batch = setup.max_graph_batch
 
     @staticmethod
     def _min_kv_splits_for(num_heads: int, num_kv_heads: int, tokens_per_gen_step: int) -> int:
@@ -209,11 +218,6 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
         workspace: torch.Tensor,
     ) -> None:
         super().prepare_workspace(q, k, v, metadata, forward_args, workspace)
-        if self._min_kv_splits:
-            self._min_kv_split_batch = max(
-                self._min_kv_split_batch,
-                int(metadata.max_num_sequences or metadata.max_num_requests),
-            )
         if not self._decode_module_loaded and metadata.num_generations > 0:
             # On the first generation call (warmup's), which a dedicated kernel may serve: the segmented and
             # trtllm-gen decodes that need the module may come only with mixed or larger batches.
@@ -384,7 +388,7 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
     ) -> bool:
         """trtllm-gen decode with _min_kv_splits KV splits per sequence where the device's SM count gives fewer: the
         same kernel launched with the SM count that gives them, and a scratch for their partials. False: the stock
-        call (no minimum, query and KV dtypes differ, or enough SMs)."""
+        call (no minimum, query and KV dtypes differ, enough SMs, or a batch above _min_kv_split_batch)."""
         splits = self._min_kv_splits
         if splits == 0 or self._multi_processor_count is None or q.dtype != kv_pool.dtype:
             return False
@@ -396,11 +400,11 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
             return False
         attn = self.attn
         sm_count = splits * attn.num_kv_heads * batch
-        if sm_count <= self._multi_processor_count:
+        if sm_count <= self._multi_processor_count or batch > self._min_kv_split_batch:
             return False
         # Split CTAs <= sm_count, one Q tile of partials each; sized for the largest batch, so every call and captured
         # graph shares one block.
-        max_sm_count = splits * attn.num_kv_heads * max(batch, self._min_kv_split_batch)
+        max_sm_count = splits * attn.num_kv_heads * self._min_kv_split_batch
         scratch = get_memory_buffers().get_buffer(
             [max_sm_count * _MAX_GEN_TILE_ROWS * (8 + 4 * attn.head_dim)],
             torch.uint8,

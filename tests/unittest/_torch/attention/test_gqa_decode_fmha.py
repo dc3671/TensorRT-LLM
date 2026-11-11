@@ -619,6 +619,25 @@ def test_min_kv_splits_need_one_q_tile_and_the_counters(
     assert GqaDecodeFmha._min_kv_splits_for(num_heads, num_kv_heads, tokens_per_gen_step) == splits
 
 
+def test_min_kv_split_stops_above_the_largest_graph_batch() -> None:
+    """Batches above the largest CUDA-graph decode batch keep FlashInfer's split, so the forced split's scratch is
+    bounded by that batch."""
+    q_len, kv_heads, sms = 7, 2, 148
+    fmha = types.SimpleNamespace(
+        _min_kv_splits=8,
+        _multi_processor_count=sms,
+        _min_kv_split_batch=16,
+        attn=types.SimpleNamespace(num_kv_heads=kv_heads),
+    )
+    batch = fmha._min_kv_split_batch + 1
+    assert 8 * kv_heads * batch > sms
+    q = torch.empty(batch * q_len, 32, HEAD_DIM, dtype=torch.float8_e4m3fn)
+    kv_pool = torch.empty(1, kv_heads, PAGE, HEAD_DIM, dtype=torch.float8_e4m3fn)
+    assert not GqaDecodeFmha._run_min_kv_split(
+        fmha, None, q, kv_pool, None, 0, -1, q_len, None, None, 1.0, 1.0
+    )
+
+
 def test_min_kv_split_decode_is_flashinfer_decode_at_that_sm_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
