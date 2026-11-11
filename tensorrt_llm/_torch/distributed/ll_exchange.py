@@ -1532,7 +1532,10 @@ class TPGroupExchange:
         self, x: torch.Tensor, out: Optional[torch.Tensor] = None, channel: int = 0, trigger=False
     ) -> torch.Tensor:
         """``[rows, *rest]`` per member -> ``[rows, G * prod(rest)]`` (member-major along the last dim);
-        e.g. q ``[T, 4, 256]`` -> ``[T, 16 * 256]`` (view it as ``[T, 16, 256]``)."""
+        e.g. q ``[T, 4, 256]`` -> ``[T, 16 * 256]`` (view it as ``[T, 16, 256]``). Floating-point payloads only:
+        a word equal to the empty-slot sentinel (all bits set, NaNs in every float format) arrives as another NaN."""
+        if not x.dtype.is_floating_point:
+            raise ValueError(f"allgather moves floating-point payloads, got {x.dtype}")
         assert x.is_contiguous()
         rows = x.shape[0]
         row_bytes = x[0].numel() * x.element_size() if rows else 0

@@ -426,8 +426,11 @@ def _group_allgather(tp):
             torch.cuda.synchronize()
             ref = torch.cat([x_of(r).reshape(rows, -1) for r in members], dim=-1)
             assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), ("allgather", rows)
-        # Refused before any launch: a pushed merge of two partials per row (its producer pushes one), and an
-        # in-kernel gather on an exchange created without its head dim.
+        # Refused before any launch: an integer payload (its all-ones words would arrive rewritten), a pushed
+        # merge of two partials per row (its producer pushes one), and an in-kernel gather on an exchange created
+        # without its head dim.
+        with pytest.raises(ValueError, match="floating-point"):
+            ex.allgather(torch.zeros(4, 256, dtype=torch.int32, device="cuda"))
         o = torch.zeros(group_size, 2, 4, 4, 256, dtype=torch.bfloat16, device="cuda")
         lse = torch.zeros(group_size, 2, 4, 4, device="cuda")
         out = torch.empty(4, 4, 256, dtype=torch.bfloat16, device="cuda")
