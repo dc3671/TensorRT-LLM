@@ -41,13 +41,13 @@ import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict, namedtuple
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Set, Tuple
 
 from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequestState
-from ..request_utils import get_from_waiting_queue
+from ..request_utils import can_process_attention_dp_request, get_from_waiting_queue
 from .rank_state import RankIterStatsPayload, RankState
 
 if TYPE_CHECKING:
@@ -1083,8 +1083,7 @@ class ConversationAwareADPRouter(ADPRouter):
     _home_wait_rounds: Optional[int] = None
     # Home-wait state; __init__ gives each instance its own (see there).
     _home_wait_age: Dict[int, int] | Mapping[int, int] = MappingProxyType({})
-    _home_wait_new_bindings: Set[int] | FrozenSet[int] = frozenset()
-    # How far into the waiting queue one home-wait round looks for requests it can admit.
+    # The first window one home-wait round peeks; it doubles while no request in it stopped the round.
     HOME_WAIT_WINDOW = 256
 
     def __init__(
@@ -1100,11 +1099,9 @@ class ConversationAwareADPRouter(ADPRouter):
         self._conv_to_rank: "OrderedDict[str, int]" = OrderedDict()
         # Home-wait admission (see pop_requests); None: overflow at once.
         self._home_wait_rounds = home_wait_rounds
-        # Request id -> rounds it was held for its home rank while another rank had room; dropped on admission
-        # or once the request has left the waiting queue.
+        # Request id -> rounds it was held for its home rank while another rank had room, for the requests in the
+        # last round's window.
         self._home_wait_age = {}
-        # Requests whose conversation was bound by this round's pop_requests (route_requests publishes them as new).
-        self._home_wait_new_bindings = set()
         # Uncached-prefill estimate for the V2 scheduler's long-prefill
         # demotion: within a conversation the prompt only grows and the rank
         # that served the previous turn caches its prompt, so on that rank
@@ -1199,10 +1196,12 @@ class ConversationAwareADPRouter(ADPRouter):
         max_num_active_requests: int,
         kv_balance: bool = True,
     ) -> Tuple[List["RequestQueueItem"], Dict[int, int]]:
-        """Pop the requests to admit and, under home-wait, plan their ranks (request id -> rank).
+        """Pop the requests to admit and, under home-wait, plan their home ranks (request id -> rank).
 
-        Home-wait admits a bound conversation only to its home rank until it was held ``home_wait_rounds`` rounds
-        while another rank had room; later requests of its admission group may pass it. Held requests stay in order.
+        Home-wait admits a returning conversation only to its home rank until it was held ``home_wait_rounds``
+        rounds while another rank had room; then it is admitted unplanned and overflows in ``route_requests``.
+        Other requests are admitted as without home-wait. Later requests of a held request's admission group
+        may pass it; held requests stay in order.
         """
         if self._home_wait_rounds is None or max_new_requests <= 0 or len(all_rank_states) <= 1:
             return super().pop_requests(
@@ -1214,117 +1213,85 @@ class ConversationAwareADPRouter(ADPRouter):
             )
         tp_size = len(all_rank_states)
         num_active = [0] * tp_size
-        num_tokens = [0] * tp_size
         for state in all_rank_states:
             num_active[state.rank] = state.num_active_requests
-            num_tokens[state.rank] = state.num_active_tokens
-        window = waiting_queue.peek_requests(self.HOME_WAIT_WINDOW)
-        self._home_wait_new_bindings = set()
         ages = self._home_wait_age
-        if not window:
-            ages.clear()
-            return [], {}
-        groups = waiting_queue.admission_groups(window)
-        soft_cap = self._expected_num_active_requests(
-            num_active,
-            min(len(window), max_new_requests),
-            tp_size,
-            multiplier=self._fair_share_multiplier,
-            hard_cap=max_num_active_requests,
-        )
         budget = max_new_requests
         chosen_idx: List[int] = []
         placement: Dict[int, int] = {}
         held_group = None
-        for idx, item in enumerate(window):
-            if held_group is not None and groups[idx] != held_group:
-                break  # a group must finish before the next one (WaitingQueue.admission_groups)
-            need = 1 + (len(item.child_req_ids) if item.child_req_ids else 0)
-            if need > budget:
+        window: List["RequestQueueItem"] = []
+        size = self.HOME_WAIT_WINDOW
+        idx = 0
+        while True:
+            # Look further only while every request so far was held or admitted and a rank has room.
+            window = waiting_queue.peek_requests(size)
+            groups = waiting_queue.admission_groups(window)
+            stopped = False
+            while idx < len(window):
+                item = window[idx]
+                if held_group is not None and groups[idx] != held_group:
+                    stopped = True  # a group must finish before the next one (WaitingQueue.admission_groups)
+                    break
+                need = 1 + (len(item.child_req_ids) if item.child_req_ids else 0)
+                if need > budget:
+                    stopped = True
+                    break
+                conv_id = self._conversation_id(item)
+                home = None if conv_id is None else self._conv_to_rank.get(conv_id)
+                if home is None:
+                    # Not bound: admitted as without home-wait (an explicit strict rank needs room).
+                    if can_process_attention_dp_request(item, num_active, max_num_active_requests):
+                        budget -= need
+                        chosen_idx.append(idx)
+                elif num_active[home] + need <= max_num_active_requests:
+                    num_active[home] += need
+                    budget -= need
+                    placement[item.id] = home
+                    chosen_idx.append(idx)
+                else:
+                    other_room = any(
+                        num_active[r] + need <= max_num_active_requests
+                        for r in range(tp_size)
+                        if r != home
+                    )
+                    if other_room and ages.get(item.id, 0) >= self._home_wait_rounds:
+                        budget -= need
+                        chosen_idx.append(idx)
+                    else:
+                        if other_room:
+                            ages[item.id] = ages.get(item.id, 0) + 1
+                        held_group = groups[idx]
+                idx += 1
+            if stopped or len(window) < size or budget <= 0:
                 break
-            rank, other_room = self._plan_home_wait_rank(
-                item, num_active, num_tokens, need, max_num_active_requests, soft_cap
-            )
-            if rank is None:
-                ages[item.id] = ages.get(item.id, 0) + (1 if other_room else 0)
-                held_group = groups[idx]
-                continue
-            ages.pop(item.id, None)
-            num_active[rank] += need
-            num_tokens[rank] += _num_input_tokens(item.request)
-            budget -= need
-            placement[item.id] = rank
-            chosen_idx.append(idx)
-        if len(ages) > len(waiting_queue) - len(chosen_idx):
-            # Some aged request left the queue without an admission here (e.g. it was cancelled).
-            queued = {item.id for item in waiting_queue}
-            for request_id in [request_id for request_id in ages if request_id not in queued]:
-                del ages[request_id]
+            if all(n >= max_num_active_requests for n in num_active):
+                break
+            size *= 2
+        # Keep the ages of requests still in the window; a request admitted, cancelled or pushed out of the window
+        # loses its age.
+        chosen_ids = {window[i].id for i in chosen_idx}
+        self._home_wait_age = {
+            item.id: ages[item.id]
+            for item in window
+            if item.id in ages and item.id not in chosen_ids
+        }
         if not chosen_idx:
             return [], {}
-        chosen = [window[idx] for idx in chosen_idx]
-        popped = [waiting_queue.pop_request() for _ in window]
-        waiting_queue.prepend_requests(item for item in popped if item.id not in placement)
+        chosen = [window[i] for i in chosen_idx]
+        popped = [waiting_queue.pop_request() for _ in range(chosen_idx[-1] + 1)]
+        waiting_queue.prepend_requests(item for item in popped if item.id not in chosen_ids)
         waiting_queue.mark_admitted(chosen)
         return chosen, placement
 
-    def _plan_home_wait_rank(
-        self,
-        item: "RequestQueueItem",
-        num_active: List[int],
-        num_tokens: List[int],
-        need: int,
-        max_num_active_requests: int,
-        soft_cap: int,
-    ) -> Tuple[Optional[int], bool]:
-        """The rank one request is admitted to this round, or None to hold it; and whether another rank had room."""
-        tp_size = len(num_active)
-        room = [r for r in range(tp_size) if num_active[r] + need <= max_num_active_requests]
-        conv_id = self._conversation_id(item)
-        home = None if conv_id is None else self._conv_to_rank.get(conv_id)
-        if home is not None:
-            if num_active[home] + need <= max_num_active_requests:
-                return home, True
-            if not room:
-                return None, False
-            if self._home_wait_age.get(item.id, 0) < self._home_wait_rounds:
-                return None, True
-            # Held long enough while other ranks had room: overflow as without home-wait, keeping the binding.
-            return self._pick_rank(num_active, num_tokens, soft_cap, room), True
-        scheduling_params = item.request.py_scheduling_params
-        target = None if scheduling_params is None else scheduling_params.attention_dp_rank
-        relax = True if scheduling_params is None else scheduling_params.attention_dp_relax
-        rank = None
-        if target is not None:
-            if num_active[target] + need <= max_num_active_requests:
-                rank = target
-            elif not relax:
-                return None, bool(room)
-        if rank is None:
-            if not room:
-                return None, False
-            rank = self._pick_rank(num_active, num_tokens, soft_cap, room)
-        if conv_id is not None:
-            # Bind now, so a later request of this conversation in the same window follows it.
-            self._record_target_rank(conv_id, rank)
-            self._home_wait_new_bindings.add(item.id)
-        return rank, True
-
-    def _pick_rank(
-        self,
-        num_active: List[int],
-        token_load: List[int],
-        soft_cap: int,
-        room: Optional[List[int]] = None,
-    ) -> int:
-        """``new_conv_placement`` among ``room`` (default: every rank), preferring ranks under ``soft_cap``.
+    def _pick_rank(self, num_active: List[int], token_load: List[int], soft_cap: int) -> int:
+        """``new_conv_placement`` over all ranks, preferring ranks under ``soft_cap``.
 
         ``token_load`` is read only by ``least_tokens``.
         """
         tp_size = len(num_active)
-        ranks = range(tp_size) if room is None else room
-        preferred = [r for r in ranks if num_active[r] < soft_cap]
-        cands = preferred or list(ranks)
+        preferred = [r for r in range(tp_size) if num_active[r] < soft_cap]
+        cands = preferred or list(range(tp_size))
         if self._new_conv_placement == "least_tokens":
             rank = min(
                 cands,
@@ -1394,20 +1361,15 @@ class ConversationAwareADPRouter(ADPRouter):
         }
         all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
 
-        # 0) Requests whose rank pop_requests planned (home-wait admission) go there.
+        # 0) Requests pop_requests planned (home-wait admission) go to their conversation's home rank.
         unplanned = []
         for req_item in new_requests:
             rank = None if placement is None else placement.get(req_item.id)
             if rank is None:
                 unplanned.append(req_item)
                 continue
-            conv_id = self._conversation_id(req_item)
-            home_rank = None
-            if conv_id is not None and req_item.id not in self._home_wait_new_bindings:
-                home_rank = self._conv_to_rank.get(conv_id)
-                if home_rank == rank:
-                    self._record_target_rank(conv_id, rank)  # LRU touch
-            self._publish_uncached_estimate(req_item, rank, home_rank)
+            self._record_target_rank(self._conversation_id(req_item), rank)  # LRU touch
+            self._publish_uncached_estimate(req_item, rank, rank)
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
 

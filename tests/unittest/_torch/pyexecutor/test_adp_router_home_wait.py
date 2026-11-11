@@ -193,17 +193,45 @@ def test_a_request_the_round_does_not_reach_keeps_its_age():
     assert router._home_wait_age == {1: 1, 2: 1}
 
 
-def test_a_request_pushed_out_of_the_window_keeps_its_age():
+def test_window_extends_past_held_requests():
+    """A round looks past a window of held requests while a rank has room."""
     router = _router(rounds=10)
     router.HOME_WAIT_WINDOW = 1
     _bind(router, {"A": 0, "B": 1})
     queue = FCFSWaitingQueue()
+    queue.add_requests([_item(1, "A"), _item(2, "B"), _item(3, "C"), _item(4, "D")])
+    pos = _round(router, queue, [1, 1, 0, 0], 1, max_new=1)
+    assert list(pos) == [3] and pos[3] in (2, 3)
+    assert router._home_wait_age == {1: 1, 2: 1}
+    # Only the requests up to the last admitted one were popped and put back.
+    assert [x.id for x in queue] == [1, 2, 4]
+
+
+def test_a_request_out_of_the_window_loses_its_age():
+    router = _router(rounds=10)
+    router.HOME_WAIT_WINDOW = 1
+    _bind(router, {"A": 0})
+    queue = FCFSWaitingQueue()
     queue.add_request(_item(1, "A"))
     assert _round(router, queue, [1, 0, 0, 0], 1) == {}  # A held while other ranks had room
-    # B's request goes ahead of A and is held too, so the one-request window no longer reaches A.
-    queue.prepend_requests([_item(2, "B")])
-    assert _round(router, queue, [1, 1, 0, 0], 1) == {}
-    assert router._home_wait_age == {1: 1, 2: 1}
+    assert router._home_wait_age == {1: 1}
+    # A new request goes ahead of A and uses the round's whole budget, so the window never reaches A.
+    queue.prepend_requests([_item(2, "C")])
+    assert list(_round(router, queue, [1, 0, 0, 0], 1, max_new=1)) == [2]
+    assert router._home_wait_age == {}
+    assert [x.id for x in queue] == [1]
+
+
+def test_unbound_requests_are_placed_as_without_home_wait():
+    """Home-wait plans only returning conversations; route_requests places the rest by its own rules."""
+    routers = [_router(rounds=4), ConversationAwareADPRouter(dist=_dist(4))]
+    results = []
+    for router in routers:
+        queue = FCFSWaitingQueue()
+        queue.add_requests([_item(i, f"n{i}", children=i % 2) for i in range(6)])
+        results.append(_round(router, queue, [2, 0, 1, 3], 4))
+        assert router._conv_to_rank == {f"n{i}": results[-1][i] for i in range(6)}
+    assert results[0] == results[1]
 
 
 def test_a_removed_request_drops_its_age():
