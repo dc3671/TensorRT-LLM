@@ -320,14 +320,13 @@ def _next_layer_l2_prefetch(layer: nn.Module,
     input projection at ``rows`` rows, or None: below ``l2_prefetch_min_rows``
     and where the resident-weight GEMM takes the projection, it loads its
     weight itself."""
-    linear = layer.next_layer_prefetch
-    if linear is None or rows < layer.l2_prefetch_min_rows:
+    w = layer.next_layer_prefetch_weight
+    if w is None or rows < layer.l2_prefetch_min_rows:
         return None
     lo, hi = layer.next_layer_resident_rows
     if lo <= rows <= hi:
         return None
-    w = linear.weight
-    return w if w.is_cuda and w.is_contiguous() and w.numel() > 0 else None
+    return w
 
 
 def _post_moe_allreduce(layer: nn.Module, mlp_output, residual: torch.Tensor):
@@ -1151,10 +1150,10 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
     # quantizes for, and whether it also reads the BF16 input.
     next_layer_input_scale: Optional[torch.Tensor] = None
     next_layer_reads_bf16 = False
-    # TP decode kernels: the next layer's input projection, whose weight the
-    # MNNVL MoE-output all-reduce pulls into L2 from l2_prefetch_min_rows rows,
-    # except in the rows the resident-weight GEMM takes it.
-    next_layer_prefetch: Optional[nn.Module] = None
+    # TP decode kernels: the weight of the next layer's input projection, which
+    # the MNNVL MoE-output all-reduce pulls into L2 from l2_prefetch_min_rows
+    # rows, except in the rows the resident-weight GEMM takes it.
+    next_layer_prefetch_weight: Optional[torch.Tensor] = None
     l2_prefetch_min_rows = 0
     next_layer_resident_rows: Tuple[int, int] = (1, 0)
     # Attention-DP decode kernels: the post-MoE chain runs as one launch
@@ -1939,10 +1938,12 @@ class Qwen3NextModel(DecoderModel):
             prefetch = (projection is not None
                         and layer.allreduce.mnnvl_allreduce is not None
                         and not projection._weights_removed)
-            # A reference to the next layer's module, not a child of this one (a Module assigned through
-            # nn.Module.__setattr__ would be registered, and read back as the class default None).
-            object.__setattr__(layer, "next_layer_prefetch",
-                               projection if prefetch else None)
+            # A tensor, not the module: a module attribute would register the
+            # projection as a second child of this layer.
+            weight = projection.weight.detach() if prefetch else None
+            layer.next_layer_prefetch_weight = (
+                weight if weight is not None and weight.is_cuda
+                and weight.is_contiguous() and weight.numel() > 0 else None)
             layer.l2_prefetch_min_rows = min_rows
             if projection is not None and layer.next_layer_input_scale is not None:
                 # Its input arrives in E4M3 from this all-reduce: from min_rows

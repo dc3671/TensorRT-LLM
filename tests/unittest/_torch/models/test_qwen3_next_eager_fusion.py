@@ -211,7 +211,7 @@ def test_pre_moe_allreduce_runs_in_mixer_output_projection() -> None:
         next_layer_layernorm=next_layer_norm,
         next_layer_input_scale=None,
         next_layer_reads_bf16=False,
-        next_layer_prefetch=None,
+        next_layer_prefetch_weight=None,
         post_moe_norm_fold=False,
         allreduce_fp8_payload=False,
         fusion_config=SimpleNamespace(PRE_MOE_FUSION=True, POST_MOE_FUSION=True),
@@ -372,6 +372,25 @@ def test_decode_kernels_follow_the_model_declaration(monkeypatch, declared, blac
     assert MoEDecodeOptions.of(config.extra_attrs).tuning is (declared and blackwell)
 
 
+def test_next_layer_l2_prefetch_rows() -> None:
+    """The MoE-output all-reduce prefetches the next projection's weight from l2_prefetch_min_rows rows, except in
+    the rows the resident-weight GEMM takes it."""
+    from tensorrt_llm._torch.models import modeling_qwen3_next as m
+
+    weight = torch.zeros(8, 4)
+    layer = SimpleNamespace(
+        next_layer_prefetch_weight=weight,
+        l2_prefetch_min_rows=14,
+        next_layer_resident_rows=(14, 64),
+    )
+    assert m._next_layer_l2_prefetch(layer, 7) is None
+    assert m._next_layer_l2_prefetch(layer, 14) is None
+    assert m._next_layer_l2_prefetch(layer, 64) is None
+    assert m._next_layer_l2_prefetch(layer, 65) is weight
+    layer.next_layer_resident_rows = (1, 0)
+    assert m._next_layer_l2_prefetch(layer, 14) is weight
+
+
 @pytest.mark.parametrize("can_defer_finalize", [False, True])
 def test_post_moe_allreduce_folds_the_shared_expert(can_defer_finalize) -> None:
     """Where the MoE-output all-reduce takes the fold, the MoE hands back its routed output with the shared
@@ -418,7 +437,7 @@ def test_post_moe_allreduce_folds_the_shared_expert(can_defer_finalize) -> None:
         next_layer_layernorm=next_layer_norm,
         next_layer_input_scale=None,
         next_layer_reads_bf16=False,
-        next_layer_prefetch=None,
+        next_layer_prefetch_weight=None,
         post_moe_norm_fold=False,
         allreduce_fp8_payload=False,
         fusion_config=SimpleNamespace(PRE_MOE_FUSION=True, POST_MOE_FUSION=True),
