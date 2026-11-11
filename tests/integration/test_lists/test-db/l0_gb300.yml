@@ -156,6 +156,9 @@ l0_gb300:
   # 3k-6k-token pass keys with their acceptance-length floor. The other layouts and KV dtypes
   # run post-merge (l0_gb300_multi_gpus).
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
+  # Qwen3.5 TP decode: KV-replica FP8 decode (TP2 / TP4) and the MNNVL all-reduce + RMSNorm kernels.
+  - unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py
+  - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
 
 # K3 collectives and decode-path exchanges, four ranks in one NVLink domain.
 - condition:
