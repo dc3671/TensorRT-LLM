@@ -19,10 +19,11 @@
 workspace without ``buffer_flags``:
 
 * CTA ``b`` owns, per region, the slot block [b][rank][threads] (geometry must be fixed per workspace). Its
-  participation count ``n_b`` (int32 at ``ctl + 128 * b``, read by thread 0, written back + 1) selects region
-  ``n_b % 3``: multicast into it, clear own region ``(n_b + 2) % 3``, poll ``n_b % 3`` (-0.0 = not written).
+  participation index ``n_b`` in 0..2 (int32 at ``ctl + 128 * b``, read by thread 0, written back as
+  ``(n_b + 1) % 3``) selects region ``n_b``: multicast into it, clear own region ``(n_b + 2) % 3``, poll ``n_b``
+  (-0.0 = not written).
 * Safety: a peer is at most one participation of CTA ``b`` ahead (it needs this rank's data in between), so
-  it writes regions ``n_b`` / ``n_b + 1`` only, never the one being cleared.
+  it writes regions ``n_b`` / ``(n_b + 1) % 3`` only, never the one being cleared.
 * Cross-CTA norm sums use st.async onto a per-CTA mbarrier (no barrier.cluster).
 
 ``ts_ctas`` > 0 (rows from ``TWO_SHOT_ROWS``): the same one-shot transport with the two-shot kernel's
@@ -386,7 +387,7 @@ class MnnvlSlotAllReduceNormKernel:
         else:
             x0, x1, x2, x3 = _ld_v4(Int64(gX.iterator.toint()) + row_off)
 
-        # ---- this CTA's participation count, read by one thread and shared through smem ----
+        # ---- this CTA's participation index, read by one thread and shared through smem ----
         if tidx == 0:
             fl[0] = _ld_cg_s32(ctl + Int64(bid) * Int64(SLOT_STATE_STRIDE))
         cute.arch.sync_threads()
@@ -478,9 +479,7 @@ class MnnvlSlotAllReduceNormKernel:
         neg0 = Int32(_NEG_ZERO)
         slot_cnt = fl[0]
         blk_bytes: cutlass.Constexpr = nranks * threads * 16  # [W slots] of this CTA
-        data_off = Int64(slot_cnt % Int32(3)) * Int64(self.region_bytes) + Int64(bid) * Int64(
-            blk_bytes
-        )
+        data_off = Int64(slot_cnt) * Int64(self.region_bytes) + Int64(bid) * Int64(blk_bytes)
         _st_v4(
             mcast + data_off + (Int64(rank) * Int64(threads) + Int64(tidx)) * Int64(16),
             _sanitize(x0),
@@ -503,9 +502,9 @@ class MnnvlSlotAllReduceNormKernel:
             cute.arch.sync_threads()
             griddepcontrol_launch_dependents()
 
-        # ---- count the participation; clear this thread's slots of the previous participation's region ----
+        # ---- advance the participation index; clear this thread's slots of the previous participation's region ----
         if tidx == 0:
-            _st_s32(ctl + Int64(bid) * Int64(SLOT_STATE_STRIDE), slot_cnt + Int32(1))
+            _st_s32(ctl + Int64(bid) * Int64(SLOT_STATE_STRIDE), (slot_cnt + Int32(1)) % Int32(3))
         pq = (slot_cnt + Int32(2)) % Int32(3)
         pbase = (
             own
