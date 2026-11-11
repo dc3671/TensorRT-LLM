@@ -97,6 +97,7 @@ def get_from_waiting_queue(
     enable_attention_dp: bool,
     max_num_active_requests: int,
     all_ranks_num_active_requests: Optional[list[int]] = None,
+    mark_admitted: bool = True,
 ) -> list["RequestQueueItem"]:
     """Get requests from the waiting queue.
 
@@ -106,6 +107,8 @@ def get_from_waiting_queue(
         enable_attention_dp: Whether to enable attention DP scheduling.
         max_num_active_requests: Maximum number of active requests per rank.
         all_ranks_num_active_requests: Number of active requests for each rank.
+        mark_admitted: Report the returned requests to ``WaitingQueue.mark_admitted``;
+            False when the caller may still put some of them back.
 
     Returns:
         List of requests that can be processed.
@@ -146,7 +149,8 @@ def get_from_waiting_queue(
     # Put the pending requests back to the waiting queue
     # All ranks should have the same waiting queue
     waiting_queue.prepend_requests(pending_requests)
-    waiting_queue.mark_admitted(items)
+    if mark_admitted:
+        waiting_queue.mark_admitted(items)
 
     return items
 

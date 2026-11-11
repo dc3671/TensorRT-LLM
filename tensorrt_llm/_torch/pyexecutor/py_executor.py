@@ -8325,15 +8325,21 @@ class PyExecutor:
                                                 max_new_requests,
                                                 self.max_num_active_requests,
                                                 kv_balance=kv_balance)
+        mm_admission = getattr(self, "_mm_encoder_item_scheduling_enabled",
+                               False)
         new_requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
             enable_attention_dp=False,
-            max_num_active_requests=self.max_num_active_requests)
-        if (not new_requests or not getattr(
-                self, "_mm_encoder_item_scheduling_enabled", False)):
+            max_num_active_requests=self.max_num_active_requests,
+            mark_admitted=not mm_admission)
+        if not mm_admission:
             return new_requests, {}
-        return self._apply_mm_encoder_admission(waiting_queue, new_requests), {}
+        # Deferred requests go back with their arrival order, so only the rest are admitted.
+        admitted = (self._apply_mm_encoder_admission(
+            waiting_queue, new_requests) if new_requests else [])
+        waiting_queue.mark_admitted(admitted)
+        return admitted, {}
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(

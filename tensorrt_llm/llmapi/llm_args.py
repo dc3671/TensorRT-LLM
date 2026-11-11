@@ -4607,7 +4607,7 @@ class WaitingQueuePolicy(StrEnum):
 
     FCFS = "fcfs"  # First-Come-First-Served
     PRIORITY = "priority"  # Higher request.priority value is served first; ties broken by FCFS
-    # Fewest max_tokens first; ties, and requests without max_tokens (last), in arrival order
+    # Fewest max_tokens first (ties in arrival order); request priorities are ignored
     SHORTEST_DECODE_FIRST = "shortest_decode_first"
 
 
@@ -4712,9 +4712,12 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
         default=60.0,
         description=(
             "With waiting_queue_policy='shortest_decode_first': a request "
-            "that has waited this many seconds goes ahead of every request "
-            "that has not, oldest first. None disables the cap. Other "
-            "policies ignore it."),
+            "that has waited this many seconds since it reached the server "
+            "(in disaggregated serving, the orchestrator) goes ahead of every "
+            "request that has not, oldest first. None disables the cap. Keep "
+            "it below the context servers' "
+            "cache_transceiver_config.kv_transfer_timeout_ms. Other policies "
+            "accept only the default."),
         status="prototype")
 
     use_python_scheduler: bool = Field(
@@ -4753,6 +4756,18 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
             "ahead of the shortest-first order, oldest first. None "
             "disables it."),
         status="prototype")
+
+    @model_validator(mode="after")
+    def validate_waiting_queue_max_wait_s(self) -> 'SchedulerConfig':
+        # Compared with the default, so that a dumped config validates again.
+        default = type(self).model_fields["waiting_queue_max_wait_s"].default
+        if (self.waiting_queue_max_wait_s != default
+                and self.waiting_queue_policy
+                != WaitingQueuePolicy.SHORTEST_DECODE_FIRST):
+            raise ValueError(
+                "scheduler_config.waiting_queue_max_wait_s requires "
+                "waiting_queue_policy='shortest_decode_first'")
+        return self
 
     @model_validator(mode="after")
     def validate_context_starvation_iterations(self) -> 'SchedulerConfig':
@@ -8063,6 +8078,26 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "GEN slot preemption (scheduler_config.gen_preemption) does "
                 "not support pipeline parallelism or attention DP.")
+        return self
+
+    @model_validator(mode="after")
+    def warn_waiting_queue_max_wait_s(self) -> 'TorchLlmArgs':
+        scheduler = self.scheduler_config
+        transceiver = self.cache_transceiver_config
+        if (scheduler.waiting_queue_policy
+                == WaitingQueuePolicy.SHORTEST_DECODE_FIRST
+                and scheduler.waiting_queue_max_wait_s is not None
+                and transceiver is not None
+                and transceiver.kv_transfer_timeout_ms is not None
+                and scheduler.waiting_queue_max_wait_s * 1000
+                >= transceiver.kv_transfer_timeout_ms):
+            logger.warning(
+                "scheduler_config.waiting_queue_max_wait_s "
+                f"({scheduler.waiting_queue_max_wait_s} s) is not below "
+                "cache_transceiver_config.kv_transfer_timeout_ms "
+                f"({transceiver.kv_transfer_timeout_ms} ms): a request passed "
+                "over that long may find its context server's KV transfer "
+                "timed out.")
         return self
 
     @model_validator(mode="after")
