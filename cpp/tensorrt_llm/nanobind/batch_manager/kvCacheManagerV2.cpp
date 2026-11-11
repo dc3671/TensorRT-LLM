@@ -933,6 +933,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
     static nb::object sCuError = nb::exception<kv::CuError>(m, "CuError");
     static nb::object sCorruptedError = nb::exception<kv::CorruptedError>(m, "CorruptedError");
+    static nb::object sRemoteMemError = nb::exception<kv::RemoteMemError>(m, "RemoteMemError");
     // Default attribute so the class mirrors the pure-Python CuError surface.
     sCuError.attr("error_code") = nb::none();
 

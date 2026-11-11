@@ -22,12 +22,15 @@
 // pages with synchronous one-sided RDMA; fabric maps claimed chunks and copies on the caller's stream.
 
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/storage/config.h"
+#include "kv_cache_manager_v2/utils/sharedPtr.h"
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cuda.h>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -44,17 +47,6 @@ class TransferStatus;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
-
-//! Remote memory could not be reached, or a transfer to or from it failed or timed out. Not an out-of-pages error:
-//! a failed transfer means the remote level's contents can no longer be trusted, which no retry fixes.
-class RemoteMemError : public std::runtime_error
-{
-public:
-    explicit RemoteMemError(std::string const& msg)
-        : std::runtime_error(msg)
-    {
-    }
-};
 
 struct RemoteMemOptions
 {
@@ -111,9 +103,9 @@ public:
     void registerLocal(MemAddress base, size_t bytes);
     void deregisterLocal(MemAddress base, size_t bytes) noexcept;
 
-    //! Move `bytes` for every entry, local -> remote (`write`) or remote -> local, and wait for all of it. Throws
-    //! RemoteMemError on any failure or timeout, after waiting for every request it submitted (cancelling the ones
-    //! still running at the timeout); the client has failed() from then on.
+    //! NIXL only: move `bytes` for every entry, local -> remote (`write`) or remote -> local, and wait for all of it.
+    //! Throws RemoteMemError on any failure or timeout, after waiting for every request it submitted (cancelling the
+    //! ones still running at the timeout); the client has failed() from then on.
     void transfer(bool write, std::vector<RemoteIo> const& ios, size_t bytes);
 
     //! Fabric only: enqueue the copies of one transfer on `stream`, which orders them after the work that wrote the
@@ -158,6 +150,8 @@ private:
         std::string fabricHandles;                           // fabric: one CUmemFabricHandle per chunk, in order
         bool loaded = false;                                 // NIXL: loaded into our agent
         bool withdrawn = false;                              // its .ready file is gone: no new claims from it
+        size_t nextClaim = 0; // chunks before it were claimed (by anyone) when last probed: claims start here
+        bool full = false;    // a probe found every chunk claimed; skipped until a claim finds no lender at all
     };
 
     //! One imported, mapped fabric chunk: unmapped, its address range freed and its handle released on close.
@@ -182,18 +176,21 @@ private:
     void ensureLoaded(Lender& lender);
 
     void startFabric();
+    //! Unmap and release what the constructor acquired; the destructor and a failed constructor run it.
+    void releaseTransport() noexcept;
     //! Fabric: synchronize mContext, where callers enqueue their copies.
     [[nodiscard]] CUresult synchronizeContext() const noexcept;
     //! Import chunk `chunk` of the lender (its own fabric allocation of `bytes`) and map it whole, readable and
     //! writable by this client's device; returns the device address.
     CUdeviceptr mapChunk(Lender const& lender, size_t chunk, uint64_t bytes);
-    //! Enqueue the copies of one transfer on `stream`, merging runs that are contiguous on both sides.
+    //! Enqueue the copies of one transfer on `stream`, merging runs that are contiguous on both sides within one
+    //! mapped chunk.
     void fabricCopy(bool write, std::vector<RemoteIo> const& ios, size_t bytes, CUstream stream);
 
     CUdevice mDevice = 0;
-    CUcontext mContext = nullptr;         // fabric: mDevice's primary context, retained
-    CUstream mFabricStream = nullptr;     // fabric: the synchronous transfer()'s stream
-    std::vector<FabricMapping> mMappings; // fabric: every mapped chunk
+    CUcontext mContext = nullptr;                   // fabric: mDevice's primary context, retained
+    std::vector<FabricMapping> mMappings;           // fabric: every mapped chunk
+    std::map<CUdeviceptr, CUdeviceptr> mMappingEnd; // fabric: start -> end of every mapped chunk
 
     RemoteMemOptions mOptions;
     std::string mName;
@@ -206,7 +203,8 @@ private:
     size_t mReportedLenders = 0; // lenders with a .ready or .failed file at the last refresh
     std::string mLastClaimError; // why the last lender was withdrawn at claim time
     std::unordered_map<MemAddress, std::pair<size_t, int>> mLocalRegions; // base -> (bytes, refs)
-    // NIXL requests that timed out and could not be cancelled; kept until the agent goes.
+    // NIXL requests that timed out, cancelled or not (a cancel does not prove the remote side quiescent); kept until
+    // the agent goes, and the claims with them.
     std::vector<std::unique_ptr<executor::kv_cache::TransferStatus>> mUncancelled;
     std::string mFailure; // the first transfer failure
     std::atomic<bool> mFailed{false};
@@ -217,7 +215,7 @@ private:
 class RemoteRange
 {
 public:
-    RemoteRange(std::shared_ptr<RemoteMemClient> client, size_t slotSize);
+    RemoteRange(SharedPtr<RemoteMemClient> client, size_t slotSize);
     ~RemoteRange();
 
     RemoteRange(RemoteRange const&) = delete;
@@ -235,7 +233,7 @@ public:
     }
 
 private:
-    std::shared_ptr<RemoteMemClient> mClient;
+    SharedPtr<RemoteMemClient> mClient;
     size_t mSlotSize = 0;
     std::vector<RemoteChunk> mChunks;
     std::vector<SlotCount> mFirstSlot; // first slot of each chunk; mFirstSlot.size() == mChunks.size()

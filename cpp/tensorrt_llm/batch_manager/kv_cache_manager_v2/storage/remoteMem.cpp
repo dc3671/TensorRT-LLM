@@ -34,6 +34,7 @@
 #include <optional>
 #include <sstream>
 #include <string_view>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 
@@ -72,6 +73,10 @@ std::optional<std::string> readLenderFile(std::filesystem::path const& path)
     return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
 }
 
+//! Bounds on what a lender's .meta may declare, so a malformed file cannot make a client allocate without limit.
+constexpr uint64_t kMinChunkBytes = 1ULL << 20;
+constexpr uint64_t kMaxChunksPerLender = 1ULL << 20;
+
 constexpr std::string_view kLenderPrefix = "lender.";
 constexpr std::string_view kReadySuffix = ".ready";
 constexpr std::string_view kFailedSuffix = ".failed";
@@ -101,37 +106,62 @@ RemoteMemClient::RemoteMemClient(RemoteMemOptions options)
     mName = "kvcm2-remote-" + hostName() + "-" + std::to_string(::getpid()) + "-"
         + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-"
         + std::to_string(reinterpret_cast<std::uintptr_t>(this));
-    if (mOptions.fabric)
+    try
     {
-        startFabric();
-    }
-    else
-    {
-        kvc::BaseAgentConfig config{};
-        config.mName = mName;
-        // NIXL's progress thread completes connection set-up with lenders that never call into NIXL themselves.
-        config.useProgThread = true;
-        config.multiThread = false;
-        config.useListenThread = false;
-        config.enableTelemetry = false;
-        // This agent's own devices, so the process-wide UCX_NET_DEVICES of the KV transceiver's agent stays as it is.
-        if (!mOptions.ucxDevices.empty())
+        if (mOptions.fabric)
         {
-            config.backendParams["ucx_devices"] = mOptions.ucxDevices;
+            startFabric();
         }
-        mNixlAgent = kvc::makeTransferAgent("nixl", &config);
-        TLLM_CHECK_WITH_INFO(mNixlAgent != nullptr, "KVCM2 remote level: creating the NIXL agent failed");
+        else
+        {
+            kvc::BaseAgentConfig config{};
+            config.mName = mName;
+            // NIXL's progress thread completes connection set-up with lenders that never call into NIXL themselves.
+            config.useProgThread = true;
+            config.multiThread = false;
+            config.useListenThread = false;
+            config.enableTelemetry = false;
+            // This agent's own devices, so the process-wide UCX_NET_DEVICES of the KV transceiver's agent stays.
+            if (!mOptions.ucxDevices.empty())
+            {
+                config.backendParams["ucx_devices"] = mOptions.ucxDevices;
+            }
+            mNixlAgent = kvc::makeTransferAgent("nixl", &config);
+            TLLM_CHECK_WITH_INFO(mNixlAgent != nullptr, "KVCM2 remote level: creating the NIXL agent failed");
+        }
+        std::lock_guard<std::mutex> lock(mMutex);
+        refreshLenders();
     }
-    std::lock_guard<std::mutex> lock(mMutex);
-    refreshLenders();
+    catch (...)
+    {
+        // No destructor runs for a failed constructor, and nothing is claimed yet.
+        releaseTransport();
+        throw;
+    }
     TLLM_LOG_INFO("KVCM2 remote level: client %s, rendezvous %s, %zu lender(s) published, transport %s", mName.c_str(),
         mOptions.directory.c_str(), mLenders.size(), mOptions.fabric ? "fabric" : "nixl");
 }
 
 RemoteMemClient::~RemoteMemClient()
 {
-    // The claims go last: another client may write into a chunk as soon as its claim is gone.
-    bool releaseClaims = true;
+    // The claims go last: another client may write into a chunk as soon as its claim is gone. A WRITE that timed out
+    // may still land in its chunk, so after one the chunks stay claimed.
+    bool const releaseClaims = mUncancelled.empty();
+    releaseTransport();
+    if (!releaseClaims)
+    {
+        TLLM_LOG_WARNING("KVCM2 remote level: %s keeps its %zu claim(s) in %s after uncancelled transfers",
+            mName.c_str(), mClaims.size(), mOptions.directory.c_str());
+        return;
+    }
+    for (auto const& path : mClaims)
+    {
+        ::unlink(path.c_str());
+    }
+}
+
+void RemoteMemClient::releaseTransport() noexcept
+{
     if (mOptions.fabric)
     {
         // Copies still queued on callers' streams must finish before their mappings go.
@@ -146,51 +176,40 @@ RemoteMemClient::~RemoteMemClient()
             cuMemAddressFree(mapping.address, mapping.bytes);
             cuMemRelease(mapping.handle);
         }
-        if (mFabricStream != nullptr)
-        {
-            cuStreamDestroy(mFabricStream);
-        }
+        mMappings.clear();
+        mMappingEnd.clear();
         if (mContext != nullptr)
         {
             cuDevicePrimaryCtxRelease(mDevice);
+            mContext = nullptr;
         }
-    }
-    else
-    {
-        try
-        {
-            for (auto const& [base, info] : mLocalRegions)
-            {
-                mNixlAgent->deregisterMemory(
-                    kvc::MemoryDescs(kvc::MemoryType::kDRAM, {kvc::MemoryDesc(base, info.first, /*deviceId=*/0)}));
-            }
-            for (auto const& lender : mLenders)
-            {
-                if (lender.loaded)
-                {
-                    mNixlAgent->invalidateRemoteAgent(lender.name);
-                }
-            }
-        }
-        catch (std::exception const& e)
-        {
-            TLLM_LOG_WARNING("KVCM2 remote level: teardown of %s: %s", mName.c_str(), e.what());
-        }
-        // A WRITE that could not be cancelled may still land in its chunk, so those chunks stay claimed.
-        releaseClaims = mUncancelled.empty();
-        mUncancelled.clear();
-        mNixlAgent.reset();
-    }
-    if (!releaseClaims)
-    {
-        TLLM_LOG_WARNING("KVCM2 remote level: %s keeps its %zu claim(s) in %s after uncancelled transfers",
-            mName.c_str(), mClaims.size(), mOptions.directory.c_str());
         return;
     }
-    for (auto const& path : mClaims)
+    if (mNixlAgent == nullptr)
     {
-        ::unlink(path.c_str());
+        return;
     }
+    try
+    {
+        for (auto const& [base, info] : mLocalRegions)
+        {
+            mNixlAgent->deregisterMemory(
+                kvc::MemoryDescs(kvc::MemoryType::kDRAM, {kvc::MemoryDesc(base, info.first, /*deviceId=*/0)}));
+        }
+        for (auto const& lender : mLenders)
+        {
+            if (lender.loaded)
+            {
+                mNixlAgent->invalidateRemoteAgent(lender.name);
+            }
+        }
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("KVCM2 remote level: teardown of %s: %s", mName.c_str(), e.what());
+    }
+    mUncancelled.clear();
+    mNixlAgent.reset();
 }
 
 void RemoteMemClient::refreshLenders()
@@ -235,7 +254,20 @@ void RemoteMemClient::refreshLenders()
         }
         fs::path const dir(mOptions.directory);
         Lender lender;
-        auto const metaText = readLenderFile(dir / ("lender." + name + ".meta"));
+        auto const metaPath = dir / ("lender." + name + ".meta");
+        // Lender files hold memory registration keys and fabric handles: only this user's lenders are trusted.
+        struct stat metaStat = {};
+        if (::stat(metaPath.c_str(), &metaStat) != 0)
+        {
+            continue; // withdrawn since the listing
+        }
+        if (metaStat.st_uid != ::geteuid())
+        {
+            TLLM_LOG_WARNING("KVCM2 remote level: ignoring lender %s: owned by uid %u, not this user", name.c_str(),
+                static_cast<unsigned>(metaStat.st_uid));
+            continue;
+        }
+        auto const metaText = readLenderFile(metaPath);
         if (!metaText)
         {
             continue; // withdrawn since the listing
@@ -290,12 +322,25 @@ void RemoteMemClient::refreshLenders()
                 name.c_str(), transport.c_str(), mOptions.fabric ? "fabric" : "nixl");
             continue;
         }
+        uint64_t numChunks = 0;
+        bool segmentsValid = lender.chunkBytes >= kMinChunkBytes;
+        for (auto const& [base, bytes] : lender.segments)
+        {
+            segmentsValid = segmentsValid && base <= UINT64_MAX - bytes;
+            numChunks += segmentsValid ? bytes / lender.chunkBytes : 0;
+        }
+        if (!segmentsValid || numChunks > kMaxChunksPerLender)
+        {
+            TLLM_LOG_WARNING("KVCM2 remote level: ignoring lender %s: chunk size %llu B or its segments out of bounds",
+                name.c_str(), static_cast<unsigned long long>(lender.chunkBytes));
+            continue;
+        }
         lender.name = name;
         for (auto const& [base, bytes] : lender.segments)
         {
-            for (uint64_t offset = 0; offset + lender.chunkBytes <= bytes; offset += lender.chunkBytes)
+            for (uint64_t chunk = 0; chunk < bytes / lender.chunkBytes; ++chunk)
             {
-                lender.chunks.emplace_back(base + offset, lender.chunkBytes);
+                lender.chunks.emplace_back(base + chunk * lender.chunkBytes, lender.chunkBytes);
             }
         }
         auto payload = readLenderFile(dir / ("lender." + name + (mOptions.fabric ? ".fabric" : ".desc")));
@@ -401,16 +446,21 @@ bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
     {
         uint32_t const index = static_cast<uint32_t>((start + k) % mLenders.size());
         auto& lender = mLenders[index];
-        if (lender.chunkBytes < minBytes || !stillPublished(lender))
+        if (lender.chunkBytes < minBytes || lender.full || !stillPublished(lender))
         {
             continue;
         }
-        for (size_t chunk = 0; chunk < lender.chunks.size(); ++chunk)
+        // Chunks are probed from the last one this client claimed or found taken, wrapping around once: claims
+        // last as long as their client, so earlier chunks rarely free up, and the shared file system sees one
+        // exclusive create per chunk per client instead of one per claim.
+        size_t const numChunks = lender.chunks.size();
+        for (size_t probe = 0; probe < numChunks; ++probe)
         {
+            size_t const chunk = (lender.nextClaim + probe) % numChunks;
             auto const path
                 = (std::filesystem::path(mOptions.directory) / ("claim." + lender.name + "." + std::to_string(chunk)))
                       .string();
-            int const fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0644);
+            int const fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
             if (fd < 0)
             {
                 if (errno == EEXIST)
@@ -453,10 +503,17 @@ bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
                 throw;
             }
             out = RemoteChunk{index, address, lender.chunks[chunk].second};
+            lender.nextClaim = chunk + 1;
             mClaims.push_back(path);
             mClaimedBytes += out.bytes;
             return true;
         }
+        lender.full = !lender.withdrawn;
+    }
+    // No lender had a chunk: the next attempt probes the ones found full again, in case a client let go of one.
+    for (auto& lender : mLenders)
+    {
+        lender.full = false;
     }
     return false;
 }
@@ -564,21 +621,11 @@ void RemoteMemClient::transfer(bool write, std::vector<RemoteIo> const& ios, siz
     {
         return;
     }
+    // A manager's remote levels share one transport (KVCacheManagerConfig::validate), so fabric copies always go
+    // on the caller's stream (transferOnStream).
+    TLLM_CHECK_WITH_INFO(!mOptions.fabric, "KVCM2 remote level: synchronous transfer on a fabric client");
     std::lock_guard<std::mutex> lock(mMutex);
     throwIfFailed();
-    if (mOptions.fabric)
-    {
-        // Callers without a stream get the same copies on this client's own stream.
-        fabricCopy(write, ios, bytes, mFabricStream);
-        CUresult const result = cuStreamSynchronize(mFabricStream);
-        if (result != CUDA_SUCCESS)
-        {
-            fail(std::string("KVCM2 remote level: fabric ") + (write ? "WRITE" : "READ") + " of "
-                + std::to_string(ios.size()) + " page(s) x " + std::to_string(bytes)
-                + " B failed: " + cuErrorName(result));
-        }
-        return;
-    }
     std::vector<std::vector<size_t>> byLender(mLenders.size());
     for (size_t i = 0; i < ios.size(); ++i)
     {
@@ -631,10 +678,15 @@ void RemoteMemClient::transfer(bool write, std::vector<RemoteIo> const& ios, siz
         {
             continue;
         }
-        if (state == kvc::TransferState::kIN_PROGRESS && !status->release())
+        if (state == kvc::TransferState::kIN_PROGRESS)
         {
-            TLLM_LOG_ERROR("KVCM2 remote level: a timed-out %s lender %s (%s) could not be cancelled", opName.c_str(),
-                mLenders[lenderIdx].name.c_str(), mLenders[lenderIdx].host.c_str());
+            // release() returning true does not prove the remote side is quiescent (UCX reports success regardless),
+            // so a timed-out request counts as uncancelled: this client keeps its claims until it is destroyed.
+            if (!status->release())
+            {
+                TLLM_LOG_ERROR("KVCM2 remote level: a timed-out %s lender %s (%s) could not be cancelled",
+                    opName.c_str(), mLenders[lenderIdx].name.c_str(), mLenders[lenderIdx].host.c_str());
+            }
             mUncancelled.push_back(std::move(status));
         }
         if (error.empty())
@@ -718,12 +770,7 @@ void RemoteMemClient::startFabric()
         cuDevicePrimaryCtxRelease(mDevice);
         throw RemoteMemError("KVCM2 remote level: the fabric transport needs the device's primary context current");
     }
-    if (CUresult const result = cuStreamCreate(&mFabricStream, CU_STREAM_NON_BLOCKING); result != CUDA_SUCCESS)
-    {
-        cuDevicePrimaryCtxRelease(mDevice);
-        cuCheck(result);
-    }
-    mContext = primary; // released by the destructor
+    mContext = primary; // released by releaseTransport()
 }
 
 CUdeviceptr RemoteMemClient::mapChunk(Lender const& lender, size_t chunk, uint64_t bytes)
@@ -769,18 +816,23 @@ CUdeviceptr RemoteMemClient::mapChunk(Lender const& lender, size_t chunk, uint64
             + " B) of lender " + lender.name + " (" + lender.host + ") failed: " + cuErrorName(result));
     }
     mMappings.push_back(FabricMapping{address, bytes, handle});
+    mMappingEnd.emplace(address, address + bytes);
     return address;
 }
 
 void RemoteMemClient::fabricCopy(bool write, std::vector<RemoteIo> const& ios, size_t bytes, CUstream stream)
 {
-    // Runs of pages that are contiguous on both sides go as one copy.
+    // Runs of pages that are contiguous on both sides go as one copy, within one mapped chunk: two chunks' separate
+    // mappings may happen to be adjacent in the address space.
     size_t i = 0;
     while (i < ios.size())
     {
+        auto const mapping = mMappingEnd.upper_bound(static_cast<CUdeviceptr>(ios[i].remoteAddr));
+        TLLM_CHECK_WITH_INFO(mapping != mMappingEnd.begin(), "KVCM2 remote level: fabric address outside every chunk");
+        CUdeviceptr const mappingEnd = std::prev(mapping)->second;
         size_t j = i + 1;
         while (j < ios.size() && ios[j].local == ios[j - 1].local + bytes
-            && ios[j].remoteAddr == ios[j - 1].remoteAddr + bytes)
+            && ios[j].remoteAddr == ios[j - 1].remoteAddr + bytes && ios[j].remoteAddr + bytes <= mappingEnd)
         {
             ++j;
         }
@@ -802,7 +854,7 @@ void RemoteMemClient::fabricCopy(bool write, std::vector<RemoteIo> const& ios, s
 // RemoteRange
 // ---------------------------------------------------------------------------
 
-RemoteRange::RemoteRange(std::shared_ptr<RemoteMemClient> client, size_t slotSize)
+RemoteRange::RemoteRange(SharedPtr<RemoteMemClient> client, size_t slotSize)
     : mClient(std::move(client))
     , mSlotSize(slotSize)
 {

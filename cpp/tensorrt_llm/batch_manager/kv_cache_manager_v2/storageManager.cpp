@@ -110,7 +110,7 @@ CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const
     CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
     TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator,
     HostMemBackingOptions const& options, std::optional<size_t> sparseReservation,
-    std::shared_ptr<RemoteMemClient> remoteClient)
+    SharedPtr<RemoteMemClient> remoteClient)
     : cacheLevel(cl)
     , cacheTier(CacheTier(tierConfig.index()))
     , controller(lifeCycleGrouping, cl)
@@ -148,11 +148,8 @@ std::optional<TypedVec<LifeCycleId, float>> remotePoolRatioOf(CacheTierConfig co
         return std::nullopt;
     }
     auto const& weights = disk->remotePoolRatio;
-    if (weights.size() != toSizeT(numLifeCycles))
-    {
-        throw std::invalid_argument("remote pool ratio: " + std::to_string(weights.size()) + " entries for "
-            + std::to_string(toSizeT(numLifeCycles)) + " layer groups");
-    }
+    TLLM_CHECK_WITH_INFO(weights.size() == toSizeT(numLifeCycles),
+        "remote pool ratio: %zu entries for %zu layer groups", weights.size(), toSizeT(numLifeCycles));
     double const sum = std::accumulate(weights.begin(), weights.end(), 0.0);
     TypedVec<LifeCycleId, float> ratio(numLifeCycles, 0.F);
     for (LifeCycleId lc{0}; lc < numLifeCycles; ++lc)
@@ -596,9 +593,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         TLLM_CHECK_WITH_INFO(mPageStagingManager != nullptr, "A remote-backed cache level needs page staging");
         client->registerLocal(mPageStagingManager->baseAddress(), mPageStagingManager->totalSize());
     }
+    mLastLiveLevel = numCacheLevels() - 1;
 }
 
-std::shared_ptr<RemoteMemClient> StorageManager::remoteClientFor(CacheTierConfig const& tier)
+SharedPtr<RemoteMemClient> StorageManager::remoteClientFor(CacheTierConfig const& tier)
 {
     auto const* disk = std::get_if<DiskCacheTierConfig>(&tier);
     if (disk == nullptr || !disk->remote)
@@ -614,16 +612,15 @@ std::shared_ptr<RemoteMemClient> StorageManager::remoteClientFor(CacheTierConfig
             continue;
         }
         auto const& held = client->options();
-        if (held.waitTimeoutMs != options.waitTimeoutMs || held.transferTimeoutMs != options.transferTimeoutMs
-            || held.fabric != options.fabric || held.ucxDevices != options.ucxDevices
-            || held.expectedLenders != options.expectedLenders)
-        {
-            throw std::invalid_argument("remote cache levels sharing rendezvous directory '" + disk->path
-                + "' must use the same timeouts, transport, devices and expected lenders");
-        }
+        TLLM_CHECK_WITH_INFO(held.waitTimeoutMs == options.waitTimeoutMs
+                && held.transferTimeoutMs == options.transferTimeoutMs && held.fabric == options.fabric
+                && held.ucxDevices == options.ucxDevices && held.expectedLenders == options.expectedLenders,
+            "remote cache levels sharing rendezvous directory '%s' must use the same timeouts, transport, devices and "
+            "expected lenders",
+            disk->path.c_str());
         return client;
     }
-    return mRemoteClients.emplace_back(std::make_shared<RemoteMemClient>(std::move(options)));
+    return mRemoteClients.emplace_back(makeShared<RemoteMemClient>(std::move(options)));
 }
 
 DiskCacheLevelStorage* StorageManager::remoteLevel(CacheLevel level) const
@@ -674,6 +671,34 @@ void StorageManager::dropPagesOfFailedRemoteLevels()
                 "KVCM2 remote level %d failed: dropped its %zu cached page(s)", level.value(), dropped.size());
         }
         // `dropped` holds the last references: the pages leave the radix tree and release their slots here.
+    }
+    // Trailing failed levels take no pages, so held pages above them stop being evictable: they would only fall
+    // into a level that cannot hold them.
+    CacheLevel lastLive = numCacheLevels() - 1;
+    while (lastLive > kHotLevel && remoteLevelFailed(lastLive))
+    {
+        --lastLive;
+    }
+    if (lastLive < mLastLiveLevel)
+    {
+        mLastLiveLevel = lastLive;
+        auto& controller = mLevels.at(lastLive).controller;
+        std::vector<SharedPtr<Page>> held;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < controller.numPoolGroups(); ++pgIdx)
+        {
+            auto next = controller.pageGenerator(pgIdx);
+            while (auto const* page = next())
+            {
+                if ((*page)->status() == PageStatus::HELD)
+                {
+                    held.push_back(*page);
+                }
+            }
+        }
+        for (auto const& page : held)
+        {
+            excludeFromEviction(*page);
+        }
     }
 }
 
@@ -1213,7 +1238,8 @@ bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> lev
         auto const& committed = static_cast<CommittedPage const&>(page);
         return committed.block && !committed.block->isOrphan() && committed.block->holdsPage(committed);
     }
-    return s == PageStatus::HELD && lvl < numCacheLevels() - 1;
+    // A held page cannot drop, so it is evictable only with a level below it that still takes pages.
+    return s == PageStatus::HELD && lvl < mLastLiveLevel;
 }
 
 // ---------------------------------------------------------------------------

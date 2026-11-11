@@ -22,6 +22,7 @@ Stop it with SIGTERM: it withdraws its files, deregisters its memory and exits.
 """
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -59,6 +60,12 @@ def main(argv=None) -> int:
         default=None,
         help="exit after this long (default: until signalled)",
     )
+    parser.add_argument(
+        "--parent-pid",
+        type=int,
+        default=None,
+        help="exit once this process is gone (a test runner that died without stopping the lender)",
+    )
     args = parser.parse_args(argv)
     nbytes = args.bytes if args.bytes is not None else int(args.gib * (1 << 30))
     lender = RemoteLender(
@@ -74,6 +81,14 @@ def main(argv=None) -> int:
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
+    if args.parent_pid is not None:
+
+        def watch_parent() -> None:
+            while not stop.wait(1.0):
+                if os.getppid() != args.parent_pid:
+                    stop.set()
+
+        threading.Thread(target=watch_parent, daemon=True).start()
     try:
         lender.start()
     except Exception as error:

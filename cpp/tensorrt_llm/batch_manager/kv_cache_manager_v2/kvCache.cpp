@@ -723,20 +723,30 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
             streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), std::move(scratchReadyEvents));
     }
 
-    try
-    {
-        activate();
-    }
-    catch (OutOfPagesError const&)
+    auto const releaseDeferredSlots = [&]()
     {
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             if (deferredSlots[lc].has_value())
                 storageMgr.releaseSlot(lc, kHotLevel, std::move(*deferredSlots[lc]));
         }
+    };
+    try
+    {
+        activate();
+    }
+    catch (OutOfPagesError const&)
+    {
+        releaseDeferredSlots();
         // Scratch slots stay in mScratchSlots — they'll be freed by close() inside
         // a recordEventScope, matching Python behavior.
         return false;
+    }
+    catch (...)
+    {
+        // E.g. a RemoteMemError reading pages back: the same rollback, then the error.
+        releaseDeferredSlots();
+        throw;
     }
 
     // Private recovery pages have no reusable source. Their contents are
@@ -1356,10 +1366,24 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
         {
             continue;
         }
+        catch (RemoteMemError const&)
+        {
+            continue; // a failed remote level holds no snapshot either
+        }
 
         CUstream stream = cudaStream();
         newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
-        storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
+        try
+        {
+            storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
+        }
+        catch (...)
+        {
+            // Whatever the copy enqueued finishes before the slot is reused.
+            newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
+            storageMgr.releaseSlot(lcIdx, lvl, std::move(newSlot));
+            throw;
+        }
 
         newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
         auto committed = makeShared<CommittedPage>(
@@ -1743,6 +1767,13 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                 _recoverExcessScratchSlots(excessScratchSlots);
                 _lockHeldBlocks(backupHolders);
                 return false;
+            }
+            catch (...)
+            {
+                // E.g. a RemoteMemError evicting to a remote level: the same rollback, then the error.
+                _recoverExcessScratchSlots(excessScratchSlots);
+                _lockHeldBlocks(backupHolders);
+                throw;
             }
         }
         else

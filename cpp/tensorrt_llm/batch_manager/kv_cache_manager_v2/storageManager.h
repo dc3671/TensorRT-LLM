@@ -102,7 +102,7 @@ public:
         CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr,
         HostMemBackingOptions const& options = {}, std::optional<size_t> sparseReservation = std::nullopt,
-        std::shared_ptr<RemoteMemClient> remoteClient = nullptr);
+        SharedPtr<RemoteMemClient> remoteClient = nullptr);
 
     CacheLevel cacheLevel;
     CacheTier cacheTier;
@@ -467,7 +467,7 @@ private:
     //! them. Pages a request holds stay until it lets go of them (scheduleForEviction then drops them).
     void dropPagesOfFailedRemoteLevels();
     //! The client of a remote-backed tier's rendezvous directory, created on first use; null for any other tier.
-    std::shared_ptr<RemoteMemClient> remoteClientFor(CacheTierConfig const& tier);
+    SharedPtr<RemoteMemClient> remoteClientFor(CacheTierConfig const& tier);
     //! A cold-to-cold migration where either side is a remote-backed level, through the page-staging buffer. A failed
     //! NIXL transfer throws RemoteMemError before any page is pointed at its new slot.
     void submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel srcLevel, PoolGroupIndex dstPgIdx,
@@ -514,8 +514,10 @@ private:
     std::unique_ptr<CopyEngine> mCopyEngine;
     // One remote-memory client per rendezvous directory, shared by this manager's levels that name it. The page
     // staging buffer is registered with each and deregistered before the staging is freed.
-    std::vector<std::shared_ptr<RemoteMemClient>> mRemoteClients;
+    std::vector<SharedPtr<RemoteMemClient>> mRemoteClients;
     bool mHasRemoteLevel = false;
+    // The deepest level that still takes pages: the last level, until trailing remote levels fail.
+    CacheLevel mLastLiveLevel{0};
 
     // Get buffer attributes for a (LayerId, DataRole) pair. Throws std::out_of_range if not found.
     // Mirrors Python's get_buffer_attr().

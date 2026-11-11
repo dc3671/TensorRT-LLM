@@ -64,6 +64,7 @@ SsmLayerConfig = base.SsmLayerConfig
 Step = base.Step
 TokenId = base.TokenId
 _introspection = base._introspection
+RemoteMemError = base.RemoteMemError
 
 
 def _sync_device() -> None:
@@ -78,7 +79,8 @@ pytestmark = pytest.mark.skipif(
 )
 # One concrete class per transport: <Class>_0_nixl, <Class>_1_fabric.
 _per_transport = parameterized_class(("transport",), [("nixl",), ("fabric",)])
-_LENDER_BYTES = 4 << 30
+# The largest claim of one test (the suite's 1 GiB disk quota, rounded up to whole chunks per pool group) and room.
+_LENDER_BYTES = 2 << 30
 _CHUNK_BYTES = 8 << 20
 _counter = itertools.count()
 _NIXL_DEATH_ONLY = (
@@ -118,6 +120,8 @@ class _Lender:
                 # The last GPU, so that on a multi-GPU node lender and client sit on different devices.
                 "--device",
                 str(gpu_count() - 1),
+                "--parent-pid",
+                str(os.getpid()),
             ],
             stdout=self._log,
             stderr=subprocess.STDOUT,
@@ -158,15 +162,22 @@ _module_lenders: "list[_Lender]" = []
 
 
 def setUpModule() -> None:
-    for transport in _TRANSPORTS:
-        _module_dirs[transport] = tempfile.mkdtemp(prefix=f"kvcm2_remote_{transport}_")
-        _module_lenders.append(_Lender(_module_dirs[transport], _LENDER_BYTES, transport))
+    try:
+        for transport in _TRANSPORTS:
+            _module_dirs[transport] = tempfile.mkdtemp(prefix=f"kvcm2_remote_{transport}_")
+            _module_lenders.append(_Lender(_module_dirs[transport], _LENDER_BYTES, transport))
+    except BaseException:
+        tearDownModule()  # unittest skips it after a failed setUpModule
+        raise
 
 
 def tearDownModule() -> None:
     for lender in _module_lenders:
         lender.stop()
-        shutil.rmtree(lender.directory, ignore_errors=True)
+    _module_lenders.clear()
+    for directory in _module_dirs.values():
+        shutil.rmtree(directory, ignore_errors=True)
+    _module_dirs.clear()
 
 
 class _Transport:
@@ -466,12 +477,9 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             # it already), so the next READ of the prompt's pages has nowhere to go.
             lender.stop()
             kv = self.manager.create_kv_cache(input_tokens=prompt)
-            message = ""
-            try:
+            # Its own class, not RuntimeError: callers tell a retired remote level from any other failure.
+            with self.assertRaisesRegex(RemoteMemError, "remote level"):
                 kv.resume(stream)
-            except Exception as error:  # noqa: BLE001 - the failure itself is what this test checks
-                message = str(error)
-            self.assertIn("remote level", message, "a promotion from a dead lender did not fail")
             try:
                 kv.close()
             except Exception:
@@ -723,9 +731,44 @@ class TestRemotePoolRatio(_Transport, unittest.TestCase):
             [float("inf"), 1.0],
             [1.0, 1.0, 1.0],
         ):
-            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "pool ratio"):
+            # A bad entry is a ValueError of the tier config; a wrong entry count a RuntimeError (TLLM_CHECK).
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex((ValueError, RuntimeError), "pool ratio"),
+            ):
                 self._levels(value)
         self.assertEqual(sorted(glob.glob(os.path.join(self.module_dir, "claim.*"))), claims)
+
+
+@_per_transport
+class TestRemoteTierCombinations(_Transport, unittest.TestCase):
+    """A remote level stages pages through pinned host memory, so it cannot sit next to a file-backed disk level."""
+
+    def test_a_file_backed_disk_level_is_rejected(self) -> None:
+        disk_dir = tempfile.mkdtemp(prefix="kvcm2_disk_")
+        try:
+            layers = [
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[BufferConfig(role=DataRole("key"), size=64 << 10)],
+                )
+            ]
+            with self.assertRaisesRegex(Exception, "file-backed disk level"):
+                KVCacheManager(
+                    KVCacheManagerConfig(
+                        tokens_per_block=32,
+                        cache_tiers=[
+                            GpuCacheTierConfig(quota=32 << 20),
+                            HostCacheTierConfig(quota=32 << 20),
+                            DiskCacheTierConfig(quota=64 << 20, path=disk_dir),
+                            self.remote_tier(64 << 20),
+                        ],
+                        layers=layers,
+                    )
+                )
+        finally:
+            gc.collect()
+            shutil.rmtree(disk_dir, ignore_errors=True)
 
 
 class TestRemoteBackedDisk(_Transport, base.TestKVCacheManagerV2):

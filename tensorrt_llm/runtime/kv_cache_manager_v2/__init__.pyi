@@ -67,6 +67,9 @@ class LogicError(Exception):
 
 class OutOfPagesError(Exception): ...
 
+class RemoteMemError(Exception):
+    """A remote cache level failed a transfer or claim; its contents can no longer be trusted."""
+
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
 

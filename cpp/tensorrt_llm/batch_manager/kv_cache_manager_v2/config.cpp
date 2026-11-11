@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <type_traits>
@@ -221,6 +222,34 @@ void KVCacheManagerConfig::validate() const
     for (auto const& tier : cacheTiers)
     {
         std::visit([](auto const& cfg) { cfg.validate(); }, tier);
+    }
+
+    // Remote levels move pages through the page staging buffer, which cannot reach a file-backed disk level, and share
+    // one transport, so that their copies are either all stream-ordered (fabric) or all synchronous (NIXL).
+    std::optional<bool> remoteFabric;
+    bool hasFileDisk = false;
+    for (auto const& tier : cacheTiers)
+    {
+        if (auto const* disk = std::get_if<DiskCacheTierConfig>(&tier))
+        {
+            if (!disk->remote)
+            {
+                hasFileDisk = true;
+            }
+            else if (remoteFabric.value_or(disk->remoteFabric) != disk->remoteFabric)
+            {
+                throw AssertionError("KVCacheManagerConfig: remote cache levels must share one transport");
+            }
+            else
+            {
+                remoteFabric = disk->remoteFabric;
+            }
+        }
+    }
+    if (remoteFabric.has_value() && hasFileDisk)
+    {
+        throw AssertionError(
+            "KVCacheManagerConfig: a remote cache level cannot be combined with a file-backed disk level");
     }
 
     // Zero asks for host-backed pools with no room for a single slot. It is not a way to turn

@@ -370,7 +370,7 @@ public:
     //! A pool whose slots live in host memory lent by other processes and reached through `remote` (see
     //! remoteMem.h) instead of a local file. Its slot addresses carry kRemoteFileDescriptor and are not file offsets:
     //! callers move its pages through remoteRange(), never with file I/O.
-    DiskSlotPool(std::shared_ptr<RemoteMemClient> remote, size_t slotSize, SlotCount numSlots);
+    DiskSlotPool(SharedPtr<RemoteMemClient> remote, size_t slotSize, SlotCount numSlots);
     ~DiskSlotPool() override;
 
     SlotCount numSlots() const noexcept override;
@@ -619,7 +619,7 @@ class DiskPoolGroup : public PoolGroupBase
 public:
     //! `remote` set: every pool of the group keeps its slots in lent remote memory instead of a file in `directory`.
     DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory,
-        std::shared_ptr<RemoteMemClient> remote = nullptr);
+        SharedPtr<RemoteMemClient> remote = nullptr);
 
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
@@ -973,7 +973,7 @@ public:
     //! directory the lenders publish into (remoteMem.h) rather than where files go.
     DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory,
-        std::shared_ptr<RemoteMemClient> remote = nullptr);
+        SharedPtr<RemoteMemClient> remote = nullptr);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -986,7 +986,7 @@ public:
     }
 
     //! The client of a remote-backed level; null for a file-backed one.
-    [[nodiscard]] std::shared_ptr<RemoteMemClient> const& remoteClient() const noexcept
+    [[nodiscard]] SharedPtr<RemoteMemClient> const& remoteClient() const noexcept
     {
         return mRemote;
     }
@@ -996,7 +996,7 @@ public:
 
 private:
     std::string mDirectory;
-    std::shared_ptr<RemoteMemClient> mRemote;
+    SharedPtr<RemoteMemClient> mRemote;
 };
 
 // Factory: create appropriate CacheLevelStorage for a given tier config.
@@ -1005,6 +1005,6 @@ private:
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
     PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, HostMemBackingOptions const& options = {},
-    std::optional<size_t> sparseReservation = std::nullopt, std::shared_ptr<RemoteMemClient> remoteClient = nullptr);
+    std::optional<size_t> sparseReservation = std::nullopt, SharedPtr<RemoteMemClient> remoteClient = nullptr);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -456,7 +456,7 @@ DiskSlotPool::DiskSlotPool(std::string const& directory, size_t slotSize, SlotCo
     resize(numSlots);
 }
 
-DiskSlotPool::DiskSlotPool(std::shared_ptr<RemoteMemClient> remote, size_t slotSize, SlotCount numSlots)
+DiskSlotPool::DiskSlotPool(SharedPtr<RemoteMemClient> remote, size_t slotSize, SlotCount numSlots)
     : SlotPoolBase(slotSize)
     , mRemote(std::make_unique<RemoteRange>(std::move(remote), slotSize))
 {
@@ -728,7 +728,7 @@ HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> con
 // ---------------------------------------------------------------------------
 
 DiskPoolGroup::DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
-    std::string const& directory, std::shared_ptr<RemoteMemClient> remote)
+    std::string const& directory, SharedPtr<RemoteMemClient> remote)
     : PoolGroupBase(numSlots)
 {
     for (size_t sz : slotSizeList)
@@ -828,8 +828,7 @@ HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
 // ---------------------------------------------------------------------------
 
 DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory,
-    std::shared_ptr<RemoteMemClient> remote)
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory, SharedPtr<RemoteMemClient> remote)
     : mDirectory(std::move(directory))
     , mRemote(std::move(remote))
 {
@@ -856,7 +855,7 @@ RemoteRange& DiskCacheLevelStorage::remoteRange(PoolGroupIndex pgIdx, PoolIndex 
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
     PooledPhysMemAllocator* gpuPhysMemAllocator, HostMemBackingOptions const& options,
-    std::optional<size_t> sparseReservation, std::shared_ptr<RemoteMemClient> remoteClient)
+    std::optional<size_t> sparseReservation, SharedPtr<RemoteMemClient> remoteClient)
 {
     TLLM_CHECK((cacheTierOf(tierCfg) == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
     return std::visit(

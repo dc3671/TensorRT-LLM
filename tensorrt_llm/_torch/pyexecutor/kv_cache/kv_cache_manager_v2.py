@@ -95,6 +95,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
     PoolRebalanceConfig,
+    RemoteMemError,
     ReusePolicy,
     ReuseScope,
     SsmLayerConfig,
@@ -9667,9 +9668,14 @@ class KVCacheManagerV2(BaseResourceManager):
             # Use the same salt derivation as _create_kv_cache so the transient
             # cache hits the same radix-tree blocks.
             reuse_salt = self._derive_reuse_salt(req.cache_salt)
-            prefetched = self.impl.prefetch_reuse(
-                ReuseScope(lora_id=req.lora_task_id, salt=reuse_salt), tokens, CACHE_LEVEL1
-            )
+            try:
+                prefetched = self.impl.prefetch_reuse(
+                    ReuseScope(lora_id=req.lora_task_id, salt=reuse_salt), tokens, CACHE_LEVEL1
+                )
+            except RemoteMemError as error:
+                # A failed remote level has retired; its pages drop from the tree, so the request recomputes them.
+                logger.warning(f"prefetch for request {req.py_request_id} failed: {error}")
+                prefetched = False
             if not prefetched:
                 logger.warning("prefetch failed for request %s", req.py_request_id)
                 success = False
