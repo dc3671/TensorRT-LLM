@@ -241,6 +241,9 @@ l0_b200:
   - unittest/_torch/modules/test_resident_fp8_gemm.py
   - unittest/_torch/modules/test_inproj_ba_splitk.py
   - unittest/_torch/modules/test_gate_add_rmsnorm_fp8.py
+  # One-GPU cases in multi_gpu/: the NCCL fallback's fused residual + RMSNorm + FP8 quantize.
+  - unittest/_torch/multi_gpu/test_allreduce.py::test_nccl_residual_rms_norm_quant_fp8_bitwise
+  - unittest/_torch/multi_gpu/test_allreduce.py::test_nccl_residual_rms_norm_quant_fp8_no_tokens
   - unittest/_torch/moe/test_moe_decode_front.py
   - unittest/_torch/modules/test_embedding_lookup.py
   - unittest/_torch/moe/test_draft_experts_nvfp4.py
