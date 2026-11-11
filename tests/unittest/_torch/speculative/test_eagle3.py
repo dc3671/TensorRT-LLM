@@ -96,6 +96,7 @@ def test_mtp_eagle_refreshes_dsa_metadata_before_draft_forward() -> None:
 
     worker = SimpleNamespace(
         is_mtp_eagle=True,
+        _draft_takes_kept_rows=False,
         draft_kv_cache_context=draft_context,
         _run_draft_forward=run_draft_forward,
     )

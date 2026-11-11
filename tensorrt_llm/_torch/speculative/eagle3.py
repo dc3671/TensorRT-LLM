@@ -863,6 +863,30 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             num_accepted_tokens, original_all_rank_num_tokens, accepted_tokens,
             pre_draft_seq_lens)
 
+    @staticmethod
+    def _draft_kept_rows(spec_metadata, step0_seq_lens, num_accepted_tokens,
+                         num_contexts, num_gens, runtime_draft_len,
+                         num_ctx_tokens,
+                         use_epilogue) -> Optional[DraftKeptRows]:
+        """Pass 0's kept rows when the step is generation-only on every rank.
+
+        Pass 0 then computes past attention only the rows the draft loop keeps
+        (under attention DP, its MoE on every rank's kept-row count); with TP
+        attention and the step-0 epilogue they come back compact.
+        """
+        kept_counts = spec_metadata.all_rank_num_seqs
+        if not generation_only_on_every_rank(num_contexts, kept_counts,
+                                             spec_metadata.all_rank_num_gens):
+            return None
+        return DraftKeptRows(kept_row_ids(step0_seq_lens,
+                                          spec_metadata.batch_indices_cuda,
+                                          num_accepted_tokens, num_contexts,
+                                          num_gens, runtime_draft_len,
+                                          num_ctx_tokens),
+                             kept_counts,
+                             compact=kept_counts is None and use_epilogue
+                             and not spec_metadata.is_layer_capture(0))
+
     def _forward_linear_draft_loop(self,
                                    inputs,
                                    attn_metadata,
@@ -944,27 +968,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # handles save/restore internally (Eagle3DraftModel.forward
                 # uses try/finally); attn_metadata is left untouched here.
                 kept_rows = None
-                kept_counts = spec_metadata.all_rank_num_seqs
                 if (i == 0 and self._draft_takes_kept_rows
-                        and self.guided_decoder is None
-                        and generation_only_on_every_rank(
-                            num_contexts, kept_counts,
-                            spec_metadata.all_rank_num_gens)):
-                    # Pass 0 of a step that is generation-only on every rank
-                    # computes past attention only the rows this loop keeps
-                    # (under attention DP, its MoE on every rank's kept-row
-                    # count); with TP attention and the step-0 epilogue they
-                    # come back compact.
-                    kept_rows = DraftKeptRows(
-                        kept_row_ids(step0_seq_lens,
-                                     spec_metadata.batch_indices_cuda,
-                                     num_accepted_tokens, num_contexts,
-                                     num_gens, runtime_draft_len,
-                                     attn_metadata.num_ctx_tokens),
-                        kept_counts,
-                        compact=kept_counts is None and use_epilogue
-                        and not spec_metadata.is_layer_capture(0))
-                    inputs["kept_rows"] = kept_rows
+                        and self.guided_decoder is None):
+                    kept_rows = self._draft_kept_rows(
+                        spec_metadata, step0_seq_lens, num_accepted_tokens,
+                        num_contexts, num_gens, runtime_draft_len,
+                        attn_metadata.num_ctx_tokens, use_epilogue)
+                    if kept_rows is not None:
+                        inputs["kept_rows"] = kept_rows
                 try:
                     hidden_states, hidden_states_to_save = self._run_draft_forward(
                         draft_model, inputs, spec_metadata, i)
