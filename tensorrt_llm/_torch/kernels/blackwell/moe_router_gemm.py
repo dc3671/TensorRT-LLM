@@ -5,8 +5,8 @@
 tcgen05 MMA with the router weight as the M operand (128 experts per CTA, "swap AB") and token tiles of 32 or 64 as
 N; a cluster of ``SPLITS`` CTAs splits K and sums the partials in split order (``MoeRouterGemmKernel``), so a token's
 logits do not depend on the batch it runs in. Weight TMA loads go out before ``griddepcontrol.wait``, x after it.
-Compile-time epilogue options feed a MoE engine that routes itself: per token the top-``CANDIDATES`` keys of each
-128-expert tile, the NVFP4 quantization of x, and the PDL release right after the dependency wait.
+The compile-time ``route_top_k`` epilogue feeds a MoE engine that routes itself: per token the top ``route_top_k``
+keys of each 128-expert tile, the NVFP4 quantization of x, and the PDL release right after the dependency wait.
 """
 
 from __future__ import annotations
@@ -57,9 +57,10 @@ EXPERT_TILE = 128  # UMMA M (cta_group 1): TMEM lane = expert
 K_TILE = 64  # one 128-byte swizzle atom of BF16 per row
 SPLITS = 8  # K ranges = CTAs per cluster
 TOKEN_TILES = (32, 64)  # UMMA N
-CANDIDATES = 10  # keys per (token, expert tile) of the ``candidates`` epilogue
-QUANT_TOKEN_TILE = 32  # the ``quant`` epilogue: 8 rows per expert tile of 4
-QUANT_EXPERTS = 4 * EXPERT_TILE
+# The ``route_top_k`` epilogue: one lane stores each key of a token's tile, and each expert tile's CTA quantizes
+# this many rows of its token tile (threads / 16 lanes per row).
+ROUTE_MAX_TOP_K = 32
+QUANT_ROWS_PER_TILE = 8
 
 
 @functools.lru_cache(maxsize=None)
@@ -129,14 +130,14 @@ class MoeRouterGemmKernel:
     bulk copy that completes bytes on CTA o's receive mbarrier; each CTA waits for its ``SPLITS`` slices and
     sums them in split order 0 .. SPLITS - 1.
 
-    Epilogue options (compile time; all off is the plain GEMM):
+    ``route_top_k`` (compile time; 0 is the plain GEMM): the epilogue a routing MoE engine reads.
 
-    * ``candidates``: each token's top ``CANDIDATES`` reduceTopK keys of every expert tile, descending
-      (``cand`` [M, E / 128, CANDIDATES] int32: twiddled BF16 logit << 16 | 65535 - expert, as the route front's).
-    * ``quant``: the NVFP4 quantization of x (``xq`` [M, K / 2] u8, linear ``xsf`` [M, K / 16] u8, global scale
-      ``gs``) from the x tiles in shared memory, bitwise ``fp4_quantize``: CTA (e, s) quantizes rows 8 e .. 8 e + 7
-      of its token tile over its K range, the K tiles the staging tile overwrites before it is written.
-    * ``early_release``: release the PDL dependents right after the dependency wait."""
+    * Each token's top ``route_top_k`` reduceTopK keys of every expert tile, descending (``cand`` [M, E / 128,
+      route_top_k] int32: twiddled BF16 logit << 16 | 65535 - expert, as the route front's).
+    * The NVFP4 quantization of x (``xq`` [M, K / 2] u8, linear ``xsf`` [M, K / 16] u8, global scale ``gs``) from
+      the x tiles in shared memory, bitwise ``fp4_quantize``: CTA (e, s) quantizes rows 8 e .. 8 e + 7 of its token
+      tile over its K range, the K tiles the staging tile overwrites before it is written.
+    * The PDL dependents are released right after the dependency wait."""
 
     threads = 128
 
@@ -148,7 +149,7 @@ class MoeRouterGemmKernel:
         num_experts: int,
         a_stride: int,
         token_tile: int,
-        quant: bool = False,
+        route_top_k: int = 0,
     ) -> Optional[str]:
         if num_experts % EXPERT_TILE:
             return f"num_experts={num_experts} must be a multiple of {EXPERT_TILE}"
@@ -163,12 +164,13 @@ class MoeRouterGemmKernel:
         smem_bytes = (k_extent // SPLITS // K_TILE) * (EXPERT_TILE + token_tile) * K_TILE * 2
         if smem_bytes + token_tile * EXPERT_TILE * 4 + 2048 > _smem_limit():
             return "shared memory over budget"
-        if quant and (
-            token_tile != QUANT_TOKEN_TILE
-            or num_experts != QUANT_EXPERTS
+        if route_top_k and not 0 < route_top_k <= ROUTE_MAX_TOP_K:
+            return f"route_top_k must be in 1..{ROUTE_MAX_TOP_K}"
+        if route_top_k and (
+            token_tile != QUANT_ROWS_PER_TILE * (num_experts // EXPERT_TILE)
             or (k_extent // SPLITS // K_TILE) % 4
         ):
-            return f"quant takes {QUANT_TOKEN_TILE}-token tiles, {QUANT_EXPERTS} experts, K tiles in 4s"
+            return f"route_top_k takes {QUANT_ROWS_PER_TILE} token rows per expert tile and K tiles in 4s"
         return None
 
     @classmethod
@@ -185,9 +187,7 @@ class MoeRouterGemmKernel:
         a_stride: int,
         token_tile: int,
         use_pdl: bool = True,
-        candidates: bool = False,
-        quant: bool = False,
-        early_release: bool = False,
+        route_top_k: int = 0,
     ) -> None:
         err = self._shape_error(
             num_rows=num_rows,
@@ -195,7 +195,7 @@ class MoeRouterGemmKernel:
             num_experts=num_experts,
             a_stride=a_stride,
             token_tile=token_tile,
-            quant=quant,
+            route_top_k=route_top_k,
         )
         if err is not None:
             raise ValueError(err)
@@ -207,9 +207,8 @@ class MoeRouterGemmKernel:
         self.tn = token_tile
         self.token_tiles = -(-num_rows // token_tile)
         self.use_pdl = use_pdl
-        self.candidates = candidates
-        self.quant = quant
-        self.early_release = early_release
+        self.route_top_k = route_top_k
+        self.route = route_top_k > 0
         self.n_etiles = num_experts // EXPERT_TILE
         self.k_tiles = k_extent // SPLITS // K_TILE
         self.tps = token_tile // SPLITS  # tokens of a CTA's output slice
@@ -232,7 +231,7 @@ class MoeRouterGemmKernel:
         xq_ptr: Optional[Int64] = None,
         xsf_ptr: Optional[Int64] = None,
     ) -> None:
-        # cand_ptr: the candidates epilogue's output; gs_ptr / xq_ptr / xsf_ptr: the quant epilogue's.
+        # route_top_k only: the candidates (cand_ptr), global scale and quantized x (gs_ptr / xq_ptr / xsf_ptr).
         # Swap AB: MMA A = router weight (M = experts), MMA B = x (N = tokens); both K-major. L = 1.
         mA = cute.make_tensor(
             w_ptr,
@@ -320,7 +319,7 @@ class MoeRouterGemmKernel:
         of the token tile. sB is K-major with the 128-byte swizzle: row r is a 128-byte line of a K tile, its 16-byte
         chunk c at c ^ (r % 8)."""
         tn: cutlass.Constexpr = self.tn
-        r_loc = e_tile * Int32(8) + tidx // Int32(16)
+        r_loc = e_tile * Int32(QUANT_ROWS_PER_TILE) + tidx // Int32(16)
         cbl = Int32(16 * phase) + tidx % Int32(16)
         kt = cbl // Int32(4)
         row = t_tile * Int32(tn) + r_loc
@@ -339,13 +338,13 @@ class MoeRouterGemmKernel:
 
     @cute.jit
     def _tile_candidates(self, cand_ptr: Int64, row, e_tile, e4, lane, p01, p23) -> None:
-        """The warp's token row: its top CANDIDATES keys among this expert tile's 128 BF16 logits (4 per lane, packed
-        in p01 / p23), descending, lane r storing key r."""
+        """The warp's token row: its top ``route_top_k`` keys among this expert tile's 128 BF16 logits (4 per lane,
+        packed in p01 / p23), descending, lane r storing key r."""
         k0, k1 = _keys2(p01, e_tile * Int32(EXPERT_TILE) + e4)
         k2, k3 = _keys2(p23, e_tile * Int32(EXPERT_TILE) + e4 + Int32(2))
         zero = Int32(0)
         mine = zero
-        for r in cutlass.range_constexpr(CANDIDATES):
+        for r in cutlass.range_constexpr(self.route_top_k):
             # keys are unique and never 0, so clearing the picked one takes it out
             g = _redux_max_u32(_max_u32(_max_u32(k0, k1), _max_u32(k2, k3)))
             k0 = _sel_eq(k0, g, zero, k0)
@@ -353,9 +352,9 @@ class MoeRouterGemmKernel:
             k2 = _sel_eq(k2, g, zero, k2)
             k3 = _sel_eq(k3, g, zero, k3)
             mine = _sel_eq(lane, Int32(r), g, mine)
-        if lane < Int32(CANDIDATES):
+        if lane < Int32(self.route_top_k):
             base = Int64(row) * Int64(self.n_etiles) + Int64(e_tile)
-            _st_b32(cand_ptr + (base * Int64(CANDIDATES) + Int64(lane)) * Int64(4), mine)
+            _st_b32(cand_ptr + (base * Int64(self.route_top_k) + Int64(lane)) * Int64(4), mine)
 
     @cute.kernel
     def kernel(
@@ -476,7 +475,7 @@ class MoeRouterGemmKernel:
                 )
         if const_expr(self.use_pdl):
             _gdc_wait()
-            if const_expr(self.early_release):
+            if const_expr(self.route):
                 _gdc_launch()
         if warp == 0:
             for kt in cutlass.range_constexpr(k_tiles):
@@ -509,7 +508,7 @@ class MoeRouterGemmKernel:
             with cute.arch.elect_one():
                 tcgen05.commit(acc_mbar)
 
-        if const_expr(self.quant):
+        if const_expr(self.route):
             # K tiles 0-3 of x now: the staging tile overwrites them next
             self._quant_phase(sB, full_mbar, gs_ptr, xq_ptr, xsf_ptr, s, e_tile, t_tile, tidx, 0)
             cute.arch.sync_threads()
@@ -541,7 +540,7 @@ class MoeRouterGemmKernel:
                         Int32(slice_bytes),
                     )
                 _bulk_commit()
-        if const_expr(self.quant):
+        if const_expr(self.route):
             # the K tiles the staging tile left alone, while the split-K slices are in flight
             for phase in cutlass.range_constexpr(1, k_tiles // 4):
                 self._quant_phase(
@@ -573,7 +572,7 @@ class MoeRouterGemmKernel:
                     p01 = _pack_bf16x2_rn(a0, a1)
                     p23 = _pack_bf16x2_rn(a2, a3)
                     _st_v2(dst, p01, p23)
-                    if const_expr(self.candidates):
+                    if const_expr(self.route):
                         self._tile_candidates(cand_ptr, row, e_tile, e4, lane, p01, p23)
         # Every peer received its slices, so no outgoing copy still reads the staging tile (the bulk wait_group does
         # not track copies that complete on an mbarrier).
@@ -582,7 +581,7 @@ class MoeRouterGemmKernel:
         if warp == 1:
             cute.arch.relinquish_tmem_alloc_permit()
             cute.arch.dealloc_tmem(tmem_ptr, self.tmem_cols)
-        if const_expr(self.use_pdl and not self.early_release):
+        if const_expr(self.use_pdl and not self.route):
             _gdc_launch()
 
 

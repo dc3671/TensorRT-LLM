@@ -861,7 +861,7 @@ def test_engine_routes_bit_for_bit(m, ls, tile, dup, state):
 
     ex = _experts()
     x, w, gs = _router_inputs(m, ex, seed=41 + m, dup=dup)
-    _, cand, xq, xsf = RouteFrontRouterGemm(engine_route=True)(x, w, gs)
+    _, cand, xq, xsf = RouteFrontRouterGemm(engine_route=True)(x, w, gs, TOPK)
     for poison in (-7, 0x2AAA):
         ref = _route_front_chain(ex, x, w, gs, ls, tile, state, poison)
         tag = (m, ls, tile, dup, poison)
@@ -935,7 +935,7 @@ def test_engine_routes_before_releasing_its_dependents(m, release_after_wait, st
     x = x.abs()
     w = torch.full_like(w, -0.02)
     w[: TOPK + 2] = 0.02  # every token routes to 10 of 12 experts
-    _, cand, xq, xsf = RouteFrontRouterGemm(engine_route=True)(x, w, gs)
+    _, cand, xq, xsf = RouteFrontRouterGemm(engine_route=True)(x, w, gs, TOPK)
     n = m * TOPK
     got = torch.empty((n, 2), dtype=torch.int32, device="cuda")
     reader = _pdl_table_reader()
@@ -968,6 +968,90 @@ def test_engine_routes_before_releasing_its_dependents(m, release_after_wait, st
         )
 
 
+def _ref_route(logits, top_k):
+    """Host routing of BF16 ``logits`` for ``top_k``: ids by reduceTopK key (equal logits to the smaller expert) and
+    the weights with the route front's arithmetic (exp of v - v0, warp-butterfly sum, divide, round to BF16)."""
+    from tensorrt_llm._torch.kernels.blackwell.moe_bf16_engine import _butterfly_sum
+
+    m, e = logits.shape
+    bits = logits.view(torch.int16).to(torch.int64) & 0xFFFF
+    tw = torch.where((bits & 0x8000) != 0, bits ^ 0xFFFF, bits | 0x8000)
+    keys = (tw << 16) | (65535 - torch.arange(e, device=logits.device))
+    top = keys.sort(dim=-1, descending=True).values[:, :top_k]
+    ids = (65535 - (top & 0xFFFF)).int()
+    vals = torch.gather(logits.float(), 1, ids.long())
+    ex = torch.exp(vals - vals[:, :1])
+
+    def tree_sum(t):
+        return ex[:, t] if isinstance(t, int) else tree_sum(t[0]) + tree_sum(t[1])
+
+    return ids, (ex / tree_sum(_butterfly_sum(top_k))[:, None]).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("m,top_k,tile", [(42, 8, 8), (63, 4, 16)])
+def test_engine_routes_another_top_k(m, top_k, tile, state):
+    """The routing engine compiled for another top-k (4 lists of 128 experts): ids and tables equal to host
+    routing (tables in token order), weights within one BF16 step of it, and the gemm2 rows bitwise those of the
+    engine on the host tables."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_front import (
+        RouteFrontRouterGemm,
+        prerouted_table_sizes,
+        prerouted_table_views,
+    )
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import n_max_for, tile_k_for
+
+    ex = _experts()
+    x, w, gs = _router_inputs(m, ex, seed=61 + m)
+    logits, cand, xq, xsf = RouteFrontRouterGemm(engine_route=True)(x, w, gs, top_k)
+    assert cand.shape == (m, E // 128, top_k)
+    flat = torch.full((sum(prerouted_table_sizes(m, top_k, E_LOCAL, tile)),), -7, dtype=torch.int32)
+    flat = flat.cuda()
+    ids = torch.full((m, top_k), -7, dtype=torch.int32, device="cuda")
+    wts = torch.zeros((m, top_k), dtype=torch.bfloat16, device="cuda")
+    views = prerouted_table_views(flat, m, top_k, E_LOCAL, tile)
+    out = _engine_on(
+        ex,
+        xq,
+        xsf,
+        views,
+        tile,
+        state,
+        -7,
+        candidates=cand,
+        topk_ids=ids,
+        topk_weights=wts,
+        local_start=0,
+    )
+    r_ids, r_wts = _ref_route(logits, top_k)
+    assert torch.equal(ids, r_ids)
+    step = (wts.view(torch.int16).int() - r_wts.view(torch.int16).int()).abs().max().item()
+    assert step <= 1, step
+    r_views, _ = _tables(r_ids, tile)
+    e2p, p2t, batch, limit, nct, npad = views
+    r_e2p, r_p2t, r_batch, r_limit, r_nct, r_npad = r_views
+    n = int(r_nct[0])
+    assert torch.equal(e2p, r_e2p) and torch.equal(nct, r_nct) and torch.equal(npad, r_npad)
+    assert torch.equal(batch[:n], r_batch[:n]) and torch.equal(limit[:n], r_limit[:n])
+    rows = r_e2p[r_e2p >= 0].long()
+    assert torch.equal(p2t[rows], r_p2t[rows])
+    n_max = n_max_for(m)
+    ref, _, _, _ = _engine(
+        ex, xq, xsf, r_ids, tile, n_max, state, tile_k=tile_k_for(n_max, H, INTER)
+    )
+    assert torch.equal(out[rows].view(torch.int16), ref[rows].view(torch.int16))
+
+
+def test_engine_route_bounds():
+    """``route_error``: whole 16-byte candidate vectors, at most two per thread for 64 tokens."""
+    from tensorrt_llm._torch.kernels.blackwell.moe_nvfp4_engine import route_error
+
+    assert route_error(10, 4) is None and route_error(8, 4) is None and route_error(12, 4) is None
+    assert route_error(13, 4) is not None  # 64 x 52 keys
+    assert route_error(10, 1) is not None and route_error(0, 4) is not None
+    assert route_error(36, 1) is not None  # the weights' warp sum
+
+
 def test_runner_routes_in_the_engine(monkeypatch):
     """A pre-routed un-finalized call with ``candidates`` takes the engine, which writes the routing today's chain
     would, also through the op backend (``PreroutedRouting.candidates``); a call that would not take the engine
@@ -988,7 +1072,7 @@ def test_runner_routes_in_the_engine(monkeypatch):
     state = new_state(torch.device("cuda"))
     x, w, gs = _router_inputs(m, ex, seed=43)
     ref = _route_front_chain(ex, x, w, gs, 0, tile, state, -7)[2:]
-    _, cand, xq, xsf = RouteFrontRouterGemm(engine_route=True)(x, w, gs)
+    _, cand, xq, xsf = RouteFrontRouterGemm(engine_route=True)(x, w, gs, TOPK)
     runner = _decode_runner()
     any8, _ = _tile8_tactics(runner, m)
     picked = _spy_select(monkeypatch)

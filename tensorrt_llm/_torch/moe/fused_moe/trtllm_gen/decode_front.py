@@ -826,9 +826,9 @@ _ROUTER_GEMM_COMPILED = {}
 
 
 def _router_gemm_compile(
-    m: int, k: int, n: int, a_stride: int, use_pdl: bool, engine_route: bool = False
+    m: int, k: int, n: int, a_stride: int, use_pdl: bool, route_top_k: int = 0
 ):
-    key = (m, k, n, a_stride, use_pdl, engine_route)
+    key = (m, k, n, a_stride, use_pdl, route_top_k)
     if key in _ROUTER_GEMM_COMPILED:
         return _ROUTER_GEMM_COMPILED[key]  # None: the kernel does not take this shape
     if torch.cuda.is_current_stream_capturing():
@@ -837,10 +837,15 @@ def _router_gemm_compile(
     import cutlass
     import cutlass.cute as cute
 
-    from ....kernels.blackwell.moe_router_gemm import MoeRouterGemmKernel, router_gemm_token_tile
+    from ....kernels.blackwell.moe_router_gemm import (
+        QUANT_ROWS_PER_TILE,
+        MoeRouterGemmKernel,
+        router_gemm_token_tile,
+    )
     from ....kernels.blackwell.utils import make_ptr
 
-    token_tile = router_gemm_token_tile(m)
+    # route_top_k: the epilogue the routing MoE engine reads, whose x quantization sets the token tile
+    token_tile = QUANT_ROWS_PER_TILE * (n // 128) if route_top_k else router_gemm_token_tile(m)
     if token_tile is None:
         _ROUTER_GEMM_COMPILED[key] = None
         return None
@@ -851,19 +856,17 @@ def _router_gemm_compile(
         a_stride=a_stride,
         token_tile=token_tile,
     )
-    if not MoeRouterGemmKernel.supports(**shape, quant=engine_route):
+    if not MoeRouterGemmKernel.supports(**shape, route_top_k=route_top_k):
         _ROUTER_GEMM_COMPILED[key] = None
         return None
-    # engine_route: the epilogue the routing MoE engine reads, which it releases right after its own wait
-    options = dict(candidates=True, quant=True, early_release=True) if engine_route else {}
-    kernel = MoeRouterGemmKernel(use_pdl=use_pdl, **shape, **options)
+    kernel = MoeRouterGemmKernel(use_pdl=use_pdl, route_top_k=route_top_k, **shape)
     dev = torch.device("cuda")
     x = torch.empty((m, a_stride), dtype=torch.bfloat16, device=dev)
     w = torch.empty((n, k), dtype=torch.bfloat16, device=dev)
     xp = make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
     wp = make_ptr(cutlass.BFloat16, w.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    epilogue = (cutlass.Int64(0),) * 4 if engine_route else ()
+    epilogue = (cutlass.Int64(0),) * 4 if route_top_k else ()
     fn = cute.compile(kernel, xp, wp, cutlass.Int64(0), stream, *epilogue)
     _ROUTER_GEMM_COMPILED[key] = fn
     return fn
@@ -874,8 +877,8 @@ class RouteFrontRouterGemm:
     then runs the stock GEMM).
 
     ``engine_route``: the GEMM of the steps the decode MoE engine routes, which also returns each token's top
-    ``KERNEL_TOP_K`` keys per 128-expert tile (candidates [m, E / 128, KERNEL_TOP_K] int32) and the NVFP4
-    quantization of x with ``global_scale`` (xq [m, H / 2] u8, linear xsf [m, H / 16] u8)."""
+    ``top_k`` keys per 128-expert tile (candidates [m, E / 128, top_k] int32) and the NVFP4 quantization of x with
+    ``global_scale`` (xq [m, H / 2] u8, linear xsf [m, H / 16] u8)."""
 
     engine_route: bool = False
 
@@ -883,7 +886,11 @@ class RouteFrontRouterGemm:
         self.engine_route = engine_route
 
     def __call__(
-        self, x: torch.Tensor, weight: torch.Tensor, global_scale: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        global_scale: Optional[torch.Tensor] = None,
+        top_k: int = 0,
     ):
         m, k = x.shape
         n = weight.shape[0]
@@ -899,7 +906,10 @@ class RouteFrontRouterGemm:
             or weight.data_ptr() % 16
         ):
             return None
-        fn = _router_gemm_compile(m, k, n, x.stride(0), get_env_enable_pdl(), self.engine_route)
+        route_top_k = top_k if self.engine_route else 0
+        if self.engine_route and top_k < 1:
+            raise ValueError("an engine_route router GEMM takes the router's top_k")
+        fn = _router_gemm_compile(m, k, n, x.stride(0), get_env_enable_pdl(), route_top_k)
         if fn is None:
             return None
         import cuda.bindings.driver as cuda
@@ -918,7 +928,7 @@ class RouteFrontRouterGemm:
         if not self.engine_route:
             fn(*args)
             return out
-        cand = torch.empty((m, n // 128, KERNEL_TOP_K), dtype=torch.int32, device=x.device)
+        cand = torch.empty((m, n // 128, top_k), dtype=torch.int32, device=x.device)
         xq = torch.empty((m, k // 2), dtype=torch.uint8, device=x.device)
         xsf = torch.empty((m, k // 16), dtype=torch.uint8, device=x.device)
         p64 = lambda t: cutlass.Int64(t.data_ptr())  # noqa: E731
@@ -1278,7 +1288,7 @@ class DecodeFront:
         if route_front:
             routed = None
             if self._engine_routes(backend, m, top_k, gate.weight.shape[0], moe_kwargs):
-                routed = self.engine_router(x, gate.weight, gs)
+                routed = self.engine_router(x, gate.weight, gs, top_k)
             if routed is not None:
                 # the MoE engine writes ids, weights and tables from the candidates
                 logits, candidates, xq, xsf = routed

@@ -148,11 +148,13 @@ def engine_routes(
 ) -> bool:
     """Whether ``backend``'s (``TRTLLMGenFp4BlockScaleBase``) un-finalized pre-routed call of ``num_rows`` NVFP4
     tokens over ``num_experts`` experts runs ``ENGINE`` with the routing in the engine (``moe_nvfp4_engine``'s
-    ``route``): :func:`takes_engine` on the operands its ``run_moe`` passes, within the routing's bounds."""
-    from tensorrt_llm._torch.kernels.blackwell.moe_nvfp4_engine import (
-        ROUTE_LISTS,
-        ROUTE_MAX_ROWS,
-        ROUTE_TOP_K,
+    ``route_top_k`` / ``route_lists``): :func:`takes_engine` on the operands its ``run_moe`` passes, within the
+    routing's bounds: ``moe_nvfp4_engine.route_error`` on ``top_k`` keys of ``num_experts / 128`` lists, and the
+    router GEMM's ``route_top_k`` epilogue that writes them."""
+    from tensorrt_llm._torch.kernels.blackwell.moe_nvfp4_engine import ROUTE_MAX_ROWS, route_error
+    from tensorrt_llm._torch.kernels.blackwell.moe_router_gemm import (
+        QUANT_ROWS_PER_TILE,
+        MoeRouterGemmKernel,
     )
     from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
@@ -160,12 +162,21 @@ def engine_routes(
 
     if not backend.decode_tuning or not 0 < num_rows <= ROUTE_MAX_ROWS:
         return False
-    if top_k != ROUTE_TOP_K or num_experts != ROUTE_LISTS * 128:
+    if num_experts % 128 or route_error(top_k, num_experts // 128) is not None:
         return False
     act_type = to_trtllm_gen_act_type(backend.activation_type)
     if act_type != ActType_TrtllmGen.SwiGlu:
         return False
     packed_hidden = backend.w3_w1_weight.shape[-1]
+    if not MoeRouterGemmKernel.supports(
+        num_rows=num_rows,
+        k_extent=2 * packed_hidden,
+        num_experts=num_experts,
+        a_stride=2 * packed_hidden,
+        token_tile=QUANT_ROWS_PER_TILE * (num_experts // 128),
+        route_top_k=top_k,
+    ):
+        return False
     args = SimpleNamespace(
         hidden_states=torch.empty((num_rows, packed_hidden), device="meta"),
         hidden_states_scale=torch.empty((num_rows * packed_hidden // 8,), device="meta"),

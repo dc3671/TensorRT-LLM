@@ -221,18 +221,18 @@ def test_route_front_router_gemm(m):
     assert rg(big, w) is None
 
 
-def _ref_candidates(logits: torch.Tensor) -> torch.Tensor:
-    """trtllm-gen reduceTopK keys (twiddled BF16 << 16 | 65535 - expert) of each 128-expert tile, top K descending:
-    equal logits go to the smaller expert."""
+def _ref_candidates(logits: torch.Tensor, top_k: int = K) -> torch.Tensor:
+    """trtllm-gen reduceTopK keys (twiddled BF16 << 16 | 65535 - expert) of each 128-expert tile, top ``top_k``
+    descending: equal logits go to the smaller expert."""
     m, e = logits.shape
     bits = logits.view(torch.int16).to(torch.int64) & 0xFFFF
     tw = torch.where((bits & 0x8000) != 0, bits ^ 0xFFFF, bits | 0x8000)
     keys = (tw << 16) | (65535 - torch.arange(e, device=logits.device))
-    top = keys.view(m, e // 128, 128).sort(dim=-1, descending=True).values[..., :K]
+    top = keys.view(m, e // 128, 128).sort(dim=-1, descending=True).values[..., :top_k]
     return torch.where(top >= 2**31, top - 2**32, top).to(torch.int32)
 
 
-def _engine_route_gemm(x, w, gs, poison: int):
+def _engine_route_gemm(x, w, gs, poison: int, top_k: int = K):
     """The engine-route router GEMM into outputs filled with ``poison`` (a missing store keeps it)."""
     import cuda.bindings.driver as cuda
     import cutlass
@@ -242,11 +242,11 @@ def _engine_route_gemm(x, w, gs, poison: int):
     from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
     m, h = x.shape
-    fn = df._router_gemm_compile(m, h, E, x.stride(0), get_env_enable_pdl(), engine_route=True)
+    fn = df._router_gemm_compile(m, h, E, x.stride(0), get_env_enable_pdl(), route_top_k=top_k)
     assert fn is not None, "the engine-route router GEMM declined"
     dev = x.device
     logits = torch.full((m, E), poison, dtype=torch.int16, device=dev).view(torch.bfloat16)
-    cand = torch.full((m, E // 128, K), poison, dtype=torch.int32, device=dev)
+    cand = torch.full((m, E // 128, top_k), poison, dtype=torch.int32, device=dev)
     xq = torch.full((m, h // 2), poison & 0xFF, dtype=torch.uint8, device=dev)
     xsf = torch.full((m, h // 16), poison & 0xFF, dtype=torch.uint8, device=dev)
 
@@ -281,10 +281,40 @@ def test_engine_route_router_gemm(m, dup):
         assert torch.equal(_bits(logits), _bits(plain)), (tag, "logits")
         assert torch.equal(cand, cand_ref), (tag, "candidates")
         assert torch.equal(xq, q_ref) and torch.equal(xsf, sf_ref), (tag, "x quant")
-    out = df.RouteFrontRouterGemm(engine_route=True)(x, w, gs)
+    out = df.RouteFrontRouterGemm(engine_route=True)(x, w, gs, K)
     assert out is not None
     for name, a, b in zip(("logits", "cand", "xq", "xsf"), out, (plain, cand_ref, q_ref, sf_ref)):
         assert torch.equal(_bits(a), _bits(b)), (m, name)
+
+
+@pytest.mark.parametrize("m,top_k", [(35, 8), (56, 4)])
+def test_engine_route_router_gemm_top_k(m, top_k):
+    """The routing epilogue for another top-k: each token's top-``top_k`` keys per expert tile equal to reduceTopK's,
+    logits and x bytes as at top-10."""
+    x, w, gs = _inputs(m, seed=1950 + m)
+    plain = df.RouteFrontRouterGemm()(x, w)
+    ref = df.RouteFrontRouterGemm(engine_route=True)(x, w, gs, K)
+    logits, cand, xq, xsf = _engine_route_gemm(x, w, gs, -1, top_k)
+    assert torch.equal(_bits(logits), _bits(plain))
+    assert torch.equal(cand, _ref_candidates(plain, top_k))
+    assert torch.equal(xq, ref[2]) and torch.equal(xsf, ref[3])
+
+
+def test_engine_route_router_gemm_rejects():
+    """The routing epilogue takes 1..32 keys per tile and 8 token rows per expert tile in a 32- or 64-token tile:
+    256 experts (a 16-token tile) and 33 keys are declined (the caller keeps the route front)."""
+    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+    from tensorrt_llm._torch.kernels.blackwell.moe_router_gemm import MoeRouterGemmKernel
+
+    pdl = get_env_enable_pdl()
+    assert df._router_gemm_compile(35, H, 256, H, pdl, route_top_k=K) is None
+    assert df._router_gemm_compile(35, H, E, H, pdl, route_top_k=33) is None
+    shape = dict(num_rows=35, k_extent=H, num_experts=E, a_stride=H, token_tile=32)
+    assert MoeRouterGemmKernel.supports(**shape, route_top_k=K)
+    assert not MoeRouterGemmKernel.supports(**dict(shape, token_tile=64), route_top_k=K)
+    assert MoeRouterGemmKernel.supports(
+        **dict(shape, num_experts=1024, token_tile=64), route_top_k=K
+    )
 
 
 @pytest.mark.parametrize(
@@ -917,6 +947,29 @@ def _engine_backend(
 
 
 _TODAY = ["router_gemm", "route_front", "moe"]
+
+
+@pytest.mark.parametrize(
+    "top_k,num_experts,routes",
+    [
+        (10, 512, True),
+        (8, 512, True),
+        (9, 512, True),
+        (6, 1024, True),
+        (13, 512, False),  # 64 tokens x 52 keys: more than two 16-byte loads per engine thread
+        (7, 128, False),  # 7 keys of one list: not whole 16-byte vectors
+        (10, 1024, False),  # 80 keys per token: more than two loads per thread
+        (10, 256, False),  # two lists: the router epilogue's 16-token tile does not exist
+        (33, 512, False),  # the router epilogue stores at most 32 keys per tile
+    ],
+)
+def test_engine_routes_top_k_and_lists(top_k: int, num_experts: int, routes: bool) -> None:
+    """The routing engine and its router epilogue take top-k and the number of 128-expert lists as compile-time
+    parameters; ``engine_routes`` declines what either kernel cannot run."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe as dm
+
+    assert dm.engine_routes(_engine_backend(), 35, top_k, num_experts) == routes
+    assert not dm.engine_routes(_engine_backend(), 65, top_k, num_experts)
 
 
 @pytest.mark.parametrize(

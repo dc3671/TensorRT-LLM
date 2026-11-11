@@ -6,9 +6,10 @@ rows: every MMA is block-scaled tcgen05 M128 x N n_max x K64 over the whole K in
 SwiGLU E2m1 epilogue operation for operation and FC2's is ``moe_lowm_fc2``'s (:func:`moe_nvfp4_engine`). Scheduling:
 ``moe_persistent_engine``.
 
-``route`` (compile time): the engine routes the call itself after its dependency wait, from each token's top
-``ROUTE_TOP_K`` keys per 128-expert tile (``moe_router_gemm``'s ``candidates`` epilogue), and writes the top-k ids,
-the BF16 weights and the pre-routed tables bit for bit as the route front (``moe_route_front``) would.
+``route_top_k`` / ``route_lists`` (compile time): the engine routes the call itself after its dependency wait, from
+each token's top ``route_top_k`` keys of each of its ``route_lists`` 128-expert tiles (``moe_router_gemm``'s
+``route_top_k`` epilogue), and writes the top-k ids, the BF16 weights and the pre-routed tables bit for bit as the
+route front (``moe_route_front``) would.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from cutlass.pipeline import (
     pipeline_init_wait,
 )
 
+from .moe_bf16_engine import _butterfly_sum
 from .moe_decode_front import (
     _add,
     _bit,
@@ -91,27 +93,40 @@ N_MAX = (16, 32, 64)  # MMA N (rows per segment) the engine compiles for
 MAX_LOCAL_EXPERTS = (
     128  # per-expert scalars and segment tables are staged for this many local experts
 )
-# ``route``: tokens per call (two token-mask words per expert), top-k, and the key lists merged per token
+# Tokens of a routing call: two token-mask words per expert.
 ROUTE_MAX_ROWS = 64
-ROUTE_TOP_K = 10
-ROUTE_LISTS = 4
-_ROUTE_KEYS = ROUTE_LISTS * ROUTE_TOP_K
-# ``route`` scratch at the start of the activation ring: the candidates, then per local expert its token mask (two
-# words) and first tile, then a sink word for the mask ORs of other ranks' picks
-_ROUTE_MASKS = ROUTE_MAX_ROWS * _ROUTE_KEYS * 4
-_ROUTE_STARTS = _ROUTE_MASKS + MAX_LOCAL_EXPERTS * 8
-_ROUTE_SINK = _ROUTE_STARTS + MAX_LOCAL_EXPERTS * 4
 _ROUTE_BAR = EPI_BAR + EPI_GROUPS  # named barrier: the epilogue warps release the activation loader
+
+
+def route_error(top_k: int, lists: int) -> Optional[str]:
+    """Why the engine cannot route from ``lists`` candidate lists of ``top_k`` keys per token, or None."""
+    if top_k < 1 or lists < 1:
+        return "route_top_k and route_lists must be positive"
+    if top_k > 32:
+        return "the weights' sum runs over the lanes of one warp: route_top_k <= 32"
+    if (lists * top_k) % 4:
+        return "a token's candidates load as 16-byte vectors: route_lists x route_top_k must be a multiple of 4"
+    if ROUTE_MAX_ROWS * lists * top_k > 8 * THREADS:
+        return f"the candidates of {ROUTE_MAX_ROWS} tokens load in two 16-byte vectors per thread"
+    return None
+
+
+def _route_scratch(top_k: int, lists: int) -> tuple:
+    """Byte offsets of the routing scratch at the start of the activation ring, after the candidates: per local
+    expert its token mask (two words), its first tile, then a sink word for the mask ORs of other ranks' picks."""
+    masks = ROUTE_MAX_ROWS * lists * top_k * 4
+    starts = masks + MAX_LOCAL_EXPERTS * 8
+    return masks, starts, starts + MAX_LOCAL_EXPERTS * 4
+
 
 __all__ = [
     "MAX_LOCAL_EXPERTS",
     "N_MAX",
-    "ROUTE_LISTS",
     "ROUTE_MAX_ROWS",
-    "ROUTE_TOP_K",
     "MoeNvfp4Engine",
     "moe_nvfp4_engine",
     "new_state",
+    "route_error",
 ]
 
 
@@ -206,6 +221,21 @@ def _fence_gpu() -> None:
     cute.arch.inline_ptx("fence.acq_rel.gpu;")
 
 
+def _max_tree(keys: list):
+    """The largest of ``keys`` (unsigned) as a pairwise tree: max(max(k0, k1), max(k2, k3)) for four."""
+    if len(keys) == 1:
+        return keys[0]
+    half = (len(keys) + 1) // 2
+    return _max_u32(_max_tree(keys[:half]), _max_tree(keys[half:]))
+
+
+def _sum_tree(vals: list, tree):
+    """``vals`` summed in the order of ``tree`` (nested pairs of indices, ``moe_bf16_engine._butterfly_sum``)."""
+    if isinstance(tree, int):
+        return vals[tree]
+    return _add(_sum_tree(vals, tree[0]), _sum_tree(vals, tree[1]))
+
+
 def _fence_cta_after(dep) -> None:
     """fence.acq_rel.cta, issued once dep is computed."""
     cute.arch.inline_ptx(
@@ -237,12 +267,13 @@ def smem_views(storage):
 class MoeNvfp4Engine(PersistentMoeEngine):
     """Compile-time configuration: ``n_max`` (MMA N, rows per segment), ``num_stages`` (ring depth), ``tile`` (the
     routing tables' token tile), ``tile_k`` (K per ring stage), ``release_after_wait`` (PDL release point:
-    ``Release.AFTER_WAIT``, else ``Release.POOL_SPENT``), ``route`` (the engine routes the call, module doc).
+    ``Release.AFTER_WAIT``, else ``Release.POOL_SPENT``), ``route_top_k`` / ``route_lists`` (0: tables given; else the
+    engine routes the call, module doc).
 
     The scheduler queues an FC2 unit once its segment's FC1 counter is complete. Warps: 0 weight TMA, 1 activation
     loader, 2 MMA, 3 unit scheduler, 4-11 two epilogue groups taking alternate units.
 
-    ``route``: every CTA merges each token's candidate lists and derives the experts' rows and segments
+    Routing: every CTA merges each token's candidate lists and derives the experts' rows and segments
     (:meth:`_route_prologue`); its epilogue warps then write their CTA's share of the routing outputs and the CTA's
     own permuted index -> token copy, which its activation loader waits for (:meth:`_route_deferred`)."""
 
@@ -257,12 +288,15 @@ class MoeNvfp4Engine(PersistentMoeEngine):
         tile: int,
         tile_k: int,
         release_after_wait: bool,
-        route: bool = False,
+        route_top_k: int = 0,
+        route_lists: int = 0,
     ):
         assert tile_k in (256, 512) and n_max in N_MAX
         super().__init__(hidden, inter, n_max, num_stages, tile_k)
         self.release = Release.AFTER_WAIT if release_after_wait else Release.POOL_SPENT
-        self.route = route
+        self.route = route_top_k > 0
+        self.route_top_k = route_top_k
+        self.route_lists = route_lists
         self.tile = tile
         self.groups = inter // 64  # 4-scale groups per intermediate row (8x4 layout)
         self.sfb_n = 128
@@ -270,8 +304,13 @@ class MoeNvfp4Engine(PersistentMoeEngine):
         self.sfb_stage_bytes = self.sfb_n * (tile_k // SF_VEC)
         self.kchunks = tile_k // 32  # 16-byte chunks of one activation row per stage
         self.kgroups = tile_k // 64  # 4-scale groups per row per stage
-        assert not route or num_stages * self.b_stage_bytes >= _ROUTE_SINK + 4, "route scratch"
-        assert not route or 2 * THREADS >= ROUTE_MAX_ROWS * ROUTE_TOP_K, "two key loads per thread"
+        if self.route:
+            err = route_error(route_top_k, route_lists)
+            assert err is None, err
+            self.route_masks, self.route_starts, self.route_sink = _route_scratch(
+                route_top_k, route_lists
+            )
+            assert num_stages * self.b_stage_bytes >= self.route_sink + 4, "route scratch"
 
     def _setup(self):
         self.tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
@@ -574,7 +613,7 @@ class MoeNvfp4Engine(PersistentMoeEngine):
         if cutlass.const_expr(self.route):
             # each token's merged keys, descending
             s_pick = smem.allocate_tensor(
-                Int32, cute.make_layout(ROUTE_MAX_ROWS * ROUTE_TOP_K), byte_alignment=16
+                Int32, cute.make_layout(ROUTE_MAX_ROWS * self.route_top_k), byte_alignment=16
             )
         sb_base = sB.iterator.toint()
         sfb_base = sSFB.iterator.toint()
@@ -884,22 +923,23 @@ class MoeNvfp4Engine(PersistentMoeEngine):
         lane,
         sb_base,
     ):
-        """``route``, whole CTA, after the dependency wait: each token's top ROUTE_TOP_K keys merged from its
-        ROUTE_LISTS descending lists (s_pick), every local expert's token mask and first tile (sB scratch), and the
+        """Routing, whole CTA, after the dependency wait: each token's top ``route_top_k`` keys merged from its
+        ``route_lists`` descending lists (s_pick), every local expert's token mask and first tile (sB scratch), and the
         experts with rows in exp_e / exp_y0 / exp_lim as the tile-table scan leaves them. Returns (experts with rows,
         some expert above n_max rows); s_wsum[0] holds the call's tiles."""
         NT: cutlass.Constexpr = THREADS
-        TK: cutlass.Constexpr = ROUTE_TOP_K
+        TK: cutlass.Constexpr = self.route_top_k
+        NL: cutlass.Constexpr = self.route_lists
         tile: cutlass.Constexpr = self.tile
         cbase = Int32(sb_base)
-        mask_base = cbase + Int32(_ROUTE_MASKS)
-        start_base = cbase + Int32(_ROUTE_STARTS)
-        sink = cbase + Int32(_ROUTE_SINK)
+        mask_base = cbase + Int32(self.route_masks)
+        start_base = cbase + Int32(self.route_starts)
+        sink = cbase + Int32(self.route_sink)
         key_base = _smem_addr(s_pick.iterator)
         warp_in = tidx // Int32(32)
-        # one round of loads: the m x 40 keys as 16-byte vectors (at most two per thread), both issued before the
-        # first store, so the copy pays one L2 round trip; the masks are zeroed meanwhile
-        nv = m_rows * Int32(_ROUTE_KEYS // 4)
+        # one round of loads: the m x NL x TK keys as 16-byte vectors (at most two per thread), both issued before
+        # the first store, so the copy pays one L2 round trip; the masks are zeroed meanwhile
+        nv = m_rows * Int32(NL * TK // 4)
         i0 = tidx
         i1 = tidx + Int32(NT)
         a0 = Int32(0)
@@ -921,40 +961,24 @@ class MoeNvfp4Engine(PersistentMoeEngine):
         if i1 < nv:
             _st_shared_v4(cbase + i1 * Int32(16), a1, b1, c1, d1)
         cute.arch.barrier()
-        # one thread per token merges its four lists: each keeps its head and next key in registers; the list whose
+        # one thread per token merges its NL lists: each keeps its head and next key in registers; the list whose
         # head is picked advances. A list whose keys are all used reads past its end, a value that could only become
-        # a head after an 11th pick. Picks stay in registers until their stores and mask ORs after the loop.
+        # a head after pick TK + 1. Picks stay in registers until their stores and mask ORs after the loop.
         t = tidx
         if t < m_rows:
-            p0 = cbase + t * Int32(_ROUTE_KEYS * 4)
-            p1 = p0 + Int32(TK * 4)
-            p2 = p0 + Int32(2 * TK * 4)
-            p3 = p0 + Int32(3 * TK * 4)
-            h0 = _ld_shared(p0)
-            h1 = _ld_shared(p1)
-            h2 = _ld_shared(p2)
-            h3 = _ld_shared(p3)
-            n0 = _ld_shared(p0 + Int32(4))
-            n1 = _ld_shared(p1 + Int32(4))
-            n2 = _ld_shared(p2 + Int32(4))
-            n3 = _ld_shared(p3 + Int32(4))
+            p = [cbase + t * Int32(NL * TK * 4)]
+            for j in cutlass.range_constexpr(1, NL):
+                p.append(p[0] + Int32(j * TK * 4))
+            h = [_ld_shared(p[j]) for j in range(NL)]
+            n = [_ld_shared(p[j] + Int32(4)) for j in range(NL)]
             gk = []
             for k in cutlass.range_constexpr(TK):
-                g = _max_u32(_max_u32(h0, h1), _max_u32(h2, h3))
+                g = _max_tree(h)
                 gk.append(g)
                 if cutlass.const_expr(k < TK - 1):
-                    p0 = _sel_eq(h0, g, p0 + Int32(4), p0)
-                    p1 = _sel_eq(h1, g, p1 + Int32(4), p1)
-                    p2 = _sel_eq(h2, g, p2 + Int32(4), p2)
-                    p3 = _sel_eq(h3, g, p3 + Int32(4), p3)
-                    h0 = _sel_eq(h0, g, n0, h0)
-                    h1 = _sel_eq(h1, g, n1, h1)
-                    h2 = _sel_eq(h2, g, n2, h2)
-                    h3 = _sel_eq(h3, g, n3, h3)
-                    n0 = _ld_shared(p0 + Int32(4))
-                    n1 = _ld_shared(p1 + Int32(4))
-                    n2 = _ld_shared(p2 + Int32(4))
-                    n3 = _ld_shared(p3 + Int32(4))
+                    p = [_sel_eq(h[j], g, p[j] + Int32(4), p[j]) for j in range(NL)]
+                    h = [_sel_eq(h[j], g, n[j], h[j]) for j in range(NL)]
+                    n = [_ld_shared(p[j] + Int32(4)) for j in range(NL)]
             kb = key_base + t * Int32(TK * 4)
             mrow = mask_base + (t // Int32(32)) * Int32(4)
             mbit = _bit(t % Int32(32))
@@ -1033,20 +1057,18 @@ class MoeNvfp4Engine(PersistentMoeEngine):
         bidx,
         gdx,
     ):
-        """``route``, epilogue thread q of 128 x EPI_GROUPS, before its first accumulator:
-        1. per pick (expanded index x = token * 10 + k), a local pick's permuted row into this CTA's p2t copy; the
-           token's owner CTA (token % grid) also writes the call's p2t and e2p (-1: another rank's expert), so every
-           word has one writer;
-        2. release the activation loader (the copy's only reader) once the masks and first tiles it overwrites are
-           read into registers;
+        """Routing, epilogue thread q of 128 x EPI_GROUPS, before its first accumulator:
+        1. each local pick (expanded index token * TK + k) into this CTA's p2t copy; the token's owner CTA (token %
+           grid) also writes the call's p2t and e2p (-1: another rank's expert), one writer per word;
+        2. release the activation loader (the copy's only reader) once the masks and first tiles are in registers;
         3. the tile tables (the expert's owner CTA) and their counts (CTA 0);
         4. ids and BF16 weights of the tokens this CTA owns, with the route front's arithmetic."""
-        TK: cutlass.Constexpr = ROUTE_TOP_K
+        TK: cutlass.Constexpr = self.route_top_k
         NE: cutlass.Constexpr = 128 * EPI_GROUPS
         tile: cutlass.Constexpr = self.tile
         key_base = _smem_addr(s_pick.iterator)
-        mask_base = Int32(sb_base) + Int32(_ROUTE_MASKS)
-        start_base = Int32(sb_base) + Int32(_ROUTE_STARTS)
+        mask_base = Int32(sb_base) + Int32(self.route_masks)
+        start_base = Int32(sb_base) + Int32(self.route_starts)
         for x in cutlass.range(q, m_rows * Int32(TK), NE, unroll=1):
             tt = x // Int32(TK)
             key = _ld_shared(key_base + x * Int32(4))
@@ -1103,10 +1125,7 @@ class MoeNvfp4Engine(PersistentMoeEngine):
             ex = []
             for k in cutlass.range_constexpr(TK):
                 ex.append(_exp_tr(_sub(val[k], val[0])))
-            ssum = _add(
-                _add(_add(_add(ex[0], ex[8]), ex[4]), _add(ex[2], ex[6])),
-                _add(_add(_add(ex[1], ex[9]), ex[5]), _add(ex[3], ex[7])),
-            )
+            ssum = _sum_tree(ex, _butterfly_sum(TK))
             for k in cutlass.range_constexpr(TK):
                 o = Int64(t) * Int64(TK) + Int64(k)
                 _st_b16(wts_addr + o * Int64(2), _div_bf16(ex[k], ssum))
@@ -1607,10 +1626,10 @@ def moe_nvfp4_engine(
     ``state`` from :func:`new_state`. Rows above n_max per expert split into segments. One CTA per SM but
     ``spare_sms``.
 
-    ``candidates`` [m, ROUTE_LISTS, ROUTE_TOP_K] int32 (m <= ROUTE_MAX_ROWS, ``moe_router_gemm``'s candidates
-    epilogue): the engine routes the call for the local experts from ``local_start`` and writes ``topk_ids`` [m, 10]
-    int32, ``topk_weights`` [m, 10] bf16, ``e2p`` [m * 10], ``p2t``, the tile tables and ``num_ctas`` /
-    ``num_padded`` (``prerouted_table_views`` of one buffer) before it reads them."""
+    ``candidates`` [m, lists, top_k] int32 (m <= ROUTE_MAX_ROWS, ``moe_router_gemm``'s ``route_top_k`` epilogue over
+    lists x 128 experts): the engine routes the call for the local experts from ``local_start`` and writes
+    ``topk_ids`` [m, top_k] int32, ``topk_weights`` [m, top_k] bf16, ``e2p`` [m * top_k], ``p2t``, the tile tables
+    and ``num_ctas`` / ``num_padded`` (``prerouted_table_views`` of one buffer) before it reads them."""
     e, two_i, half_h = w31.shape
     hidden, inter = 2 * half_h, two_i // 2
     assert e <= MAX_LOCAL_EXPERTS, "per-expert scalars are staged for <= 128 local experts"
@@ -1638,16 +1657,18 @@ def moe_nvfp4_engine(
         Int64(state.data_ptr()),
         Int32(e),
     )
-    route = candidates is not None
+    route_lists, route_top_k = 0, 0
     route_args = ()
-    if route:
+    if candidates is not None:
         m = xq.shape[0]
-        assert m <= ROUTE_MAX_ROWS and candidates.shape == (m, ROUTE_LISTS, ROUTE_TOP_K)
+        assert candidates.dim() == 3 and candidates.shape[0] == m <= ROUTE_MAX_ROWS
+        _, route_lists, route_top_k = candidates.shape
+        assert route_error(route_top_k, route_lists) is None, route_error(route_top_k, route_lists)
         assert candidates.dtype == torch.int32 and candidates.is_contiguous()
-        assert topk_ids.shape == (m, ROUTE_TOP_K) and topk_ids.dtype == torch.int32
-        assert topk_weights.shape == (m, ROUTE_TOP_K) and topk_weights.dtype == torch.bfloat16
+        assert topk_ids.shape == (m, route_top_k) and topk_ids.dtype == torch.int32
+        assert topk_weights.shape == (m, route_top_k) and topk_weights.dtype == torch.bfloat16
         assert topk_ids.is_contiguous() and topk_weights.is_contiguous()
-        assert e2p.numel() == m * ROUTE_TOP_K and num_padded.numel() == 1
+        assert e2p.numel() == m * route_top_k and num_padded.numel() == 1
         assert p2t.numel() == (cta_batch.numel() + 1) * tile
         sms = torch.cuda.get_device_properties(xq.device).multi_processor_count
         p2t_copies = torch.empty((sms, p2t.numel()), dtype=torch.int32, device=xq.device)
@@ -1661,7 +1682,17 @@ def moe_nvfp4_engine(
             Int32(m),
             Int32(local_start),
         )
-    config = (hidden, inter, n_max, num_stages, tile, tile_k, release_after_wait, route)
+    config = (
+        hidden,
+        inter,
+        n_max,
+        num_stages,
+        tile,
+        tile_k,
+        release_after_wait,
+        route_top_k,
+        route_lists,
+    )
     launch(
         lambda: MoeNvfp4Engine(*config),
         (MoeNvfp4Engine, e, *config),
