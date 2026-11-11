@@ -349,6 +349,56 @@ def gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
                        logits.float().argmax(-1)).to(torch.int32)
 
 
+@triton.jit
+def _fast_gumbel_score(logits_ptr, out_ptr, row, vocab, cols, u, inv_t):
+    ok = cols < vocab
+    x = tl.load(logits_ptr + row * vocab + cols, mask=ok,
+                other=0.0).to(tl.float32)
+    u = tl.minimum(tl.maximum(u, 1e-12), 0.99999994)
+    tl.store(out_ptr + row * vocab + cols,
+             x * inv_t - tl.log(-tl.log(u)),
+             mask=ok)
+
+
+@triton.jit
+def _fast_gumbel_scores_kernel(logits_ptr, temp_ptr, seed_ptr, out_ptr, vocab,
+                               BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    n = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    u0, u1, u2, u3 = tl.rand4x(tl.load(seed_ptr), row * (vocab // 4) + n)
+    inv_t = 1.0 / tl.load(temp_ptr + row).to(tl.float32)
+    # Entry 4 * n + j takes Philox word (0, 2, 1, 3)[j].
+    _fast_gumbel_score(logits_ptr, out_ptr, row, vocab, 4 * n, u0, inv_t)
+    _fast_gumbel_score(logits_ptr, out_ptr, row, vocab, 4 * n + 1, u2, inv_t)
+    _fast_gumbel_score(logits_ptr, out_ptr, row, vocab, 4 * n + 2, u1, inv_t)
+    _fast_gumbel_score(logits_ptr, out_ptr, row, vocab, 4 * n + 3, u3, inv_t)
+
+
+def fast_gumbel_max_reference(logits: torch.Tensor, temperatures: torch.Tensor,
+                              seed: torch.Tensor,
+                              greedy_threshold: float) -> torch.Tensor:
+    """As ``gumbel_max_reference`` with the noise of ``TPKeyExchange``'s
+    ``fast_gumbel`` kernel: entry ``4 * n + j`` of ``row`` takes word
+    ``(0, 2, 1, 3)[j]`` of ``philox(seed, row * vocab / 4 + n)``, scaled logits
+    ``x * (1 / T)``."""
+    rows, vocab = logits.shape
+    assert vocab % 4 == 0
+    scores = torch.empty((rows, vocab),
+                         dtype=torch.float32,
+                         device=logits.device)
+    block = 256
+    grid = (rows, triton.cdiv(vocab // 4, block))
+    _fast_gumbel_scores_kernel[grid](logits.contiguous(),
+                                     temperatures,
+                                     seed,
+                                     scores,
+                                     vocab,
+                                     BLOCK=block)
+    sampled = temperatures >= greedy_threshold
+    return torch.where(sampled, scores.argmax(-1),
+                       logits.float().argmax(-1)).to(torch.int32)
+
+
 def triton_num_compiled(kernel) -> int:
     """Specializations of a ``triton.jit`` kernel compiled in this process.
 
