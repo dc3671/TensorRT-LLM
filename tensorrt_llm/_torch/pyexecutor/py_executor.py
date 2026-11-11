@@ -1002,12 +1002,9 @@ class PyExecutor:
         self._late_compile_detect = False
         if model_hooks.mxfp8_pinned_tactics or model_hooks.late_compile_detect:
             self._late_compile_detect = _arm_runtime_opt_ins(model_hooks)
-        timing_side_stream = False
-        if model_hooks.perf_metrics_timing_side_stream:
-            timing_side_stream = True
         self.perf_manager = PerfMetricsManager(
             enabled=self.llm_args.return_perf_metrics,
-            timing_side_stream=timing_side_stream)
+            timing_side_stream=model_hooks.perf_metrics_timing_side_stream)
         self.attention_dp_enable_balance = (
             self.llm_args.attention_dp_config is not None
             and self.llm_args.attention_dp_config.enable_balance)
