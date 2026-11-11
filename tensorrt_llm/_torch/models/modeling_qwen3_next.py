@@ -1939,7 +1939,10 @@ class Qwen3NextModel(DecoderModel):
             prefetch = (projection is not None
                         and layer.allreduce.mnnvl_allreduce is not None
                         and not projection._weights_removed)
-            layer.next_layer_prefetch = projection if prefetch else None
+            # A reference to the next layer's module, not a child of this one (a Module assigned through
+            # nn.Module.__setattr__ would be registered, and read back as the class default None).
+            object.__setattr__(layer, "next_layer_prefetch",
+                               projection if prefetch else None)
             layer.l2_prefetch_min_rows = min_rows
             if projection is not None and layer.next_layer_input_scale is not None:
                 # Its input arrives in E4M3 from this all-reduce: from min_rows
