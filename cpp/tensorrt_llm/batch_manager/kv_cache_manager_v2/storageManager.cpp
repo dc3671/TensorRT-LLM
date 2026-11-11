@@ -112,7 +112,7 @@ CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const
     HostMemBackingOptions const& options, std::optional<size_t> sparseReservation,
     SharedPtr<RemoteMemClient> remoteClient)
     : cacheLevel(cl)
-    , cacheTier(CacheTier(tierConfig.index()))
+    , cacheTier(cacheTierOf(tierConfig))
     , controller(lifeCycleGrouping, cl)
 {
     TLLM_CHECK((cacheTier == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
@@ -134,20 +134,19 @@ bool isGpuAccessibleMemory(CacheTier tier) noexcept
 
 bool isRemoteTier(CacheTierConfig const& tier) noexcept
 {
-    auto const* disk = std::get_if<DiskCacheTierConfig>(&tier);
-    return disk != nullptr && disk->remote;
+    return std::holds_alternative<RemoteCacheTierConfig>(tier);
 }
 
-//! A remote level's own split of its quota across layer groups (DiskCacheTierConfig::remotePoolRatio), normalized;
+//! A remote level's own split of its quota across layer groups (RemoteCacheTierConfig::poolRatio), normalized;
 //! nullopt where the level follows the hot level's ratio. Throws when the entry count is not one per layer group.
 std::optional<TypedVec<LifeCycleId, float>> remotePoolRatioOf(CacheTierConfig const& tier, LifeCycleId numLifeCycles)
 {
-    auto const* disk = std::get_if<DiskCacheTierConfig>(&tier);
-    if (disk == nullptr || !disk->remote || disk->remotePoolRatio.empty())
+    auto const* remote = std::get_if<RemoteCacheTierConfig>(&tier);
+    if (remote == nullptr || remote->poolRatio.empty())
     {
         return std::nullopt;
     }
-    auto const& weights = disk->remotePoolRatio;
+    auto const& weights = remote->poolRatio;
     TLLM_CHECK_WITH_INFO(weights.size() == toSizeT(numLifeCycles),
         "remote pool ratio: %zu entries for %zu layer groups", weights.size(), toSizeT(numLifeCycles));
     double const sum = std::accumulate(weights.begin(), weights.end(), 0.0);
@@ -586,11 +585,11 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     mCopyEngine = std::make_unique<CopyEngine>(mPageStagingManager.get());
 
-    // A remote-backed level moves its pages between the page staging buffer and remote memory, so the staging buffer
-    // is registered with each client once, for the life of this manager.
+    // A remote level moves its pages between the page staging buffer and remote memory, so the staging buffer is
+    // registered with each client once, for the life of this manager.
     for (auto const& client : mRemoteClients)
     {
-        TLLM_CHECK_WITH_INFO(mPageStagingManager != nullptr, "A remote-backed cache level needs page staging");
+        TLLM_CHECK_WITH_INFO(mPageStagingManager != nullptr, "A remote cache level needs page staging");
         client->registerLocal(mPageStagingManager->baseAddress(), mPageStagingManager->totalSize());
     }
     mLastLiveLevel = numCacheLevels() - 1;
@@ -598,16 +597,16 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
 SharedPtr<RemoteMemClient> StorageManager::remoteClientFor(CacheTierConfig const& tier)
 {
-    auto const* disk = std::get_if<DiskCacheTierConfig>(&tier);
-    if (disk == nullptr || !disk->remote)
+    auto const* remote = std::get_if<RemoteCacheTierConfig>(&tier);
+    if (remote == nullptr)
     {
         return nullptr;
     }
-    RemoteMemOptions options{disk->path, disk->remoteWaitTimeoutMs, disk->remoteTransferTimeoutMs, disk->remoteFabric,
-        disk->remoteUcxDevices, disk->remoteExpectedLenders};
+    RemoteMemOptions options{remote->path, remote->waitTimeoutMs, remote->transferTimeoutMs,
+        remote->transport == RemoteTransport::FABRIC, remote->ucxDevices, remote->expectedLenders};
     for (auto const& client : mRemoteClients)
     {
-        if (client->directory() != disk->path)
+        if (client->directory() != remote->path)
         {
             continue;
         }
@@ -617,16 +616,16 @@ SharedPtr<RemoteMemClient> StorageManager::remoteClientFor(CacheTierConfig const
                 && held.ucxDevices == options.ucxDevices && held.expectedLenders == options.expectedLenders,
             "remote cache levels sharing rendezvous directory '%s' must use the same timeouts, transport, devices and "
             "expected lenders",
-            disk->path.c_str());
+            remote->path.c_str());
         return client;
     }
     return mRemoteClients.emplace_back(makeShared<RemoteMemClient>(std::move(options)));
 }
 
-DiskCacheLevelStorage* StorageManager::remoteLevel(CacheLevel level) const
+RemoteCacheLevelStorage* StorageManager::remoteLevel(CacheLevel level) const
 {
-    auto* const disk = dynamic_cast<DiskCacheLevelStorage*>(mLevels.at(level).storage.get());
-    return disk != nullptr && disk->remoteClient() != nullptr ? disk : nullptr;
+    auto const& lvl = mLevels.at(level);
+    return lvl.cacheTier == CacheTier::REMOTE ? static_cast<RemoteCacheLevelStorage*>(lvl.storage.get()) : nullptr;
 }
 
 bool StorageManager::remoteLevelFailed(CacheLevel level) const
@@ -637,7 +636,7 @@ bool StorageManager::remoteLevelFailed(CacheLevel level) const
         return false;
     }
     auto const* const remote = remoteLevel(level);
-    return remote != nullptr && remote->remoteClient()->failed();
+    return remote != nullptr && remote->client().failed();
 }
 
 void StorageManager::dropPagesOfFailedRemoteLevels()
@@ -916,17 +915,16 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
         return;
     }
 
-    TLLM_CHECK_WITH_INFO(coldTier == CacheTier::DISK, "Unsupported cold cache tier");
     thread_local std::vector<PageIndexPair> stagingPageIndices;
     size_t remaining = numPages;
     size_t offset = 0;
 
-    if (auto* const remote = remoteLevel(coldLevel))
+    if (coldTier == CacheTier::REMOTE)
     {
-        // Remote-backed level: the codec runs against the page staging buffer, and the bytes move between staging and
+        // Remote level: the codec runs against the page staging buffer, and the bytes move between staging and
         // the remote slots, on the stream (fabric) or synchronously (NIXL: a failure throws before _batchedMigrate
         // points any page at its new slot).
-        RemoteRange& range = remote->remoteRange(coldPgIdx, PoolIndex{0});
+        RemoteRange& range = remoteLevel(coldLevel)->remoteRange(coldPgIdx, PoolIndex{0});
         bool const streamOrdered = range.client().fabric();
         std::vector<RemoteIo> ios;
         while (remaining > 0)
@@ -1006,6 +1004,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
         return;
     }
 
+    TLLM_CHECK_WITH_INFO(coldTier == CacheTier::DISK, "Unsupported cold cache tier");
     while (remaining > 0)
     {
         size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / coldPageBytes
@@ -1070,7 +1069,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
 void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel srcLevel, PoolGroupIndex dstPgIdx,
     PoolGroupIndex srcPgIdx, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
 {
-    TLLM_CHECK_WITH_INFO(mPageStagingManager != nullptr, "A remote-backed cache level needs page staging");
+    TLLM_CHECK_WITH_INFO(mPageStagingManager != nullptr, "A remote cache level needs page staging");
     auto* const srcRemote = remoteLevel(srcLevel);
     auto* const dstRemote = remoteLevel(dstLevel);
     auto const sizes = slotSize(srcLevel, srcPgIdx);
@@ -1091,9 +1090,9 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
         // The local side is copied to or from staging by the GPU's batched copy kernel, which needs memory the GPU
         // can address (the host level's pinned pages are).
         TLLM_CHECK_WITH_INFO(srcRange != nullptr || isGpuAccessibleMemory(poolMedium(srcLevel, srcPgIdx, poolIdx)),
-            "Remote-backed level: unsupported source medium");
+            "Remote level: unsupported source medium");
         TLLM_CHECK_WITH_INFO(dstRange != nullptr || isGpuAccessibleMemory(poolMedium(dstLevel, dstPgIdx, poolIdx)),
-            "Remote-backed level: unsupported destination medium");
+            "Remote level: unsupported destination medium");
         // Stream-ordered only if every remote side is fabric: the legs (and the local copies) then follow one another
         // on the stream.
         bool const streamOrdered = (srcRange == nullptr || srcRange->client().fabric())
@@ -1945,7 +1944,7 @@ int64_t StorageManager::prefetch(
         _batchedMigrate(dstLevel, srcLevel, migrationPages, /*updateSrc=*/true);
         // Per batch, after it landed: the pages are already grouped by source level, so this costs
         // nothing per page and never credits a batch that did not run.
-        if (cacheTier(srcLevel) == CacheTier::DISK)
+        if (!isGpuAccessibleMemory(cacheTier(srcLevel)))
         {
             diskBlocksMigrated += static_cast<int64_t>(migrationPages.size());
         }

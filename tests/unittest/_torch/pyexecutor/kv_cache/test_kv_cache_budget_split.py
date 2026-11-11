@@ -1310,7 +1310,7 @@ class TestRemoteLevelOwnership:
 
         lender_cls = Mock()
         monkeypatch.setattr(remote_lender, "RemoteLender", lender_cls)
-        monkeypatch.setattr(kv_cache_manager_v2, "DiskCacheTierConfig", Mock())
+        monkeypatch.setattr(kv_cache_manager_v2, "RemoteCacheTierConfig", Mock())
         monkeypatch.setattr(kv_cache_manager_v2.torch.cuda, "current_device", lambda: 0)
         manager = SimpleNamespace(is_draft=is_draft, _remote_lender=None)
         config = RemoteCacheConfig(directory=str(tmp_path), cache_size=4 * GB, lend_size=4 * GB)
@@ -1330,7 +1330,7 @@ class TestRemoteLevelOwnership:
 
         start_lend = Mock()
         monkeypatch.setattr(remote_lender, "start_lend", start_lend)
-        monkeypatch.setattr(kv_cache_manager_v2, "DiskCacheTierConfig", Mock())
+        monkeypatch.setattr(kv_cache_manager_v2, "RemoteCacheTierConfig", Mock())
         early = Mock()
         manager = SimpleNamespace(is_draft=False, _remote_lender=early)
         config = RemoteCacheConfig(directory=str(tmp_path), cache_size=4 * GB, lend_size=4 * GB)

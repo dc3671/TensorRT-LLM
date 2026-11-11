@@ -83,6 +83,11 @@ class CacheTier(enum.IntEnum):
     GPU_MEM = 0
     HOST_MEM = 1
     DISK = 2
+    REMOTE = 3
+
+class RemoteTransport(enum.Enum):
+    NIXL = 0
+    FABRIC = 1
 
 class PageStatus(enum.Enum):
     LOCKED = enum.auto()
@@ -278,13 +283,20 @@ class HostCacheTierConfig:
 class DiskCacheTierConfig:
     quota: int
     path: str
-    remote: bool = False
-    remote_wait_timeout_ms: int = 0  # required with remote=True
-    remote_transfer_timeout_ms: int = 0  # required with remote=True
-    remote_expected_lenders: int = 0  # 0: unknown
-    remote_fabric: bool = False
-    remote_ucx_devices: str = ""
-    remote_pool_ratio: list[float] = ...  # empty: the hot level's split
+    @property
+    def tier(self) -> CacheTier: ...
+    def validate(self) -> None: ...
+
+@dataclass(slots=True)
+class RemoteCacheTierConfig:
+    quota: int
+    path: str  # the rendezvous directory
+    wait_timeout_ms: int = 0  # required
+    transfer_timeout_ms: int = 0  # required
+    expected_lenders: int = 0  # 0: unknown
+    transport: RemoteTransport = RemoteTransport.NIXL
+    ucx_devices: str = ""  # NIXL only
+    pool_ratio: list[float] = ...  # empty: the hot level's split
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...

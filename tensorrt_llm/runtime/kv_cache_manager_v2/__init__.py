@@ -153,6 +153,8 @@ LogicError = _cpp.LogicError
 OutOfMemoryError = _cpp.OutOfMemoryError
 OutOfPagesError = _cpp.OutOfPagesError
 RemoteMemError = _cpp.RemoteMemError
+RemoteCacheTierConfig = _cpp.RemoteCacheTierConfig
+RemoteTransport = _cpp.RemoteTransport
 PageIndexConverter = _cpp.PageIndexConverter
 PageIndexMode = _cpp.PageIndexMode
 PageStatus = _cpp.PageStatus
@@ -186,7 +188,9 @@ take_poison = _cpp.take_poison
 BeamIndex = int
 CacheGroupId = int
 CacheLevel = int
-CacheTierConfig = Union[GpuCacheTierConfig, HostCacheTierConfig, DiskCacheTierConfig]
+CacheTierConfig = Union[
+    GpuCacheTierConfig, HostCacheTierConfig, DiskCacheTierConfig, RemoteCacheTierConfig
+]
 BatchRow = int
 CudaStream = int
 DataRole = str
@@ -267,6 +271,8 @@ __all__ = [
     "NDEBUG",
     "OutOfPagesError",
     "RemoteMemError",
+    "RemoteCacheTierConfig",
+    "RemoteTransport",
     "PageIndexConverter",
     "PlannedDropHandle",
     "PoolGroupPeakBlockStats",

@@ -95,7 +95,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
     PoolRebalanceConfig,
+    RemoteCacheTierConfig,
     RemoteMemError,
+    RemoteTransport,
     ReusePolicy,
     ReuseScope,
     SsmLayerConfig,
@@ -184,6 +186,7 @@ _CACHE_TIER_NAMES = {
     CacheTier.GPU_MEM: "gpu",
     CacheTier.HOST_MEM: "host",
     CacheTier.DISK: "disk",
+    CacheTier.REMOTE: "remote",
 }
 
 # The guard page is a permanent sequence that must never collide with any other
@@ -8325,18 +8328,17 @@ class KVCacheManagerV2(BaseResourceManager):
                     timeout_s=remote_config.lender_wait_timeout_s,
                     log=logger.info,
                 )
-            # The remote level takes the disk level's place below the host tier.
+            # The remote level goes below the host tier.
             cache_tiers.append(
-                DiskCacheTierConfig(
+                RemoteCacheTierConfig(
                     quota=remote_config.cache_size,
                     path=remote_dir,
-                    remote=True,
-                    remote_wait_timeout_ms=math.ceil(remote_config.lender_wait_timeout_s * 1000),
-                    remote_transfer_timeout_ms=math.ceil(remote_config.transfer_timeout_s * 1000),
-                    remote_expected_lenders=remote_config.expected_num_lenders or 0,
-                    remote_fabric=remote_config.transport == "fabric",
-                    remote_ucx_devices=ucx_devices or "",
-                    remote_pool_ratio=list(remote_config.pool_ratio or []),
+                    wait_timeout_ms=math.ceil(remote_config.lender_wait_timeout_s * 1000),
+                    transfer_timeout_ms=math.ceil(remote_config.transfer_timeout_s * 1000),
+                    expected_lenders=remote_config.expected_num_lenders or 0,
+                    transport=RemoteTransport[remote_config.transport.upper()],
+                    ucx_devices=ucx_devices or "",
+                    pool_ratio=list(remote_config.pool_ratio or []),
                 )
             )
             logger.info(

@@ -52,15 +52,15 @@ struct RemoteMemOptions
 {
     //! Rendezvous directory the lenders publish into.
     std::string directory;
-    //! How long a claim waits for a lender with a free chunk (DiskCacheTierConfig::remoteWaitTimeoutMs).
+    //! How long a claim waits for a lender with a free chunk (RemoteCacheTierConfig::waitTimeoutMs).
     int64_t waitTimeoutMs = 0;
-    //! How long one NIXL transfer may take before it counts as failed (DiskCacheTierConfig::remoteTransferTimeoutMs).
+    //! How long one NIXL transfer may take before it counts as failed (RemoteCacheTierConfig::transferTimeoutMs).
     int64_t transferTimeoutMs = 0;
     //! Move pages over NVLink fabric memory instead of NIXL.
     bool fabric = false;
     //! NIXL only: the UCX devices of this client's agent; empty uses the process's UCX environment.
     std::string ucxDevices;
-    //! Lenders the job starts (DiskCacheTierConfig::remoteExpectedLenders); 0 if unknown.
+    //! Lenders the job starts (RemoteCacheTierConfig::expectedLenders); 0 if unknown.
     uint32_t expectedLenders = 0;
 };
 

@@ -255,7 +255,7 @@ public:
         return lvl == numCacheLevels() - 1;
     }
 
-    //! Whether a cold level keeps its slots in remote memory (DiskCacheTierConfig::remote).
+    //! Whether a cold level keeps its slots in remote memory (RemoteCacheTierConfig).
     [[nodiscard]] bool hasRemoteLevel() const noexcept
     {
         return mHasRemoteLevel;
@@ -459,16 +459,16 @@ private:
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
         PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
 
-    //! The level's storage when it is a remote-backed disk level (storage/remoteMem.h), else null.
-    [[nodiscard]] DiskCacheLevelStorage* remoteLevel(CacheLevel level) const;
-    //! Whether `level` is a remote-backed level whose client failed a transfer: it takes and gives up no pages.
+    //! The level's storage when it is a remote level (storage/remoteMem.h), else null.
+    [[nodiscard]] RemoteCacheLevelStorage* remoteLevel(CacheLevel level) const;
+    //! Whether `level` is a remote level whose client failed a transfer: it takes and gives up no pages.
     [[nodiscard]] bool remoteLevelFailed(CacheLevel level) const;
     //! Drop the evictable pages of every failed remote level, which could not be read back, so reuse no longer finds
     //! them. Pages a request holds stay until it lets go of them (scheduleForEviction then drops them).
     void dropPagesOfFailedRemoteLevels();
-    //! The client of a remote-backed tier's rendezvous directory, created on first use; null for any other tier.
+    //! The client of a remote tier's rendezvous directory, created on first use; null for any other tier.
     SharedPtr<RemoteMemClient> remoteClientFor(CacheTierConfig const& tier);
-    //! A cold-to-cold migration where either side is a remote-backed level, through the page-staging buffer. A failed
+    //! A cold-to-cold migration where either side is a remote level, through the page-staging buffer. A failed
     //! NIXL transfer throws RemoteMemError before any page is pointed at its new slot.
     void submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel srcLevel, PoolGroupIndex dstPgIdx,
         PoolGroupIndex srcPgIdx, PageIndexPair const* pageIndices, size_t numPages, CUstream stream);

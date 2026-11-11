@@ -94,28 +94,40 @@ void AttentionLayerConfig::validate() const
         "AttentionLayerConfig: sparse_cache is set on a layer with no sparse buffer to serve");
 }
 
+namespace
+{
+
+//! The checks every staged tier shares: a positive quota and an existing directory. `kind` names the tier.
+void validateStagedTier(StagedCacheTierConfig const& cfg, std::string const& kind)
+{
+    if (cfg.quota == 0)
+    {
+        throw std::invalid_argument(kind + ": quota must be > 0");
+    }
+    if (!std::filesystem::is_directory(cfg.path))
+    {
+        throw std::invalid_argument(kind + ": path '" + cfg.path + "' is not a directory");
+    }
+}
+
+} // namespace
+
 void DiskCacheTierConfig::validate() const
 {
-    if (quota == 0)
+    validateStagedTier(*this, "DiskCacheTierConfig");
+}
+
+void RemoteCacheTierConfig::validate() const
+{
+    validateStagedTier(*this, "RemoteCacheTierConfig");
+    if (waitTimeoutMs <= 0 || transferTimeoutMs <= 0)
     {
-        throw std::invalid_argument("DiskCacheTierConfig: quota must be > 0");
+        throw std::invalid_argument("RemoteCacheTierConfig: timeouts must be positive");
     }
-    if (!std::filesystem::is_directory(path))
+    if (std::any_of(
+            poolRatio.begin(), poolRatio.end(), [](double weight) { return !std::isfinite(weight) || weight <= 0.0; }))
     {
-        throw std::invalid_argument("DiskCacheTierConfig: path '" + path + "' is not a directory");
-    }
-    if (remote && (remoteWaitTimeoutMs <= 0 || remoteTransferTimeoutMs <= 0))
-    {
-        throw std::invalid_argument("DiskCacheTierConfig: remote timeouts must be positive");
-    }
-    if (!remote && (remoteFabric || !remoteUcxDevices.empty() || !remotePoolRatio.empty()))
-    {
-        throw std::invalid_argument("DiskCacheTierConfig: remote options are set on a file-backed level");
-    }
-    if (std::any_of(remotePoolRatio.begin(), remotePoolRatio.end(),
-            [](double weight) { return !std::isfinite(weight) || weight <= 0.0; }))
-    {
-        throw std::invalid_argument("DiskCacheTierConfig: remote pool ratio entries must be positive and finite");
+        throw std::invalid_argument("RemoteCacheTierConfig: pool ratio entries must be positive and finite");
     }
 }
 
@@ -225,28 +237,25 @@ void KVCacheManagerConfig::validate() const
     }
 
     // Remote levels move pages through the page staging buffer, which cannot reach a file-backed disk level, and share
-    // one transport, so that their copies are either all stream-ordered (fabric) or all synchronous (NIXL).
-    std::optional<bool> remoteFabric;
+    // one transport, so that their copies are either all stream-ordered or all host-synchronous.
+    std::optional<RemoteTransport> remoteTransport;
     bool hasFileDisk = false;
     for (auto const& tier : cacheTiers)
     {
-        if (auto const* disk = std::get_if<DiskCacheTierConfig>(&tier))
+        if (std::holds_alternative<DiskCacheTierConfig>(tier))
         {
-            if (!disk->remote)
-            {
-                hasFileDisk = true;
-            }
-            else if (remoteFabric.value_or(disk->remoteFabric) != disk->remoteFabric)
+            hasFileDisk = true;
+        }
+        else if (auto const* remote = std::get_if<RemoteCacheTierConfig>(&tier))
+        {
+            if (remoteTransport.value_or(remote->transport) != remote->transport)
             {
                 throw AssertionError("KVCacheManagerConfig: remote cache levels must share one transport");
             }
-            else
-            {
-                remoteFabric = disk->remoteFabric;
-            }
+            remoteTransport = remote->transport;
         }
     }
-    if (remoteFabric.has_value() && hasFileDisk)
+    if (remoteTransport.has_value() && hasFileDisk)
     {
         throw AssertionError(
             "KVCacheManagerConfig: a remote cache level cannot be combined with a file-backed disk level");

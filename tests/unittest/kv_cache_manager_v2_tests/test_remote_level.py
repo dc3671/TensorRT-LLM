@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KV cache manager v2 with a remote-backed cold level (``DiskCacheTierConfig(remote=True)``).
+"""KV cache manager v2 with a remote cold level (``RemoteCacheTierConfig``).
 
 The level keeps its slots in host memory that lender processes (``remote_lender.py``) publish in a rendezvous
 directory, and moves pages with NIXL READ / WRITE or over NVLink fabric memory (``storage/remoteMem.h``). Every test
@@ -64,7 +64,9 @@ SsmLayerConfig = base.SsmLayerConfig
 Step = base.Step
 TokenId = base.TokenId
 _introspection = base._introspection
+RemoteCacheTierConfig = base.RemoteCacheTierConfig
 RemoteMemError = base.RemoteMemError
+RemoteTransport = base.RemoteTransport
 
 
 def _sync_device() -> None:
@@ -203,15 +205,14 @@ class _Transport:
         wait_timeout_ms: int = 60_000,
         expected_lenders: int = 0,
     ):
-        return DiskCacheTierConfig(
+        return RemoteCacheTierConfig(
             quota=quota,
             path=directory or self.module_dir,
-            remote=True,
-            remote_wait_timeout_ms=wait_timeout_ms,
-            remote_transfer_timeout_ms=transfer_timeout_ms,
-            remote_expected_lenders=expected_lenders,
-            remote_fabric=self.transport == "fabric",
-            remote_pool_ratio=pool_ratio or [],
+            wait_timeout_ms=wait_timeout_ms,
+            transfer_timeout_ms=transfer_timeout_ms,
+            expected_lenders=expected_lenders,
+            transport=RemoteTransport[self.transport.upper()],
+            pool_ratio=pool_ratio or [],
         )
 
 
@@ -630,7 +631,7 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
 
 @_per_transport
 class TestRemotePoolRatio(_Transport, unittest.TestCase):
-    """DiskCacheTierConfig.remote_pool_ratio splits only the remote level's quota across layer groups.
+    """RemoteCacheTierConfig.pool_ratio splits only the remote level's quota across layer groups.
 
     The model has an attention layer group (a 1 MiB block) and an SSM group (a 512 KiB state), at initial_pool_ratio
     0.5 / 0.5. Without the ratio, every cold level follows that split. With it, the remote level gives each layer
@@ -771,8 +772,8 @@ class TestRemoteTierCombinations(_Transport, unittest.TestCase):
             shutil.rmtree(disk_dir, ignore_errors=True)
 
 
-class TestRemoteBackedDisk(_Transport, base.TestKVCacheManagerV2):
-    """The suite's disk-level tests (reuse through eviction, out-of-pages, shrink, naive stress) on remote memory."""
+class TestRemoteInPlaceOfDisk(_Transport, base.TestKVCacheManagerV2):
+    """The suite's disk-level tests (reuse via eviction, out-of-pages, shrink, naive stress), remote in disk's place."""
 
     Request = base.TestNoBatching.Request
     new_request = base.TestNoBatching.new_request
@@ -823,6 +824,6 @@ for _name, _test in vars(base.TestNoBatching).items():
         and not _name.startswith("test_naive_perf")
         and callable(_test)
     ):
-        setattr(TestRemoteBackedDisk, _name, _test)
+        setattr(TestRemoteInPlaceOfDisk, _name, _test)
 del _name, _test
-TestRemoteBackedDisk = _per_transport(TestRemoteBackedDisk)
+TestRemoteInPlaceOfDisk = _per_transport(TestRemoteInPlaceOfDisk)

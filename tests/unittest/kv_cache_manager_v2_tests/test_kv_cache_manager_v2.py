@@ -67,7 +67,9 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         PageIndexMode,
         PlannedDropHandle,
         PoolRebalanceConfig,
+        RemoteCacheTierConfig,  # noqa: F401 - for test_remote_level
         RemoteMemError,  # noqa: F401 - for test_remote_level
+        RemoteTransport,  # noqa: F401 - for test_remote_level
         ReuseScope,
         SlidingWindowSize,
         SparseCacheConfig,
@@ -129,7 +131,9 @@ else:
         PageIndexMode,
         PlannedDropHandle,
         PoolRebalanceConfig,
+        RemoteCacheTierConfig,  # noqa: F401 - for test_remote_level
         RemoteMemError,  # noqa: F401 - for test_remote_level
+        RemoteTransport,  # noqa: F401 - for test_remote_level
         ReuseScope,
         SlidingWindowSize,
         SparseCacheConfig,

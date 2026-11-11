@@ -95,27 +95,17 @@ struct HostCacheTierConfig
     }
 };
 
-struct DiskCacheTierConfig
+//! What the tiers the GPU cannot address share: a quota and a directory. Their pages move only through the
+//! page-staging buffer.
+struct StagedCacheTierConfig
 {
     size_t quota = 0; // bytes
-    std::string path; // directory for temp files
+    std::string path;
+};
 
-    //! Keep the slots in host memory other processes lend instead of a local file; `path` is then the rendezvous
-    //! directory the lenders publish into (storage/remoteMem.h). Pages are staged through the page-staging buffer.
-    bool remote = false;
-    //! Remote only, required: how long creating the level waits for lender capacity, and how long one transfer may
-    //! take (RemoteCacheConfig.lender_wait_timeout_s and transfer_timeout_s).
-    int64_t remoteWaitTimeoutMs = 0;
-    int64_t remoteTransferTimeoutMs = 0;
-    //! Remote only: lenders the job starts; once all have reported, a claim stops waiting. 0 if unknown.
-    uint32_t remoteExpectedLenders = 0;
-    //! Remote only: move pages over NVLink fabric memory instead of NIXL. Lenders must use the same transport.
-    bool remoteFabric = false;
-    //! Remote over NIXL only: the UCX devices of the level's agent (e.g. "mlx5_0:1"); empty uses the process's.
-    std::string remoteUcxDevices;
-    //! Remote only: positive weights, one per layer group, that split the quota across layer groups instead of the
-    //! hot level's ratio; normalized by the storage manager. Empty follows the hot level.
-    std::vector<double> remotePoolRatio;
+struct DiskCacheTierConfig : StagedCacheTierConfig
+{
+    // path: directory for temp files
 
     [[nodiscard]] CacheTier tier() const noexcept
     {
@@ -125,8 +115,43 @@ struct DiskCacheTierConfig
     void validate() const;
 };
 
-// Variant holding any tier config.
-using CacheTierConfig = std::variant<GpuCacheTierConfig, HostCacheTierConfig, DiskCacheTierConfig>;
+//! How a remote tier moves pages (storage/remoteMem.h). Lenders must use the same one.
+enum class RemoteTransport : int
+{
+    //! One-sided NIXL RDMA, finished on the host before a transfer returns.
+    NIXL = 0,
+    //! NVLink fabric memory, copied on the caller's stream.
+    FABRIC = 1,
+};
+
+//! Slots in host memory other processes lend (storage/remoteMem.h); `path` is the rendezvous directory the lenders
+//! publish into.
+struct RemoteCacheTierConfig : StagedCacheTierConfig
+{
+    //! Required: how long creating the level waits for lender capacity, and how long one transfer may take
+    //! (RemoteCacheConfig.lender_wait_timeout_s and transfer_timeout_s).
+    int64_t waitTimeoutMs = 0;
+    int64_t transferTimeoutMs = 0;
+    //! Lenders the job starts; once all have reported, a claim stops waiting. 0 if unknown.
+    uint32_t expectedLenders = 0;
+    RemoteTransport transport = RemoteTransport::NIXL;
+    //! NIXL only: the UCX devices of the level's agent (e.g. "mlx5_0:1"); empty uses the process's.
+    std::string ucxDevices;
+    //! Positive weights, one per layer group, that split the quota across layer groups instead of the hot level's
+    //! ratio; normalized by the storage manager. Empty follows the hot level.
+    std::vector<double> poolRatio;
+
+    [[nodiscard]] CacheTier tier() const noexcept
+    {
+        return CacheTier::REMOTE;
+    }
+
+    void validate() const;
+};
+
+// Variant holding any tier config; an alternative's index is its CacheTier.
+using CacheTierConfig
+    = std::variant<GpuCacheTierConfig, HostCacheTierConfig, DiskCacheTierConfig, RemoteCacheTierConfig>;
 
 // Helper to extract tier from a variant.
 inline CacheTier cacheTierOf(CacheTierConfig const& cfg)

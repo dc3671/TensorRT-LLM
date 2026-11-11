@@ -202,9 +202,9 @@ private:
     DynamicBitset mOccupiedMask;
 };
 
-//! Granularity a disk pool is sized in. Disk has no allocation unit to match,
-//! so this is just a rounding quantum.
-inline constexpr size_t kDiskPoolSizeGranularity = size_t{2} << 20;
+//! Granularity a staged (disk or remote) pool is sized in. Neither has an allocation
+//! unit to match, so this is just a rounding quantum.
+inline constexpr size_t kStagedPoolSizeGranularity = size_t{2} << 20;
 
 //! The grain a hot-level pool of `medium` rounds its bytes to, where
 //! `deviceGranularity` is the VMM allocation granularity device pools grow in.
@@ -360,28 +360,44 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// StagedSlotPool — a pool the GPU cannot address (disk, remote); its pages move
+// only through the page-staging buffer.
+// ---------------------------------------------------------------------------
+class StagedSlotPool : public SlotPoolBase
+{
+public:
+    using SlotPoolBase::SlotPoolBase;
+
+    SlotCount numSlots() const noexcept override
+    {
+        return mNumSlots;
+    }
+
+    [[nodiscard]] size_t sizeGranularity() const noexcept override
+    {
+        return kStagedPoolSizeGranularity;
+    }
+
+protected:
+    // Tracks the backing's size, which only resize() changes: the backing is owned solely by this
+    // pool, so nothing else can grow or shrink it behind us. Held here because slot lookups
+    // bounds-check against it on every call, and querying the backing would cost a call per page.
+    SlotCount mNumSlots{0};
+};
+
+// ---------------------------------------------------------------------------
 // DiskSlotPool — temp-file backed disk pool.
 // ---------------------------------------------------------------------------
-class DiskSlotPool : public SlotPoolBase
+class DiskSlotPool : public StagedSlotPool
 {
 public:
     // directory: path under which to create the temp file.
     DiskSlotPool(std::string const& directory, size_t slotSize, SlotCount numSlots);
-    //! A pool whose slots live in host memory lent by other processes and reached through `remote` (see
-    //! remoteMem.h) instead of a local file. Its slot addresses carry kRemoteFileDescriptor and are not file offsets:
-    //! callers move its pages through remoteRange(), never with file I/O.
-    DiskSlotPool(SharedPtr<RemoteMemClient> remote, size_t slotSize, SlotCount numSlots);
     ~DiskSlotPool() override;
 
-    SlotCount numSlots() const noexcept override;
     void destroy() override;
     void resize(SlotCount newNumSlots) override;
     Address slotAddress(SlotId slot) const override;
-
-    [[nodiscard]] size_t sizeGranularity() const noexcept override
-    {
-        return kDiskPoolSizeGranularity;
-    }
 
     [[nodiscard]] CacheTier medium() const noexcept override
     {
@@ -393,25 +409,35 @@ public:
         return mFd;
     }
 
-    //! The remote slots of a remote-backed pool; null for a file-backed one.
-    [[nodiscard]] RemoteRange* remoteRange() const noexcept
-    {
-        return mRemote.get();
-    }
-
 private:
     int mFd = kBadFileDescriptor;
-    // Tracks the file size, which only resize() changes: the file is created unlinked and owned
-    // solely by this pool, so nothing else can grow or shrink it behind us. Held here because
-    // slotAddress() bounds-checks against it on every call, and querying the file would make that
-    // an lseek per page of a migration.
-    SlotCount mNumSlots{0};
-    std::unique_ptr<RemoteRange> mRemote;
 };
 
-//! The fd a remote-backed disk pool puts in its slot addresses, so that file I/O on one fails instead of reading a
-//! file.
-inline constexpr FileDescriptor kRemoteFileDescriptor = -2;
+// ---------------------------------------------------------------------------
+// RemoteSlotPool — slots in host memory other processes lend (remoteMem.h).
+// ---------------------------------------------------------------------------
+class RemoteSlotPool : public StagedSlotPool
+{
+public:
+    RemoteSlotPool(SharedPtr<RemoteMemClient> client, size_t slotSize, SlotCount numSlots);
+    ~RemoteSlotPool() override;
+
+    void destroy() override;
+    //! Growing claims more chunks and throws without resizing if none can be had; shrinking keeps them.
+    void resize(SlotCount newNumSlots) override;
+    //! Remote slots have no local address: their pages move through remoteRange(). Throws LogicError.
+    Address slotAddress(SlotId slot) const override;
+
+    [[nodiscard]] CacheTier medium() const noexcept override
+    {
+        return CacheTier::REMOTE;
+    }
+
+    [[nodiscard]] RemoteRange& remoteRange() const;
+
+private:
+    std::unique_ptr<RemoteRange> mRange;
+};
 
 // ---------------------------------------------------------------------------
 // PoolGroupBase — manages multiple pools with mirrored slot allocation.
@@ -617,17 +643,27 @@ public:
 class DiskPoolGroup : public PoolGroupBase
 {
 public:
-    //! `remote` set: every pool of the group keeps its slots in lent remote memory instead of a file in `directory`.
-    DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory,
-        SharedPtr<RemoteMemClient> remote = nullptr);
+    DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory);
 
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
         return CacheTier::DISK;
     }
+};
 
-    //! The remote slots of pool `poolIdx`, or null where the group is file-backed.
-    [[nodiscard]] RemoteRange* remoteRange(PoolIndex poolIdx) const;
+class RemotePoolGroup : public PoolGroupBase
+{
+public:
+    RemotePoolGroup(
+        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, SharedPtr<RemoteMemClient> const& client);
+
+    [[nodiscard]] CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::REMOTE;
+    }
+
+    //! The remote slots of pool `poolIdx`.
+    [[nodiscard]] RemoteRange& remoteRange(PoolIndex poolIdx) const;
 };
 
 //! A second medium's budget over a disjoint subset of each pool group's pools.
@@ -969,11 +1005,8 @@ private:
 class DiskCacheLevelStorage : public CacheLevelStorage
 {
 public:
-    //! `remote` set: the level keeps its slots in memory lent through that client, and `directory` is the rendezvous
-    //! directory the lenders publish into (remoteMem.h) rather than where files go.
     DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory,
-        SharedPtr<RemoteMemClient> remote = nullptr);
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -985,23 +1018,37 @@ public:
         return mDirectory;
     }
 
-    //! The client of a remote-backed level; null for a file-backed one.
-    [[nodiscard]] SharedPtr<RemoteMemClient> const& remoteClient() const noexcept
+private:
+    std::string mDirectory;
+};
+
+//! A level whose slots are memory other processes lend, reached through one client (remoteMem.h).
+class RemoteCacheLevelStorage : public CacheLevelStorage
+{
+public:
+    RemoteCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, SharedPtr<RemoteMemClient> client);
+
+    CacheTier cacheTier() const noexcept override
     {
-        return mRemote;
+        return CacheTier::REMOTE;
     }
 
-    //! The remote slots of one pool of a remote-backed level.
+    [[nodiscard]] RemoteMemClient& client() const noexcept
+    {
+        return *mClient;
+    }
+
+    //! The remote slots of one pool.
     [[nodiscard]] RemoteRange& remoteRange(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
 
 private:
-    std::string mDirectory;
-    SharedPtr<RemoteMemClient> mRemote;
+    SharedPtr<RemoteMemClient> mClient;
 };
 
 // Factory: create appropriate CacheLevelStorage for a given tier config.
 // `sparseReservation` applies to a GPU tier only; see GpuPoolGroup. `remoteClient` is required by, and only used for,
-// a remote-backed disk tier (DiskCacheTierConfig::remote).
+// a remote tier: the client of its rendezvous directory.
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
     PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, HostMemBackingOptions const& options = {},
