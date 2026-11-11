@@ -1501,8 +1501,8 @@ def _create_py_executor(
                     max_num_sequences=max_num_seq_slots,
                 )
                 py_executor.rebind_resources(execution_resources)
-        except BaseException:
-            kv_cache_creator.close_remote_lender()
+        except BaseException as error:
+            kv_cache_creator.close_remote_lender(error)
             py_executor.shutdown()
             raise
 

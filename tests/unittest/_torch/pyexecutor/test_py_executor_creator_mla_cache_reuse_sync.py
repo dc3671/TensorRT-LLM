@@ -155,7 +155,7 @@ class _DummyKvCacheCreator:
             _stream=self._execution_stream,
         )
 
-    def close_remote_lender(self):
+    def close_remote_lender(self, error=None):
         """No remote lend is started (no-op)."""
 
 

@@ -2801,10 +2801,12 @@ class KvCacheCreator:
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
         cold_page_codec_provider: Optional[object] = None,
+        remote_lender=None,
     ) -> Optional[KVCacheManager]:
         """
         Create a KV cache manager for draft model layers in one-model mode
-        when target and draft have different KV cache layouts.
+        when target and draft have different KV cache layouts. `remote_lender`
+        is the target's lend, which the draft waits for but does not own.
         """
         num_draft_layers = self._get_num_draft_layers()
         spec_dec_layer_mask = self._get_one_model_draft_layer_mask()
@@ -2885,6 +2887,7 @@ class KvCacheCreator:
             disable_overlap_scheduler=self._disable_overlap_scheduler,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
+            remote_lender=remote_lender,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -3382,7 +3385,9 @@ class KvCacheCreator:
                              "KV cache pool.")
 
         self_kv_cache_config = base_kv_cache_config.model_copy()
-        cross_kv_cache_config = base_kv_cache_config.model_copy()
+        # The self-attention manager owns the rank's remote level and lend.
+        cross_kv_cache_config = base_kv_cache_config.model_copy(
+            update={"remote_cache_config": None})
         split_any_budget = False
 
         free_fraction = base_kv_cache_config.free_gpu_memory_fraction
@@ -3636,6 +3641,18 @@ class KvCacheCreator:
         )
         if not estimating_kv_cache:
             self._remote_lender = None  # the manager owns it now
+        try:
+            draft_kv_cache_manager, cross_kv_cache_manager = (
+                self._build_secondary_managers(
+                    kv_cache_manager, has_separate_one_model_draft,
+                    original_max_seq_len, estimating_kv_cache,
+                    self_kv_cache_config, draft_kv_cache_config,
+                    cross_kv_cache_config, cold_page_codec_provider))
+        except BaseException:
+            # Nothing holds the target manager yet; shutting it down withdraws its lend.
+            if kv_cache_manager is not None:
+                kv_cache_manager.shutdown()
+            raise
 
         # Carry the fp8 context-MLA workspace admission cap (computed in configure_kv_cache_capacity) onto
         # the real KV manager so the scheduler reads it directly instead of re-deriving from pool layout.
@@ -3643,26 +3660,6 @@ class KvCacheCreator:
         # attribute unset there (PyExecutor._get_ctx_mla_kv_len_cap does not cap during warmup).
         if not estimating_kv_cache and kv_cache_manager is not None:
             kv_cache_manager.fp8_ctx_mla_kv_len_cap = self._fp8_ctx_mla_kv_len_cap
-
-        draft_kv_cache_manager = None
-        draft_build_kv_cache_config = (draft_kv_cache_config
-                                       if draft_kv_cache_config is not None else
-                                       self_kv_cache_config)
-
-        # One-model speculative decoding with different KV layouts
-        if has_separate_one_model_draft:
-            draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
-                original_max_seq_len,
-                estimating_kv_cache,
-                kv_cache_config_override=draft_build_kv_cache_config,
-                cold_page_codec_provider=cold_page_codec_provider)
-
-        # Encoder-decoder cross-attention pool
-        cross_kv_cache_manager = None
-        if cross_kv_cache_config is not None:
-            cross_kv_cache_manager = self._create_cross_kv_cache_manager(
-                cross_kv_cache_config, estimating_kv_cache,
-                original_max_seq_len)
 
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
@@ -3674,6 +3671,38 @@ class KvCacheCreator:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)
 
+    def _build_secondary_managers(
+            self, kv_cache_manager, has_separate_one_model_draft: bool,
+            original_max_seq_len: int, estimating_kv_cache: bool,
+            self_kv_cache_config: KvCacheConfig,
+            draft_kv_cache_config: Optional[KvCacheConfig],
+            cross_kv_cache_config: Optional[KvCacheConfig],
+            cold_page_codec_provider):
+        """The one-model draft and encoder-decoder cross managers built beside the target."""
+        draft_kv_cache_manager = None
+        draft_build_kv_cache_config = (draft_kv_cache_config
+                                       if draft_kv_cache_config is not None else
+                                       self_kv_cache_config)
+
+        # One-model speculative decoding with different KV layouts
+        if has_separate_one_model_draft:
+            draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
+                original_max_seq_len,
+                estimating_kv_cache,
+                kv_cache_config_override=draft_build_kv_cache_config,
+                cold_page_codec_provider=cold_page_codec_provider,
+                remote_lender=(kv_cache_manager.remote_lender
+                               if self_kv_cache_config.remote_cache_config
+                               is not None else None))
+
+        # Encoder-decoder cross-attention pool
+        cross_kv_cache_manager = None
+        if cross_kv_cache_config is not None:
+            cross_kv_cache_manager = self._create_cross_kv_cache_manager(
+                cross_kv_cache_config, estimating_kv_cache,
+                original_max_seq_len)
+        return draft_kv_cache_manager, cross_kv_cache_manager
+
     def _start_remote_lend(self) -> None:
         """Start this rank's lend for the final target manager, once."""
         remote_config = self._kv_cache_config.remote_cache_config
@@ -3684,11 +3713,13 @@ class KvCacheCreator:
         self._remote_lender = start_lend(remote_config,
                                          torch.cuda.current_device())
 
-    def close_remote_lender(self) -> None:
-        """Withdraw a lend that no manager took over (startup failed before the final build)."""
-        if self._remote_lender is not None:
-            self._remote_lender.close()
-            self._remote_lender = None
+    def close_remote_lender(self,
+                            error: Optional[BaseException] = None) -> None:
+        """Withdraw a lend that no manager took over (startup failed before the final build), leaving its failure
+        marker when `error` is given."""
+        lender, self._remote_lender = self._remote_lender, None
+        if lender is not None:
+            lender.close(error)
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model, draft model, and cross pool."""

@@ -1151,7 +1151,7 @@ class TestBuildManagersBudgetGates:
             remote_cache_config={"directory": str(tmp_path), "lend_size": 4 * GB},
         )
         c._create_kv_cache_manager.side_effect = lambda *args, **kwargs: (
-            events.append(("target", kwargs["remote_lender"])) or Mock()
+            events.append(("target", kwargs["remote_lender"])) or Mock(remote_lender=lender)
         )
         return c, lender, events
 
@@ -1171,10 +1171,46 @@ class TestBuildManagersBudgetGates:
         c.build_managers(resources, estimating_kv_cache=False)
 
         assert events == ["lend", ("target", None), ("target", lender)]
-        assert "remote_lender" not in c._create_one_model_draft_kv_cache_manager.call_args.kwargs
+        # The draft only waits for the target's lend (TestRemoteLevelOwnership); the target owns it.
+        assert (
+            c._create_one_model_draft_kv_cache_manager.call_args.kwargs["remote_lender"] is lender
+        )
         assert c._remote_lender is None
         c.close_remote_lender()
         lender.close.assert_not_called()
+
+    def test_a_failed_draft_build_shuts_the_target_down(self, tmp_path, monkeypatch):
+        """Nothing holds the target manager until build_managers returns, so its lend would leak."""
+        c, lender, _ = self._gen_style_lend(tmp_path, monkeypatch)
+        targets = []
+        c._create_kv_cache_manager.side_effect = lambda *args, **kwargs: (
+            targets.append(Mock(remote_lender=kwargs["remote_lender"])) or targets[-1]
+        )
+        c._create_one_model_draft_kv_cache_manager.side_effect = RuntimeError("draft OOM")
+        resources = {}
+
+        with pytest.raises(RuntimeError, match="draft OOM"):
+            c.build_managers(resources, estimating_kv_cache=False)
+
+        targets[-1].shutdown.assert_called_once_with()
+        assert resources == {}
+
+    def test_cross_manager_neither_claims_nor_lends(self, tmp_path):
+        """The self-attention manager owns the rank's remote level and lend; a cross manager with the config would
+        lend and claim a second time."""
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._kv_cache_config = KvCacheConfig(
+            max_gpu_total_bytes=10 * GB,
+            cross_kv_cache_fraction=0.5,
+            remote_cache_config={
+                "directory": str(tmp_path),
+                "cache_size": 4 * GB,
+                "lend_size": 4 * GB,
+            },
+        )
+        self_config, cross_config = c._split_kv_cache_budget_for_cross()
+        assert self_config.remote_cache_config is not None
+        assert cross_config.remote_cache_config is None
 
     def test_lend_is_placed_before_the_estimation_takes_host_memory(self, tmp_path, monkeypatch):
         """A GEN node of two 176 GiB fabric lends (xb2): the second one fits at the default 24 GiB reserve only
@@ -1238,9 +1274,10 @@ class TestBuildManagersBudgetGates:
         c, lender, _ = self._gen_style_lend(tmp_path, monkeypatch)
         c.build_managers({}, estimating_kv_cache=True)
 
-        c.close_remote_lender()
+        error = RuntimeError("warmup failed")
+        c.close_remote_lender(error)
 
-        lender.close.assert_called_once_with()
+        lender.close.assert_called_once_with(error)
         assert c._remote_lender is None
 
     def test_without_estimation_the_manager_starts_the_lend(self, tmp_path, monkeypatch):

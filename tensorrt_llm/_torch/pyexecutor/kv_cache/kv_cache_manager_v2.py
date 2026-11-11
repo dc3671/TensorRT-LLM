@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import math
 import os
 import sys
@@ -1962,12 +1963,28 @@ class _BasePageTableMaterializer:
         )
 
 
+def _withdraws_remote_lend_on_error(init):
+    """Wrap ``__init__`` so a construction that raises withdraws the lend the manager took over."""
+
+    @functools.wraps(init)
+    def wrapper(self, *args, **kwargs):
+        try:
+            init(self, *args, **kwargs)
+        except BaseException as error:
+            self._close_remote_lender(error)
+            raise
+
+    return wrapper
+
+
 class KVCacheManagerV2(BaseResourceManager):
     gen_preemption_headroom: int = 0
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
     # Host memory this rank lends to remote cache levels (remote_cache_config.lend_size); closed by shutdown().
     _remote_lender: Optional["RemoteLender"] = None
+    # The remote config of a lend this manager owns, started or not; a failure leaves its marker.
+    _planned_lend: Optional[RemoteCacheConfig] = None
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -2066,6 +2083,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # device quota; None until offload sizing first asks for it.
     _offload_sizing_config: Optional[KVCacheManagerConfigPy] = None
 
+    @_withdraws_remote_lend_on_error
     def __init__(
         self,
         kv_cache_config: KvCacheConfig,
@@ -2107,8 +2125,13 @@ class KVCacheManagerV2(BaseResourceManager):
         gen_preemption_headroom: int = 0,
         **kwargs,
     ) -> None:
-        # A lend started before this manager (remote_lender.start_lend); owned from here, closed by shutdown().
-        self._remote_lender = remote_lender
+        # A lend started before this manager (remote_lender.start_lend) is owned from here and closed by shutdown(). A
+        # draft manager gets the target's lend only to wait for it before measuring host memory.
+        remote_config = kv_cache_config.remote_cache_config
+        if not is_draft:
+            self._remote_lender = remote_lender
+            if remote_config is not None and remote_config.lend_size:
+                self._planned_lend = remote_config
         self.mapping = mapping
         self.gen_preemption_headroom = gen_preemption_headroom
         self.dtype = dtype
@@ -2309,6 +2332,13 @@ class KVCacheManagerV2(BaseResourceManager):
                         "to disk is not validated to make the same decisions "
                         "on every CP rank. Set "
                         "kv_cache_config.disk_cache_size=0."
+                    )
+                if remote_config is not None and remote_config.cache_size:
+                    raise ValueError(
+                        "KVCacheManagerV2 does not support a remote cache level "
+                        "with aggregated helix context parallelism, for the same "
+                        "reason as a disk tier. Set "
+                        "kv_cache_config.remote_cache_config.cache_size=0."
                     )
                 if kv_connector_manager is not None:
                     raise ValueError(
@@ -2917,7 +2947,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if init_status == _KVCacheManagerInitStatus.ABORT:
                 if candidate is not None:
                     candidate.shutdown()
-                self._close_remote_lender()
+                # The construction guard withdraws the lend and leaves its failure marker.
                 if init_error is not None:
                     raise init_error
                 raise RuntimeError("KV cache manager initialization failed on another rank")
@@ -8272,10 +8302,15 @@ class KVCacheManagerV2(BaseResourceManager):
         lend in its automatic host tier."""
         if self.is_draft:
             return
-        from .remote_lender import check_remote_capacity, resolve_ucx_devices, start_lend
+        from .remote_lender import (
+            check_remote_capacity,
+            ensure_rendezvous_directory,
+            resolve_ucx_devices,
+            start_lend,
+        )
 
         remote_dir = os.path.expandvars(os.path.expanduser(remote_config.directory))
-        os.makedirs(remote_dir, exist_ok=True)
+        ensure_rendezvous_directory(remote_dir)
         ucx_devices = resolve_ucx_devices(remote_config.ucx_devices)
         if remote_config.lend_size and self._remote_lender is None:
             # This rank's memory joins the pool before its own cache exists: clients wait for lenders.
@@ -8295,8 +8330,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     quota=remote_config.cache_size,
                     path=remote_dir,
                     remote=True,
-                    remote_wait_timeout_ms=int(remote_config.lender_wait_timeout_s * 1000),
-                    remote_transfer_timeout_ms=int(remote_config.transfer_timeout_s * 1000),
+                    remote_wait_timeout_ms=math.ceil(remote_config.lender_wait_timeout_s * 1000),
+                    remote_transfer_timeout_ms=math.ceil(remote_config.transfer_timeout_s * 1000),
                     remote_expected_lenders=remote_config.expected_num_lenders or 0,
                     remote_fabric=remote_config.transport == "fabric",
                     remote_ucx_devices=ucx_devices or "",
@@ -8308,11 +8343,22 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{remote_config.cache_size / (1 << 30):.2f}GiB via {remote_dir} ({remote_config.transport})"
             )
 
-    def _close_remote_lender(self) -> None:
-        """Withdraw this rank's lend: clients still holding its chunks fail their next transfer."""
-        if self._remote_lender is not None:
-            self._remote_lender.close()
-            self._remote_lender = None
+    @property
+    def remote_lender(self) -> Optional["RemoteLender"]:
+        """This rank's lend, owned by this manager; None for a draft manager or a rank that lends nothing."""
+        return self._remote_lender
+
+    def _close_remote_lender(self, error: Optional[BaseException] = None) -> None:
+        """Withdraw this rank's lend: clients still holding its chunks fail their next transfer. With `error`, leave
+        the lend's failure marker too, also for a lend that never started, so that peers stop waiting for it."""
+        lender, self._remote_lender = self._remote_lender, None
+        planned, self._planned_lend = self._planned_lend, None
+        if lender is not None:
+            lender.close(error)
+        elif error is not None and planned is not None:
+            from .remote_lender import publish_lend_failure
+
+            publish_lend_failure(planned, error)
 
     def enable_deferred_close(self, enabled: bool) -> None:
         """Turn the deferred close of finished generation-only requests on or off
@@ -8711,6 +8757,19 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
+        try:
+            self._shutdown_caches()
+        finally:
+            self._close_remote_lender()
+        # Shut the streaming event manager down last so removals emitted during
+        # cache / impl teardown (via the radix tree's own event-manager
+        # reference) are still flushed before the publisher stops. Do not null
+        # event_manager: get_latest_events/flush snapshot it and operate safely
+        # on a closed manager, so there is no teardown-time None race.
+        if isinstance(self.event_manager, StreamingKVCacheEventManager):
+            self.event_manager.shutdown()
+
+    def _shutdown_caches(self) -> None:
         # impl.shutdown() raises while any cache is open, deferred ones included.
         self.enable_deferred_close(False)
         if self._sharing is not None:
@@ -8734,14 +8793,6 @@ class KVCacheManagerV2(BaseResourceManager):
             # After the runtime's shutdown, which raises while any cache is open, in the map or not;
             # a poisoned runtime returns at once, and a close then does nothing.
             self._sharing._on_caches_closed()
-        self._close_remote_lender()
-        # Shut the streaming event manager down last so removals emitted during
-        # cache / impl teardown (via the radix tree's own event-manager
-        # reference) are still flushed before the publisher stops. Do not null
-        # event_manager: get_latest_events/flush snapshot it and operate safely
-        # on a closed manager, so there is no teardown-time None race.
-        if isinstance(self.event_manager, StreamingKVCacheEventManager):
-            self.event_manager.shutdown()
 
     def get_max_resource_count(self) -> int:
         # TODO: implement this

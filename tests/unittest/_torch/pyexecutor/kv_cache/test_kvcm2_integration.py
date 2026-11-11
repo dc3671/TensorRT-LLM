@@ -414,6 +414,7 @@ def _make_manager_for_cache_tier_test(
     vocab_size: int | None = 16,
     dtype: DataType = DataType.HALF,
     layer_specs: list[KVCacheLayerSpec] | None = None,
+    remote_lender: object | None = None,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -483,6 +484,7 @@ def _make_manager_for_cache_tier_test(
             vocab_size=vocab_size,
             execution_stream=Mock(),
             cold_page_codec_provider=cold_page_codec_provider,
+            remote_lender=remote_lender,
         )
     return manager, impl_constructor
 
@@ -1763,7 +1765,8 @@ class TestRemoteTierInitStatus:
                 self._config(tmp_path, cache_size=1 << 30, lend_size=1 << 30), [Mock()]
             )
         assert sync.call_args.args[0] == _KVCacheManagerInitStatus.ABORT
-        lender.close.assert_called_once_with()
+        # Closed with the error, which leaves the lend's failure marker for the peers.
+        assert str(lender.close.call_args.args[0]) == "capacity check failed"
 
     @pytest.mark.cpu_only
     def test_peer_failure_discards_the_cache_and_closes_the_lender(self, tmp_path) -> None:
@@ -1782,7 +1785,8 @@ class TestRemoteTierInitStatus:
             )
         assert sync.call_args.args[0] == _KVCacheManagerInitStatus.OK
         local_impl.shutdown.assert_called_once_with()
-        lender.close.assert_called_once_with()
+        lender.close.assert_called_once()
+        assert "another rank" in str(lender.close.call_args.args[0])
 
     @pytest.mark.cpu_only
     def test_lend_without_host_memory_left_aborts_through_the_sync(self, tmp_path) -> None:
@@ -1802,6 +1806,67 @@ class TestRemoteTierInitStatus:
             _make_manager_for_cache_tier_test(config, [Mock()])
         assert sync.call_args.args[0] == _KVCacheManagerInitStatus.ABORT
         add_remote_level.assert_not_called()
+        # The lend never started, yet its failure marker counts it as reported for the peers.
+        assert [p.name.endswith(".failed") for p in tmp_path.iterdir()] == [True]
+
+    @pytest.mark.cpu_only
+    def test_failure_after_the_sync_withdraws_the_lend(self, tmp_path) -> None:
+        lender, add_remote_level = self._starting_lender()
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ),
+            patch.object(
+                KVCacheManagerV2, "_reserve_guard_page", side_effect=RuntimeError("late failure")
+            ),
+            pytest.raises(RuntimeError, match="late failure"),
+        ):
+            _make_manager_for_cache_tier_test(self._config(tmp_path, lend_size=1 << 30), [Mock()])
+        assert str(lender.close.call_args.args[0]) == "late failure"
+
+    @pytest.mark.cpu_only
+    def test_shutdown_withdraws_the_lend_when_a_deferred_close_raises(self, tmp_path) -> None:
+        lender, add_remote_level = self._starting_lender()
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ),
+        ):
+            manager, _ = _make_manager_for_cache_tier_test(
+                self._config(tmp_path, lend_size=1 << 30), [Mock()]
+            )
+        with (
+            patch.object(manager, "flush_deferred_closes", side_effect=RuntimeError("close")),
+            pytest.raises(RuntimeError, match="close"),
+        ):
+            manager.shutdown()
+        lender.close.assert_called_once_with(None)
+
+    @pytest.mark.cpu_only
+    def test_draft_waits_for_the_targets_lend_instead_of_charging_it_again(self, tmp_path) -> None:
+        """The target's lend is resident once the draft measures host memory: subtracting it again would leave the
+        draft's automatic host tier nothing (here: a lend larger than the host)."""
+        config = KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            remote_cache_config={"directory": str(tmp_path), "lend_size": 1 << 50},
+        )
+        target_lender = Mock()
+        with patch(
+            f"{self.module}._sync_kv_cache_manager_init_status",
+            side_effect=lambda status, mapping: status,
+        ):
+            draft, _ = _make_manager_for_cache_tier_test(
+                config, [Mock()], is_draft=True, remote_lender=target_lender
+            )
+        target_lender.wait_started.assert_called_once_with()
+        assert draft.remote_lender is None  # the target owns it
+        draft._close_remote_lender(RuntimeError("draft failed"))
+        target_lender.close.assert_not_called()
+        assert list(tmp_path.iterdir()) == []  # nor does the draft mark a lend failed
 
 
 @pytest.mark.cpu_only
