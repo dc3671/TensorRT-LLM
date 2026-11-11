@@ -721,6 +721,32 @@ class TestShortestDecodeFirstWaitingQueue:
         queue.prepend_requests(popped[1:])
         assert [item.id for item in queue] == [2, 3, 4]
 
+    def test_put_back_every_iteration_adds_no_entries(self, monkeypatch):
+        """Requests that admission rejects and puts back every iteration (strict-rank attention
+        DP) reuse their heap entries, so the heaps stay bounded without compaction and the
+        requests still age once, oldest first."""
+        queue = ShortestDecodeFirstWaitingQueue(max_wait_s=60.0)
+        queue.set_now(0.0)
+        queue.add_requests([create_decode_request_item(i, 100 + i, float(3 - i)) for i in range(4)])
+        compactions = []
+        compact = ShortestDecodeFirstWaitingQueue._compact
+        monkeypatch.setattr(
+            ShortestDecodeFirstWaitingQueue,
+            "_compact",
+            lambda self: compactions.append(len(self)) or compact(self),
+        )
+        for step in range(1000):
+            queue.set_now(3.0 + step * 0.01)
+            popped = [queue.pop_request() for _ in range(4)]
+            assert [item.id for item in popped] == [0, 1, 2, 3]
+            queue.prepend_requests(popped)
+        assert len(queue._shortest_heap) == 4
+        assert len(queue._arrival_heap) == 4
+        assert compactions == []
+        queue.set_now(63.0)
+        assert [item.id for item in queue] == [3, 2, 1, 0]
+        assert [queue.pop_request().id for _ in range(4)] == [3, 2, 1, 0]
+
     def test_peek_requests_does_not_sort_the_queue(self, monkeypatch):
         queue = ShortestDecodeFirstWaitingQueue(max_wait_s=60.0)
         queue.set_now(0.0)

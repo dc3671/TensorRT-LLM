@@ -349,6 +349,9 @@ class ShortestDecodeFirstWaitingQueue(WaitingQueue):
         self._shortest_heap: list[tuple[int, int]] = []
         self._arrival_heap: list[tuple[float, int]] = []
         self._aged_heap: list[tuple[float, int]] = []
+        # Arrival sequences with an entry in _arrival_heap. A pop from _shortest_heap leaves the
+        # arrival entry in place, so a request put back reuses it rather than adding another.
+        self._in_arrival_heap: set[int] = set()
         self._counter = itertools.count()
         # For a request put back that was never added.
         self._prepend_counter = itertools.count(-1, -1)
@@ -366,6 +369,7 @@ class ShortestDecodeFirstWaitingQueue(WaitingQueue):
         heap = self._arrival_heap
         while heap and now - heap[0][0] >= self.max_wait_s:
             arrival, seq = heapq.heappop(heap)
+            self._in_arrival_heap.discard(seq)
             if self._waiting((arrival, seq)):
                 self._aged.add(seq)
                 heapq.heappush(self._aged_heap, (arrival, seq))
@@ -390,7 +394,8 @@ class ShortestDecodeFirstWaitingQueue(WaitingQueue):
             heapq.heappush(self._aged_heap, (arrival, seq))
             return
         heapq.heappush(self._shortest_heap, (item.request.max_tokens, seq))
-        if arrival is not None:
+        if arrival is not None and seq not in self._in_arrival_heap:
+            self._in_arrival_heap.add(seq)
             heapq.heappush(self._arrival_heap, (arrival, seq))
         if len(self._shortest_heap) + len(self._arrival_heap) > 4 * len(self._items) + 64:
             self._compact()
@@ -399,6 +404,7 @@ class ShortestDecodeFirstWaitingQueue(WaitingQueue):
         """Drop the entries of requests that aged or left the queue."""
         self._shortest_heap = [e for e in self._shortest_heap if self._waiting(e)]
         self._arrival_heap = [e for e in self._arrival_heap if self._waiting(e)]
+        self._in_arrival_heap = {seq for _, seq in self._arrival_heap}
         self._aged_heap = [e for e in self._aged_heap if e[1] in self._items]
         for heap in (self._shortest_heap, self._arrival_heap, self._aged_heap):
             heapq.heapify(heap)
