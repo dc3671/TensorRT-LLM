@@ -157,6 +157,51 @@ def _multirow_pdl(grid_size: int, device_index: int) -> bool:
     return allowed and grid_size < num_sms
 
 
+@triton.jit
+def _gated_rows_load(X, Z, rows, cols, M, stride_x_row, stride_z_tok,
+                     N: tl.constexpr, HEADS_PER_TOK: tl.constexpr):
+    """One ROWS-row tile of X and its gate rows of Z (see the kernel below)."""
+    mask2d = (rows < M)[:, None]
+    x = tl.load(X + rows[:, None].to(tl.int64) * stride_x_row + cols[None, :],
+                mask=mask2d,
+                other=0.0)
+    tok = rows // HEADS_PER_TOK
+    head = rows % HEADS_PER_TOK
+    z = tl.load(Z + (tok[:, None].to(tl.int64) * stride_z_tok +
+                     head[:, None] * N + cols[None, :]),
+                mask=mask2d,
+                other=0.0)
+    return x, z
+
+
+@triton.jit
+def _gated_rows_store(X, Y, Rstd, FP8_SCALE, x, z, w, rows, cols, M, eps,
+                      stride_y_row, N: tl.constexpr, GATE_SIGMOID: tl.constexpr,
+                      SAVE_RSTD: tl.constexpr, OUTPUT_FP8: tl.constexpr):
+    """Gated RMSNorm of one loaded tile, stored to Y (and Rstd)."""
+    row_mask = rows < M
+    x = x.to(tl.float32)
+    var = tl.sum(x * x, axis=1) / N
+    rstd = 1.0 / tl.sqrt(var + eps)
+    if SAVE_RSTD:
+        tl.store(Rstd + rows, rstd, mask=row_mask)
+    y = x * rstd[:, None] * w[None, :]
+    z = z.to(tl.float32)
+    gate = tl.sigmoid(z)
+    if not GATE_SIGMOID:
+        gate *= z
+    y *= gate
+    if OUTPUT_FP8:
+        # Match the existing two-kernel path: RMSNorm first stores to the
+        # input dtype, then static quantization reloads and multiplies by the
+        # rounded reciprocal of its input scale.
+        y = y.to(X.dtype.element_ty).to(tl.float32)
+        y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
+    tl.store(Y + rows[:, None].to(tl.int64) * stride_y_row + cols[None, :],
+             y.to(Y.dtype.element_ty),
+             mask=row_mask[:, None])
+
+
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
 @triton.heuristics({"SAVE_RSTD": lambda args: args["Rstd"] is not None})
 @triton.jit
@@ -173,7 +218,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
     M,  # number of rows in X
     eps,
     N: tl.constexpr,  # row length; power of two, whole row per program
-    ROWS: tl.constexpr,  # rows per program
+    ROWS: tl.constexpr,  # rows per tile
     HEADS_PER_TOK: tl.constexpr,
     GATE_SIGMOID: tl.constexpr,
     WEIGHT_IS_DELTA: tl.constexpr,
@@ -181,6 +226,7 @@ def _rms_norm_gated_fwd_multirow_kernel(
     OUTPUT_FP8: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     EARLY_TRIGGER: tl.constexpr = False,
+    GROUPS: tl.constexpr = 1,
 ):
     """Gated rmsnorm(x), several short rows per program.
 
@@ -189,12 +235,12 @@ def _rms_norm_gated_fwd_multirow_kernel(
     HEADS_PER_TOK == 1 and stride_z_tok == z's row stride this is a plain
     [M, N] z; with HEADS_PER_TOK == heads it reads a [num_tokens, heads, N]
     view whose (heads, N) block is contiguous per token, e.g. a column slice
-    of a wider projection.
+    of a wider projection. A program runs GROUPS ROWS-row tiles, loading tile
+    g + 1 before it computes tile g; each row's arithmetic does not depend on
+    GROUPS.
     """
-    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
-    row_mask = rows < M
+    base = tl.program_id(0) * (ROWS * GROUPS)
     cols = tl.arange(0, N)
-    mask2d = row_mask[:, None]
     if EARLY_TRIGGER:
         # Dependents read Y only after their own griddepcontrol.wait.
         tl.extra.cuda.gdc_launch_dependents()
@@ -206,33 +252,29 @@ def _rms_norm_gated_fwd_multirow_kernel(
         w += 1.0
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
-    x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
-    x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
-    var = tl.sum(x * x, axis=1) / N
-    rstd = 1.0 / tl.sqrt(var + eps)
-    if SAVE_RSTD:
-        tl.store(Rstd + rows, rstd, mask=row_mask)
-    y = x * rstd[:, None] * w[None, :]
-    tok = rows // HEADS_PER_TOK
-    head = rows % HEADS_PER_TOK
-    z_off = (tok[:, None].to(tl.int64) * stride_z_tok + head[:, None] * N +
-             cols[None, :])
-    z = tl.load(Z + z_off, mask=mask2d, other=0.0).to(tl.float32)
-    gate = tl.sigmoid(z)
-    if not GATE_SIGMOID:
-        gate *= z
-    y *= gate
-    if OUTPUT_FP8:
-        # Match the existing two-kernel path: RMSNorm first stores to the
-        # input dtype, then static quantization reloads and multiplies by the
-        # rounded reciprocal of its input scale.
-        y = y.to(X.dtype.element_ty).to(tl.float32)
-        y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
-    y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
-    tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
+    x_next, z_next = _gated_rows_load(X, Z, base + tl.arange(0, ROWS), cols, M,
+                                      stride_x_row, stride_z_tok, N,
+                                      HEADS_PER_TOK)
+    for g in tl.static_range(GROUPS):
+        rows = base + g * ROWS + tl.arange(0, ROWS)
+        x_cur = x_next
+        z_cur = z_next
+        if g + 1 < GROUPS:
+            x_next, z_next = _gated_rows_load(X, Z, rows + ROWS, cols, M,
+                                              stride_x_row, stride_z_tok, N,
+                                              HEADS_PER_TOK)
+        _gated_rows_store(X, Y, Rstd, FP8_SCALE, x_cur, z_cur, w, rows, cols, M,
+                          eps, stride_y_row, N, GATE_SIGMOID, SAVE_RSTD,
+                          OUTPUT_FP8)
     if LAUNCH_WITH_PDL and not EARLY_TRIGGER:
         # Release only after both Rstd (when present) and Y have been stored.
         tl.extra.cuda.gdc_launch_dependents()
+
+
+# Tiles per program of rms_norm_gated_token_major from _MULTIROW_GROUPS_MIN_ROWS
+# rows (prefill-sized inputs).
+_MULTIROW_GROUPS = 4
+_MULTIROW_GROUPS_MIN_ROWS = 1 << 16
 
 
 def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
@@ -290,8 +332,9 @@ def rms_norm_gated_token_major(
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     out = torch.empty_like(x, dtype=out_dtype)
-    grid_size = triton.cdiv(M, _MULTIROW_ROWS)
     device_index = x.device.index
+    groups = _MULTIROW_GROUPS if M >= _MULTIROW_GROUPS_MIN_ROWS else 1
+    grid_size = triton.cdiv(M, _MULTIROW_ROWS * groups)
     launch_with_pdl = _multirow_pdl(grid_size, device_index)
     with torch.cuda.device(device_index):
         _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
@@ -316,6 +359,7 @@ def rms_norm_gated_token_major(
             # Dependents (out_proj) prefetch their weights; they read Y only
             # after their own griddepcontrol.wait.
             EARLY_TRIGGER=_pdl_device_policy(device_index)[0],
+            GROUPS=groups,
             launch_pdl=launch_with_pdl,
         )
     return out

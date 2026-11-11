@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import functools
+import types
 import weakref
 from typing import Optional
 
@@ -28,13 +30,17 @@ from tensorrt_llm._torch.attention.backends.fmha import gqa_kv_replica_fused as 
 from tensorrt_llm._torch.attention.backends.fmha import gqa_segmented_decode
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     _get_generation_workspace_layout,
+    trtllm_gen_paged_decode,
 )
 from tensorrt_llm._torch.attention.backends.fmha.gqa_decode import (
+    FoldInputs,
     GqaDecodeFmha,
     GqaDecodeSetup,
     GqaKvReplicaFmha,
+    GqaKvReplicaFusedFmha,
     GqaSegmentedFmha,
     GqaSplitKvFmha,
+    KvAppendPlan,
 )
 from tensorrt_llm._torch.attention.backends.fmha.gqa_kv_replica import kv_replica_partial_merge_free
 from tensorrt_llm._torch.attention.backends.fmha.gqa_segmented_decode import (
@@ -128,6 +134,51 @@ def test_gqa_decode_matches_golden(
         assert taken == []
     else:
         assert taken and all(t == (library, True) for t in taken)
+
+
+def test_generation_call_loads_trtllm_gen_decode_module(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A generation call served by a dedicated kernel (the warmup's) loads FlashInfer's trtllm-gen decode module, so
+    the first segmented or trtllm-gen decode does not JIT-build it."""
+    import flashinfer
+
+    loads = []
+    load = flashinfer.decode.get_trtllm_gen_fmha_module
+
+    def spy():
+        loads.append(True)
+        return load()
+
+    monkeypatch.setattr(flashinfer.decode, "get_trtllm_gen_fmha_module", spy)
+    monkeypatch.setattr(
+        backend_case,
+        "create_attention",
+        functools.partial(backend_case.create_attention, gqa_decode=GqaDecodeSetup()),
+    )
+    monkeypatch.setattr(backend_case, "BACKENDS_UNDER_TEST", ("TRTLLM",))
+    taken = []
+    run_split_kv = GqaSplitKvFmha._run_dedicated
+
+    def spy_split_kv(self, *args, **kwargs):
+        taken.append(run_split_kv(self, *args, **kwargs))
+        return taken[-1]
+
+    monkeypatch.setattr(GqaSplitKvFmha, "_run_dedicated", spy_split_kv)
+    run_case(
+        BackendCase(
+            num_heads=4,
+            num_kv_heads=1,
+            head_dim=HEAD_DIM,
+            seq_lens=[1],
+            num_cached_tokens=[300],
+            num_contexts=0,
+            dtype="bfloat16",
+            kv_dtype="fp8",
+            page_size=PAGE,
+            kv_layout="HND",
+        )
+    )
+    assert taken and all(taken)
+    assert loads
 
 
 def _qwen3_next_attention(use_gqa_decode_fmha: bool) -> Qwen3Attention:
@@ -309,6 +360,80 @@ def _kv_replica_fused_partial_ref(q_all, kv_pool, block_tables, seq_lens, q_len,
     ids=["balanced", "wide", "two_slot", "two_slot_uniform"],
 )
 def test_kv_replica_fused_partial_matches_reference(q_len: int, lens: list) -> None:
+    _check_kv_replica_fused_partial(q_len, lens)
+
+
+@pytest.mark.parametrize("q_len", [7, 1])
+def test_kv_replica_fused_two_slot_plan_up_to_64_requests(q_len: int) -> None:
+    """At most 64 requests take the two-slot plan where a whole-CTA plan would leave CTAs idle; its partials match
+    the reference as the plan of larger batches does."""
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    n_ctas = F._num_ctas(sms)
+    batches = [b for b in range(F._LANE_PLAN_MAX_BATCH + 1, 65) if F._plan(b, n_ctas) == "two"]
+    if not batches:
+        pytest.skip(f"no batch of at most 64 requests takes the two-slot plan on {sms} SMs")
+    b = batches[-1]
+    _check_kv_replica_fused_partial(q_len, [1 + (i * 7919) % 50000 for i in range(b - 1)] + [90000])
+
+
+@pytest.mark.parametrize("q_len", [7, 1])
+@pytest.mark.parametrize(
+    "lens",
+    [
+        [7, 9000, 33000, 64, 130, 21000, 1, 4000],
+        [1 + (i * 7919) % 50000 for i in range(40)] + [120000],
+        [1 + (i * 7919) % 50000 for i in range(100)] + [120000],
+    ],
+    ids=["lane", "wide", "two_slot"],
+)
+def test_kv_replica_fused_partial_softmax_v2_is_bitwise(q_len: int, lens: list) -> None:
+    """softmax_v2 (row maxima by tcgen05.ld.red.max) and the default softmax write the same bits, on every plan."""
+    device = torch.device("cuda", 0)
+    if not F.ld_red_max_supported(device):
+        pytest.skip("softmax_v2 needs tcgen05.ld.red.max")
+    lens = [max(L, q_len) for L in lens]
+    b = len(lens)
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if not F.kv_replica_fused_supported(q_len, CP, HEADS, b, sms):
+        pytest.skip("shape outside the fused KV-replica split partial kernel's limits")
+    state = F.kv_replica_fused_state(device, sms, b)
+    assert state.softmax_v2
+    v1 = copy.copy(state)
+    v1.softmax_v2 = False
+    g = torch.Generator(device="cuda").manual_seed(b * 10 + q_len + 1)
+    max_pages = max((max(lens) + PAGE - 1) // PAGE, CP)
+    nblocks = b * 2 * max_pages + 8
+    kv = (torch.randn(nblocks, 1, PAGE, HEAD_DIM, device="cuda", generator=g) * 0.6).to(
+        torch.float8_e4m3fn
+    )
+    tables = torch.randperm(nblocks, device="cuda", generator=g)[: b * 2 * max_pages]
+    tables = tables.to(torch.int32).view(b, 2, max_pages).contiguous()
+    seq = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    q_all = (
+        torch.randn(b * q_len, CP, HEADS, HEAD_DIM, device="cuda", generator=g)
+        .to(torch.float8_e4m3fn)
+        .permute(1, 0, 2, 3)
+    )
+    for rank in range(CP):
+        outs = []
+        for st in (state, v1):
+            o = torch.full(
+                (CP, b * q_len, HEADS, HEAD_DIM), float("nan"), dtype=torch.bfloat16, device="cuda"
+            )
+            lse = torch.full(
+                (CP, b * q_len, HEADS), float("nan"), dtype=torch.float32, device="cuda"
+            )
+            F.kv_replica_fused_partial(
+                q_all, kv, tables, seq, q_len, rank, CP, 1.0 / 16, 1.0, o, lse, st
+            )
+            outs.append((o, lse))
+        torch.cuda.synchronize()
+        (o2, lse2), (o1, lse1) = outs
+        assert torch.equal(o2.view(torch.int16), o1.view(torch.int16)), rank
+        assert torch.equal(lse2.view(torch.int32), lse1.view(torch.int32)), rank
+
+
+def _check_kv_replica_fused_partial(q_len: int, lens: list) -> None:
     hq, d = HEADS, HEAD_DIM
     lens = [max(L, q_len) for L in lens]
     b = len(lens)
@@ -478,3 +603,204 @@ def test_segment_workspace_growth_keeps_replaced_buffer() -> None:
     assert large.data_ptr() != small_ptr
     reserve_segment_attention_workspace(dev, 1 << 20)
     assert segment_attention_workspace(dev) is large
+
+
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,tokens_per_gen_step,splits",
+    [
+        (32, 2, 7, 8),  # Qwen3.5-397B under attention DP, MTP draft length 6
+        (32, 2, 9, 0),  # 144 rows: more than one Q tile
+        (8, 2, 1, 0),  # 8 splits x 2 KV heads exceed the counters of 8 heads
+    ],
+)
+def test_min_kv_splits_need_one_q_tile_and_the_counters(
+    num_heads: int, num_kv_heads: int, tokens_per_gen_step: int, splits: int
+) -> None:
+    assert GqaDecodeFmha._min_kv_splits_for(num_heads, num_kv_heads, tokens_per_gen_step) == splits
+
+
+def test_min_kv_split_decode_is_flashinfer_decode_at_that_sm_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The forced-split decode (trtllm_gen_paged_decode with splits x KV heads x batch SMs) writes exactly what
+    FlashInfer's public decode writes on a device of that many SMs: same kernel, same split."""
+    import flashinfer
+
+    hq, hkv, q_len, b, splits = 32, 2, 7, 52, 8
+    g = torch.Generator(device="cuda").manual_seed(0)
+    lens = torch.randint(6000, 9000, (b,), device="cuda", generator=g).to(torch.int32)
+    pages = (int(lens.max()) + PAGE - 1) // PAGE
+    nblocks = b * 2 * pages
+    kv = (torch.randn(nblocks, hkv, PAGE, HEAD_DIM, device="cuda", generator=g) * 0.6).to(
+        torch.float8_e4m3fn
+    )
+    tables = torch.randperm(nblocks, device="cuda", generator=g).to(torch.int32).view(b, 2, pages)
+    q = torch.randn(b * q_len, hq, HEAD_DIM, device="cuda", generator=g).to(torch.float8_e4m3fn)
+    sm_count = splits * hkv * b
+    assert sm_count > torch.cuda.get_device_properties(0).multi_processor_count
+    workspace = torch.zeros(sm_count * 128 * (8 + 4 * HEAD_DIM), dtype=torch.uint8, device="cuda")
+    counter = torch.zeros(max(b * hq, sm_count) * 4, dtype=torch.uint8, device="cuda")
+    max_kv_len = int(lens.max())
+
+    out = torch.empty(b * q_len, hq, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    trtllm_gen_paged_decode(
+        out, q, kv, workspace, counter, tables, lens, q_len, max_kv_len, 1.0 / 16, 1.0, b, -1,
+        sm_count, False,
+    )  # fmt: skip
+
+    def public(sms: int) -> torch.Tensor:
+        monkeypatch.setattr(flashinfer.decode, "get_device_sm_count", lambda *_: sms)
+        ref = torch.empty_like(out)
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=q,
+            kv_cache=(kv, kv),
+            workspace_buffer=workspace,
+            block_tables=tables,
+            seq_lens=lens,
+            max_seq_len=max_kv_len,
+            bmm1_scale=1.0 / 16,
+            bmm2_scale=1.0,
+            out=ref,
+            kv_layout="HND",
+            enable_pdl=False,
+            backend="trtllm-gen",
+            q_len_per_req=q_len,
+            uses_shared_paged_kv_idx=False,
+            multi_ctas_kv_counter_buffer=counter,
+        )
+        return ref
+
+    assert torch.equal(out, public(sm_count))
+    # The device's own SM count splits less, which only reorders the FP32 sums.
+    heuristic = public(torch.cuda.get_device_properties(0).multi_processor_count)
+    torch.testing.assert_close(out, heuristic, atol=2e-2, rtol=2e-2)
+
+
+def test_rope_gather_grid_residency_comes_from_the_compiled_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fused q all-gather takes a grid only while all of it stays resident: at most min(occupancy of the compiled
+    kernel, GATHER_MAX_PROGRAMS_PER_SM) programs per SM. At a TEP8 Qwen3.5 layer (4 q heads, 1 KV head, group of 4)
+    the occupancy is above the cap, so the cap decides the token bound."""
+    from tensorrt_llm._torch.attention.kernels import fused_qk_norm_rope_gate as K
+
+    hq, hkv, d, rot, q_len, group = 4, 1, HEAD_DIM, 64, 7, 4
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    occupancy = []
+    resident = K._resident_programs_per_sm
+
+    def spy(kernel):
+        occupancy.append(resident(kernel))
+        return occupancy[-1]
+
+    monkeypatch.setattr(K, "_resident_programs_per_sm", spy)
+
+    def resident_tokens(num_tokens: int) -> int:
+        b = num_tokens // q_len
+        dev = "cuda"
+        plan = KvAppendPlan(
+            0,
+            num_tokens,
+            b,
+            q_len,
+            torch.zeros(8, hkv, PAGE, d, dtype=torch.float8_e4m3fn, device=dev),
+            torch.zeros(b, 2, 4, dtype=torch.int32, device=dev),
+            torch.full((b,), q_len, dtype=torch.int32, device=dev),
+            torch.ones(1, dtype=torch.float32, device=dev),
+            torch.ones(1, dtype=torch.float32, device=dev),
+            1.0 / 16,
+        )
+        return K.rope_gather_max_tokens(
+            torch.zeros(num_tokens, (2 * hq + 2 * hkv) * d, dtype=torch.bfloat16, device=dev),
+            torch.zeros(d, dtype=torch.bfloat16, device=dev),
+            torch.zeros(d, dtype=torch.bfloat16, device=dev),
+            torch.zeros(4096, 2, rot // 2, dtype=torch.float32, device=dev),
+            torch.zeros(num_tokens, dtype=torch.int32, device=dev),
+            1e-6,
+            hq,
+            hkv,
+            d,
+            rot,
+            None,
+            plan,
+            (
+                torch.zeros(group, dtype=torch.int64, device=dev),
+                torch.zeros(num_tokens * hq, dtype=torch.int32, device=dev),
+                0,
+                group,
+                1 << 16,
+                True,
+            ),
+        )
+
+    bound = K.GATHER_MAX_PROGRAMS_PER_SM * sms // (hq + 2 * hkv)
+    assert resident_tokens(q_len) == bound
+    assert resident_tokens(16 * q_len) == bound
+    assert occupancy and min(occupancy) >= K.GATHER_MAX_PROGRAMS_PER_SM
+
+
+@pytest.mark.parametrize("folded", [False, True])
+def test_rope_gather_launches_only_with_a_resident_grid(
+    monkeypatch: pytest.MonkeyPatch, folded: bool
+) -> None:
+    """GqaKvReplicaFusedFmha's prologue (the module's unfolded one, and the folded call's fallback) all-gathers q in
+    the RoPE kernel only for token counts within rope_gather_max_tokens, taken once per count; otherwise, and
+    without the plan's gather arguments, the plain kernel runs and plan.q_gathered stays None."""
+    from tensorrt_llm._torch.attention.kernels import fused_qk_norm_rope_gate as K
+
+    bound = 21
+    calls = []
+
+    def max_tokens(qkv, *args):
+        calls.append(("bound", qkv.shape[0]))
+        return bound
+
+    def gather(qkv, *args):
+        calls.append(("gather", qkv.shape[0]))
+        return qkv, qkv, qkv, qkv, qkv
+
+    def plain(qkv, *args):
+        calls.append(("plain", qkv.shape[0]))
+        return qkv, qkv, qkv, qkv
+
+    monkeypatch.setattr(K, "rope_gather_max_tokens", max_tokens)
+    monkeypatch.setattr(K, "fused_qkv_rope_gate_fp8_append_gather", gather)
+    monkeypatch.setattr(K, "fused_qkv_rope_gate_fp8_append", plain)
+
+    class _Attn:
+        num_heads, num_kv_heads, head_dim = HEADS, 1, HEAD_DIM
+
+    attn = _Attn()
+    lib = GqaKvReplicaFusedFmha.__new__(GqaKvReplicaFusedFmha)
+    lib._attn_ref = weakref.ref(attn)
+    lib._rope_gather_resident = {}
+    x = torch.zeros(1)
+
+    def prologue(num_tokens: int, offered: bool) -> Optional[torch.Tensor]:
+        qkv = torch.zeros(num_tokens, 8)
+        plan = KvAppendPlan(0, num_tokens, num_tokens // 7, 7, x, x, x, x, x, 1.0)
+        plan.rope_gather = (x, x, 0, CP, 1, True) if offered else None
+        f = FoldInputs(qkv, x, x, x, x, 1e-6, 64, None)
+        if folded:
+            plan.fold = f
+            params = types.SimpleNamespace(
+                num_tokens=num_tokens, fwd=types.SimpleNamespace(output_gate=None)
+            )
+            lib._run_fold_prologue(params, plan)
+            assert params.qkv_input.shape[0] == num_tokens
+        else:
+            lib.run_prologue(plan, f.qkv, x, x, x, x, 1e-6, 64, None)
+        return plan.q_gathered
+
+    assert prologue(21, True) is not None
+    assert prologue(28, True) is None
+    assert prologue(21, True) is not None
+    assert prologue(14, False) is None
+    assert calls == [
+        ("bound", 21),
+        ("gather", 21),
+        ("bound", 28),
+        ("plain", 28),
+        ("gather", 21),
+        ("plain", 14),
+    ]

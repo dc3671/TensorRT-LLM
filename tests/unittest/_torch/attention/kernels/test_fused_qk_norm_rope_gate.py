@@ -24,6 +24,7 @@ import tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate as _kernel_
 from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention.kernels.fused_qk_norm_rope_gate import (
     fused_qkv_gemma_rmsnorm_rope_gate,
+    fused_sigmoid_mul_fp8,
     fused_sigmoid_mul_inplace,
 )
 
@@ -297,6 +298,31 @@ def test_output_gate_fallback_flattens_fused_gate():
     expected = attention * torch.sigmoid(gate.reshape_as(attention))
     actual = Attention.apply_output_gate(None, attention, gate)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("scale", (0.13, 32.0))
+@pytest.mark.parametrize("num_tokens", (1, 37, 1024, 2049))
+@pytest.mark.parametrize("strided_gate", (False, True))
+def test_fused_sigmoid_mul_fp8_matches_gate_then_static_quantize(scale, num_tokens, strided_gate):
+    """The FP8-output gate writes the bytes of the in-place gate followed by o_proj's static quantization."""
+    torch.manual_seed(num_tokens)
+    num_heads, head_dim = 8, 256
+    attention = torch.randn((num_tokens, num_heads * head_dim), dtype=torch.bfloat16, device="cuda")
+    if strided_gate:
+        gate = torch.randn(
+            (num_tokens, num_heads, 2 * head_dim), dtype=torch.bfloat16, device="cuda"
+        )[..., :head_dim]
+    else:
+        gate = torch.randn_like(attention)
+    input_scale = torch.tensor([scale], dtype=torch.float32, device="cuda")
+
+    gated = attention.clone()
+    fused_sigmoid_mul_inplace(gated, gate)
+    expected, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(gated, input_scale)
+    actual = fused_sigmoid_mul_fp8(attention, gate, input_scale)
+
+    assert actual.dtype == torch.float8_e4m3fn
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
 def test_fused_sigmoid_mul_inplace_supports_flat_gate():

@@ -60,7 +60,7 @@ def chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
+    g: Optional[torch.Tensor],
     beta: torch.Tensor,
     scale: Optional[float] = None,
     initial_state: Optional[torch.Tensor] = None,
@@ -73,6 +73,7 @@ def chunk_gated_delta_rule(
     output: Optional[torch.Tensor] = None,
     state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     cu_seqlens_cpu: Optional[torch.Tensor] = None,
+    g_linear: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Adapter for FlashInfer's ``chunk_gated_delta_rule``.
 
@@ -84,7 +85,8 @@ def chunk_gated_delta_rule(
     each shaped ``[capacity, H, V, K]`` in the state I/O dtype.
     Returned states never alias this scratch. A batch with more sequences than
     ``capacity`` runs in groups of at most ``capacity`` sequences, which needs
-    ``cu_seqlens_cpu``: a host copy of ``cu_seqlens``.
+    ``cu_seqlens_cpu``: a host copy of ``cu_seqlens``. ``g_linear`` optionally supplies exp(g)
+    (computed with g), which skips the exp here; ``g`` may then be None.
     """
     # FlashInfer is imported lazily so importing this module on a non-FlashInfer
     # build does not error until the function is actually called.
@@ -97,7 +99,8 @@ def chunk_gated_delta_rule(
         f"num_q_heads ({q.shape[2]}) must equal num_k_heads ({k.shape[2]})"
     )
     assert q.dtype in (torch.bfloat16, torch.float16), f"q dtype must be bf16/fp16, got {q.dtype}"
-    assert g.dtype == torch.float32, f"g must be fp32, got {g.dtype}"
+    assert g is not None or g_linear is not None, "g or g_linear is required"
+    assert g is None or g.dtype == torch.float32, f"g must be fp32, got {g.dtype}"
     assert cu_seqlens is not None, "cu_seqlens is required (varlen mode)"
     assert initial_state is not None, "initial_state is required"
     if inplace_indexed_state_update:
@@ -117,7 +120,21 @@ def chunk_gated_delta_rule(
     # SSM state by ``g`` directly each chunk; passing log-space values produces
     # NaN. ``torch.exp`` always returns a fresh contiguous tensor, so no
     # explicit .contiguous() is needed.
-    g2 = torch.exp(g.squeeze(0))
+    if g_linear is not None:
+        # exp(g) from the caller: the GDN gates kernel writes it next to g, bit-identical to torch.exp(g).
+        shape = tuple(g.shape) if g is not None else tuple(beta.shape)
+        if not (
+            tuple(g_linear.shape) == shape
+            and g_linear.dtype == torch.float32
+            and g_linear.is_contiguous()
+        ):
+            raise ValueError(
+                f"g_linear must be a contiguous fp32 tensor of shape {shape}, got "
+                f"{g_linear.dtype} {tuple(g_linear.shape)}"
+            )
+        g2 = g_linear.squeeze(0)
+    else:
+        g2 = torch.exp(g.squeeze(0))
     # ``.to(torch.float32)`` allocates a fresh contiguous fp32 tensor when the
     # source is bf16 (the common case), or returns the (already contiguous)
     # input view when beta is already fp32 — no .contiguous() needed.
@@ -166,7 +183,15 @@ def chunk_gated_delta_rule(
         else q3.new_empty(total_seq_len, num_o_heads, head_size)
     )
     final_to_return: Optional[torch.Tensor] = None
-    if output_final_state and not inplace_indexed_state_update:
+    # Without a workspace the batch is one group, and FlashInfer writes the final state into this call's own buffer:
+    # when that buffer is already in the pool dtype it is returned as is (the cast-scatter would be a plain copy).
+    hand_over_final = (
+        output_final_state
+        and not inplace_indexed_state_update
+        and state_workspace is None
+        and state_dtype == initial_state.dtype
+    )
+    if output_final_state and not inplace_indexed_state_update and not hand_over_final:
         final_to_return = initial_state.new_empty(num_seqs, *initial_state.shape[1:])
 
     # Sequences are independent, so a batch larger than the workspace runs in
@@ -200,12 +225,23 @@ def chunk_gated_delta_rule(
 
         # --- Step 5: gather initial state (+ cast dtype only when required)
         # Fuse gather (+ optional cast) and contiguous into a single Triton kernel.
-        gathered_init = gather_cast_vk_to_fp32_vk(
-            group_state,
-            group_indices,
-            out_dtype=state_dtype,
-            output=state_workspace[0][:group_seqs] if state_workspace is not None else None,
-        )
+        if (
+            group_indices is None
+            and state_workspace is None
+            and group_state.dtype == state_dtype
+            and group_state.is_contiguous()
+            and group_state.shape[0] == group_seqs
+        ):
+            # Already packed [num_seqs, H, V, K] in the kernel's I/O dtype (the in-forward snapshot split gathers
+            # its rows itself): FlashInfer only reads it, so the gather would be a plain copy.
+            gathered_init = group_state
+        else:
+            gathered_init = gather_cast_vk_to_fp32_vk(
+                group_state,
+                group_indices,
+                out_dtype=state_dtype,
+                output=state_workspace[0][:group_seqs] if state_workspace is not None else None,
+            )
 
         # --- Step 6: call FlashInfer with pre-allocated output/state buffers
         # A q/k/v/output token row is heads x head_size (128) 16-bit values, a multiple
@@ -245,6 +281,8 @@ def chunk_gated_delta_rule(
         # slots named by ``initial_state_indices`` and leaves the rest untouched.
         if inplace_indexed_state_update:
             cast_scatter_fp32_vk_to_vk(out_state, group_state, group_indices)
+        elif hand_over_final:
+            final_to_return = out_state
         elif output_final_state:
             cast_scatter_fp32_vk_to_vk(out_state, final_to_return[seq_lo:seq_hi], None)
 

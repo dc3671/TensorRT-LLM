@@ -46,7 +46,7 @@ from ...utils import (
 from ..linear import FP8QDQLinearMethod, FP8RowwiseLinearMethod, Linear, TensorParallelMode
 from ..low_m_gemm import low_m_gemm_dispatcher
 from ..low_m_mma_gemm import conv_supported, low_m_mma_gemm, warp_mma_supported
-from ..multi_stream_utils import maybe_execute_in_parallel_deferred_join
+from ..multi_stream_utils import maybe_execute_in_parallel, maybe_execute_in_parallel_deferred_join
 from ..rms_norm_fp8_per_token import (
     rms_norm_gated_fp8_per_token,
     rms_norm_gated_fp8_per_token_eligible,
@@ -57,6 +57,19 @@ from .fuse_elementwise_ops import (
     extract_transpose_prefill_slice,
     fused_gdn_post_conv,
     pack_gdn_decode_qkv,
+)
+from .gdn_inforward_split import (
+    gather_tail_tokens,
+    scatter_tail,
+    split_conv_states,
+    split_conv_states_ok,
+    split_core_ok,
+    split_state_rows,
+)
+from .gdn_prefill_conv import (
+    gdn_prefill_conv_eligible,
+    gdn_prefill_conv_post,
+    gdn_prefill_conv_supported,
 )
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import rms_norm_gated_token_major
@@ -158,6 +171,8 @@ def _inforward_split_prefill_core(
     split: InforwardSnapshotSplit,
     stage_ssm: torch.Tensor,
     output: Optional[torch.Tensor],
+    alpha: Optional[torch.Tensor] = None,
+    fused_copies: bool = False,
 ) -> torch.Tensor:
     """Chunked GDN prefill of a context-only batch with in-forward Mamba snapshots.
 
@@ -174,7 +189,10 @@ def _inforward_split_prefill_core(
         split: This step's split (``Mamba2Metadata.inforward_split``).
         stage_ssm: The layer's SSM staging rows, ``[rows, H, V, K]``.
         output: Optional preallocated output.
+        alpha: Optional exp(g) for FlashInfer (``g_linear``); the tails then gather it instead of g.
+        fused_copies: Run the state / token copies as the bit-identical Triton launches of gdn_inforward_split.py.
     """
+    lin = {"g_linear": alpha} if alpha is not None else {}
     initial = ssm_states.index_select(0, split.gather)
     core_out, final = chunk_gated_delta_rule(
         q=query,
@@ -188,24 +206,44 @@ def _inforward_split_prefill_core(
         head_first=False,
         use_qk_l2norm_in_kernel=False,
         output=output,
+        **lin,
     )
     final = final.to(ssm_states.dtype)
-    ssm_states.index_copy_(0, split.live, final.index_select(0, split.main_rows))
     tail = split.tail_tok
+    gate = g if alpha is None else alpha
+    fused = fused_copies and split_core_ok(
+        query, key, value, g, beta, final, ssm_states, stage_ssm, core_out
+    )
+    if fused:
+        tail_initial = split_state_rows(final, ssm_states, split)
+        tail_q, tail_k, tail_v, tail_g, tail_beta = gather_tail_tokens(
+            query, key, value, gate, beta, split
+        )
+    else:
+        ssm_states.index_copy_(0, split.live, final.index_select(0, split.main_rows))
+        tail_q, tail_k, tail_v, tail_g, tail_beta = (
+            x.index_select(1, tail) for x in (query, key, value, gate, beta)
+        )
+        tail_initial = final.index_select(0, split.split_rows)
+    # The tails gather alpha in place of g: FlashInfer takes only exp(g).
     tail_out, tail_final = chunk_gated_delta_rule(
-        q=query.index_select(1, tail),
-        k=key.index_select(1, tail),
-        v=value.index_select(1, tail),
-        g=g.index_select(1, tail),
-        beta=beta.index_select(1, tail),
-        initial_state=final.index_select(0, split.split_rows),
+        q=tail_q,
+        k=tail_k,
+        v=tail_v,
+        g=None if alpha is not None else tail_g,
+        beta=tail_beta,
+        initial_state=tail_initial,
         output_final_state=True,
         cu_seqlens=split.cu_tail,
         head_first=False,
         use_qk_l2norm_in_kernel=False,
+        **({"g_linear": tail_g} if alpha is not None else {}),
     )
-    stage_ssm.index_copy_(0, split.stage_rows, tail_final.to(stage_ssm.dtype))
-    core_out[0].index_copy_(0, tail, tail_out[0].to(core_out.dtype))
+    tail_final = tail_final.to(stage_ssm.dtype)
+    tail_out = tail_out.to(core_out.dtype)
+    if not (fused and scatter_tail(tail_final, stage_ssm, tail_out, core_out, split)):
+        stage_ssm.index_copy_(0, split.stage_rows, tail_final)
+        core_out[0].index_copy_(0, tail, tail_out[0])
     return core_out
 
 
@@ -396,7 +434,35 @@ def _verify_intermediate_state_indices(
     return indices[:num_decodes]
 
 
+def _verify_conv_launch(num_decodes: int, conv_dim: int) -> tuple[Optional[int], Optional[int]]:
+    """(BLOCK_N, num_warps) of the verify step's conv1d update, or (None, None) for the kernel's default (128, 4).
+
+    Every launch shape computes the same values; steps of many requests take 64-channel programs, whose serial
+    store chains are half as long.
+    """
+    programs = num_decodes * triton.cdiv(conv_dim, 128)
+    if num_decodes >= 24 and programs <= 1024:
+        return 64, 4
+    if num_decodes >= 12 and programs <= 1024:
+        return 64, 2
+    return None, None
+
+
 class Qwen3NextGatedDeltaNet(nn.Module):
+    # Context-only prefill runs gdn_prefill_conv_post (conv1d + post-conv in one pass over the token-major in_proj
+    # output); not bitwise to the stock kernels in the FP32 order of the q / k L2 norms.
+    fused_prefill_conv: bool = False
+    # The in-forward snapshot split runs its state / token copies as bit-identical Triton launches.
+    fused_split_copies: bool = False
+    # Row gates of the verify step's resident-weight in_proj_qkvz and split-K in_proj_ba (0: never).
+    resident_min_rows: int = 0
+    resident_ba_min_rows: int = 0
+    # Row gate of the verify replay + gated norm on the tcgen05 kernel (0: never), and its draft rows per request.
+    verify_tcgen05_min_rows: int = 0
+    verify_tcgen05_tokens: int = 0
+    # A verify step with an E4M3 input runs in_proj through the gated norm as one launch (qwen3_5_gdn_verify_chain).
+    verify_chain: bool = False
+
     def __init__(
         self,
         model_config: ModelConfig[Qwen3NextConfig],
@@ -404,11 +470,27 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         layer_idx: Optional[int] = None,
         *,
         fused_verify: bool = False,
+        resident_min_rows: int = 0,
+        resident_ba_min_rows: int = 0,
+        verify_tcgen05_min_rows: int = 0,
+        verify_chain: bool = False,
+        fused_prefill: bool = False,
     ):
         """Gated DeltaNet mixer.
 
         Args:
             fused_verify: Verify MTP drafts with the fused target-verify kernels where the layer's shapes allow it.
+            resident_min_rows: From this many rows (0: never), a verify step with an E4M3 input runs in_proj_qkvz
+                on the resident-weight FP8 GEMM with the conv1d update in its epilogue. The caller keeps it above
+                the rows the low-M race takes for in_proj_qkvz.
+            resident_ba_min_rows: From this many rows (0: never), that step's in_proj_ba runs the split-K replica
+                of cuBLAS with its weights loaded before the PDL wait.
+            verify_tcgen05_min_rows: From this many rows (0: never), a fused verify step that writes the E4M3
+                out_proj input runs the replay + gated RMSNorm on the tcgen05 kernel (gdn_verify_tcgen05).
+            verify_chain: A fused verify step with an E4M3 input runs in_proj_qkvz, in_proj_ba, the conv1d update,
+                the replay and the gated RMSNorm in one launch (qwen3_5_gdn_verify_chain) where it takes the step.
+            fused_prefill: Run context-only prefill on the fused conv1d + post-conv kernel and the in-forward
+                snapshot split's copies on the fused copy kernels, where the layer's shapes allow it.
         """
         super().__init__()
         config = model_config.pretrained_config
@@ -573,6 +655,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.aux_stream = aux_stream
         self._out_proj_fp8_per_token = False
 
+        self.resident_min_rows = resident_min_rows
+        self.resident_ba_min_rows = resident_ba_min_rows
         self.fused_verify = (
             fused_verify
             and self.head_k_dim == 128
@@ -585,6 +669,35 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # The verify in_proj always runs the warp-MMA GEMM with the conv1d update in its epilogue: its low-M race
         # takes only the tactics that epilogue supports (no split-K), instead of the separate conv1d kernel.
         self.fuse_conv1d_into_in_proj = self.fused_verify and warp_mma_supported()
+        if (
+            self.fused_verify
+            and verify_tcgen05_min_rows > 0
+            and model_config.spec_config is not None
+        ):
+            from ...kernels.blackwell import gdn_verify_tcgen05 as tcgen05
+
+            tokens = model_config.spec_config.tokens_per_gen_step
+            hv, hk = self.num_v_heads_per_tp, self.num_k_heads_per_tp
+            if tcgen05.gdn_verify_tcgen05_supported(tokens, hv, hk, fp8_out=True):
+                # Compiled here: never inside a warm-up step or a CUDA-graph capture.
+                tcgen05.compile_gdn_verify_tcgen05(tokens, hv, hk)
+                self.verify_tcgen05_min_rows = verify_tcgen05_min_rows
+                self.verify_tcgen05_tokens = tokens
+        if self.fused_verify and verify_chain:
+            from ...kernels.blackwell import qwen3_5_gdn_verify_chain as chain
+
+            # Its launch tickets and hand-off buffer exist before any CUDA-graph capture.
+            chain.prepare_qwen3_5_gdn_verify_chain(torch.cuda.current_device())
+            self.verify_chain = True
+        self.fused_split_copies = fused_prefill
+        self.fused_prefill_conv = fused_prefill and gdn_prefill_conv_supported(
+            self.head_k_dim,
+            self.head_v_dim,
+            self.conv_kernel_size,
+            self.activation,
+            self.conv_dim_per_tp,
+            self.num_k_heads_per_tp,
+        )
 
     def cache_derived_state(self) -> None:
         """Attach downstream static quantization state after loading weights."""
@@ -620,6 +733,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         dispatcher = low_m_gemm_dispatcher(qkvz)
         if (
             dispatcher is None
+            or not dispatcher.takes_rows(qkvz, hidden_states.shape[0])
             or not isinstance(qkvz.quant_method, FP8QDQLinearMethod)
             or qkvz.bias is not None
             or ba.bias is not None
@@ -706,16 +820,28 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             def _compute_projected_states_ba():
                 return self.in_proj_ba(hidden_states_ba)
 
-            projected_states_qkvz, projected_states_ba, ba_ready = (
-                maybe_execute_in_parallel_deferred_join(
-                    _compute_projected_states_qkvz,
+            if h_fp8 is not None and self.mapping.enable_attention_dp:
+                # No quant launch precedes in_proj_qkvz after the post-MoE fold, so in_proj_ba goes first on this
+                # stream and in_proj_qkvz on the aux stream; otherwise in_proj_qkvz would take the SMs ahead of it.
+                projected_states_ba, projected_states_qkvz = maybe_execute_in_parallel(
                     _compute_projected_states_ba,
+                    _compute_projected_states_qkvz,
                     self.event_dict[EventType.Main],
                     self.event_dict[EventType.Attention],
                     self.aux_stream,
                     disable_on_compile=True,
                 )
-            )
+            else:
+                projected_states_qkvz, projected_states_ba, ba_ready = (
+                    maybe_execute_in_parallel_deferred_join(
+                        _compute_projected_states_qkvz,
+                        _compute_projected_states_ba,
+                        self.event_dict[EventType.Main],
+                        self.event_dict[EventType.Attention],
+                        self.aux_stream,
+                        disable_on_compile=True,
+                    )
+                )
 
         # The weight mapper reorders in_proj rows into the dense per-rank
         # layouts [Q|K|V|Z] and [b|a] (see grouped_to_dense_in_proj_qkvz_perm),
@@ -831,7 +957,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         """Replay + gated RMSNorm (+ FP8) of convolved q|k|v rows; returns the out_proj input."""
         layer_cache = plan.layer_cache
-        return torch.ops.trtllm.gdn_verify(
+        verify = torch.ops.trtllm.gdn_verify
+        if (
+            0 < self.verify_tcgen05_min_rows <= mixed_qkv.shape[0]
+            and plan.draft_token_num == self.verify_tcgen05_tokens
+            and self.norm.fp8_scale is not None
+        ):
+            from ...kernels.blackwell.gdn_verify_tcgen05 import gdn_verify_tcgen05 as verify
+        return verify(
             mixed_qkv,
             z,
             a,
@@ -889,6 +1022,154 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         a = out_ba[:, self.num_v_heads_per_tp :]
         return self._fused_verify_replay_norm(plan, mixed_qkv, z, a, b)
 
+    def _verify_chain(
+        self,
+        hidden_states: torch.Tensor,
+        h_fp8: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        spec_metadata: Optional[SpecMetadata],
+    ) -> Optional[torch.Tensor]:
+        """The whole decode-only MTP target-verify chain (in_proj_qkvz, in_proj_ba, conv1d update, replay, gated
+        RMSNorm, E4M3 out_proj input) in one launch, or None when the step, the shapes or the caches do not
+        qualify."""
+        if h_fp8 is None or is_torch_compiling():
+            return None
+        qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
+        if not isinstance(qkvz.quant_method, FP8QDQLinearMethod):
+            return None
+        plan = self._fused_verify_plan(attn_metadata, spec_metadata, hidden_states.shape[0])
+        if plan is None:
+            return None
+        from ...kernels.blackwell import qwen3_5_gdn_verify_chain as chain
+
+        layer_cache = plan.layer_cache
+        args = (
+            h_fp8,
+            hidden_states,
+            qkvz.quant_method.get_static_input_scale(qkvz),
+            qkvz.weight,
+            qkvz.weight_scale,
+            ba.weight,
+            plan.conv_weight,
+            layer_cache.conv,
+            layer_cache.intermediate_conv_window,
+            self.A_log,
+            self.dt_bias,
+            self.norm.weight,
+            self.norm.fp8_scale,
+        )
+        caches = (
+            layer_cache.temporal,
+            plan.state_indices,
+            layer_cache.old_x,
+            layer_cache.old_B,
+            layer_cache.old_dt,
+            layer_cache.cache_buf_idx,
+            layer_cache.prev_num_accepted_tokens,
+        )
+        if not chain.qwen3_5_gdn_verify_chain_supported(
+            *args,
+            *caches,
+            plan.draft_token_num,
+            qkvz_bias=qkvz.bias,
+            ba_bias=ba.bias,
+            conv_bias=self.conv1d.bias,
+        ):
+            return None
+        y = torch.empty(
+            (hidden_states.shape[0], self.value_dim_per_tp),
+            dtype=torch.float8_e4m3fn,
+            device=h_fp8.device,
+        )
+        return chain.qwen3_5_gdn_verify_chain(*args, self.norm.eps, *caches, 1, y)
+
+    def _resident_verify_inproj(
+        self,
+        hidden_states: torch.Tensor,
+        h_fp8: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        spec_metadata: Optional[SpecMetadata],
+    ) -> Optional[torch.Tensor]:
+        """in_proj_qkvz on the resident-weight FP8 GEMM with the conv1d update in its epilogue (convolved q|k|v,
+        intermediate windows and conv state written by the GEMM), in_proj_ba on the aux stream, then the fused replay
+        + gated RMSNorm: the out_proj input of a decode-only MTP target-verify step of at least
+        ``resident_min_rows`` rows, or None when the step, the shapes or the caches do not qualify."""
+        if (
+            not self.resident_min_rows
+            or h_fp8 is None
+            or is_torch_compiling()
+            or hidden_states.shape[0] < self.resident_min_rows
+        ):
+            return None
+        qkvz = self.in_proj_qkvz
+        if (
+            not isinstance(qkvz.quant_method, FP8QDQLinearMethod)
+            or qkvz.bias is not None
+            or h_fp8.dtype != torch.float8_e4m3fn
+            or h_fp8.dim() != 2
+            or not h_fp8.is_contiguous()
+            or qkvz.weight.dtype != torch.float8_e4m3fn
+        ):
+            return None
+        plan = self._fused_verify_plan(attn_metadata, spec_metadata, hidden_states.shape[0])
+        if plan is None:
+            return None
+        from ...kernels.blackwell import resident_fp8_gemm as resident
+
+        layer_cache = plan.layer_cache
+        conv = resident.ConvUpdate(
+            weight=plan.conv_weight,
+            state=layer_cache.conv,
+            slots=plan.state_indices,
+            windows=layer_cache.intermediate_conv_window,
+            tokens=plan.draft_token_num,
+        )
+        weight = qkvz.weight
+        if plan.conv_weight.shape[0] != self.conv_dim_per_tp or not resident.supports_conv(
+            h_fp8, weight, conv
+        ):
+            return None
+        input_scale = qkvz.quant_method.get_static_input_scale(qkvz)
+        if input_scale is None:
+            return None
+
+        def _qkvz():
+            return resident.resident_fp8_gemm(
+                h_fp8, weight, input_scale, qkvz.weight_scale, conv=conv
+            )
+
+        ba = self.in_proj_ba
+        ba_replica = None
+        if 0 < self.resident_ba_min_rows <= hidden_states.shape[0] and ba.bias is None:
+            from ...kernels.blackwell import inproj_ba_splitk
+
+            if inproj_ba_splitk.supports(hidden_states, ba.weight):
+                ba_replica = inproj_ba_splitk.ba_splitk
+
+        def _ba():
+            if ba_replica is not None:
+                return ba_replica(hidden_states, ba.weight)
+            return ba(hidden_states)
+
+        out_qkvz, out_ba, ba_ready = maybe_execute_in_parallel_deferred_join(
+            _qkvz,
+            _ba,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.Attention],
+            self.aux_stream,
+            disable_on_compile=True,
+        )
+        num_tokens = out_qkvz.shape[0]
+        mixed_qkv = out_qkvz[:, : self.conv_dim_per_tp]
+        z = out_qkvz[:, self.conv_dim_per_tp :].view(
+            num_tokens, self.num_v_heads_per_tp, self.head_v_dim
+        )
+        b = out_ba[:, : self.num_v_heads_per_tp]
+        a = out_ba[:, self.num_v_heads_per_tp :]
+        if ba_ready is not None:
+            ba_ready.wait()
+        return self._fused_verify_replay_norm(plan, mixed_qkv, z, a, b)
+
     def _fused_verify(
         self,
         mixed_qkv: torch.Tensor,
@@ -908,6 +1189,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         draft_token_num = plan.draft_token_num
         layer_cache = plan.layer_cache
         # As forward_decode's replay branch: PDL chain conv1d -> fused replay.
+        block_n, num_warps = _verify_conv_launch(num_decodes, mixed_qkv.shape[-1])
         conv_out = causal_conv1d_update_triton(
             mixed_qkv.reshape(num_decodes, draft_token_num, -1).transpose(1, 2),
             layer_cache.conv,
@@ -922,6 +1204,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             launch_dependent_kernels=True,
             launch_with_pdl_wait=True,
             hoist_x=True,
+            _block_n=block_n,
+            _num_warps=num_warps,
         )
         mixed_qkv = conv_out.transpose(1, 2).reshape(num_decodes * draft_token_num, -1)
         if ba_ready is not None:
@@ -1290,11 +1574,32 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         inforward_split = kwargs.get("inforward_split")
 
         conv_states_to_use = conv_states
+        # Context-only batches may take the fused prefill conv, which leaves mixed_qkv untouched.
+        fused_conv = (
+            num_decode_tokens == 0
+            and self.fused_prefill_conv
+            and gdn_prefill_conv_eligible(
+                mixed_qkv,
+                self.conv1d.weight,
+                conv_states_to_use,
+                query_start_loc,
+                cache_indices,
+                has_initial_states,
+            )
+        )
+        inforward_window = None
+        # exp(g) for FlashInfer's chunked kernel, written by the fused prefill conv's gates kernel.
+        alpha = None
         if inforward_split is not None:
             if num_decode_tokens > 0 or is_target_verify:
                 raise RuntimeError("In-forward Mamba snapshots need a context-only batch")
-            # The convolution state at P: the d_conv - 1 raw inputs before P.
-            inforward_window = mixed_qkv.index_select(0, inforward_split.conv_win)
+            if not (
+                fused_conv
+                and self.fused_split_copies
+                and split_conv_states_ok(conv_states, mixed_qkv, kwargs["inforward_stage"][1])
+            ):
+                # The convolution state at P: the d_conv - 1 raw inputs before P.
+                inforward_window = mixed_qkv.index_select(0, inforward_split.conv_win)
 
         seqlen_split_size = [num_prefill_tokens, num_decode_tokens]
         if num_decode_tokens > 0:
@@ -1404,6 +1709,42 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     self.num_v_heads_per_tp,
                     self.head_v_dim,
                 )
+        elif fused_conv:
+            if _use_flashinfer_gdn_prefill():
+                alpha = torch.empty(
+                    (1, mixed_qkv.shape[0], self.num_v_heads_per_tp),
+                    dtype=torch.float32,
+                    device=mixed_qkv.device,
+                )
+            query, key, value, g, beta = gdn_prefill_conv_post(
+                mixed_qkv,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                conv_states_to_use,
+                query_start_loc,
+                cache_indices,
+                has_initial_states,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                self.num_k_heads_per_tp,
+                self.head_k_dim,
+                self.num_v_heads_per_tp,
+                self.head_v_dim,
+                activation=self.activation,
+                alpha_out=alpha,
+            )
+            if inforward_split is not None:
+                if inforward_window is None:
+                    # One launch: stage the live states, then load the window at P straight from mixed_qkv.
+                    split_conv_states(
+                        conv_states, mixed_qkv, inforward_split, kwargs["inforward_stage"][1]
+                    )
+                else:
+                    _inforward_split_conv_states(
+                        conv_states, inforward_window, inforward_split, kwargs["inforward_stage"][1]
+                    )
         else:
             mixed_qkv_t = extract_transpose_prefill_slice(
                 mixed_qkv,
@@ -1575,6 +1916,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 inforward_split,
                 kwargs["inforward_stage"][0],
                 output,
+                alpha,
+                fused_copies=self.fused_split_copies,
             )
 
         core_attn_out, _ = chunk_gated_delta_rule(
@@ -1599,6 +1942,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             else output,
             state_workspace=state_workspace,
             cu_seqlens_cpu=cu_seqlens_cpu,
+            **({"g_linear": alpha} if alpha is not None else {}),
         )
 
         if split_decode:
@@ -1654,7 +1998,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         h_fp8: Optional[torch.Tensor] = None,
     ):
-        fused = self._fused_verify_inproj(hidden_states, h_fp8, attn_metadata, spec_metadata)
+        fused = None
+        if self.verify_chain:
+            fused = self._verify_chain(hidden_states, h_fp8, attn_metadata, spec_metadata)
+        if fused is None:
+            fused = self._fused_verify_inproj(hidden_states, h_fp8, attn_metadata, spec_metadata)
+        if fused is None:
+            fused = self._resident_verify_inproj(hidden_states, h_fp8, attn_metadata, spec_metadata)
         if fused is not None:
             return self.out_proj(fused, all_reduce_params=all_reduce_params)
 

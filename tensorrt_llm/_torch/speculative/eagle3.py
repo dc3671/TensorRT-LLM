@@ -25,6 +25,8 @@ from ..pyexecutor.scheduler import ScheduledRequests
 from .fused_accept import step0_epilogue
 from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
                         SpecWorkerBase, supports_sharded_target_sampling)
+from .kept_rows import (DraftKeptRows, generation_only_on_every_rank,
+                        kept_row_ids)
 from .mtp import _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
@@ -456,6 +458,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     ``eagle3_dynamic_tree.py``.
     """
 
+    # Declared by the MTP draft model (set_draft_model): pass 0 takes the kept
+    # rows; the recurrent-state promotion runs beside the draft loop.
+    _draft_takes_kept_rows: bool = False
+    _promotion_stream: Optional[torch.cuda.Stream] = None
+    _promotion_done: Optional[torch.cuda.Event] = None
+
     def __init__(self,
                  spec_config: "EagleDecodingConfig",
                  mapping: Optional[Mapping] = None,
@@ -472,6 +480,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # model_config is required for MTP Eagle TP / ADP / Mamba support; the
         # Eagle3 path can leave it as None.
         self.model_config = model_config
+        self.fused_sample_accept = (model_config is not None
+                                    and model_config.extra_attrs.get(
+                                        "spec_fused_sample_accept", False)
+                                    and key_exchange is not None
+                                    and key_exchange.fast_gumbel)
 
         # Mode flag: True = MTP Eagle one-model, False = Eagle3 one-model.
         self.is_mtp_eagle = spec_config.spec_dec_mode.is_mtp_eagle_one_model()
@@ -512,6 +525,13 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self._draft_folds_kv_lens_increment = (
             self.is_mtp_eagle and isinstance(draft_model, MTPForCausalLM)
             and draft_model.folds_kv_lens_increment)
+        self._draft_takes_kept_rows = (self.is_mtp_eagle and isinstance(
+            draft_model, MTPForCausalLM) and draft_model.takes_kept_rows)
+        if (self.is_mtp_eagle and isinstance(draft_model, MTPForCausalLM)
+                and draft_model.promotes_target_state_beside
+                and not self._uses_external_shared_target_kv):
+            self._promotion_stream = torch.cuda.Stream()
+            self._promotion_done = torch.cuda.Event()
 
     @property
     def max_draft_len(self) -> int:
@@ -631,7 +651,18 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if self._is_mamba_hybrid_cache is None:
             self._is_mamba_hybrid_cache = isinstance(
                 attn_metadata.kv_cache_manager, MambaHybridCacheManager)
-        if num_gens > 0 and self._is_mamba_hybrid_cache:
+        promoting = num_gens > 0 and self._is_mamba_hybrid_cache
+        if promoting and self._promotion_stream is not None:
+            # Beside the draft loop, which reads no target recurrent state; its
+            # inputs are not written before the join after the loop.
+            self._promotion_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._promotion_stream):
+                attn_metadata.kv_cache_manager.update_mamba_states(
+                    attn_metadata=attn_metadata,
+                    num_accepted_tokens=num_accepted_tokens,
+                    state_indices=attn_metadata.mamba_metadata.state_indices)
+                self._promotion_done.record()
+        elif promoting:
             attn_metadata.kv_cache_manager.update_mamba_states(
                 attn_metadata=attn_metadata,
                 num_accepted_tokens=num_accepted_tokens,
@@ -700,6 +731,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             # restore all_rank_num_tokens for attention DP
             if original_all_rank_num_tokens is not None:
                 attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+        if promoting and self._promotion_stream is not None:
+            torch.cuda.current_stream().wait_event(self._promotion_done)
 
         # prepare next new tokens to support overlap scheduler; the draft loop
         # may have built them already as a view of its token buffer.
@@ -910,8 +943,34 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # passes ``all_rank_num_tokens`` as a kwarg so the draft model
                 # handles save/restore internally (Eagle3DraftModel.forward
                 # uses try/finally); attn_metadata is left untouched here.
-                hidden_states, hidden_states_to_save = self._run_draft_forward(
-                    draft_model, inputs, spec_metadata, i)
+                kept_rows = None
+                kept_counts = spec_metadata.all_rank_num_seqs
+                if (i == 0 and self._draft_takes_kept_rows
+                        and self.guided_decoder is None
+                        and generation_only_on_every_rank(
+                            num_contexts, kept_counts,
+                            spec_metadata.all_rank_num_gens)):
+                    # Pass 0 of a step that is generation-only on every rank
+                    # computes past attention only the rows this loop keeps
+                    # (under attention DP, its MoE on every rank's kept-row
+                    # count); with TP attention and the step-0 epilogue they
+                    # come back compact.
+                    kept_rows = DraftKeptRows(
+                        kept_row_ids(step0_seq_lens,
+                                     spec_metadata.batch_indices_cuda,
+                                     num_accepted_tokens, num_contexts,
+                                     num_gens, runtime_draft_len,
+                                     attn_metadata.num_ctx_tokens),
+                        kept_counts,
+                        compact=kept_counts is None and use_epilogue
+                        and not spec_metadata.is_layer_capture(0))
+                    inputs["kept_rows"] = kept_rows
+                try:
+                    hidden_states, hidden_states_to_save = self._run_draft_forward(
+                        draft_model, inputs, spec_metadata, i)
+                finally:
+                    inputs.pop("kept_rows", None)
+                compact = kept_rows is not None and kept_rows.compact
 
                 # Compute gather_ids: on the first draft step each generation
                 # request may have accepted multiple tokens, so we index into
@@ -935,7 +994,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                            accepted_tokens=accepted_tokens if
                                            token_buffer is not None else None,
                                            last_out=token_buffer[0] if
-                                           token_buffer is not None else None)
+                                           token_buffer is not None else None,
+                                           hidden_compact=compact)
                     if step0 is None:
                         token_buffer = None  # needs the epilogue's row 0
                 if i == 0 and step0 is not None:
@@ -957,6 +1017,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # step and the draft input on the next.
                 if i == 0 and step0 is not None:
                     request_hidden_states = step0.hidden
+                elif compact:
+                    request_hidden_states = hidden_states
                 elif self.is_mtp_eagle:
                     request_hidden_states = hidden_states[gather_ids]
                 else:
@@ -1093,15 +1155,22 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         mapping_lm_head_tp = getattr(
                             draft_model.mtp_layers[0].shared_head,
                             "mapping_lm_head_tp", None)
+                    # Fast paths: the sampler writes the tokens straight into
+                    # the step's token buffer row.
+                    token_row = (token_buffer[i + 1] if
+                                 (self.spec_decode_fast_paths
+                                  and token_buffer is not None
+                                  and not use_lm_head_tp_in_adp) else None)
                     new_draft_token = self.sample_draft_tokens(
                         logits,
                         spec_metadata,
                         batch_size,
                         draft_step=i,
-                        mapping_lm_head_tp=mapping_lm_head_tp)
+                        mapping_lm_head_tp=mapping_lm_head_tp,
+                        out=token_row)
                     if use_lm_head_tp_in_adp:
                         new_draft_token = new_draft_token[:token_count]
-                    if token_buffer is not None:
+                    if token_buffer is not None and token_row is None:
                         token_buffer[i + 1].copy_(new_draft_token)
                     next_draft_tokens.append(new_draft_token)
 
@@ -1397,8 +1466,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         input_ids_gen = accepted_tokens[
             num_contexts:, :spec_metadata.runtime_draft_len + 1].flatten()
 
-        # get draft inputs
-        input_ids = torch.concat([input_ids_ctx, input_ids_gen], dim=0)
+        # get draft inputs; a generation-only batch reads the accepted tokens
+        # in place where the model declares it (the loop never writes them).
+        if self.fused_sample_accept and input_ids_ctx.numel() == 0:
+            input_ids = input_ids_gen
+        else:
+            input_ids = torch.concat([input_ids_ctx, input_ids_gen], dim=0)
 
         return {
             "input_ids": input_ids,

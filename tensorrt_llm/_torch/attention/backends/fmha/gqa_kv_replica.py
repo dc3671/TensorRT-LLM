@@ -32,8 +32,14 @@ from ....modules.fla.op import gdc_wait_with_memory_clobber
 from .gqa_kv_replica_fused import KvReplicaFusedState, kv_replica_fused_partial
 from .gqa_segmented_decode import draft_block, seg_geometry, segment_attention
 
-# Channels of the KV group's exchange: 0 carries the q all-gather, 1 the all-to-all + merge.
-EXCHANGE_CHANNELS = 2
+# Channels of the KV group's exchange: 0 carries the q all-gather, 1 the all-to-all + merge, 2 the q all-gather inside
+# the RoPE / FP8 kernel (fused_qkv_rope_gate_fp8_append_gather), which runs only with PDL.
+ROPE_GATHER_CHANNEL = 2
+
+
+def exchange_channels(enable_pdl: bool) -> int:
+    """Channels of the KV group's exchange (the RoPE kernel's channel only with PDL)."""
+    return ROPE_GATHER_CHANNEL + 1 if enable_pdl else ROPE_GATHER_CHANNEL
 
 
 @triton.jit
@@ -491,20 +497,33 @@ def kv_replica_fused_decode(
     fused_state: KvReplicaFusedState,
     enable_pdl: bool,
     gate: Optional[torch.Tensor] = None,
+    q_gathered: Optional[torch.Tensor] = None,
+    out_fp8: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
 ) -> None:
     """KV-replica split generation attention of this rank's heads, partials from the fused kernel
-    (gqa_kv_replica_fused.py).
+    (gqa_kv_replica_fused.py). With out_fp8 [b * q_len, Hq_local, D] E4M3 and out_scale (the consumer's static
+    input scale), the merge writes the (gated) result there as the consumer's own static quant would and leaves
+    out unwritten (TPGroupExchange.alltoall_merge).
 
     exchange: TPGroupExchange (distributed/ll_exchange.py) whose groups are the KV groups (member = CP rank);
     channel 0 carries the q all-gather, channel 1 the all-to-all + LSE merge (+ gate) of the per-destination
     (O, LSE) partials. q [b * q_len, Hq_local, D] (FP8), out [b * q_len, Hq_local, D]; gate optional
     (out * sigmoid(gate)). fused_state: the fused kernel's counters and workspace on this device.
+    q_gathered: the group's q [b * q_len, cp * Hq_local * D] FP8 when the RoPE kernel already all-gathered it
+    (fused_qkv_rope_gate_fp8_append_gather); then no all-gather is launched here.
     """
     cp, cp_rank = exchange.group_size, exchange.grank
     rows, hq, d = q.shape
-    q_all = _allgather_q(exchange, q, enable_pdl)
+    if q_gathered is not None:
+        assert q_gathered.shape == (rows, cp * hq * d) and q_gathered.dtype == q.dtype
+        q_all = q_gathered.view(rows, cp, hq, d).permute(1, 0, 2, 3)
+    else:
+        q_all = _allgather_q(exchange, q, enable_pdl)
     o = torch.empty(cp, rows, hq, d, dtype=out.dtype, device=q.device)
     lse = torch.empty(cp, rows, hq, dtype=torch.float32, device=q.device)
+    # The partial kernel's combine pushes its (O, LSE) rows into the members' merge slots.
+    ll = exchange.merge_push_args(1, rows * hq, d)
     kv_replica_fused_partial(
         q_all,
         kv_pool,
@@ -519,8 +538,21 @@ def kv_replica_fused_decode(
         lse,
         fused_state,
         enable_pdl=enable_pdl,
+        ll=ll,
     )
-    exchange.alltoall_merge(o, lse, out.view(rows, hq, d), gate=gate, channel=1)
+    if out_fp8 is not None:
+        exchange.alltoall_merge(
+            o,
+            lse,
+            None,
+            gate=gate,
+            channel=1,
+            out_fp8=out_fp8.view(rows, hq, d),
+            out_scale=out_scale,
+            pushed=True,
+        )
+    else:
+        exchange.alltoall_merge(o, lse, out.view(rows, hq, d), gate=gate, channel=1, pushed=True)
 
 
 def kv_replica_decode(

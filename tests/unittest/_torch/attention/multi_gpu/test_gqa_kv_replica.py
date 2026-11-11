@@ -49,6 +49,7 @@ pytestmark = [
 
 HQ, D, PAGE = 4, 256, 64
 BMM1, BMM2 = 1.0 / 16, 1.0
+_OUT_SCALE = 0.37
 
 
 def _inputs(lens, q_len, tp, rank):
@@ -85,6 +86,67 @@ def _reference(kv, tables, lens, q, gate, q_len):
     return gated.to(torch.bfloat16)
 
 
+def _decode_all(ex, q, kv, tables, seq, lens, q_len, sms, gate, enable_pdl, workspace, counter):
+    """The outputs of every KV-replica decode path on exchange ``ex``: segmented, fused (BF16) and fused (E4M3, the
+    merge writing o_proj's input), the last two where the fused partial kernel takes the shape."""
+    out = torch.empty(q.shape, dtype=torch.bfloat16, device="cuda")
+    kv_replica_decode(
+        ex,
+        q,
+        kv,
+        tables,
+        seq,
+        max(lens),
+        q_len,
+        2,
+        BMM1,
+        BMM2,
+        workspace,
+        counter,
+        out,
+        enable_pdl,
+        gate=gate,
+    )
+    outs = {"segmented": out}
+    if kv_replica_fused_supported(q_len, ex.group_size, HQ, len(lens), sms):
+        out = torch.empty_like(out)
+        kv_replica_fused_decode(
+            ex,
+            q,
+            kv,
+            tables,
+            seq,
+            q_len,
+            BMM1,
+            BMM2,
+            out,
+            kv_replica_fused_state(q.device, sms, len(seq)),
+            enable_pdl,
+            gate=gate,
+        )
+        outs["fused"] = out
+        out_fp8 = torch.empty(q.shape, dtype=torch.float8_e4m3fn, device="cuda")
+        kv_replica_fused_decode(
+            ex,
+            q,
+            kv,
+            tables,
+            seq,
+            q_len,
+            BMM1,
+            BMM2,
+            torch.empty_like(out),
+            kv_replica_fused_state(q.device, sms, len(seq)),
+            enable_pdl,
+            gate=gate,
+            out_fp8=out_fp8,
+            out_scale=torch.tensor([_OUT_SCALE], dtype=torch.float32, device="cuda"),
+        )
+        outs["fused_fp8"] = out_fp8
+    torch.cuda.synchronize()
+    return outs
+
+
 def _kv_replica(tp):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -100,45 +162,19 @@ def _kv_replica(tp):
         for lens, q_len in (([5000, 70, 1300], 7), ([9000, 64, 130, 4100, 70, 12000], 1)):
             kv, tables, seq, q, gate = _inputs(lens, q_len, tp, rank)
             ref = _reference(kv, tables, lens, q, gate, q_len)
-            fused = kv_replica_fused_supported(q_len, tp, HQ, len(lens), sms)
             for enable_pdl in (False, True):
-                out = torch.empty(q.shape, dtype=torch.bfloat16, device="cuda")
-                kv_replica_decode(
-                    ex,
-                    q,
-                    kv,
-                    tables,
-                    seq,
-                    max(lens),
-                    q_len,
-                    2,
-                    BMM1,
-                    BMM2,
-                    workspace,
-                    counter,
-                    out,
-                    enable_pdl,
-                    gate=gate,
-                )
-                outs = {"segmented": out}
-                if fused:
-                    out = torch.empty_like(out)
-                    kv_replica_fused_decode(
-                        ex,
-                        q,
-                        kv,
-                        tables,
-                        seq,
-                        q_len,
-                        BMM1,
-                        BMM2,
-                        out,
-                        kv_replica_fused_state(q.device, sms, len(seq)),
-                        enable_pdl,
-                        gate=gate,
+                args = (q, kv, tables, seq, lens, q_len, sms, gate, enable_pdl, workspace, counter)
+                outs = _decode_all(ex, *args)
+                if "fused_fp8" in outs:
+                    # The merge writing o_proj's E4M3 input: the bytes of the BF16 result's static quant.
+                    # static_quantize_e4m3_per_tensor: FP32(BF16) x (1 / s), round to nearest.
+                    out_scale = torch.tensor([_OUT_SCALE], dtype=torch.float32, device="cuda")
+                    expected_fp8 = (outs["fused"].float() * (1.0 / out_scale)).to(
+                        torch.float8_e4m3fn
                     )
-                    outs["fused"] = out
-                torch.cuda.synchronize()
+                    assert torch.equal(
+                        outs.pop("fused_fp8").view(torch.uint8), expected_fp8.view(torch.uint8)
+                    ), (lens, q_len, enable_pdl)
                 for name, out in outs.items():
                     # FP8 P / partials: a few percent of the row max per element
                     err = (out.float() - ref.float()).abs().amax(dim=-1)

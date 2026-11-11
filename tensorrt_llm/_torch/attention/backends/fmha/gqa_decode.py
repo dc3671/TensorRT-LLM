@@ -31,22 +31,33 @@ decode kernel for a call whose runtime layout their kernel does not take.
 import functools
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantMode
 
 from . import gqa_kv_replica_fused, gqa_split_kv_decode
-from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha, _get_generation_workspace_layout
-from .gqa_kv_replica import EXCHANGE_CHANNELS, kv_replica_decode, kv_replica_fused_decode
+from .flashinfer_trtllm_gen import (
+    FlashInferTrtllmGenFmha,
+    _get_generation_workspace_layout,
+    trtllm_gen_paged_decode,
+)
+from .gqa_kv_replica import (
+    ROPE_GATHER_CHANNEL,
+    exchange_channels,
+    kv_replica_decode,
+    kv_replica_fused_decode,
+)
 from .gqa_kv_replica_fused import kv_replica_fused_state, kv_replica_fused_supported
 from .gqa_segmented_decode import (
     MAX_FOLDED_ROWS,
+    load_segment_attention_module,
     reserve_segment_attention_workspace,
     segment_attention_softmax_bytes,
     segment_attention_workspace,
@@ -79,6 +90,11 @@ _COUNTER_SLOTS_PER_REQUEST = 128
 # Smallest sizes of the KV-replica exchange: per-pair payload bytes, rows of one all-to-all merge.
 _MIN_EXCHANGE_BYTES = 1 << 20
 _MIN_MERGE_ROWS = 2048
+# trtllm-gen splits each sequence's KV over at most sm_count // (CTAs of one split) CTAs, so a large decode batch
+# streams each sequence on one CTA. Attention-DP decode keeps at least this many splits per sequence.
+_ATTENTION_DP_MIN_KV_SPLITS = 8
+# Largest Q tile of trtllm-gen's generation kernels; a split CTA keeps one tile of partials (FP32 O + softmax stats).
+_MAX_GEN_TILE_ROWS = 128
 
 
 @dataclass(frozen=True)
@@ -132,6 +148,12 @@ class KvAppendPlan:
     # then runs the folded kernel or the prologue, which fills q_fp8, scales and the contiguous gate.
     fold: Optional[FoldInputs] = None
     gate: Optional[torch.Tensor] = None
+    # The KV group's FP8 query [num_tokens, group * num_heads * head_dim], when the prologue all-gathered it
+    # (GqaKvReplicaFusedFmha).
+    q_gathered: Optional[torch.Tensor] = None
+    # The q all-gather arguments of GqaKvReplicaFusedFmha when it takes the call (peer table, epochs, member index,
+    # group size, slot words, PDL); its run_prologue gathers only with a resident grid.
+    rope_gather: Optional[tuple] = None
 
 
 def _kv_replica_exchange_sizes(
@@ -153,10 +175,50 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
     """trtllm-gen for a layer built with a ``GqaDecodeSetup``; base of the dedicated GQA decode libraries."""
 
     supports_deferred_prologue = True
+    # Whether a generation call of this library loaded FlashInfer's trtllm-gen decode module.
+    _decode_module_loaded = False
+    # Minimum KV splits per sequence of a trtllm-gen decode call; 0: FlashInfer's heuristic.
+    _min_kv_splits: int = 0
+    # Largest decode batch of this layer, which sizes the min-KV-split scratch.
+    _min_kv_split_batch: int = 0
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
         self._counter_buffer: Optional[torch.Tensor] = None
+        mapping = attn.gqa_decode.mapping
+        if mapping is not None and mapping.enable_attention_dp:
+            self._min_kv_splits = self._min_kv_splits_for(
+                attn.num_heads, attn.num_kv_heads, attn.gqa_decode.tokens_per_gen_step
+            )
+
+    @staticmethod
+    def _min_kv_splits_for(num_heads: int, num_kv_heads: int, tokens_per_gen_step: int) -> int:
+        """_ATTENTION_DP_MIN_KV_SPLITS when the forced split fits the counter buffer (splits x KV heads <= heads) and
+        one Q tile (group x q_len rows), else 0."""
+        splits = _ATTENTION_DP_MIN_KV_SPLITS
+        rows = num_heads // num_kv_heads * tokens_per_gen_step
+        return splits if splits * num_kv_heads <= num_heads and rows <= _MAX_GEN_TILE_ROWS else 0
+
+    def prepare_workspace(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
+    ) -> None:
+        super().prepare_workspace(q, k, v, metadata, forward_args, workspace)
+        if self._min_kv_splits:
+            self._min_kv_split_batch = max(
+                self._min_kv_split_batch,
+                int(metadata.max_num_sequences or metadata.max_num_requests),
+            )
+        if not self._decode_module_loaded and metadata.num_generations > 0:
+            # On the first generation call (warmup's), which a dedicated kernel may serve: the segmented and
+            # trtllm-gen decodes that need the module may come only with mixed or larger batches.
+            load_segment_attention_module()
+            self._decode_module_loaded = True
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -262,6 +324,20 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
             )
         ):
             return
+        if kv_scale_pool is None and self._run_min_kv_split(
+            params,
+            q,
+            kv_pool,
+            block_tables,
+            max_kv_len,
+            window_left,
+            q_len_per_req,
+            max_q_len,
+            cu_seqlens,
+            bmm1_scale,
+            bmm2_scale,
+        ):
+            return
         super()._run_generation_decode(
             params,
             q,
@@ -291,6 +367,66 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
     ) -> bool:
         """Run this library's kernel on a uniform-q_len generation call with an FP8 query; False: trtllm-gen."""
         return False
+
+    def _run_min_kv_split(
+        self,
+        params: FmhaParams,
+        q: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        max_kv_len: int,
+        window_left: int,
+        q_len_per_req: Optional[int],
+        max_q_len: Optional[int],
+        cu_seqlens: Optional[torch.Tensor],
+        bmm1_scale,
+        bmm2_scale,
+    ) -> bool:
+        """trtllm-gen decode with _min_kv_splits KV splits per sequence where the device's SM count gives fewer: the
+        same kernel launched with the SM count that gives them, and a scratch for their partials. False: the stock
+        call (no minimum, query and KV dtypes differ, or enough SMs)."""
+        splits = self._min_kv_splits
+        if splits == 0 or self._multi_processor_count is None or q.dtype != kv_pool.dtype:
+            return False
+        if q_len_per_req is not None:
+            batch, max_q_len, cu_seqlens = q.size(0) // q_len_per_req, q_len_per_req, None
+        elif cu_seqlens is not None:
+            batch = cu_seqlens.size(0) - 1
+        else:
+            return False
+        attn = self.attn
+        sm_count = splits * attn.num_kv_heads * batch
+        if sm_count <= self._multi_processor_count:
+            return False
+        # Split CTAs <= sm_count, one Q tile of partials each; sized for the largest batch, so every call and captured
+        # graph shares one block.
+        max_sm_count = splits * attn.num_kv_heads * max(batch, self._min_kv_split_batch)
+        scratch = get_memory_buffers().get_buffer(
+            [max_sm_count * _MAX_GEN_TILE_ROWS * (8 + 4 * attn.head_dim)],
+            torch.uint8,
+            buffer_name="trtllm_gen_min_kv_split_scratch",
+            reserve_buffer=True,
+        )
+        trtllm_gen_paged_decode(
+            params.output,
+            q,
+            kv_pool,
+            scratch,
+            self._get_multi_ctas_kv_counter_buffer(),
+            block_tables,
+            params.sequence_lengths,
+            max_q_len,
+            max_kv_len,
+            bmm1_scale,
+            bmm2_scale,
+            batch,
+            window_left,
+            sm_count,
+            self._enable_pdl,
+            sinks=params.fwd.attention_sinks,
+            cum_seq_lens_q=cu_seqlens,
+        )
+        return True
 
     @staticmethod
     def _gate(params: FmhaParams) -> Optional[torch.Tensor]:
@@ -350,29 +486,55 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
         )
         return workspace if workspace is not None and workspace.numel() >= need else None
 
-    @staticmethod
-    def _run_fold_prologue(params: FmhaParams, plan: KvAppendPlan) -> None:
+    def run_prologue(
+        self,
+        plan: KvAppendPlan,
+        qkv: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos_sin: torch.Tensor,
+        positions: torch.Tensor,
+        eps: float,
+        rotary_dim: int,
+        mrope_section: Optional[tuple],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The prologue kernel of a call with KV-append ``plan`` (fused_qkv_rope_gate_fp8_append): sets plan.q_fp8
+        and plan.scales, returns the packed QKV and the gate. The module's unfolded prologue runs it too."""
+        from ...kernels.fused_qk_norm_rope_gate import fused_qkv_rope_gate_fp8_append
+
+        attn = self.attn
+        qkv_out, gate_out, plan.q_fp8, plan.scales = fused_qkv_rope_gate_fp8_append(
+            qkv,
+            q_weight,
+            k_weight,
+            cos_sin,
+            positions,
+            eps,
+            attn.num_heads,
+            attn.num_kv_heads,
+            attn.head_dim,
+            rotary_dim,
+            mrope_section,
+            plan,
+        )
+        return qkv_out, gate_out
+
+    def _run_fold_prologue(self, params: FmhaParams, plan: KvAppendPlan) -> None:
         """Run the prologue kernel the module skipped for a folded call that misses the folded kernel.
 
         Sets the packed QKV of this call as params.qkv_input and the prologue outputs on the plan.
         """
-        from ...kernels.fused_qk_norm_rope_gate import fused_qkv_rope_gate_fp8_append
-
-        attn = params.attn
         f = plan.fold
-        qkv_out, gate_out, plan.q_fp8, plan.scales = fused_qkv_rope_gate_fp8_append(
+        qkv_out, gate_out = self.run_prologue(
+            plan,
             f.qkv,
             f.q_weight,
             f.k_weight,
             f.cos_sin,
             f.positions,
             f.eps,
-            attn.num_heads,
-            attn.num_kv_heads,
-            attn.head_dim,
             f.rotary_dim,
             f.mrope_section,
-            plan,
         )
         params.qkv_input = qkv_out[: params.num_tokens]
         if params.fwd.output_gate is not None:
@@ -668,7 +830,12 @@ class _GqaKvReplicaFmha(GqaDecodeFmha):
                 metadata.max_num_requests, self._tokens_per_gen_step, attn.num_heads, attn.head_dim
             )
             self._exchange = get_tp_group_exchange(
-                self._mapping, self._kv_replicas, max_bytes, max_merge_rows, EXCHANGE_CHANNELS
+                self._mapping,
+                self._kv_replicas,
+                max_bytes,
+                max_merge_rows,
+                exchange_channels(self._enable_pdl),
+                attn.head_dim,
             )
             self._exchange_created = True
 
@@ -712,6 +879,13 @@ class _GqaKvReplicaFmha(GqaDecodeFmha):
 class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
     """KV-replica split with the fused partial attention kernel (gqa_kv_replica_fused.py)."""
 
+    # Per token count: whether the RoPE kernel's q all-gather grid stays resident (decided once per count).
+    _rope_gather_resident: Optional[Dict[int, bool]] = None
+
+    def __init__(self, attn: "TrtllmAttention") -> None:
+        super().__init__(attn)
+        self._rope_gather_resident = {}
+
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
         return (
@@ -741,6 +915,102 @@ class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
         super().prepare_workspace(q, k, v, metadata, forward_args, workspace)
         kv_replica_fused_state(q.device, self._multi_processor_count, metadata.max_num_requests)
 
+    def kv_append_plan(
+        self, metadata: "TrtllmAttentionMetadata", num_tokens: int
+    ) -> Optional[KvAppendPlan]:
+        """GqaDecodeFmha.kv_append_plan; when this library takes the call, the plan also carries the q all-gather
+        arguments (plan.rope_gather) for run_prologue."""
+        plan = super().kv_append_plan(metadata, num_tokens)
+        if plan is not None:
+            if self._multi_processor_count is None:
+                self._multi_processor_count = self._get_multi_processor_count(plan.seq_lens.device)
+            if self._takes(plan.num_requests, plan.q_len, metadata):
+                plan.rope_gather = self._rope_gather(self.attn, num_tokens)
+        return plan
+
+    def _rope_gather(self, attn: "TrtllmAttention", num_tokens: int) -> Optional[tuple]:
+        """Arguments of a q all-gather inside the prologue's RoPE kernel, or None.
+
+        Every member decides from the same shapes, so the members' exchange calls stay identical. The conditions
+        are _run_dedicated's (exchange, payload) and PDL (the kernel releases the partial kernel right after its own
+        wait, which keeps the prefix-KV prefetch overlapping the exchange); run_prologue checks the grid residency."""
+        exchange = self._exchange
+        if (
+            not self._enable_pdl
+            or exchange is None
+            or num_tokens * attn.num_heads * (attn.head_dim * 2 + 4) > exchange.max_words * 4
+        ):
+            return None
+        return (
+            *exchange.rope_gather_args(
+                ROPE_GATHER_CHANNEL, num_tokens * attn.num_heads, attn.head_dim
+            ),
+            True,
+        )
+
+    def run_prologue(
+        self,
+        plan: KvAppendPlan,
+        qkv: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos_sin: torch.Tensor,
+        positions: torch.Tensor,
+        eps: float,
+        rotary_dim: int,
+        mrope_section: Optional[tuple],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """GqaDecodeFmha.run_prologue; with plan.rope_gather and a grid that stays resident (it polls the peers), the
+        RoPE kernel also all-gathers the FP8 query over the KV group (plan.q_gathered), and kv_replica_fused_decode
+        launches no all-gather."""
+        from ...kernels.fused_qk_norm_rope_gate import (
+            fused_qkv_rope_gate_fp8_append_gather,
+            rope_gather_max_tokens,
+        )
+
+        attn = self.attn
+        gather = plan.rope_gather
+        num_tokens = qkv.shape[0]
+        if gather is not None and num_tokens not in self._rope_gather_resident:
+            # Triton specializes the kernel on the token count, so the bound is taken per count.
+            self._rope_gather_resident[num_tokens] = num_tokens <= rope_gather_max_tokens(
+                qkv,
+                q_weight,
+                k_weight,
+                cos_sin,
+                positions,
+                eps,
+                attn.num_heads,
+                attn.num_kv_heads,
+                attn.head_dim,
+                rotary_dim,
+                mrope_section,
+                plan,
+                gather,
+            )
+        if gather is None or not self._rope_gather_resident[num_tokens]:
+            return super().run_prologue(
+                plan, qkv, q_weight, k_weight, cos_sin, positions, eps, rotary_dim, mrope_section
+            )
+        qkv_out, gate_out, plan.q_fp8, plan.scales, plan.q_gathered = (
+            fused_qkv_rope_gate_fp8_append_gather(
+                qkv,
+                q_weight,
+                k_weight,
+                cos_sin,
+                positions,
+                eps,
+                attn.num_heads,
+                attn.num_kv_heads,
+                attn.head_dim,
+                rotary_dim,
+                mrope_section,
+                plan,
+                gather,
+            )
+        )
+        return qkv_out, gate_out
+
     def _run_kv_replica(
         self,
         params,
@@ -755,6 +1025,26 @@ class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
         gate,
     ) -> None:
         rows, hq, d = q.shape
+        plan = params.fwd.kv_append
+        q_gathered = None
+        if (
+            plan is not None
+            and plan.q_gathered is not None
+            and plan.q_fp8 is not None
+            and q.data_ptr() == plan.q_fp8.data_ptr()
+            and plan.q_gathered.shape[0] == rows
+        ):
+            q_gathered = plan.q_gathered
+        # The caller offered o_proj's static FP8 input scale with the gate: the merge writes the gated output as
+        # o_proj's own quant would, for the whole call, and the caller hands that E4M3 tensor to o_proj.
+        fwd = params.fwd
+        out_fp8 = None
+        if (
+            gate is not None
+            and fwd.gated_out_scale is not None
+            and (fwd.output is None or fwd.output.shape[0] == rows)
+        ):
+            out_fp8 = torch.empty((rows, hq, d), dtype=torch.float8_e4m3fn, device=q.device)
         kv_replica_fused_decode(
             exchange,
             q,
@@ -770,7 +1060,12 @@ class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
             ),
             self._enable_pdl,
             gate=gate,
+            q_gathered=q_gathered,
+            out_fp8=out_fp8,
+            out_scale=fwd.gated_out_scale if out_fp8 is not None else None,
         )
+        if out_fp8 is not None:
+            fwd.output_fp8 = out_fp8.view(rows, hq * d)
 
 
 class GqaKvReplicaFmha(_GqaKvReplicaFmha):

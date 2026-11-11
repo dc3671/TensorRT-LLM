@@ -19,10 +19,12 @@ import types
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.mamba import gdn_inforward_split
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import (
     _inforward_split_conv_states,
     _inforward_split_prefill_core,
+    _use_flashinfer_gdn_prefill,
     chunk_gated_delta_rule,
 )
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -185,3 +187,119 @@ def test_split_conv_states_match_two_iterations():
     assert torch.equal(conv_states, expected_live)
     assert torch.equal(stage, expected_stage)
     assert torch.equal(out, expected_out)
+
+
+def _random_states(rows, seed):
+    torch.manual_seed(seed)
+    return torch.randn(rows, NUM_V_HEADS, HEAD_DIM, HEAD_DIM, device="cuda").to(torch.bfloat16)
+
+
+def test_split_kernels_match_index_ops():
+    """Each gdn_inforward_split launch writes exactly the bytes of the index ops it replaces."""
+    split = _split()
+    total = sum(length for _, _, length, _ in _BATCH)
+    q, k, v, g, beta = _inputs(total, seed=2)
+    # One final state per chunked-prefill sequence: a split request runs as two.
+    final = _random_states(split.gather.numel(), seed=3)
+    ssm_states = _random_states(NUM_SLOTS, seed=4)
+    assert gdn_inforward_split.split_core_ok(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        final,
+        ssm_states,
+        ssm_states[:4],
+        q.new_empty(1, total, NUM_V_HEADS, HEAD_DIM),
+    )
+
+    # Final states into the live slots, and the tails' initial states.
+    expected_ssm = ssm_states.clone()
+    expected_ssm.index_copy_(0, split.live, final.index_select(0, split.main_rows))
+    tail_init = gdn_inforward_split.split_state_rows(final, ssm_states, split)
+    assert torch.equal(ssm_states, expected_ssm)
+    assert torch.equal(tail_init, final.index_select(0, split.split_rows))
+
+    # Tail tokens.
+    gathered = gdn_inforward_split.gather_tail_tokens(q, k, v, g, beta, split)
+    for got, x in zip(gathered, (q, k, v, g, beta)):
+        assert torch.equal(got, x.index_select(1, split.tail_tok))
+
+    # Tail final states into the staging rows, tail outputs into the output.
+    tail_final = _random_states(split.k, seed=5)
+    tail_out = torch.randn(1, split.num_tail_tokens, NUM_V_HEADS, HEAD_DIM, device="cuda").to(
+        torch.bfloat16
+    )
+    stage = _random_states(4, seed=6)
+    core_out = torch.randn(1, total, NUM_V_HEADS, HEAD_DIM, device="cuda").to(torch.bfloat16)
+    expected_stage, expected_out = stage.clone(), core_out.clone()
+    expected_stage.index_copy_(0, split.stage_rows, tail_final)
+    expected_out[0].index_copy_(0, split.tail_tok, tail_out[0])
+    # Rows whose inner dims are not packed are refused, with nothing written.
+    wide = torch.zeros(1, total, NUM_V_HEADS, 2 * HEAD_DIM, dtype=core_out.dtype, device="cuda")
+    assert not gdn_inforward_split.scatter_tail(
+        tail_final, stage, tail_out, wide[..., :HEAD_DIM], split
+    )
+    strided_stage = stage.transpose(2, 3)
+    assert not gdn_inforward_split.scatter_tail(
+        tail_final, strided_stage, tail_out, core_out, split
+    )
+    assert not wide.any()
+    assert gdn_inforward_split.scatter_tail(tail_final, stage, tail_out, core_out, split)
+    assert torch.equal(stage, expected_stage)
+    assert torch.equal(core_out, expected_out)
+
+
+def test_split_conv_states_kernel_matches_index_ops():
+    split = _split()
+    total = sum(length for _, _, length, _ in _BATCH)
+    torch.manual_seed(7)
+    mixed_qkv = torch.randn(total, CONV_DIM, device="cuda").to(torch.bfloat16)
+    conv_states = torch.randn(NUM_SLOTS, CONV_DIM, D_CONV - 1, device="cuda").to(torch.bfloat16)
+    stage = torch.randn(4, CONV_DIM, D_CONV - 1, device="cuda").to(torch.bfloat16)
+    expected_states, expected_stage = conv_states.clone(), stage.clone()
+    _inforward_split_conv_states(
+        expected_states, mixed_qkv.index_select(0, split.conv_win), split, expected_stage
+    )
+    assert gdn_inforward_split.split_conv_states_ok(conv_states, mixed_qkv, stage)
+    gdn_inforward_split.split_conv_states(conv_states, mixed_qkv, split, stage)
+    assert torch.equal(conv_states, expected_states)
+    assert torch.equal(stage, expected_stage)
+
+
+def test_split_prefill_core_fused_copies_bitwise():
+    """fused_copies only changes how the states and tokens move: outputs and states are bit-identical."""
+    split = _split()
+    total = sum(length for _, _, length, _ in _BATCH)
+    q, k, v, g, beta = _inputs(total, seed=8)
+    results = []
+    for fused_copies in (False, True):
+        ssm_states = _random_states(NUM_SLOTS, seed=9) * 0.01
+        stage = torch.zeros(4, NUM_V_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        out = _inforward_split_prefill_core(
+            q, k, v, g, beta, ssm_states, split, stage, None, fused_copies=fused_copies
+        )
+        results.append((out, ssm_states, stage))
+    for reference, fused in zip(*results):
+        assert torch.equal(reference, fused)
+
+
+@pytest.mark.parametrize("fused_copies", [False, True])
+def test_split_prefill_core_alpha_bitwise(fused_copies):
+    """alpha = exp(g) passed as g_linear (the tails gather it in place of g) gives the bits of g alone."""
+    if not _use_flashinfer_gdn_prefill():
+        pytest.skip("alpha (g_linear) feeds only the FlashInfer prefill")
+    split = _split()
+    total = sum(length for _, _, length, _ in _BATCH)
+    q, k, v, g, beta = _inputs(total, seed=10)
+    results = []
+    for alpha in (None, torch.exp(g)):
+        ssm_states = _random_states(NUM_SLOTS, seed=11) * 0.01
+        stage = torch.zeros(4, NUM_V_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        out = _inforward_split_prefill_core(
+            q, k, v, g, beta, ssm_states, split, stage, None, alpha=alpha, fused_copies=fused_copies
+        )
+        results.append((out, ssm_states, stage))
+    for reference, with_alpha in zip(*results):
+        assert torch.equal(reference, with_alpha)

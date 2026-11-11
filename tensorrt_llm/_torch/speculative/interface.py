@@ -49,8 +49,8 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
-from ..pyexecutor.sampler.watermark import WatermarkSpecState
-from .fused_accept import MAX_DRAFT_LEN, fused_strict_accept
+from .fused_accept import (MAX_DRAFT_LEN, fused_strict_accept,
+                           sample_and_strict_accept)
 from .greedy_argmax import greedy_argmax
 from .spec_tail_kernels import strict_accept
 from .vocab_parallel import VocabParallelHead, VocabShardedLogits
@@ -778,6 +778,10 @@ class SpecMetadata:
     # consume rows rather than requests.
     seeds: Optional[torch.Tensor] = None
     offsets: Optional[torch.Tensor] = None
+    # The Philox state the last populate call left for the steady MTP stager
+    # (defer_rng_rows): (request_seeds, request_offsets) in batch order; None
+    # when it uploaded the four buffers (or skipped them) itself.
+    deferred_rng_state: Optional[tuple] = field(default=None, repr=False)
     # Whether to use sampling parameters when sampling draft tokens.
     use_sampling_params_for_draft_tokens: bool = False
     # Vocab size used for draft_probs buffer allocation.
@@ -901,10 +905,14 @@ class SpecMetadata:
             offsets.append(base + step * window)
         return offsets
 
-    def _populate_request_rng_state(
-        self, requests: list["LlmRequest"],
-        per_request_normalized: list[tuple[float, int, float, float,
-                                           int]]) -> None:
+    def _populate_request_rng_state(self,
+                                    requests: list["LlmRequest"],
+                                    per_request_normalized: list[tuple[float,
+                                                                       int,
+                                                                       float,
+                                                                       float,
+                                                                       int]],
+                                    defer_rows: Optional[int] = None) -> None:
         """Fill the Philox seed/offset buffers for this batch.
 
         A request's seed is fixed for its lifetime, so the offset is what has
@@ -937,14 +945,8 @@ class SpecMetadata:
         request_offsets = self._take_rng_window_offsets(
             requests, [seed is not None for seed in user_seeds])
         num_tokens_per_request = [n for *_, n in per_request_normalized]
-
-        flat_seeds: list[int] = []
-        flat_offsets: list[int] = []
-        for seed, offset, num_tokens in zip(request_seeds, request_offsets,
-                                            num_tokens_per_request):
-            flat_seeds.extend(seed for _ in range(num_tokens))
-            flat_offsets.extend(offset + row * _RNG_SLOT_SPAN
-                                for row in range(num_tokens))
+        total_rows = sum(num_tokens_per_request)
+        self.deferred_rng_state = None
 
         # A batch wider than the buffers would silently truncate the copies
         # below, so assert rather than grow: CUDA graph batch sizes are already
@@ -962,11 +964,11 @@ class SpecMetadata:
             self.request_offsets = torch.zeros(self.max_num_requests,
                                                dtype=torch.int64,
                                                device='cuda')
-        if self.seeds is None or self.seeds.numel() < len(flat_seeds):
+        if self.seeds is None or self.seeds.numel() < total_rows:
             # Match the per-token buffers' capacity so a later batch with more
             # rows does not reallocate mid-stream.
             capacity = max(
-                len(flat_seeds),
+                total_rows,
                 self.temperatures.numel()
                 if self.temperatures is not None else 0)
             self.seeds = torch.zeros(capacity, dtype=torch.int64, device='cuda')
@@ -992,6 +994,21 @@ class SpecMetadata:
         # samples it on the stock path, which reads them.
         if self.is_all_greedy_sample:
             return
+        if (defer_rows is not None and num_tokens_per_request
+                and all(n == defer_rows for n in num_tokens_per_request)):
+            # The steady MTP stager writes the four buffers from these values in
+            # its one kernel: request_* as given, and row j of request r as
+            # (seed_r, offset_r + j * _RNG_SLOT_SPAN), the expansion below.
+            self.deferred_rng_state = (request_seeds, request_offsets)
+            return
+
+        flat_seeds: list[int] = []
+        flat_offsets: list[int] = []
+        for seed, offset, num_tokens in zip(request_seeds, request_offsets,
+                                            num_tokens_per_request):
+            flat_seeds.extend(seed for _ in range(num_tokens))
+            flat_offsets.extend(offset + row * _RNG_SLOT_SPAN
+                                for row in range(num_tokens))
         _upload(self.request_seeds, request_seeds)
         _upload(self.request_offsets, request_offsets)
         _upload(self.seeds, flat_seeds)
@@ -1552,13 +1569,22 @@ class SpecMetadata:
         self._scan_one_model_sampling(requests)
 
     def populate_sampling_params_for_one_model(
-            self, requests: list["LlmRequest"]) -> None:
+            self,
+            requests: list["LlmRequest"],
+            defer_rng_rows: Optional[int] = None) -> None:
         """
         Set up topp/topk/temperatures for 1-model sampler.
 
         Scans sampling configs to set skip_*/is_all_greedy_sample flags. When
         any request needs sampling, also builds per-token/per-request lists
         and copies them to GPU buffers; all-greedy batches skip this entirely.
+
+        Args:
+            requests: The batch's requests.
+            defer_rng_rows: The logits rows per request of a caller that writes
+                the Philox buffers itself (the steady MTP stager). When every
+                request has that many rows, their values are left in
+                ``deferred_rng_state`` instead of uploaded.
         """
         if not self.spec_dec_mode.use_one_engine():
             return
@@ -1619,7 +1645,8 @@ class SpecMetadata:
                                               dtype=torch.float32,
                                               device='cuda')
 
-        self._populate_request_rng_state(requests, per_request_normalized)
+        self._populate_request_rng_state(requests, per_request_normalized,
+                                         defer_rng_rows)
 
         # Always-populate the per-request slot id table when rejection sampling
         # is configured: it's tiny (max_num_requests longs) and needed at
@@ -1883,6 +1910,11 @@ class SpecWorkerBase(nn.Module, ABC):
     Base class for speculative decoding workers.
     Provides common functionality for sampling and token handling.
     """
+
+    # Declared by the model: a temperature verify step on the key exchange's
+    # four-draws Gumbel noise bumps the seed, samples and accepts in one launch
+    # (fused_accept.sample_and_strict_accept; same outputs).
+    fused_sample_accept: bool = False
 
     def __init__(self,
                  use_separate_draft_kv_cache: bool = False,
@@ -2313,6 +2345,39 @@ class SpecWorkerBase(nn.Module, ABC):
                 _FORCE_ACCEPT_RNG_COUNTER_STRIDE, _FORCE_ACCEPT_RNG_SLOT_STRIDE,
                 _FORCE_ACCEPT_RNG_POOL_SIZE)
 
+    def _sample_and_accept_in_one_launch(self, logits, draft_tokens,
+                                         num_contexts, batch_size,
+                                         spec_metadata):
+        """The sharded temperature sample (``_sample_sharded_temperature``)
+        and the strict acceptance below as one launch, or None where the
+        launches below run: another sampling mode, a ragged verify, the eager
+        warmup of a forced run, a shape the launch does not take."""
+        if (spec_metadata is None or spec_metadata.is_ragged_verify
+                or not isinstance(logits, torch.Tensor)
+                or spec_metadata.is_all_greedy_sample
+                or not spec_metadata.sharded_target_logits
+                or self.key_exchange is None or self._gumbel_seed is None
+                or draft_tokens.shape[-1] > MAX_DRAFT_LEN):
+            return None
+        force = self._fused_force_params(draft_tokens.shape[-1], spec_metadata,
+                                         logits.device)
+        if force is None and self.force_num_accepted_tokens != 0.0:
+            return None
+        from ..pyexecutor.sampler.ops.vanilla import \
+            GREEDY_TEMPERATURE_THRESHOLD
+        return sample_and_strict_accept(
+            self.key_exchange,
+            logits,
+            self.mapping.tp_rank * logits.shape[-1],
+            spec_metadata.temperatures[:logits.shape[0]],
+            self._gumbel_seed,
+            GREEDY_TEMPERATURE_THRESHOLD,
+            draft_tokens,
+            num_contexts,
+            batch_size,
+            force,
+            channel=1)
+
     def _sample_and_accept_draft_tokens_base(
         self,
         logits: torch.Tensor,
@@ -2347,6 +2412,12 @@ class SpecWorkerBase(nn.Module, ABC):
 
         if isinstance(logits, torch.Tensor) and logits.dim() == 1:
             logits = logits.unsqueeze(0)
+
+        if self.fused_sample_accept:
+            fused = self._sample_and_accept_in_one_launch(
+                logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+            if fused is not None:
+                return fused
 
         # Sample tokens using per-request sampling parameters
         if _watermark_active(spec_metadata):
@@ -3237,7 +3308,8 @@ class SpecWorkerBase(nn.Module, ABC):
     def greedy_sample_draft_with_tp_gather(self,
                                            logits: torch.Tensor,
                                            spec_metadata=None,
-                                           mapping_lm_head_tp=None):
+                                           mapping_lm_head_tp=None,
+                                           tokens_out=None):
         """Greedy draft-token sampling with a TP all-gather of the argmax.
 
         When the draft LM head is vocab-sharded under plain tensor parallelism,
@@ -3247,6 +3319,10 @@ class SpecWorkerBase(nn.Module, ABC):
         vocab-sharded (see ``_draft_logits_are_sharded``) -- e.g. a borrowed or
         gathered full-vocab draft head. Returns tokens in draft-vocab space (the
         caller applies d2t). Expects 2D ``[num_tokens, vocab_shard]`` logits.
+
+        ``tokens_out`` (int32 ``[num_tokens]``, optional): the tokens are
+        written there and it is returned (the one-launch LL exchange writes it
+        directly).
 
         Under ADP + LM-head TP (``mapping_lm_head_tp`` given) the logits are the
         LM-head-TP group's row-stacked batch (``tp_size`` segments of
@@ -3266,7 +3342,8 @@ class SpecWorkerBase(nn.Module, ABC):
             local_rows = logits.shape[0] // group_size
             own_segment = gathered.view(group_size, local_rows,
                                         -1)[mapping_lm_head_tp.tp_rank]
-            return self._get_draft_tokens_from_gathered(own_segment)
+            return self._tokens_into(
+                self._get_draft_tokens_from_gathered(own_segment), tokens_out)
         mapping = self.mapping
         sharded = self._draft_logits_are_sharded(logits, spec_metadata)
         if (sharded and mapping is not None
@@ -3282,25 +3359,38 @@ class SpecWorkerBase(nn.Module, ABC):
                     return exchange.argmax_logits(logits,
                                                   mapping.tp_rank *
                                                   logits.shape[-1],
+                                                  tokens_out=tokens_out,
                                                   channel=0)
                 local_max, local_argmax = torch.max(logits, dim=-1)
                 return exchange.argmax_tokens(local_max,
                                               local_argmax,
                                               mapping.tp_rank *
                                               logits.shape[-1],
+                                              tokens_out=tokens_out,
                                               channel=0)
             from ..distributed.ops import allgather
             combined = self._get_local_max_and_combined(logits)
             gathered = allgather(combined, mapping, dim=-1)
-            return self._get_draft_tokens_from_gathered(gathered)
+            return self._tokens_into(
+                self._get_draft_tokens_from_gathered(gathered), tokens_out)
         # No cross-rank gather for plain attention-DP: each rank owns its own
         # requests with replicated full-vocab logits, so a per-rank argmax is
         # the correct proposal and a gather would desync the ranks (see
         # _draft_logits_are_sharded). Plain argmax; caller applies d2t.
-        return greedy_argmax(logits,
-                             torch.int32,
-                             small_rows=spec_metadata is not None
-                             and spec_metadata.is_cuda_graph)
+        return self._tokens_into(
+            greedy_argmax(logits,
+                          torch.int32,
+                          small_rows=spec_metadata is not None
+                          and spec_metadata.is_cuda_graph), tokens_out)
+
+    @staticmethod
+    def _tokens_into(tokens: torch.Tensor,
+                     tokens_out: Optional[torch.Tensor]) -> torch.Tensor:
+        """``tokens``, or ``tokens_out`` holding them when given."""
+        if tokens_out is None:
+            return tokens
+        tokens_out.copy_(tokens)
+        return tokens_out
 
     def _watermark_draft_step(self, spec_metadata: "SpecMetadata",
                               batch_size: int, draft_step: int,
@@ -3452,7 +3542,8 @@ class SpecWorkerBase(nn.Module, ABC):
                             *,
                             num_contexts=0,
                             draft_step=None,
-                            mapping_lm_head_tp=None):
+                            mapping_lm_head_tp=None,
+                            out=None):
         """Unified draft-token production entry for all one-model workers.
 
         Branches by logits rank: 3D ``[num_gens, K, vocab]`` is the block form
@@ -3468,6 +3559,10 @@ class SpecWorkerBase(nn.Module, ABC):
         down to the gen segment. The step form receives full-batch logits
         (context requests draft from target hidden states already available), so
         no slicing is needed.
+
+        ``out`` (int32 ``[num_tokens]``, optional, step form): the tokens are
+        written there and ``out`` is returned; the greedy sampler writes it
+        directly when there is no d2t map or LM-head TP gather.
         """
         is_block = logits.dim() == 3
 
@@ -3481,6 +3576,7 @@ class SpecWorkerBase(nn.Module, ABC):
         # matches sglang/vLLM, which draft with argmax/top-k by default and apply
         # sampling params only on the target/acceptance side.
         advanced = spec_metadata.wants_advanced_draft_sampling
+        tokens_out = None
 
         # All samplers below return tokens in draft-vocab space; d2t is applied
         # once after the branch.
@@ -3488,9 +3584,15 @@ class SpecWorkerBase(nn.Module, ABC):
             # greedy_sample_draft_with_tp_gather expects 2D [tokens, vocab];
             # flatten the block form and restore its shape (step form is 2D).
             batch_shape = logits.shape[:-1]
+            if (out is not None and not is_block and self._d2t is None
+                    and mapping_lm_head_tp is None and out.dtype == torch.int32
+                    and out.is_contiguous() and out.numel() == logits.shape[0]):
+                tokens_out = out
             tokens = self.greedy_sample_draft_with_tp_gather(
-                logits.reshape(-1, logits.shape[-1]), spec_metadata,
-                mapping_lm_head_tp)
+                logits.reshape(-1, logits.shape[-1]),
+                spec_metadata,
+                mapping_lm_head_tp,
+                tokens_out=tokens_out)
             if mapping_lm_head_tp is None:
                 tokens = tokens.reshape(batch_shape)
             # else: ADP+LM-head-TP (2D step form only) -- the sampler returned
@@ -3516,7 +3618,11 @@ class SpecWorkerBase(nn.Module, ABC):
         if self._d2t is not None:
             tokens = self._d2t[tokens] + tokens
 
-        return tokens.type(torch.int32)
+        tokens = tokens.type(torch.int32)
+        if out is not None and tokens_out is None:
+            out.copy_(tokens)
+            return out
+        return tokens
 
     def _execute_guided_decoder_if_present(self, logits):
         """Execute the guided decoder on the target logits, if configured.
