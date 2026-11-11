@@ -1389,11 +1389,8 @@ class MTPForCausalLM(nn.Module):
         mtp_layer = None
         lm_head_quant_config = None
         # Whether the MTP layer's forward takes the draft loop's deferred
-        # ``kv_lens_increment`` and pass 0's ``kept_rows``, and whether the
-        # target's recurrent-state promotion may run beside the draft loop.
+        # ``kv_lens_increment``.
         folds_kv_lens_increment = False
-        takes_kept_rows = False
-        promotes_target_state_beside = False
         # A target model that owns its MTP layer class (a Modeling V2
         # target, for example) names it, and the drafter builds that class
         # instead of the built-in one registered for the model type.
@@ -1417,9 +1414,6 @@ class MTPForCausalLM(nn.Module):
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
                 folds_kv_lens_increment = True
-                takes_kept_rows = Qwen3NextMTP.takes_kept_rows(model_config)
-                promotes_target_state_beside = (
-                    Qwen3NextMTP.promotes_target_state_beside(model_config))
             case "qwen4_exp_text":
                 from .modeling_qwen4_exp import Qwen4ExpMTP
                 mtp_layer = Qwen4ExpMTP
@@ -1435,6 +1429,15 @@ class MTPForCausalLM(nn.Module):
             case _:
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
+
+        # Optional layer capabilities: whether its forward takes pass 0's
+        # ``kept_rows``, and whether the target's recurrent-state promotion
+        # may run beside the draft loop.
+        takes_kept_rows = getattr(mtp_layer, "takes_kept_rows",
+                                  lambda _: False)(model_config)
+        promotes_target_state_beside = getattr(mtp_layer,
+                                               "promotes_target_state_beside",
+                                               lambda _: False)(model_config)
 
         if (spec_config.uses_replacement_heads
                 and getattr(mtp_layer, "uses_shared_lm_head", True)):
