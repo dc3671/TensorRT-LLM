@@ -810,7 +810,9 @@ class DecoderInputPreparer:
             and self._steady_gen_cache_supported
             and not self.mapping.has_cp_helix()
         ):
-            stage_rng = self.runtime_hooks.pack_spec_rng_uploads
+            stage_rng = False
+            if self.runtime_hooks.pack_spec_rng_uploads:
+                stage_rng = True
             self._steady_mtp = SteadyMtpPrepare(
                 max_batch_size=self._config.max_batch_size,
                 max_num_tokens=self._config.max_num_tokens,
