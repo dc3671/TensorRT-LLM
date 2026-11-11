@@ -394,6 +394,21 @@ def test_gemm_twoshot_rows() -> None:
     assert not kern.supports_hidden(H // 2, 8, sms)
 
 
+def test_l2_prefetch_args() -> None:
+    """The L2 prefetch splits a weight into 16-byte multiple slices that cover it, and is off for a weight whose
+    address or size is not a 16-byte multiple."""
+    from tensorrt_llm._torch.distributed.mnnvl_fused_allreduce import _l2pf_args
+
+    weight = torch.empty((3 * 1024 + 8,), dtype=torch.bfloat16, device="cuda")
+    l2pf, ptr, nbytes, per = _l2pf_args(weight, 7)
+    assert l2pf and ptr == weight.data_ptr() and nbytes == weight.numel() * 2
+    assert per % 16 == 0 and 7 * per >= nbytes > 6 * per
+    assert _l2pf_args(None, 7) == (False, 0, 0, 0)
+    assert _l2pf_args(weight, 0) == (False, 0, 0, 0)
+    assert _l2pf_args(weight[:9], 7) == (False, 0, 0, 0)
+    assert _l2pf_args(weight[1:9], 7) == (False, 0, 0, 0)
+
+
 def test_slot_kernel_takes_every_supported_hidden_size() -> None:
     """Every hidden size MnnvlAllReduceNorm.is_supported accepts builds the slot kernel at every row count it takes
     (from TWO_SHOT_ROWS with the two-shot CTA split, which stays within 1024 threads per CTA as the library's), and

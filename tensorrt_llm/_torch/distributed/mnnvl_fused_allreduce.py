@@ -210,13 +210,17 @@ def _compiled_slot(
 
 def _l2pf_args(weight: Optional[torch.Tensor], nblk: int) -> Tuple[bool, int, int, int]:
     """(l2pf, ptr, bytes, bytes per CTA) for a launch of ``nblk`` CTAs that prefetches ``weight`` into L2, a
-    16-byte aligned slice per CTA; no prefetch without a weight."""
+    16-byte aligned slice per CTA; no prefetch without a weight or for one whose address or size is not a 16-byte
+    multiple (the bulk prefetch requires both)."""
     if weight is None or nblk <= 0:
         return False, 0, 0, 0
+    ptr = weight.data_ptr()
     nbytes = weight.numel() * weight.element_size()
+    if ptr % 16 or nbytes % 16:
+        return False, 0, 0, 0
     per = -(-nbytes // nblk)
     per = -(-per // 16) * 16
-    return True, weight.data_ptr(), nbytes, per
+    return True, ptr, nbytes, per
 
 
 def _example_operands(hidden: int, nranks: int):
