@@ -190,7 +190,6 @@ def test_deferred_close_that_raises_still_forgets_its_request() -> None:
     manager, cache = _manager_for_release(7)
     manager.enable_deferred_close(True)
     manager.free_resources(_finished_request(7))
-    manager._early_freed_index_requests.add(7)
     later = Mock()
     manager._deferred_closes.append((8, later))
     cache.close.side_effect = RuntimeError("close failed")
@@ -199,9 +198,22 @@ def test_deferred_close_that_raises_still_forgets_its_request() -> None:
         manager.flush_deferred_closes()
 
     manager.impl.clear_stats_excluded.assert_called_once_with(7)
-    assert 7 not in manager._early_freed_index_requests
     later.close.assert_not_called()
     assert list(manager._deferred_closes) == [(8, later)]
+
+
+def test_an_id_reused_before_the_flush_keeps_its_own_early_free() -> None:
+    """The deferred request leaves nothing under its id, so a new request with the same id whose index slot was freed
+    early (a context-only worker) still skips the second slot release when it is removed."""
+    manager, _ = _manager_for_release(7)
+    manager.enable_deferred_close(True)
+    manager.free_resources(_finished_request(7))
+    assert 7 not in manager._early_freed_index_requests
+
+    manager._early_freed_index_requests.add(7)  # the new request's early free
+    manager.flush_deferred_closes()
+
+    assert 7 in manager._early_freed_index_requests
 
 
 @pytest.mark.parametrize("defer", [False, True])

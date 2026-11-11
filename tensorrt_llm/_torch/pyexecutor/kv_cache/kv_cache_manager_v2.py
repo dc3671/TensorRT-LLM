@@ -8377,6 +8377,8 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
         if request_id not in self._early_freed_index_requests:
             self.release_index_slot(request_id)
+        # Nothing of the id is left to free, so a new request with the same id takes the normal path.
+        self._early_freed_index_requests.discard(request_id)
         self.kv_cache_map.pop(request_id, None)
         kv_cache.discard_pending_stats()
         self._deferred_closes.append((request_id, kv_cache))
@@ -8395,7 +8397,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.close()
             finally:
                 self.impl.clear_stats_excluded(request_id)
-                self._early_freed_index_requests.discard(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
