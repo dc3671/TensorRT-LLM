@@ -99,7 +99,7 @@ def main(argv=None) -> int:
         donor.close()
         donor.publish_failure(error)
         raise
-    print(f"READY {donor.name} {donor.transport} {donor.nbytes}", flush=True)
+    print(f"READY {donor.name} {donor.transport.kind} {donor.nbytes}", flush=True)
     try:
         stop.wait(args.seconds)
     finally:

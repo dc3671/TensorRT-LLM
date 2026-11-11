@@ -18,15 +18,17 @@ A donor publishes host memory in a rendezvous directory on a shared file system;
 (``KvCacheConfig.remote_cache_config``; C++ ``storage/remoteMem.h``, which also describes the directory layout) claims
 whole chunks of it with O_EXCL claim files and moves cold pages itself, so the donor does no work after publishing.
 
-``RemoteMemDonor`` holds what every transport shares (the files, the failure marker, start and close); each transport
-allocates and publishes the memory its own way:
+``RemoteMemDonor`` declares the donation (size, chunks, the files, the failure marker, start and close) and does not
+pick how it is reached: its ``DonorTransport``, chosen apart (``make_donor``, ``RemoteCacheConfig.transport``),
+allocates and registers the memory:
 
-* ``NixlDonor``: anonymous memory registered with a NIXL agent; ``donor.<name>.desc`` holds the agent's ``AgentDesc``.
-* ``FabricDonor``: Grace DRAM allocated with cuMemCreate (``CU_MEM_LOCATION_TYPE_HOST_NUMA``), one allocation per
-  chunk because an imported fabric allocation maps only whole; ``donor.<name>.fabric`` holds one 64-byte handle per
-  chunk. Chunks fill the GPU's host NUMA node first, then the other nodes; a donation that only partly fits is published
-  with ``short_bytes``. Donors on one host take turns at reclaim-and-compact passes per NUMA node by flock on
-  ``compact.<host>.node<N>.lock``.
+* ``AgentDonorTransport``: anonymous memory registered with the donor's own transfer agent through the
+  ``BaseTransferAgent`` interface (a NIXL agent); ``donor.<name>.desc`` holds the agent's ``AgentDesc``.
+* ``FabricDonorTransport``: Grace DRAM allocated with cuMemCreate (``CU_MEM_LOCATION_TYPE_HOST_NUMA``), one
+  allocation per chunk because an imported fabric allocation maps only whole; ``donor.<name>.fabric`` holds one
+  64-byte handle per chunk. Chunks fill the GPU's host NUMA node first, then the other nodes; a donation that only
+  partly fits is published with ``short_bytes``. Donors on one host take turns at reclaim-and-compact passes per NUMA
+  node by flock on ``compact.<host>.node<N>.lock``.
 
 A donor that cannot start, or whose owner fails, leaves ``donor.<name>.failed``, which clients ignore and capacity
 checks count. In a serving process ``start_donation`` starts the donation (``remote_cache_config.donate_size``)
@@ -553,16 +555,36 @@ def check_remote_capacity(
     return {"published": published, "failed": failed, "offered_bytes": offered, "need_bytes": need}
 
 
+class DonorTransport:
+    """How a donation is made reachable: allocates the memory its transfers need, registers it and hands the donor
+    what clients read (``RemoteMemDonor._publish``); frees it again. Chosen apart from the donation itself
+    (``make_donor``)."""
+
+    # The transport's name, as written to the donor's files.
+    kind: str = ""
+
+    @classmethod
+    def options_from(cls, remote_config: "RemoteCacheConfig") -> dict:
+        """The constructor options of this transport that ``remote_config`` sets."""
+        return {}
+
+    def start(self, donor: "RemoteMemDonor") -> None:
+        """Allocate and register `donor`'s memory, then publish it (``donor._publish``)."""
+        raise NotImplementedError
+
+    def release(self, donor: "RemoteMemDonor") -> None:
+        """Free what ``start`` made; teardown keeps going past errors."""
+
+
 class RemoteMemDonor:
-    """One donated region: allocated, registered and published by ``start()``, withdrawn by ``close()``.
+    """One donation: the host memory a rank gives remote cache levels, published by ``start()`` in the rendezvous
+    directory and withdrawn by ``close()``.
 
-    The rendezvous files, the failure marker and the start / close lifecycle are common to every transport; a transport
-    (``NixlDonor``, ``FabricDonor``; ``make_donor`` picks one) allocates and publishes the memory in
-    ``_start_transport`` and frees it in ``_release_transport``. A donor collected or left at exit without
-    ``close()`` withdraws its files and leaves the failure marker."""
+    The donation declares the memory (size, chunks, placement, rendezvous files, failure marker, lifecycle); its
+    ``transport`` (``AgentDonorTransport`` or ``FabricDonorTransport``) allocates and registers it. A donor collected
+    or left at exit without ``close()`` withdraws its files and leaves the failure marker."""
 
-    # The transport's name, as written to the donor's files; set by each transport.
-    transport: str = ""
+    transport: Optional[DonorTransport] = None
     directory: str = ""
     nbytes: int = 0
     chunk_bytes: int = REMOTE_CACHE_CHUNK_BYTES
@@ -582,6 +604,7 @@ class RemoteMemDonor:
         self,
         directory: str,
         nbytes: int,
+        transport: DonorTransport,
         *,
         chunk_bytes: int = REMOTE_CACHE_CHUNK_BYTES,
         name: Optional[str] = None,
@@ -590,6 +613,7 @@ class RemoteMemDonor:
     ):
         if nbytes < chunk_bytes:
             raise ValueError(f"donation size {nbytes} is below one chunk ({chunk_bytes})")
+        self.transport = transport
         self.directory = directory
         # Whole chunks only: a client never sees a partial chunk.
         self.nbytes = nbytes - nbytes % chunk_bytes
@@ -604,18 +628,6 @@ class RemoteMemDonor:
         self._start_thread = None
         self._close_lock = threading.Lock()
         self._finalizer = None
-
-    @classmethod
-    def options_from(cls, remote_config: "RemoteCacheConfig") -> dict:
-        """The constructor options of this transport that ``remote_config`` sets."""
-        return {}
-
-    def _start_transport(self) -> None:
-        """Allocate and register the donation, then publish it (``_publish``)."""
-        raise NotImplementedError
-
-    def _release_transport(self) -> None:
-        """Free what ``_start_transport`` made; teardown keeps going past errors."""
 
     def _path(self, suffix: str) -> str:
         return os.path.join(self.directory, f"donor.{self.name}.{suffix}")
@@ -651,7 +663,7 @@ class RemoteMemDonor:
                 f"name {self.name}",
                 f"host {self.host}",
                 f"pid {os.getpid()}",
-                f"transport {self.transport}",
+                f"transport {self.transport.kind}",
                 f"planned_bytes {self.nbytes}",
                 f"error {error!r}".replace("\n", " "),
                 "",
@@ -676,7 +688,7 @@ class RemoteMemDonor:
                 self._path("failed"),
                 self._failure_text(RuntimeError("the donor's owner exited without closing it")),
             )
-        self._start_transport()
+        self.transport.start(self)
 
     def start_or_report(self) -> None:
         """``start()``; on failure, release what was made and leave the failure marker (``publish_failure``)."""
@@ -720,23 +732,39 @@ class RemoteMemDonor:
             except OSError:
                 pass
         self._published.clear()
-        self._release_transport()
+        self.transport.release(self)
 
 
-class NixlDonor(RemoteMemDonor):
-    """Anonymous memory registered with this donor's own NIXL agent; ``donor.<name>.desc`` holds the agent's
-    ``AgentDesc``. ``ucx_devices`` (``{GPU}`` resolved at start) selects the agent's UCX devices."""
+def _make_nixl_agent(name: str, backend_params: dict):
+    """A NIXL transfer agent (the C++ binding's ``NixlTransferAgent``, a ``BaseTransferAgent``) named `name`."""
+    from tensorrt_llm.tensorrt_llm_transfer_agent_binding import BaseAgentConfig, NixlTransferAgent
 
-    transport = "nixl"
+    config = BaseAgentConfig()
+    config.name = name
+    config.use_prog_thread = True
+    config.multi_thread = False
+    config.use_listen_thread = False
+    # This agent's own UCX devices; the process-wide UCX_NET_DEVICES stays as the serving process needs it.
+    if backend_params:
+        config.backend_params = backend_params
+    return NixlTransferAgent(config)
+
+
+class AgentDonorTransport(DonorTransport):
+    """Anonymous memory registered with the donor's own transfer agent, through the ``BaseTransferAgent`` interface
+    only (``make_agent``, default a NIXL agent); ``donor.<name>.desc`` holds the agent's ``AgentDesc``.
+    ``ucx_devices`` (``{GPU}`` resolved at start) selects the agent's UCX devices."""
+
+    kind = "nixl"
     ucx_devices: Optional[str] = None
     _map: Optional[mmap.mmap] = None
     _address: int = 0
     _agent = None
     _registered: bool = False
 
-    def __init__(self, directory: str, nbytes: int, *, ucx_devices: Optional[str] = None, **kwargs):
-        super().__init__(directory, nbytes, **kwargs)
+    def __init__(self, *, ucx_devices: Optional[str] = None, make_agent=_make_nixl_agent):
         self.ucx_devices = ucx_devices
+        self._make_agent = make_agent
         self._map = None
         self._address = 0
         self._agent = None
@@ -750,56 +778,48 @@ class NixlDonor(RemoteMemDonor):
     def address(self) -> int:
         return self._address
 
-    def _start_transport(self) -> None:
+    def start(self, donor: "RemoteMemDonor") -> None:
         from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
-            BaseAgentConfig,
             MemoryDesc,
             MemoryDescs,
             MemoryType,
-            NixlTransferAgent,
         )
 
-        ensure_rendezvous_directory(self.directory)
-        backend_params = nixl_ucx_backend_params(resolve_ucx_devices(self.ucx_devices, self.device))
+        ensure_rendezvous_directory(donor.directory)
+        backend_params = nixl_ucx_backend_params(
+            resolve_ucx_devices(self.ucx_devices, donor.device)
+        )
         t0 = time.monotonic()
         flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_NORESERVE
-        self._map = mmap.mmap(-1, self.nbytes, flags=flags)
+        self._map = mmap.mmap(-1, donor.nbytes, flags=flags)
         self._address = ctypes.addressof(ctypes.c_char.from_buffer(self._map))
         try:
             self._map.madvise(_MADV_HUGEPAGE)
         except OSError:
             pass
-        if self.numa_node is not None and not _bind_to_numa_node(
-            self._address, self.nbytes, self.numa_node
+        if donor.numa_node is not None and not _bind_to_numa_node(
+            self._address, donor.nbytes, donor.numa_node
         ):
-            _log(f"libnuma unavailable; {self.name} relies on first touch for NUMA placement")
+            _log(f"libnuma unavailable; {donor.name} relies on first touch for NUMA placement")
         # Fault every page in now: registration does not pin memory where the NIC pages on demand, and a resident
         # donation fails here rather than mid-run and never makes a remote write wait on a page fault.
-        _populate(self._map, self._address, self.nbytes)
+        _populate(self._map, self._address, donor.nbytes)
         t1 = time.monotonic()
 
-        config = BaseAgentConfig()
-        config.name = self.name
-        config.use_prog_thread = True
-        config.multi_thread = False
-        config.use_listen_thread = False
-        # This agent's own UCX devices; the process-wide UCX_NET_DEVICES stays as the serving process needs it.
-        if backend_params:
-            config.backend_params = backend_params
-        self._agent = NixlTransferAgent(config)
+        self._agent = self._make_agent(donor.name, backend_params)
         self._agent.register_memory(
-            MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, self.nbytes, 0)])
+            MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, donor.nbytes, 0)])
         )
         self._registered = True
         t2 = time.monotonic()
         desc = self._agent.get_local_agent_desc().serialize()
-        self._publish(
+        donor._publish(
             [("desc", desc)],
-            [f"segment {self._address} {self.nbytes}"],
+            [f"segment {self._address} {donor.nbytes}"],
             f"map + populate {t1 - t0:.1f} s, register {t2 - t1:.1f} s",
         )
 
-    def _release_transport(self) -> None:
+    def release(self, donor: "RemoteMemDonor") -> None:
         # Clients still holding chunks fail their next transfer at the NIC.
         if self._agent is not None and self._registered:
             from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
@@ -810,10 +830,10 @@ class NixlDonor(RemoteMemDonor):
 
             try:
                 self._agent.deregister_memory(
-                    MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, self.nbytes, 0)])
+                    MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, donor.nbytes, 0)])
                 )
             except Exception as error:  # noqa: BLE001 - teardown keeps going
-                _log(f"{self.name}: deregistering failed: {error}")
+                _log(f"{donor.name}: deregistering failed: {error}")
             self._registered = False
         self._agent = None
         if self._map is not None:
@@ -824,29 +844,23 @@ class NixlDonor(RemoteMemDonor):
             self._map = None
 
 
-class FabricDonor(RemoteMemDonor):
+class FabricDonorTransport(DonorTransport):
     """Grace DRAM allocated with cuMemCreate (``CU_MEM_LOCATION_TYPE_HOST_NUMA``), one allocation per chunk because an
     imported fabric allocation maps only whole, published as one 64-byte CUDA fabric handle per chunk in
-    ``donor.<name>.fabric``. Chunks fill NUMA node ``numa_node`` (default: the node of CUDA device ``device``) first,
-    then the other nodes, leaving ``reserve_bytes`` free per node; a donation that only partly fits is published with
-    ``short_bytes``."""
+    ``donor.<name>.fabric``. Chunks fill the donor's NUMA node (default: the node of its CUDA device) first, then the
+    other nodes, leaving ``reserve_bytes`` free per node; a donation that only partly fits is published with
+    ``short_bytes``. Clients map the chunks and copy on their own streams, so no transfer agent is involved."""
 
-    transport = "fabric"
+    kind = "fabric"
+    name: str = ""  # the donor's, for logs
+    chunk_bytes: int = REMOTE_CACHE_CHUNK_BYTES
     reserve_bytes: int = REMOTE_CACHE_DONOR_RESERVE_BYTES
     _fabric: Optional[list] = None  # the cuMemCreate handles, one per chunk
     _fabric_ctx = None
     # The device whose primary context _fabric_ctx retains; close() releases it.
     _fabric_device = None
 
-    def __init__(
-        self,
-        directory: str,
-        nbytes: int,
-        *,
-        reserve_bytes: int = REMOTE_CACHE_DONOR_RESERVE_BYTES,
-        **kwargs,
-    ):
-        super().__init__(directory, nbytes, **kwargs)
+    def __init__(self, *, reserve_bytes: int = REMOTE_CACHE_DONOR_RESERVE_BYTES):
         self.reserve_bytes = reserve_bytes
         self._fabric = []
         self._fabric_ctx = None
@@ -884,14 +898,16 @@ class FabricDonor(RemoteMemDonor):
                 return None
             raise
 
-    def _start_transport(self) -> None:
+    def start(self, donor: "RemoteMemDonor") -> None:
         """Allocate the donation one chunk at a time, placed by _place_chunks, and publish their fabric handles in chunk
         order. What fits is published with short_bytes; a donor that fits nothing raises."""
         from cuda.bindings import driver as drv
 
-        ensure_rendezvous_directory(self.directory)
+        self.name = donor.name
+        self.chunk_bytes = donor.chunk_bytes
+        ensure_rendezvous_directory(donor.directory)
         _cuda_check(drv.cuInit(0))
-        device = _cuda_check(drv.cuDeviceGet(0 if self.device is None else self.device))
+        device = _cuda_check(drv.cuDeviceGet(0 if donor.device is None else donor.device))
         self._fabric_ctx = _cuda_check(drv.cuDevicePrimaryCtxRetain(device))
         self._fabric_device = device
         # cuMemCreate and the export may run while the serving thread captures a CUDA graph in global mode.
@@ -901,14 +917,16 @@ class FabricDonor(RemoteMemDonor):
             )
         )
         handles = []
-        planned = self.nbytes
+        planned = donor.nbytes
         chunk_gib = self.chunk_bytes / _GIB
         reserve_gib = self.reserve_bytes / _GIB
         pushed = started = False
         try:
             _cuda_check(drv.cuCtxPushCurrent(self._fabric_ctx))
             pushed = True
-            numa = self.numa_node if self.numa_node is not None else _host_numa_node_of(drv, device)
+            numa = (
+                donor.numa_node if donor.numa_node is not None else _host_numa_node_of(drv, device)
+            )
             nodes = [numa] + [n for n in _host_numa_nodes() if n != numa]
             props = {n: self._fabric_prop(drv, n) for n in nodes}
             gran = _cuda_check(
@@ -936,7 +954,7 @@ class FabricDonor(RemoteMemDonor):
                 create,
                 chunk_gib=chunk_gib,
                 reserve_gib=reserve_gib,
-                node_lock=lambda node: _node_compaction_lock(self.directory, self.host, node),
+                node_lock=lambda node: _node_compaction_lock(donor.directory, donor.host, node),
             )
             for handle in placed:
                 exported = _cuda_check(
@@ -961,22 +979,22 @@ class FabricDonor(RemoteMemDonor):
             raise
         finally:
             self._leave_fabric_context(drv, capture_mode, pop=pushed, raise_errors=started)
-        self.nbytes = len(handles) * self.chunk_bytes
-        short = planned - self.nbytes
+        donor.nbytes = len(handles) * self.chunk_bytes
+        short = planned - donor.nbytes
         placement = ",".join(f"{n}:{c}" for n, c in per_node.items() if c)
         meta = [
             "transport fabric",
             f"numa {numa}",
             f"numa_chunks {placement}",
-            f"segment 0 {self.nbytes}",
+            f"segment 0 {donor.nbytes}",
         ]
         if short:
             meta.append(f"short_bytes {short}")
             _log(
-                f"{self.name}: only {self.nbytes / _GIB:.0f} of {planned / _GIB:.0f} GiB fit as fabric memory "
+                f"{self.name}: only {donor.nbytes / _GIB:.0f} of {planned / _GIB:.0f} GiB fit as fabric memory "
                 f"(reserve {reserve_gib:.0f} GiB per node)"
             )
-        self._publish(
+        donor._publish(
             [("fabric", b"".join(handles))],
             meta,
             f"fabric memory, chunks per NUMA node {placement}, {len(handles)} allocation(s) created in "
@@ -997,7 +1015,7 @@ class FabricDonor(RemoteMemDonor):
                     raise
                 _log(f"{self.name}: leaving the fabric context failed: {error}")
 
-    def _release_transport(self) -> None:
+    def release(self, donor: "RemoteMemDonor") -> None:
         if self._fabric_ctx is not None:
             from cuda.bindings import driver as drv
 
@@ -1019,25 +1037,44 @@ class FabricDonor(RemoteMemDonor):
         self._fabric = []
 
 
-# The donor of each RemoteCacheConfig.transport.
-DONORS = {"nixl": NixlDonor, "fabric": FabricDonor}
-TRANSPORTS = tuple(DONORS)
+# The donor transport of each RemoteCacheConfig.transport.
+DONOR_TRANSPORTS = {"nixl": AgentDonorTransport, "fabric": FabricDonorTransport}
+TRANSPORTS = tuple(DONOR_TRANSPORTS)
 
 
-def make_donor(directory: str, nbytes: int, transport: str = "nixl", **kwargs) -> RemoteMemDonor:
-    """A donor of `transport` (one of ``TRANSPORTS``); `kwargs` go to its constructor."""
-    if transport not in DONORS:
+def make_donor(
+    directory: str,
+    nbytes: int,
+    transport: str = "nixl",
+    *,
+    chunk_bytes: int = REMOTE_CACHE_CHUNK_BYTES,
+    name: Optional[str] = None,
+    numa_node: Optional[int] = None,
+    device: Optional[int] = None,
+    **transport_options,
+) -> RemoteMemDonor:
+    """A donation of `nbytes` in `directory`, made reachable by `transport` (one of ``TRANSPORTS``) built with
+    `transport_options` (``ucx_devices`` for NIXL, ``reserve_bytes`` for fabric)."""
+    if transport not in DONOR_TRANSPORTS:
         raise ValueError(f"transport {transport!r} is not one of {TRANSPORTS}")
-    return DONORS[transport](directory, nbytes, **kwargs)
+    return RemoteMemDonor(
+        directory,
+        nbytes,
+        DONOR_TRANSPORTS[transport](**transport_options),
+        chunk_bytes=chunk_bytes,
+        name=name,
+        numa_node=numa_node,
+        device=device,
+    )
 
 
 def _donor_for(remote_config: "RemoteCacheConfig", device: Optional[int]) -> RemoteMemDonor:
-    donor_cls = DONORS[remote_config.transport]
-    return donor_cls(
+    transport_cls = DONOR_TRANSPORTS[remote_config.transport]
+    return RemoteMemDonor(
         os.path.expandvars(os.path.expanduser(remote_config.directory)),
         remote_config.donate_size,
+        transport_cls(**transport_cls.options_from(remote_config)),
         device=device,
-        **donor_cls.options_from(remote_config),
     )
 
 

@@ -156,7 +156,7 @@ class TestNixlUcxBackendParams(unittest.TestCase):
         finally:
             shutil.rmtree(directory, ignore_errors=True)
         self.assertEqual(len(tiers), 1)
-        self.assertEqual(tiers[0].agent_backend_params, {"device_list": "mlx5_0, mlx5_3"})
+        self.assertEqual(tiers[0].transfer.backend_params, {"device_list": "mlx5_0, mlx5_3"})
 
 
 if __name__ == "__main__":

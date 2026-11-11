@@ -154,6 +154,7 @@ OutOfMemoryError = _cpp.OutOfMemoryError
 OutOfPagesError = _cpp.OutOfPagesError
 RemoteMemError = _cpp.RemoteMemError
 RemoteCacheTierConfig = _cpp.RemoteCacheTierConfig
+RemoteTransferConfig = _cpp.RemoteTransferConfig
 RemoteTransport = _cpp.RemoteTransport
 PageIndexConverter = _cpp.PageIndexConverter
 PageIndexMode = _cpp.PageIndexMode
@@ -272,6 +273,7 @@ __all__ = [
     "OutOfPagesError",
     "RemoteMemError",
     "RemoteCacheTierConfig",
+    "RemoteTransferConfig",
     "RemoteTransport",
     "PageIndexConverter",
     "PlannedDropHandle",

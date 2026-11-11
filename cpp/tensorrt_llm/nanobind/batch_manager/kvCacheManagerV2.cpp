@@ -1764,21 +1764,24 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
+    nb::class_<kv::RemoteTransferConfig>(m, "RemoteTransferConfig")
+        .def(nb::init<kv::RemoteTransport, int64_t, std::map<std::string, std::string>>(),
+            nb::arg("transport") = kv::RemoteTransport::NIXL, nb::arg("timeout_ms") = 0,
+            nb::arg("backend_params") = std::map<std::string, std::string>{})
+        .def_rw("transport", &kv::RemoteTransferConfig::transport)
+        .def_rw("timeout_ms", &kv::RemoteTransferConfig::timeoutMs)
+        .def_rw("backend_params", &kv::RemoteTransferConfig::backendParams) DEF_COPY(kv::RemoteTransferConfig);
+
     nb::class_<kv::RemoteCacheTierConfig>(m, "RemoteCacheTierConfig")
-        .def(nb::init<size_t, std::string, int64_t, int64_t, uint32_t, kv::RemoteTransport,
-                 std::map<std::string, std::string>, std::vector<double>>(),
-            nb::arg("quota"), nb::arg("path"), nb::arg("wait_timeout_ms") = 0, nb::arg("transfer_timeout_ms") = 0,
-            nb::arg("expected_donors") = 0, nb::arg("transport") = kv::RemoteTransport::NIXL,
-            nb::arg("agent_backend_params") = std::map<std::string, std::string>{},
-            nb::arg("pool_ratio") = std::vector<double>{})
+        .def(nb::init<size_t, std::string, int64_t, uint32_t, std::vector<double>, kv::RemoteTransferConfig>(),
+            nb::arg("quota"), nb::arg("path"), nb::arg("wait_timeout_ms") = 0, nb::arg("expected_donors") = 0,
+            nb::arg("pool_ratio") = std::vector<double>{}, nb::arg("transfer") = kv::RemoteTransferConfig{})
         .def_rw("quota", &kv::RemoteCacheTierConfig::quota)
         .def_rw("path", &kv::RemoteCacheTierConfig::path)
         .def_rw("wait_timeout_ms", &kv::RemoteCacheTierConfig::waitTimeoutMs)
-        .def_rw("transfer_timeout_ms", &kv::RemoteCacheTierConfig::transferTimeoutMs)
         .def_rw("expected_donors", &kv::RemoteCacheTierConfig::expectedDonors)
-        .def_rw("transport", &kv::RemoteCacheTierConfig::transport)
-        .def_rw("agent_backend_params", &kv::RemoteCacheTierConfig::agentBackendParams)
         .def_rw("pool_ratio", &kv::RemoteCacheTierConfig::poolRatio)
+        .def_rw("transfer", &kv::RemoteCacheTierConfig::transfer)
         .def_prop_ro("tier", &kv::RemoteCacheTierConfig::tier)
         .def("validate", &kv::RemoteCacheTierConfig::validate) DEF_COPY(kv::RemoteCacheTierConfig);
 
@@ -2753,6 +2756,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return std::move(utilization.raw());
         },
         nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "remote_unquiesced_transfers",
+        // Remote transfers past their deadline whose staging is still out of use, after releasing the quiesced ones.
+        [](kv::KvCacheManager& manager) { return manager.storage().reapQuiescedRemoteTransfers(); }, nb::arg("manager"),
+        nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "level_pool_groups",
         [](kv::KvCacheManager& manager, int cacheLevel)

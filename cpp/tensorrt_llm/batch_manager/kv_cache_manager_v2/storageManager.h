@@ -43,6 +43,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 class Page;
 class KvCache;
 class CopyEngine;
+class StagingBuffer;
 class StagingBufferManager;
 
 using MigrationRecorder
@@ -261,6 +262,10 @@ public:
         return mHasRemoteLevel;
     }
 
+    //! Release the staging leases of remote transfers that have quiesced since their deadline; returns how many
+    //! remain out of use.
+    size_t reapQuiescedRemoteTransfers() noexcept;
+
     PoolGroupIndex getPoolGroupIndex(CacheLevel level, LifeCycleId lc) const;
     PoolGroupIndex getPoolGroupIndex(LifeCycleId lc) const;
     PoolIndex numPools(CacheLevel level, PoolGroupIndex pgIdx) const;
@@ -466,6 +471,11 @@ private:
     //! Drop the evictable pages of every failed remote level, which could not be read back, so reuse no longer finds
     //! them. Pages a request holds stay until it lets go of them (scheduleForEviction then drops them).
     void dropPagesOfFailedRemoteLevels();
+    //! Run one remote transfer of a migration batch and act on its outcome: stream-ordered, the enqueue's; on the
+    //! host, waited for up to the transfer timeout, and a transfer not quiesced by then keeps `staging` out of use.
+    //! A fault or timeout fails the client (RemoteMemError).
+    void runRemoteTransfer(RemoteMemClient& client, bool write, std::vector<RemoteIo> const& ios, size_t bytes,
+        CUstream stream, std::unique_ptr<StagingBuffer>& staging);
     //! The client of a remote tier's rendezvous directory, created on first use; null for any other tier.
     SharedPtr<RemoteMemClient> remoteClientFor(CacheTierConfig const& tier);
     //! A hot-to-remote or remote-to-hot migration: the cold-page codec runs against the page-staging buffer and the
@@ -519,6 +529,18 @@ private:
     // One remote-memory client per rendezvous directory, shared by this manager's levels that name it. The page
     // staging buffer is registered with each and deregistered before the staging is freed.
     std::vector<SharedPtr<RemoteMemClient>> mRemoteClients;
+
+    //! A host-concluded remote transfer that had not quiesced by its deadline, and the staging lease it may still
+    //! access: kept out of use until it quiesces (reapQuiescedRemoteTransfers), leaked with its client at teardown
+    //! if it never does.
+    struct UnquiescedRemoteTransfer
+    {
+        std::unique_ptr<RemoteTransferAttempt> attempt;
+        std::unique_ptr<StagingBuffer> staging;
+        RemoteMemClient* client;
+    };
+
+    std::vector<UnquiescedRemoteTransfer> mUnquiescedRemoteTransfers;
     bool mHasRemoteLevel = false;
     // The deepest level that still takes pages: the last level, until trailing remote levels fail.
     CacheLevel mLastLiveLevel{0};

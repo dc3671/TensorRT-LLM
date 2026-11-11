@@ -36,9 +36,9 @@ from unittest import mock
 
 from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
 from tensorrt_llm._torch.pyexecutor.kv_cache.remote_donor import (
-    FabricDonor,
-    NixlDonor,
+    FabricDonorTransport,
     check_remote_capacity,
+    make_donor,
     scan_donors,
 )
 
@@ -84,7 +84,7 @@ class TestCapacityCheck(unittest.TestCase):
     def test_scan_counts_whole_chunks_and_failures(self):
         _publish(self.dir, "a", 160)
         _publish(self.dir, "b", 100, short_gib=60)
-        donor = NixlDonor(self.dir, 160 * _GIB, chunk_bytes=_GIB, name="c")
+        donor = make_donor(self.dir, 160 * _GIB, chunk_bytes=_GIB, name="c")
         donor.publish_failure(RuntimeError("CUDA_ERROR_OUT_OF_MEMORY"))
         open(os.path.join(self.dir, "claim.a.0"), "w").close()  # claims are not donors
         published, failed = scan_donors(self.dir)
@@ -106,7 +106,7 @@ class TestCapacityCheck(unittest.TestCase):
         for i in range(5):
             _publish(self.dir, f"ok{i}", 160)
         for i in range(3):
-            NixlDonor(self.dir, 160 * _GIB, chunk_bytes=_GIB, name=f"bad{i}").publish_failure(
+            make_donor(self.dir, 160 * _GIB, chunk_bytes=_GIB, name=f"bad{i}").publish_failure(
                 RuntimeError("CUDA_ERROR_OUT_OF_MEMORY")
             )
         t0 = time.monotonic()
@@ -205,7 +205,7 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertEqual(result["offered_bytes"], 200 * _GIB)
 
     def test_failure_marker_survives_close(self):
-        donor = NixlDonor(self.dir, 4 * _GIB, chunk_bytes=_GIB, name="gone")
+        donor = make_donor(self.dir, 4 * _GIB, chunk_bytes=_GIB, name="gone")
         donor.close()
         donor.publish_failure(RuntimeError("boom\nsecond line"))
         path = os.path.join(self.dir, "donor.gone.failed")
@@ -216,7 +216,7 @@ class TestCapacityCheck(unittest.TestCase):
 
     def test_close_waits_for_a_failed_background_start_closing_itself(self):
         # The start thread closes the donor itself on failure; a concurrent close() must not withdraw alongside it.
-        donor = NixlDonor(self.dir, 4 * _GIB, chunk_bytes=_GIB, name="racy")
+        donor = make_donor(self.dir, 4 * _GIB, chunk_bytes=_GIB, name="racy")
         entered, release = threading.Event(), threading.Event()
         active, depths = [0], []
         real_withdraw = donor._withdraw
@@ -254,11 +254,11 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertFalse(start_threads[0].is_alive())
 
     def _started(self, name):
-        donor = FabricDonor(self.dir, 4 * _GIB, chunk_bytes=_GIB, name=name)
+        donor = make_donor(self.dir, 4 * _GIB, "fabric", chunk_bytes=_GIB, name=name)
         with mock.patch.object(
-            FabricDonor,
-            "_start_transport",
-            lambda self: self._publish([], ["segment 0 1"], "test"),
+            FabricDonorTransport,
+            "start",
+            lambda self, donor: donor._publish([], ["segment 0 1"], "test"),
         ):
             donor.start()
         return donor
@@ -288,7 +288,7 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertIn("another rank", failed[0]["error"])
 
     def test_donor_names_are_unique_within_a_process(self):
-        names = {NixlDonor(self.dir, _GIB, chunk_bytes=_GIB).name for _ in range(64)}
+        names = {make_donor(self.dir, _GIB, chunk_bytes=_GIB).name for _ in range(64)}
         self.assertEqual(len(names), 64)
 
 
@@ -315,7 +315,7 @@ class TestRendezvousPermissions(unittest.TestCase):
         remote_donor.ensure_rendezvous_directory(self.dir)
 
     def test_donor_files_are_private(self):
-        NixlDonor(self.dir, _GIB, chunk_bytes=_GIB, name="x").publish_failure(RuntimeError("e"))
+        make_donor(self.dir, _GIB, chunk_bytes=_GIB, name="x").publish_failure(RuntimeError("e"))
         self.assertEqual(os.stat(os.path.join(self.dir, "donor.x.failed")).st_mode & 0o077, 0)
 
 
@@ -628,9 +628,10 @@ class TestFabricPlacement(unittest.TestCase):
         return remote_donor._meta_fields(os.path.join(self.dir, f"donor.{donor.name}.meta"))
 
     def test_full_preferred_node_spills_to_the_other(self):
-        donor = FabricDonor(
+        donor = make_donor(
             self.dir,
             4 * self.CHUNK,
+            transport="fabric",
             chunk_bytes=self.CHUNK,
             numa_node=0,
             device=0,
@@ -649,15 +650,19 @@ class TestFabricPlacement(unittest.TestCase):
             donor.close()
 
     def test_donation_that_only_partly_fits_is_published_short(self):
-        donor = FabricDonor(
+        donor = make_donor(
             self.dir,
             4 * self.CHUNK,
+            transport="fabric",
             chunk_bytes=self.CHUNK,
             numa_node=0,
             device=0,
         )
+
         # Node 0 is full, node 1 has room for two chunks.
-        fake = lambda n: self._full(n) if n == 0 or len(donor._fabric) >= 2 else self.real(n)  # noqa: E731
+        def fake(n):
+            return self._full(n) if n == 0 or len(donor.transport._fabric) >= 2 else self.real(n)
+
         with mock.patch.object(remote_donor, "_node_meminfo", fake):
             donor.start()
         try:
@@ -672,22 +677,23 @@ class TestFabricPlacement(unittest.TestCase):
     def test_refused_chunks_are_retried_with_real_allocations(self):
         # The driver refuses two calls (chunk 1's first try and its first retry); the donation still completes on
         # node 0.
-        real_create = FabricDonor._try_create
+        real_create = FabricDonorTransport._try_create
         calls = [0]
 
-        def flaky(donor, drv, prop):
+        def flaky(transport, drv, prop):
             calls[0] += 1
-            return None if calls[0] in (2, 3) else real_create(donor, drv, prop)
+            return None if calls[0] in (2, 3) else real_create(transport, drv, prop)
 
-        donor = FabricDonor(
+        donor = make_donor(
             self.dir,
             4 * self.CHUNK,
+            transport="fabric",
             chunk_bytes=self.CHUNK,
             numa_node=0,
             device=0,
         )
         with (
-            mock.patch.object(FabricDonor, "_try_create", flaky),
+            mock.patch.object(FabricDonorTransport, "_try_create", flaky),
             mock.patch.object(remote_donor, "_FABRIC_RETRY_S", 0.5),
         ):
             donor.start()
@@ -701,7 +707,7 @@ class TestFabricPlacement(unittest.TestCase):
     def test_a_real_reclaim_pass_recovers_a_refusal(self):
         # Refuse until one real reclaim-and-compact pass (64 chunks of 16 MiB, libnuma-bound, huge pages) has run on
         # node 0.
-        real_create = FabricDonor._try_create
+        real_create = FabricDonorTransport._try_create
         real_compact = remote_donor._compact_node
         passes = []
 
@@ -709,18 +715,19 @@ class TestFabricPlacement(unittest.TestCase):
             passes.append((node, gib))
             return real_compact(node, gib)
 
-        def refusing(donor, drv, prop):
-            return real_create(donor, drv, prop) if passes or not donor._fabric else None
+        def refusing(transport, drv, prop):
+            return real_create(transport, drv, prop) if passes or not transport._fabric else None
 
-        donor = FabricDonor(
+        donor = make_donor(
             self.dir,
             3 * self.CHUNK,
+            transport="fabric",
             chunk_bytes=self.CHUNK,
             numa_node=0,
             device=0,
         )
         with (
-            mock.patch.object(FabricDonor, "_try_create", refusing),
+            mock.patch.object(FabricDonorTransport, "_try_create", refusing),
             mock.patch.object(remote_donor, "_compact_node", counted),
             mock.patch.object(remote_donor, "_FABRIC_RETRY_S", 0.2),
         ):
@@ -733,7 +740,7 @@ class TestFabricPlacement(unittest.TestCase):
             donor.close()
 
     def test_no_room_anywhere_leaves_a_failure_marker(self):
-        donor = FabricDonor(self.dir, 4 * self.CHUNK, chunk_bytes=self.CHUNK)
+        donor = make_donor(self.dir, 4 * self.CHUNK, "fabric", chunk_bytes=self.CHUNK)
         with mock.patch.object(remote_donor, "_node_meminfo", self._full):
             donor.start_or_report()
         self.assertFalse(os.path.exists(os.path.join(self.dir, f"donor.{donor.name}.ready")))

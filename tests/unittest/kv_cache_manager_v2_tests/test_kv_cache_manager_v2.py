@@ -69,6 +69,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         PoolRebalanceConfig,
         RemoteCacheTierConfig,  # noqa: F401 - for test_remote_level
         RemoteMemError,  # noqa: F401 - for test_remote_level
+        RemoteTransferConfig,  # noqa: F401 - for test_remote_level
         RemoteTransport,  # noqa: F401 - for test_remote_level
         ReuseScope,
         SlidingWindowSize,
@@ -133,6 +134,7 @@ else:
         PoolRebalanceConfig,
         RemoteCacheTierConfig,  # noqa: F401 - for test_remote_level
         RemoteMemError,  # noqa: F401 - for test_remote_level
+        RemoteTransferConfig,  # noqa: F401 - for test_remote_level
         RemoteTransport,  # noqa: F401 - for test_remote_level
         ReuseScope,
         SlidingWindowSize,

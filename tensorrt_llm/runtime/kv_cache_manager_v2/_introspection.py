@@ -246,6 +246,11 @@ def storage_utilization(manager: Any, cache_level: int = 0) -> list[float]:
     return list(_cpp().storage_utilization(manager, cache_level))
 
 
+def remote_unquiesced_transfers(manager: Any) -> int:
+    """Release the staging of remote transfers that quiesced after their deadline; return how many still have not."""
+    return int(_cpp().remote_unquiesced_transfers(manager))
+
+
 def level_pool_groups(manager: Any, cache_level: int) -> list[tuple[int, int, list[int]]]:
     """Return (slot count, bytes per slot, layer-group IDs) for each pool group of a cache level."""
     return [

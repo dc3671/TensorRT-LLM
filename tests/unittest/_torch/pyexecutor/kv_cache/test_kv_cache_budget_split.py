@@ -1338,8 +1338,11 @@ class TestRemoteLevelOwnership:
     def _add_remote_level(is_draft, tmp_path, monkeypatch, transport="nixl"):
         from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, remote_donor
 
-        donor_cls = Mock(options_from=remote_donor.DONORS[transport].options_from)
-        monkeypatch.setitem(remote_donor.DONORS, transport, donor_cls)
+        transport_cls = Mock(options_from=remote_donor.DONOR_TRANSPORTS[transport].options_from)
+        monkeypatch.setitem(remote_donor.DONOR_TRANSPORTS, transport, transport_cls)
+        donor_cls = Mock()
+        donor_cls.transport_cls = transport_cls
+        monkeypatch.setattr(remote_donor, "RemoteMemDonor", donor_cls)
         monkeypatch.setattr(kv_cache_manager_v2, "RemoteCacheTierConfig", Mock())
         monkeypatch.setattr(kv_cache_manager_v2.torch.cuda, "current_device", lambda: 0)
         manager = SimpleNamespace(is_draft=is_draft, _remote_donor=None)
@@ -1362,8 +1365,9 @@ class TestRemoteLevelOwnership:
     )
     def test_each_donor_gets_its_transport_options(self, transport, options, tmp_path, monkeypatch):
         _, _, donor_cls = self._add_remote_level(False, tmp_path, monkeypatch, transport)
-        kwargs = donor_cls.call_args.kwargs
-        assert {key: kwargs[key] for key in kwargs if key != "device"} == options
+        # The transport is made from its own options, apart from the donation it reaches.
+        donor_cls.transport_cls.assert_called_once_with(**options)
+        assert donor_cls.call_args.args[2] is donor_cls.transport_cls.return_value
 
     def test_target_takes_over_a_donation_started_before_it(self, tmp_path, monkeypatch):
         from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, remote_donor

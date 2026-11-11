@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "kv_cache_manager_v2/storage/remoteMemFabric.h"
+#include "kv_cache_manager_v2/storage/remoteTransferFabric.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -41,30 +41,42 @@ std::string cuErrorName(CUresult result)
     return name;
 }
 
+//! A submission's copies, enqueued on the caller's stream: concluded at once with the enqueue's outcome.
+class FabricTransferAttempt final : public RemoteTransferAttempt
+{
+public:
+    FabricTransferAttempt(std::string fault, CUstream stream)
+        : mOutcome{std::move(fault)}
+        , mStream(stream)
+    {
+    }
+
+    std::optional<RemoteTransferOutcome> poll() override
+    {
+        return mOutcome;
+    }
+
+    //! The stream has run everything enqueued on it so far, these copies included.
+    bool quiesced() override
+    {
+        mQuiesced = mQuiesced || cuStreamQuery(mStream) == CUDA_SUCCESS;
+        return mQuiesced;
+    }
+
+    std::optional<RemoteTransferOutcome> wait(int64_t /*timeoutMs*/) override
+    {
+        return mOutcome;
+    }
+
+private:
+    RemoteTransferOutcome mOutcome;
+    CUstream mStream;
+    bool mQuiesced = false;
+};
+
 } // namespace
 
-FabricRemoteMemClient::FabricRemoteMemClient(RemoteMemOptions options)
-    : RemoteMemClient(std::move(options))
-{
-    try
-    {
-        retainContext();
-        discoverDonors();
-    }
-    catch (...)
-    {
-        // No destructor runs for a failed constructor, and nothing is claimed yet.
-        releaseTransport();
-        throw;
-    }
-}
-
-FabricRemoteMemClient::~FabricRemoteMemClient()
-{
-    releaseTransport();
-}
-
-void FabricRemoteMemClient::retainContext()
+FabricTransferBackend::FabricTransferBackend()
 {
     CUcontext context = nullptr;
     cuCheck(cuCtxGetCurrent(&context));
@@ -83,16 +95,21 @@ void FabricRemoteMemClient::retainContext()
         cuDevicePrimaryCtxRelease(mDevice);
         throw RemoteMemError("KVCM2 remote level: the fabric transport needs the device's primary context current");
     }
-    mContext = primary; // released by releaseTransport()
+    mContext = primary; // released by release()
 }
 
-void FabricRemoteMemClient::releaseTransport() noexcept
+FabricTransferBackend::~FabricTransferBackend()
+{
+    release();
+}
+
+void FabricTransferBackend::release() noexcept
 {
     // Copies still queued on callers' streams must finish before their mappings go.
     if (CUresult const result = synchronizeContext(); result != CUDA_SUCCESS)
     {
-        TLLM_LOG_WARNING("KVCM2 remote level: teardown of %s: synchronizing failed: %s", name().c_str(),
-            cuErrorName(result).c_str());
+        TLLM_LOG_WARNING(
+            "KVCM2 remote level: fabric transport teardown: synchronizing failed: %s", cuErrorName(result).c_str());
     }
     for (auto const& mapping : mMappings)
     {
@@ -109,17 +126,16 @@ void FabricRemoteMemClient::releaseTransport() noexcept
     }
 }
 
-void FabricRemoteMemClient::drain() noexcept
+void FabricTransferBackend::drain() noexcept
 {
     // Copies on callers' streams reach memory that is about to be released or reused.
     if (CUresult const result = synchronizeContext(); result != CUDA_SUCCESS)
     {
-        TLLM_LOG_ERROR("KVCM2 remote level: draining the fabric copies of %s failed: %s", mOptions.directory.c_str(),
-            cuErrorName(result).c_str());
+        TLLM_LOG_ERROR("KVCM2 remote level: draining the fabric copies failed: %s", cuErrorName(result).c_str());
     }
 }
 
-CUresult FabricRemoteMemClient::synchronizeContext() const noexcept
+CUresult FabricTransferBackend::synchronizeContext() const noexcept
 {
     if (mContext == nullptr)
     {
@@ -136,7 +152,7 @@ CUresult FabricRemoteMemClient::synchronizeContext() const noexcept
     return result;
 }
 
-bool FabricRemoteMemClient::acceptPayload(Donor const& donor) const
+bool FabricTransferBackend::acceptPayload(RemoteDonor const& donor) const
 {
     if (donor.payload.size() != donor.chunks.size() * sizeof(CUmemFabricHandle))
     {
@@ -149,7 +165,7 @@ bool FabricRemoteMemClient::acceptPayload(Donor const& donor) const
     return true;
 }
 
-uint64_t FabricRemoteMemClient::attachChunk(Donor& donor, size_t chunk)
+uint64_t FabricTransferBackend::attachChunk(RemoteDonor& donor, size_t chunk)
 {
     // The chunk is its own fabric allocation, imported only as it is claimed.
     uint64_t const bytes = donor.chunks[chunk].second;
@@ -195,11 +211,12 @@ uint64_t FabricRemoteMemClient::attachChunk(Donor& donor, size_t chunk)
     }
     mMappings.push_back(FabricMapping{address, bytes, handle});
     mMappingEnd.emplace(address, address + bytes);
-    donor.loaded = true;
+    donor.attached = true;
     return address;
 }
 
-void FabricRemoteMemClient::doTransfer(bool write, std::vector<RemoteIo> const& ios, size_t bytes, CUstream stream)
+std::unique_ptr<RemoteTransferAttempt> FabricTransferBackend::submit(bool write,
+    std::vector<RemoteDonor> const& /*donors*/, std::vector<RemoteIo> const& ios, size_t bytes, CUstream stream)
 {
     // Runs of pages that are contiguous on both sides go as one copy, within one mapped chunk: two chunks' separate
     // mappings may happen to be adjacent in the address space.
@@ -222,11 +239,14 @@ void FabricRemoteMemClient::doTransfer(bool write, std::vector<RemoteIo> const& 
             = write ? cuMemcpyAsync(remote, local, n, stream) : cuMemcpyAsync(local, remote, n, stream);
         if (result != CUDA_SUCCESS)
         {
-            fail(std::string("KVCM2 remote level: enqueuing a fabric ") + (write ? "WRITE" : "READ") + " of "
-                + std::to_string(n) + " B failed: " + cuErrorName(result));
+            // The copies enqueued before it run on; the stream orders them before anything reuses their memory.
+            return std::make_unique<FabricTransferAttempt>(std::string("KVCM2 remote level: enqueuing a fabric ")
+                    + (write ? "WRITE" : "READ") + " of " + std::to_string(n) + " B failed: " + cuErrorName(result),
+                stream);
         }
         i = j;
     }
+    return std::make_unique<FabricTransferAttempt>(std::string{}, stream);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

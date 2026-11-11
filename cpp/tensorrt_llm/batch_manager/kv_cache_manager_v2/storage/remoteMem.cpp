@@ -17,13 +17,12 @@
 
 #include "kv_cache_manager_v2/storage/remoteMem.h"
 #include "kv_cache_manager_v2/exceptions.h"
-#include "kv_cache_manager_v2/storage/remoteMemFabric.h"
-#include "kv_cache_manager_v2/storage/remoteMemNixl.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -87,41 +86,42 @@ constexpr std::string_view kFailedSuffix = ".failed";
 // RemoteMemClient
 // ---------------------------------------------------------------------------
 
-RemoteMemClient::RemoteMemClient(RemoteMemOptions options)
-    : mOptions(std::move(options))
+RemoteMemClient::RemoteMemClient(std::string name, RemoteMemOptions options, RemoteTransferConfig transferConfig,
+    std::unique_ptr<RemoteTransferBackend> backend)
+    : mName(std::move(name))
+    , mOptions(std::move(options))
+    , mTransferConfig(std::move(transferConfig))
+    , mBackend(std::move(backend))
 {
-    TLLM_CHECK_WITH_INFO(std::filesystem::is_directory(mOptions.directory),
-        "KVCM2 remote level: rendezvous directory '%s' does not exist", mOptions.directory.c_str());
-    // Unique among the process's clients, past and present: it names the NIXL agent and the owner of each claim.
-    mName = "kvcm2-remote-" + hostName() + "-" + std::to_string(::getpid()) + "-"
-        + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-"
-        + std::to_string(reinterpret_cast<std::uintptr_t>(this));
-}
-
-RemoteMemClient::~RemoteMemClient()
-{
-    // The claims go last, after the transport's teardown: another client may write into a chunk as soon as its claim
-    // is gone.
-    if (mKeepClaims)
-    {
-        TLLM_LOG_WARNING("KVCM2 remote level: %s keeps its %zu claim(s) in %s after uncancelled transfers",
-            mName.c_str(), mClaims.size(), mOptions.directory.c_str());
-        return;
-    }
-    for (auto const& path : mClaims)
-    {
-        ::unlink(path.c_str());
-    }
-}
-
-void RemoteMemClient::discoverDonors()
-{
+    TLLM_CHECK(mBackend != nullptr);
+    mStreamOrdered = mBackend->streamOrdered();
     {
         std::lock_guard<std::mutex> lock(mMutex);
         refreshDonors();
     }
     TLLM_LOG_INFO("KVCM2 remote level: client %s, rendezvous %s, %zu donor(s) published, transport %s", mName.c_str(),
-        mOptions.directory.c_str(), mDonors.size(), transportName());
+        mOptions.directory.c_str(), mDonors.size(), mBackend->kind());
+}
+
+RemoteMemClient::~RemoteMemClient()
+{
+    if (mAbandoned)
+    {
+        // A transfer that never quiesced may still reach the chunks and the backend: both outlive this client.
+        static_cast<void>(mBackend.release());
+        TLLM_LOG_WARNING(
+            "KVCM2 remote level: %s keeps its %zu claim(s) in %s and its transport after transfers "
+            "that never quiesced",
+            mName.c_str(), mClaims.size(), mOptions.directory.c_str());
+        return;
+    }
+    // The claims go last, after the backend's teardown: another client may write into a chunk as soon as its claim
+    // is gone.
+    mBackend.reset();
+    for (auto const& path : mClaims)
+    {
+        ::unlink(path.c_str());
+    }
 }
 
 void RemoteMemClient::refreshDonors()
@@ -164,7 +164,7 @@ void RemoteMemClient::refreshDonors()
             continue;
         }
         fs::path const dir(mOptions.directory);
-        Donor donor;
+        RemoteDonor donor;
         auto const metaPath = dir / ("donor." + name + ".meta");
         // Donor files hold memory registration keys and fabric handles: only this user's donors are trusted.
         struct stat metaStat = {};
@@ -227,10 +227,10 @@ void RemoteMemClient::refreshDonors()
                 name.c_str(), version, agentName.c_str());
             continue;
         }
-        if (transport != transportName())
+        if (transport != mBackend->kind())
         {
             TLLM_LOG_WARNING("KVCM2 remote level: ignoring donor %s: it donates over %s, this client uses %s",
-                name.c_str(), transport.c_str(), transportName());
+                name.c_str(), transport.c_str(), mBackend->kind());
             continue;
         }
         uint64_t numChunks = 0;
@@ -254,13 +254,13 @@ void RemoteMemClient::refreshDonors()
                 donor.chunks.emplace_back(base + chunk * donor.chunkBytes, donor.chunkBytes);
             }
         }
-        auto payload = readDonorFile(dir / ("donor." + name + "." + payloadSuffix()));
+        auto payload = readDonorFile(dir / ("donor." + name + "." + mBackend->payloadSuffix()));
         if (!payload)
         {
             continue; // withdrawn since the listing
         }
         donor.payload = std::move(*payload);
-        if (!acceptPayload(donor))
+        if (!mBackend->acceptPayload(donor))
         {
             continue;
         }
@@ -272,7 +272,7 @@ void RemoteMemClient::refreshDonors()
     }
 }
 
-bool RemoteMemClient::stillPublished(Donor& donor)
+bool RemoteMemClient::stillPublished(RemoteDonor& donor)
 {
     if (!donor.withdrawn)
     {
@@ -300,12 +300,15 @@ void RemoteMemClient::throwIfFailed() const
 
 void RemoteMemClient::fail(std::string const& message)
 {
-    if (!mFailed.load(std::memory_order_relaxed))
     {
-        mFailure = message;
-        mFailed.store(true, std::memory_order_release);
-        TLLM_LOG_ERROR(
-            "%s; the remote level in %s takes no further transfers", message.c_str(), mOptions.directory.c_str());
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!mFailed.load(std::memory_order_relaxed))
+        {
+            mFailure = message;
+            mFailed.store(true, std::memory_order_release);
+            TLLM_LOG_ERROR(
+                "%s; the remote level in %s takes no further transfers", message.c_str(), mOptions.directory.c_str());
+        }
     }
     throw RemoteMemError(message);
 }
@@ -357,7 +360,7 @@ bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
             uint64_t address = 0;
             try
             {
-                address = attachChunk(donor, chunk);
+                address = mBackend->attachChunk(donor, chunk);
             }
             catch (RemoteMemError const& e)
             {
@@ -446,25 +449,52 @@ void RemoteMemClient::releaseChunk(RemoteChunk chunk) noexcept
     mFreeChunks.push_back(std::move(chunk));
 }
 
-void RemoteMemClient::transfer(bool write, std::vector<RemoteIo> const& ios, size_t bytes, CUstream stream)
+std::unique_ptr<RemoteTransferAttempt> RemoteMemClient::submit(
+    bool write, std::vector<RemoteIo> const& ios, size_t bytes, CUstream stream)
 {
-    if (ios.empty() || bytes == 0)
-    {
-        return;
-    }
     std::lock_guard<std::mutex> lock(mMutex);
     throwIfFailed();
-    doTransfer(write, ios, bytes, stream);
+    return mBackend->submit(write, mDonors, ios, bytes, stream);
 }
 
-SharedPtr<RemoteMemClient> makeRemoteMemClient(RemoteMemOptions options)
+void RemoteMemClient::registerLocal(MemAddress base, size_t bytes)
 {
-    switch (options.transport)
+    std::lock_guard<std::mutex> lock(mMutex);
+    mBackend->registerLocal(base, bytes);
+}
+
+void RemoteMemClient::deregisterLocal(MemAddress base, size_t bytes) noexcept
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    if (!mAbandoned)
     {
-    case RemoteTransport::NIXL: return makeShared<NixlRemoteMemClient>(std::move(options));
-    case RemoteTransport::FABRIC: return makeShared<FabricRemoteMemClient>(std::move(options));
+        mBackend->deregisterLocal(base, bytes);
     }
-    throw std::invalid_argument("KVCM2 remote level: unknown transport");
+}
+
+void RemoteMemClient::drain() noexcept
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    mBackend->drain();
+}
+
+void RemoteMemClient::abandon() noexcept
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    mAbandoned = true;
+}
+
+SharedPtr<RemoteMemClient> makeRemoteMemClient(RemoteMemOptions options, RemoteTransferConfig const& transferConfig)
+{
+    TLLM_CHECK_WITH_INFO(std::filesystem::is_directory(options.directory),
+        "KVCM2 remote level: rendezvous directory '%s' does not exist", options.directory.c_str());
+    // Unique among the process's clients, past and present: it names the transfer agent and the owner of each claim.
+    static std::atomic<uint64_t> sClients{0};
+    std::string name = "kvcm2-remote-" + hostName() + "-" + std::to_string(::getpid()) + "-"
+        + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-"
+        + std::to_string(sClients.fetch_add(1));
+    auto backend = makeRemoteTransferBackend(transferConfig, name);
+    return makeShared<RemoteMemClient>(std::move(name), std::move(options), transferConfig, std::move(backend));
 }
 
 // ---------------------------------------------------------------------------

@@ -17,21 +17,23 @@
 
 #pragma once
 
-// Remote memory behind a remote cache level: host memory that donors (remote_donor.py, which describes the files)
-// publish in a rendezvous directory, claimed in whole chunks with O_EXCL claim.<donor>.<chunk> files. How pages move
-// is a transport's: remoteMemNixl.h (one-sided RDMA, host-synchronous) or remoteMemFabric.h (stream-ordered copies).
+// The memory behind a remote cache level: host memory that donors (remote_donor.py, which describes the files)
+// publish in a rendezvous directory, claimed in whole chunks with O_EXCL claim.<donor>.<chunk> files. Declaring and
+// claiming it does not pick a transport: pages move through the client's RemoteTransferBackend (remoteTransfer.h),
+// which makeRemoteMemClient makes from the tier's RemoteTransferConfig.
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/storage/config.h"
+#include "kv_cache_manager_v2/storage/remoteTransfer.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cuda.h>
-#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -41,17 +43,13 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
+//! The memory a remote level declares: where donors publish it and how long to wait for them.
 struct RemoteMemOptions
 {
     //! Rendezvous directory the donors publish into.
     std::string directory;
     //! How long a claim waits for a donor with a free chunk (RemoteCacheTierConfig::waitTimeoutMs).
     int64_t waitTimeoutMs = 0;
-    //! How long one NIXL transfer may take before it counts as failed (RemoteCacheTierConfig::transferTimeoutMs).
-    int64_t transferTimeoutMs = 0;
-    RemoteTransport transport = RemoteTransport::NIXL;
-    //! NIXL only: backend parameters of this client's agent (RemoteCacheTierConfig::agentBackendParams).
-    std::map<std::string, std::string> agentBackendParams;
     //! Donors the job starts (RemoteCacheTierConfig::expectedDonors); 0 if unknown.
     uint32_t expectedDonors = 0;
 
@@ -62,25 +60,20 @@ struct RemoteMemOptions
 struct RemoteChunk
 {
     uint32_t donor = 0;      // index into the client's donor table
-    uint64_t remoteAddr = 0; // the address transfers name the chunk by (RemoteMemClient::attachChunk)
+    uint64_t remoteAddr = 0; // the address transfers name the chunk by (RemoteTransferBackend::attachChunk)
     uint64_t bytes = 0;
 };
 
-//! One page to move: `bytes` between local memory at `local` and donor `donor` at `remoteAddr`.
-struct RemoteIo
-{
-    MemAddress local;
-    uint32_t donor;
-    uint64_t remoteAddr;
-};
-
-//! A connection to the donors of one rendezvous directory. The donor table and the claimed chunks are common to
-//! every transport; how pages move is the transport's (makeRemoteMemClient). Owned by a StorageManager and shared by
-//! its levels that name the directory; the last one to go releases the claims.
+//! A connection to the donors of one rendezvous directory: the donor table and the claimed chunks, and the backend
+//! that moves pages. Owned by a StorageManager and shared by its levels that name the directory; the last one to go
+//! releases the claims.
 class RemoteMemClient
 {
 public:
-    virtual ~RemoteMemClient();
+    //! Reads the donors published so far. `name` is unique among the process's clients and names each claim's owner.
+    RemoteMemClient(std::string name, RemoteMemOptions options, RemoteTransferConfig transferConfig,
+        std::unique_ptr<RemoteTransferBackend> backend);
+    ~RemoteMemClient();
 
     RemoteMemClient(RemoteMemClient const&) = delete;
     RemoteMemClient& operator=(RemoteMemClient const&) = delete;
@@ -92,29 +85,37 @@ public:
     //! Return a chunk to this process's free list. The claim is kept until the client is destroyed.
     void releaseChunk(RemoteChunk chunk) noexcept;
 
-    //! Whether transfers are copies enqueued on the caller's stream. Otherwise a transfer runs on the host and has
-    //! finished when transfer() returns, so its local memory must be ready, and free of stream work, before the call.
-    [[nodiscard]] virtual bool streamOrdered() const noexcept = 0;
+    //! RemoteTransferBackend::streamOrdered().
+    [[nodiscard]] bool streamOrdered() const noexcept
+    {
+        return mStreamOrdered;
+    }
 
-    //! Register local memory that transfers read from or write into, reference-counted by base address. A transport
-    //! that reaches local memory without registration ignores it.
-    virtual void registerLocal(MemAddress /*base*/, size_t /*bytes*/) {}
+    //! Register local memory transfers read from or write into with the backend (reference-counted by base).
+    void registerLocal(MemAddress base, size_t bytes);
+    //! Ignored once the client is abandoned: a transfer may still access the memory.
+    void deregisterLocal(MemAddress base, size_t bytes) noexcept;
 
-    virtual void deregisterLocal(MemAddress /*base*/, size_t /*bytes*/) noexcept {}
+    //! Start a transfer (RemoteTransferBackend::submit). Throws RemoteMemError when an earlier one failed: the
+    //! contents of the remote slots can no longer be trusted.
+    [[nodiscard]] std::unique_ptr<RemoteTransferAttempt> submit(
+        bool write, std::vector<RemoteIo> const& ios, size_t bytes, CUstream stream);
 
-    //! Move `bytes` for every entry, local -> remote (`write`) or remote -> local: enqueued on `stream`, or finished
-    //! on return (streamOrdered()). Throws RemoteMemError on any failure; the client has failed() from then on.
-    void transfer(bool write, std::vector<RemoteIo> const& ios, size_t bytes, CUstream stream);
+    //! Record the first transfer failure and throw it as RemoteMemError; the client has failed() from then on.
+    [[noreturn]] void fail(std::string const& message);
 
-    //! Whether a transfer failed. A failed client throws RemoteMemError on every transfer and claim, since the
-    //! contents of its remote slots can no longer be trusted.
+    //! Whether a transfer failed. A failed client throws RemoteMemError on every transfer and claim.
     [[nodiscard]] bool failed() const noexcept
     {
         return mFailed.load(std::memory_order_acquire);
     }
 
-    //! Wait until every transfer enqueued on a stream so far has finished; a failure is logged (teardown).
-    virtual void drain() noexcept {}
+    //! Wait until every stream-ordered transfer enqueued so far has finished (teardown).
+    void drain() noexcept;
+
+    //! A transfer that never quiesced may still access the claimed chunks, the backend's registrations and its
+    //! agent: keep the claims and leak the backend instead of releasing them.
+    void abandon() noexcept;
 
     [[nodiscard]] std::string const& directory() const noexcept
     {
@@ -126,81 +127,43 @@ public:
         return mOptions;
     }
 
-protected:
-    struct Donor
+    [[nodiscard]] RemoteTransferConfig const& transferConfig() const noexcept
     {
-        std::string name;
-        std::string host;
-        uint64_t chunkBytes = 0;
-        std::vector<std::pair<uint64_t, uint64_t>> segments; // (base, bytes)
-        std::vector<std::pair<uint64_t, uint64_t>> chunks;   // (address, bytes), in claim-index order; fabric: offsets
-        std::string payload;    // the donor's payloadSuffix() file: what the transport needs to reach it
-        bool loaded = false;    // the transport has reached it (attachChunk)
-        bool withdrawn = false; // its .ready file is gone: no new claims from it
-        size_t nextClaim = 0;   // chunks before it were claimed (by anyone) when last probed: claims start here
-        bool full = false;      // a probe found every chunk claimed; skipped until a claim finds no donor at all
-    };
-
-    explicit RemoteMemClient(RemoteMemOptions options);
-
-    //! Called by the transport's constructor once the transport is ready: reads the donors published so far.
-    void discoverDonors();
-
-    //! The transport's name, as donors write it in their .meta ("nixl" when absent).
-    [[nodiscard]] virtual char const* transportName() const noexcept = 0;
-    //! The suffix of the donor file holding what this transport needs to reach a donor.
-    [[nodiscard]] virtual char const* payloadSuffix() const noexcept = 0;
-    //! Whether `donor`'s payload fits its chunks; logs why not.
-    [[nodiscard]] virtual bool acceptPayload(Donor const& donor) const = 0;
-    //! Make the newly claimed chunk `chunk` of `donor` reachable; returns the address transfers name it by. Throws
-    //! RemoteMemError when the donor cannot be reached, which passes over that donor.
-    virtual uint64_t attachChunk(Donor& donor, size_t chunk) = 0;
-    //! The transport's half of transfer(): `ios` is non-empty, mMutex is held and the client has not failed.
-    virtual void doTransfer(bool write, std::vector<RemoteIo> const& ios, size_t bytes, CUstream stream) = 0;
-
-    //! Caller holds mMutex. Record the first transfer failure and throw it as RemoteMemError.
-    [[noreturn]] void fail(std::string const& message);
-
-    //! The claims outlive this client: a transfer the transport could not stop may still land in a chunk.
-    void keepClaims() noexcept
-    {
-        mKeepClaims = true;
+        return mTransferConfig;
     }
-
-    [[nodiscard]] std::string const& name() const noexcept
-    {
-        return mName;
-    }
-
-    RemoteMemOptions mOptions;
-    std::vector<Donor> mDonors;
-    mutable std::mutex mMutex;
 
 private:
     //! Add the donors newly published in the directory, mark the ones whose .ready file is gone as withdrawn, and
     //! count the donors that reported (.ready or .failed).
     void refreshDonors();
     //! Whether `donor` still publishes its .ready file; marks it withdrawn when not.
-    bool stillPublished(Donor& donor);
+    bool stillPublished(RemoteDonor& donor);
     //! Claim a free chunk; a donor whose chunk cannot be attached (e.g. it crashed) is marked withdrawn.
     bool tryClaim(size_t minBytes, RemoteChunk& out);
     //! Caller holds mMutex. Throws RemoteMemError when an earlier transfer failed.
     void throwIfFailed() const;
 
     std::string mName;
+    RemoteMemOptions mOptions;
+    RemoteTransferConfig mTransferConfig;
+    std::unique_ptr<RemoteTransferBackend> mBackend;
+    bool mStreamOrdered = false;
+    std::vector<RemoteDonor> mDonors;
+    mutable std::mutex mMutex;
     std::unordered_map<std::string, size_t> mDonorIndex;
     std::vector<RemoteChunk> mFreeChunks;
     std::vector<std::string> mClaims;
     uint64_t mClaimedBytes = 0;
     size_t mReportedDonors = 0;  // donors with a .ready or .failed file at the last refresh
     std::string mLastClaimError; // why the last donor was withdrawn at claim time
-    bool mKeepClaims = false;
+    bool mAbandoned = false;
     std::string mFailure;        // the first transfer failure
     std::atomic<bool> mFailed{false};
 };
 
-//! The client of `options.directory` over `options.transport`.
-[[nodiscard]] SharedPtr<RemoteMemClient> makeRemoteMemClient(RemoteMemOptions options);
+//! The client of `options.directory`, moving pages through the backend `transferConfig` selects.
+[[nodiscard]] SharedPtr<RemoteMemClient> makeRemoteMemClient(
+    RemoteMemOptions options, RemoteTransferConfig const& transferConfig);
 
 //! A pool's slots in remote memory: whole chunks, each holding floor(chunk bytes / slot size) slots, in order.
 class RemoteRange

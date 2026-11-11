@@ -32,6 +32,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -39,6 +40,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <variant>
@@ -602,21 +604,20 @@ SharedPtr<RemoteMemClient> StorageManager::remoteClientFor(CacheTierConfig const
     {
         return nullptr;
     }
-    RemoteMemOptions options{remote->path, remote->waitTimeoutMs, remote->transferTimeoutMs, remote->transport,
-        remote->agentBackendParams, remote->expectedDonors};
+    RemoteMemOptions options{remote->path, remote->waitTimeoutMs, remote->expectedDonors};
     for (auto const& client : mRemoteClients)
     {
         if (client->directory() != remote->path)
         {
             continue;
         }
-        TLLM_CHECK_WITH_INFO(client->options() == options,
+        TLLM_CHECK_WITH_INFO(client->options() == options && client->transferConfig() == remote->transfer,
             "remote cache levels sharing rendezvous directory '%s' must use the same timeouts, transport, devices and "
             "expected donors",
             remote->path.c_str());
         return client;
     }
-    return mRemoteClients.emplace_back(makeRemoteMemClient(std::move(options)));
+    return mRemoteClients.emplace_back(makeRemoteMemClient(std::move(options), remote->transfer));
 }
 
 RemoteCacheLevelStorage* StorageManager::remoteLevel(CacheLevel level) const
@@ -638,6 +639,10 @@ bool StorageManager::remoteLevelFailed(CacheLevel level) const
 
 void StorageManager::dropPagesOfFailedRemoteLevels()
 {
+    if (!mUnquiescedRemoteTransfers.empty())
+    {
+        reapQuiescedRemoteTransfers();
+    }
     for (CacheLevel level{1}; level < numCacheLevels(); ++level)
     {
         if (!remoteLevelFailed(level))
@@ -705,6 +710,29 @@ StorageManager::~StorageManager()
 
 void StorageManager::destroy()
 {
+    // A transfer that missed its deadline gets one more transfer timeout to quiesce. One that still has not may yet
+    // access its staging lease, its chunks and its client's registrations: all of them are leaked rather than reused.
+    bool leakStaging = false;
+    for (auto& transfer : mUnquiescedRemoteTransfers)
+    {
+        auto const deadline
+            = std::chrono::steady_clock::now() + std::chrono::milliseconds(transfer.client->transferConfig().timeoutMs);
+        while (!transfer.attempt->quiesced() && std::chrono::steady_clock::now() < deadline)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!transfer.attempt->quiesced())
+        {
+            TLLM_LOG_ERROR(
+                "KVCM2 remote level %s: a transfer never quiesced; its staging, claims and transport are leaked",
+                transfer.client->directory().c_str());
+            transfer.client->abandon();
+            static_cast<void>(transfer.attempt.release());
+            static_cast<void>(transfer.staging.release());
+            leakStaging = true;
+        }
+    }
+    mUnquiescedRemoteTransfers.clear();
     // Before the levels go: the last level holding a client destroys it, and the staging must be deregistered first,
     // after every stream-ordered transfer that uses it has finished.
     for (auto const& client : mRemoteClients)
@@ -723,7 +751,52 @@ void StorageManager::destroy()
 
     mIndexStagingManager.reset();
     mCopyEngine.reset();
+    if (leakStaging)
+    {
+        static_cast<void>(mPageStagingManager.release());
+    }
     mPageStagingManager.reset();
+}
+
+size_t StorageManager::reapQuiescedRemoteTransfers() noexcept
+{
+    auto const quiesced = [](UnquiescedRemoteTransfer& transfer) { return transfer.attempt->quiesced(); };
+    mUnquiescedRemoteTransfers.erase(
+        std::remove_if(mUnquiescedRemoteTransfers.begin(), mUnquiescedRemoteTransfers.end(), quiesced),
+        mUnquiescedRemoteTransfers.end());
+    return mUnquiescedRemoteTransfers.size();
+}
+
+void StorageManager::runRemoteTransfer(RemoteMemClient& client, bool write, std::vector<RemoteIo> const& ios,
+    size_t bytes, CUstream stream, std::unique_ptr<StagingBuffer>& staging)
+{
+    auto attempt = client.submit(write, ios, bytes, stream);
+    if (client.streamOrdered())
+    {
+        // Concluded at once; the staging lease, retired on the stream, is reused only after the copies have run.
+        auto const outcome = attempt->poll();
+        if (!outcome.has_value() || !outcome->ok())
+        {
+            client.fail(outcome.has_value() ? outcome->fault : "KVCM2 remote level: a transfer did not conclude");
+        }
+        return;
+    }
+    int64_t const timeoutMs = client.transferConfig().timeoutMs;
+    auto const outcome = attempt->wait(timeoutMs);
+    if (!attempt->quiesced())
+    {
+        mUnquiescedRemoteTransfers.push_back({std::move(attempt), std::move(staging), &client});
+    }
+    if (!outcome.has_value())
+    {
+        client.fail("KVCM2 remote level: a " + std::string(write ? "WRITE" : "READ") + " of "
+            + std::to_string(ios.size()) + " page(s) x " + std::to_string(bytes) + " B timed out after "
+            + std::to_string(timeoutMs) + " ms");
+    }
+    if (!outcome->ok())
+    {
+        client.fail(outcome->fault);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,21 +1113,22 @@ void StorageManager::submitRemoteHotMigration(CacheLevel dstLevel, CacheLevel sr
         if (srcIsHot)
         {
             // Hot -> remote: encode into staging on the stream, then WRITE once the encode is done.
-            StagingBuffer staging
-                = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, stream);
-            size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
+            auto staging = std::make_unique<StagingBuffer>(*mPageStagingManager, coldPageBytes, maxStagingBytes,
+                coldPageBytes, 16, std::optional<CUstream>{stream});
+            MemAddress const base = staging->address();
+            size_t const batchSize = std::min(remaining, staging->size() / coldPageBytes);
             stagingPageIndices.resize(batchSize);
             for (size_t index = 0; index < batchSize; ++index)
             {
                 stagingPageIndices[index] = PageIndexPair{static_cast<int32_t>(index), pageIndices[offset + index].src};
             }
             TLLM_CHECK_WITH_INFO(
-                encodeBatch(reinterpret_cast<void*>(staging.address()), stagingPageIndices.data(), batchSize, stream),
+                encodeBatch(reinterpret_cast<void*>(base), stagingPageIndices.data(), batchSize, stream),
                 "Cold-page codec rejected a migration batch");
             for (size_t index = 0; index < batchSize; ++index)
             {
                 auto const [donor, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].dst));
-                ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, donor, remoteAddr});
+                ios.push_back(RemoteIo{base + index * coldPageBytes, donor, remoteAddr});
             }
             // Stream-ordered, the WRITE starts when the stream has encoded the batch and the lease retires after
             // it; on the host, it waits for the encode.
@@ -1062,7 +1136,7 @@ void StorageManager::submitRemoteHotMigration(CacheLevel dstLevel, CacheLevel sr
             {
                 cuCheck(cuStreamSynchronize(stream));
             }
-            client.transfer(/*write=*/true, ios, coldPageBytes, stream);
+            runRemoteTransfer(client, /*write=*/true, ios, coldPageBytes, stream, staging);
             offset += batchSize;
             remaining -= batchSize;
         }
@@ -1071,26 +1145,27 @@ void StorageManager::submitRemoteHotMigration(CacheLevel dstLevel, CacheLevel sr
             // Remote -> hot: READ into staging, then decode on the stream. Stream-ordered, the lease is the
             // stream's from the start and the READ begins when the stream reaches it; on the host, the lease is
             // host-synchronous and moves to the stream only after the READ has finished.
-            StagingBuffer staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16,
-                streamOrdered ? std::optional<CUstream>{stream} : std::nullopt);
-            size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
+            auto staging = std::make_unique<StagingBuffer>(*mPageStagingManager, coldPageBytes, maxStagingBytes,
+                coldPageBytes, 16, streamOrdered ? std::optional<CUstream>{stream} : std::nullopt);
+            MemAddress const base = staging->address();
+            size_t const batchSize = std::min(remaining, staging->size() / coldPageBytes);
             for (size_t index = 0; index < batchSize; ++index)
             {
                 auto const [donor, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].src));
-                ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, donor, remoteAddr});
+                ios.push_back(RemoteIo{base + index * coldPageBytes, donor, remoteAddr});
             }
-            client.transfer(/*write=*/false, ios, coldPageBytes, stream);
+            runRemoteTransfer(client, /*write=*/false, ios, coldPageBytes, stream, staging);
             if (!streamOrdered)
             {
-                staging.setStream(stream);
+                staging->setStream(stream);
             }
             stagingPageIndices.resize(batchSize);
             for (size_t index = 0; index < batchSize; ++index)
             {
                 stagingPageIndices[index] = PageIndexPair{pageIndices[offset + index].dst, static_cast<int32_t>(index)};
             }
-            TLLM_CHECK_WITH_INFO(decodeBatch(reinterpret_cast<void const*>(staging.address()),
-                                     stagingPageIndices.data(), batchSize, stream),
+            TLLM_CHECK_WITH_INFO(
+                decodeBatch(reinterpret_cast<void const*>(base), stagingPageIndices.data(), batchSize, stream),
                 "Cold-page codec rejected a migration batch");
             offset += batchSize;
             remaining -= batchSize;
@@ -1140,10 +1215,10 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
                 : pageBytes * remaining;
             // Stream-ordered: the stream's lease, so every leg below is ordered after the range's previous users.
             // On the host: a host-synchronous lease, nothing else is using this range of staging once acquire returns.
-            StagingBuffer staging = mPageStagingManager->acquire(pageBytes, maxStagingBytes, pageBytes, 16,
-                streamOrdered ? std::optional<CUstream>{stream} : std::nullopt);
-            size_t const batchSize = std::min(remaining, staging.size() / pageBytes);
-            MemAddress const base = staging.address();
+            auto staging = std::make_unique<StagingBuffer>(*mPageStagingManager, pageBytes, maxStagingBytes, pageBytes,
+                16, streamOrdered ? std::optional<CUstream>{stream} : std::nullopt);
+            size_t const batchSize = std::min(remaining, staging->size() / pageBytes);
+            MemAddress const base = staging->address();
 
             // 1. Source pages into staging.
             if (srcRange != nullptr)
@@ -1154,7 +1229,7 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
                     auto const [donor, remoteAddr] = srcRange->locate(toSlotId(pageIndices[offset + index].src));
                     ios.push_back(RemoteIo{base + index * pageBytes, donor, remoteAddr});
                 }
-                srcRange->client().transfer(/*write=*/false, ios, pageBytes, stream);
+                runRemoteTransfer(srcRange->client(), /*write=*/false, ios, pageBytes, stream, staging);
             }
             else
             {
@@ -1166,7 +1241,7 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
                             srcGroup.slotAddress(toSlotId(pageIndices[offset + index].src)).at(poolIdx))});
                 }
                 // The stream already waits for the source pages' writers; the copy kernel reads host memory over C2C.
-                staging.setStream(stream);
+                staging->setStream(stream);
                 cuCheck(copyHostToDevice(tasks, static_cast<ssize_t>(pageBytes), stream));
                 if (!streamOrdered)
                 {
@@ -1184,7 +1259,7 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
                     ios.push_back(RemoteIo{base + index * pageBytes, donor, remoteAddr});
                 }
                 // Stream-ordered, starts when the stream has the source bytes in staging; on the host, they are there.
-                dstRange->client().transfer(/*write=*/true, ios, pageBytes, stream);
+                runRemoteTransfer(dstRange->client(), /*write=*/true, ios, pageBytes, stream, staging);
             }
             else
             {
@@ -1197,7 +1272,7 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
                 }
                 // On the host: the READ above has finished, so handing the lease to the stream needs no
                 // synchronization. Stream-ordered: the lease is the stream's already, and the copy waits for the READ.
-                staging.setStream(stream);
+                staging->setStream(stream);
                 cuCheck(copyHostToDevice(tasks, static_cast<ssize_t>(pageBytes), stream));
             }
             offset += batchSize;

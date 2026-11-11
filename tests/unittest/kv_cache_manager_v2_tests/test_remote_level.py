@@ -19,11 +19,13 @@ directory, and moves pages with NIXL READ / WRITE or over NVLink fabric memory (
 class runs once per transport; a transport this machine lacks (remote_test_utils) is skipped.
 """
 
+import contextlib
 import gc
 import glob
 import itertools
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -32,6 +34,7 @@ import time
 import unittest
 from dataclasses import replace
 from typing import cast
+from unittest import mock
 
 import cuda.bindings.driver as drv
 import pytest
@@ -66,6 +69,7 @@ TokenId = base.TokenId
 _introspection = base._introspection
 RemoteCacheTierConfig = base.RemoteCacheTierConfig
 RemoteMemError = base.RemoteMemError
+RemoteTransferConfig = base.RemoteTransferConfig
 RemoteTransport = base.RemoteTransport
 
 
@@ -99,7 +103,12 @@ class _Donor:
     """
 
     def __init__(
-        self, directory: str, nbytes: int, transport: str, chunk_bytes: int = _CHUNK_BYTES
+        self,
+        directory: str,
+        nbytes: int,
+        transport: str,
+        chunk_bytes: int = _CHUNK_BYTES,
+        env: "dict[str, str] | None" = None,
     ):
         self.directory = directory
         self.name = f"test-donor-{os.getpid()}-{next(_counter)}"
@@ -128,6 +137,7 @@ class _Donor:
             stdout=self._log,
             stderr=subprocess.STDOUT,
             text=True,
+            env=None if env is None else {**os.environ, **env},
         )
         ready = os.path.join(directory, f"donor.{self.name}.ready")
         deadline = time.monotonic() + 300
@@ -209,10 +219,11 @@ class _Transport:
             quota=quota,
             path=directory or self.module_dir,
             wait_timeout_ms=wait_timeout_ms,
-            transfer_timeout_ms=transfer_timeout_ms,
             expected_donors=expected_donors,
-            transport=RemoteTransport[self.transport.upper()],
             pool_ratio=pool_ratio or [],
+            transfer=RemoteTransferConfig(
+                transport=RemoteTransport[self.transport.upper()], timeout_ms=transfer_timeout_ms
+            ),
         )
 
 
@@ -537,6 +548,66 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
                     self.manager.shutdown()
                 except Exception:
                     pass
+                del self.manager
+            gc.collect()
+            base.take_poison()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_a_transfer_past_its_deadline_keeps_its_staging_until_it_quiesces(self) -> None:
+        """A READ past its deadline keeps its staging lease out of use until it concludes, then is reaped.
+
+        The READ fails the level but is not released while in progress.
+
+        Over UCX's TCP transport a one-sided READ needs the donor's progress thread, so a stopped (SIGSTOP) donor holds
+        the request in progress until it is continued.
+        """
+        if self.transport == "fabric":
+            self.skipTest(
+                "fabric copies are stream-ordered: their staging is retired on the stream"
+            )
+        directory = tempfile.mkdtemp(prefix="kvcm2_unquiesced_")
+        # cuda_copy only because NIXL refuses a UCX_TLS without CUDA support on a GPU node; it moves no host memory.
+        tcp = {"UCX_TLS": "tcp,cuda_copy"}
+        donor = _Donor(directory, 1 << 30, self.transport, env=tcp)
+        stopped = False
+        try:
+            self.cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=2_000)
+            # The client's agent reads UCX_TLS when it is created, with the manager.
+            with mock.patch.dict(os.environ, tcp):
+                self.manager = KVCacheManager(self.cfg)
+            self.engine = FakeEngine(self.cfg)
+            stream_holder = base.CachedCudaStream()
+            stream = cast(CudaStream, stream_holder.handle)
+            prompt = self._prompt(4 * self.tokens_per_block)
+            self._prefill(prompt, stream)
+            self._push_to_last_level(prompt, stream)
+            self.assertEqual(_introspection.remote_unquiesced_transfers(self.manager), 0)
+            os.kill(donor.proc.pid, signal.SIGSTOP)
+            stopped = True
+            kv = self.manager.create_kv_cache(input_tokens=prompt)
+            with self.assertRaisesRegex(RemoteMemError, "timed out"):
+                kv.resume(stream)
+            # The request is still in progress: its staging stays out of use.
+            self.assertEqual(_introspection.remote_unquiesced_transfers(self.manager), 1)
+            os.kill(donor.proc.pid, signal.SIGCONT)
+            stopped = False
+            deadline = time.monotonic() + 60
+            while (
+                _introspection.remote_unquiesced_transfers(self.manager)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.1)
+            self.assertEqual(_introspection.remote_unquiesced_transfers(self.manager), 0)
+            with contextlib.suppress(Exception):
+                kv.close()
+            del kv
+        finally:
+            if stopped:
+                os.kill(donor.proc.pid, signal.SIGCONT)
+            donor.stop()
+            if hasattr(self, "manager"):
+                with contextlib.suppress(Exception):
+                    self.manager.shutdown()
                 del self.manager
             gc.collect()
             base.take_poison()

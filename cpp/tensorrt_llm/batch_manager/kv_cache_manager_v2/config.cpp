@@ -116,7 +116,7 @@ void RemoteCacheTierConfig::validate() const
     {
         throw std::invalid_argument("RemoteCacheTierConfig: rendezvous directory '" + path + "' is not a directory");
     }
-    if (waitTimeoutMs <= 0 || transferTimeoutMs <= 0)
+    if (waitTimeoutMs <= 0 || transfer.timeoutMs <= 0)
     {
         throw std::invalid_argument("RemoteCacheTierConfig: timeouts must be positive");
     }
@@ -244,11 +244,11 @@ void KVCacheManagerConfig::validate() const
         }
         else if (auto const* remote = std::get_if<RemoteCacheTierConfig>(&tier))
         {
-            if (remoteTransport.value_or(remote->transport) != remote->transport)
+            if (remoteTransport.value_or(remote->transfer.transport) != remote->transfer.transport)
             {
                 throw AssertionError("KVCacheManagerConfig: remote cache levels must share one transport");
             }
-            remoteTransport = remote->transport;
+            remoteTransport = remote->transfer.transport;
         }
     }
     if (remoteTransport.has_value() && hasFileDisk)

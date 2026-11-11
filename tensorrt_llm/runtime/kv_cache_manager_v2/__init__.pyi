@@ -288,15 +288,21 @@ class DiskCacheTierConfig:
     def validate(self) -> None: ...
 
 @dataclass(slots=True)
+class RemoteTransferConfig:
+    """How a remote tier's pages move, apart from the memory it declares."""
+
+    transport: RemoteTransport = RemoteTransport.NIXL
+    timeout_ms: int = 0  # required: how long one batch may take before the level fails
+    backend_params: dict[str, str] = ...  # NIXL only: e.g. {"device_list": "mlx5_0"}
+
+@dataclass(slots=True)
 class RemoteCacheTierConfig:
     quota: int
     path: str  # the rendezvous directory
     wait_timeout_ms: int = 0  # required
-    transfer_timeout_ms: int = 0  # required
     expected_donors: int = 0  # 0: unknown
-    transport: RemoteTransport = RemoteTransport.NIXL
-    agent_backend_params: dict[str, str] = ...  # NIXL only: e.g. {"device_list": "mlx5_0"}
     pool_ratio: list[float] = ...  # empty: the hot level's split
+    transfer: RemoteTransferConfig = ...
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...

@@ -102,6 +102,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PoolRebalanceConfig,
     RemoteCacheTierConfig,
     RemoteMemError,
+    RemoteTransferConfig,
     RemoteTransport,
     ReusePolicy,
     ReuseScope,
@@ -8337,11 +8338,14 @@ class KVCacheManagerV2(BaseResourceManager):
                     quota=remote_config.cache_size,
                     path=remote_dir,
                     wait_timeout_ms=math.ceil(remote_config.donor_wait_timeout_s * 1000),
-                    transfer_timeout_ms=math.ceil(remote_config.transfer_timeout_s * 1000),
                     expected_donors=remote_config.expected_num_donors or 0,
-                    transport=RemoteTransport[remote_config.transport.upper()],
-                    agent_backend_params=agent_backend_params,
                     pool_ratio=list(remote_config.pool_ratio or []),
+                    # How pages move is declared apart from the memory.
+                    transfer=RemoteTransferConfig(
+                        transport=RemoteTransport[remote_config.transport.upper()],
+                        timeout_ms=math.ceil(remote_config.transfer_timeout_s * 1000),
+                        backend_params=agent_backend_params,
+                    ),
                 )
             )
             logger.info(
