@@ -1204,16 +1204,15 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             and params.num_tokens > params.batch_size
         ):
             # Each request's last row only, against the full KV (preprocess appended every row's K / V).
-            last = (cu_q_seqlens[1 : params.batch_size + 1] - 1).long()
-            out_last = params.output.new_empty((params.batch_size, *params.output.shape[1:]))
-            fmha(
-                q_processed.index_select(0, last),
-                out_last,
-                torch.arange(
-                    params.batch_size + 1, dtype=cu_q_seqlens.dtype, device=cu_q_seqlens.device
-                ),
-                1,
+            # The PDL-launched FMHA may read its sequence offsets before its dependency wait, so they are not
+            # written by the kernel right before it (the query gather, which it reads after the wait).
+            cu_q_last = torch.arange(
+                params.batch_size + 1, dtype=cu_q_seqlens.dtype, device=cu_q_seqlens.device
             )
+            last = (cu_q_seqlens[1 : params.batch_size + 1] - 1).long()
+            q_last = q_processed.index_select(0, last)
+            out_last = params.output.new_empty((params.batch_size, *params.output.shape[1:]))
+            fmha(q_last, out_last, cu_q_last, 1)
             params.output.zero_()
             params.output.index_copy_(0, last, out_last)
         else:
