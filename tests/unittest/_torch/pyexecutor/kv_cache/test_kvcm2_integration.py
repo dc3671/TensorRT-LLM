@@ -1863,7 +1863,7 @@ class TestRemoteTierInitStatus:
                 config, [Mock()], is_draft=True, remote_lender=target_lender
             )
         target_lender.wait_started.assert_called_once_with()
-        assert draft.remote_lender is None  # the target owns it
+        assert draft._remote_lender is None  # the target owns it
         draft._close_remote_lender(RuntimeError("draft failed"))
         target_lender.close.assert_not_called()
         assert list(tmp_path.iterdir()) == []  # nor does the draft mark a lend failed

@@ -1151,8 +1151,7 @@ class TestBuildManagersBudgetGates:
             remote_cache_config={"directory": str(tmp_path), "lend_size": 4 * GB},
         )
         c._create_kv_cache_manager.side_effect = lambda *args, **kwargs: (
-            events.append(("target", kwargs["remote_lender"]))
-            or Mock(spec=KVCacheManagerV2, remote_lender=lender)
+            events.append(("target", kwargs["remote_lender"])) or Mock()
         )
         return c, lender, events
 
@@ -1185,8 +1184,7 @@ class TestBuildManagersBudgetGates:
         c, lender, _ = self._gen_style_lend(tmp_path, monkeypatch)
         targets = []
         c._create_kv_cache_manager.side_effect = lambda *args, **kwargs: (
-            targets.append(Mock(spec=KVCacheManagerV2, remote_lender=kwargs["remote_lender"]))
-            or targets[-1]
+            targets.append(Mock()) or targets[-1]
         )
         c._create_one_model_draft_kv_cache_manager.side_effect = RuntimeError("draft OOM")
         resources = {}

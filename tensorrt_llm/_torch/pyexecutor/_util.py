@@ -3640,21 +3640,23 @@ class KvCacheCreator:
             compression_manager if compression_manager is not None
             and compression_manager.provides_cold_page_codec else None)
 
+        # The early lend goes to the final target, which owns it; a separate draft only waits for it.
+        early_lender = None if estimating_kv_cache else self._remote_lender
         kv_cache_manager = self._create_kv_cache_manager(
             estimating_kv_cache,
             kv_cache_config_override=self_kv_cache_config,
             cold_page_codec_provider=cold_page_codec_provider,
-            remote_lender=None if estimating_kv_cache else self._remote_lender,
+            remote_lender=early_lender,
         )
         if not estimating_kv_cache:
             self._remote_lender = None  # the manager owns it now
         try:
             draft_kv_cache_manager, cross_kv_cache_manager = (
                 self._build_secondary_managers(
-                    kv_cache_manager, has_separate_one_model_draft,
-                    original_max_seq_len, estimating_kv_cache,
-                    self_kv_cache_config, draft_kv_cache_config,
-                    cross_kv_cache_config, cold_page_codec_provider))
+                    has_separate_one_model_draft, original_max_seq_len,
+                    estimating_kv_cache, self_kv_cache_config,
+                    draft_kv_cache_config, cross_kv_cache_config,
+                    cold_page_codec_provider, early_lender))
         except BaseException:
             # Nothing holds the target manager yet; shutting it down withdraws its lend.
             if kv_cache_manager is not None:
@@ -3679,13 +3681,13 @@ class KvCacheCreator:
                 compression_manager)
 
     def _build_secondary_managers(
-            self, kv_cache_manager, has_separate_one_model_draft: bool,
-            original_max_seq_len: int, estimating_kv_cache: bool,
-            self_kv_cache_config: KvCacheConfig,
+            self, has_separate_one_model_draft: bool, original_max_seq_len: int,
+            estimating_kv_cache: bool, self_kv_cache_config: KvCacheConfig,
             draft_kv_cache_config: Optional[KvCacheConfig],
             cross_kv_cache_config: Optional[KvCacheConfig],
-            cold_page_codec_provider):
-        """The one-model draft and encoder-decoder cross managers built beside the target."""
+            cold_page_codec_provider, early_lender):
+        """The one-model draft and encoder-decoder cross managers built beside the target; the draft waits for
+        `early_lender`, the target's lend, before measuring host memory."""
         draft_kv_cache_manager = None
         draft_build_kv_cache_config = (draft_kv_cache_config
                                        if draft_kv_cache_config is not None else
@@ -3698,8 +3700,7 @@ class KvCacheCreator:
                 estimating_kv_cache,
                 kv_cache_config_override=draft_build_kv_cache_config,
                 cold_page_codec_provider=cold_page_codec_provider,
-                remote_lender=(kv_cache_manager.remote_lender if isinstance(
-                    kv_cache_manager, KVCacheManagerV2) else None))
+                remote_lender=early_lender)
 
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None

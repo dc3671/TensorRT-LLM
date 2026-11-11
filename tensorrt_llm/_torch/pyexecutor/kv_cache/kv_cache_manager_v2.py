@@ -8344,11 +8344,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{remote_config.cache_size / (1 << 30):.2f}GiB via {remote_dir} ({remote_config.transport})"
             )
 
-    @property
-    def remote_lender(self) -> Optional["RemoteLender"]:
-        """This rank's lend, owned by this manager; None for a draft manager or a rank that lends nothing."""
-        return self._remote_lender
-
     def _close_remote_lender(self, error: Optional[BaseException] = None) -> None:
         """Withdraw this rank's lend: clients still holding its chunks fail their next transfer. With `error`, leave
         the lend's failure marker too, also for a lend that never started, so that peers stop waiting for it."""
