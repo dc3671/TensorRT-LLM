@@ -186,7 +186,7 @@ class MoEOpBackend:
         tunes for the model's decode steps and runs its decode kernels
         (``FP4BlockScaleMoERunner``); ``decode_engine_state`` /
         ``lamport_fc2_out`` / ``decode_early_release_rows`` /
-        ``decode_shared_expert_rows``: see ``fp4_block_scale_moe_runner``."""
+        ``decode_shared_expert_rows``: see ``fp4_block_scale_moe_decode_runner``."""
         raise NotImplementedError
 
     def run_bf16_moe(
@@ -433,8 +433,32 @@ class TRTLLMOpBackend(MoEOpBackend):
                 gemm1_weights_scale is not None
                 and gemm1_weights_scale.shape[-1] == hidden_size // 16
             ):
-                # nvfp4
-                outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
+                # nvfp4; the op that writes the decode kernels' state where the model declares them
+                if not decode_tuning and (
+                    decode_engine_state is not None
+                    or lamport_fc2_out is not None
+                    or (prerouted is not None and prerouted.candidates is not None)
+                ):
+                    raise ValueError(
+                        "the decode engine state, Lamport FC2 rows and engine routing need decode_tuning"
+                    )
+                decode_kwargs = (
+                    dict(
+                        prerouted_candidates=None if prerouted is None else prerouted.candidates,
+                        decode_engine_state=decode_engine_state,
+                        lamport_fc2_out=lamport_fc2_out,
+                        decode_early_release_rows=decode_early_release_rows,
+                        decode_shared_expert_rows=decode_shared_expert_rows,
+                    )
+                    if decode_tuning
+                    else {}
+                )
+                fp4_op = (
+                    torch.ops.trtllm.fp4_block_scale_moe_decode_runner
+                    if decode_tuning
+                    else torch.ops.trtllm.fp4_block_scale_moe_runner
+                )
+                outputs = fp4_op(
                     router_logits,
                     routing_bias,
                     hidden_states,
@@ -473,12 +497,8 @@ class TRTLLMOpBackend(MoEOpBackend):
                     prerouted_ids=None if prerouted is None else prerouted.topk_ids,
                     prerouted_weights=None if prerouted is None else prerouted.topk_weights,
                     prerouted_tactic=None if prerouted is None else prerouted.tactic,
-                    prerouted_candidates=None if prerouted is None else prerouted.candidates,
                     decode_tuning=decode_tuning,
-                    decode_engine_state=decode_engine_state,
-                    lamport_fc2_out=lamport_fc2_out,
-                    decode_early_release_rows=decode_early_release_rows,
-                    decode_shared_expert_rows=decode_shared_expert_rows,
+                    **decode_kwargs,
                 )
                 if not do_finalize:
                     if lamport_fc2_out is not None:
