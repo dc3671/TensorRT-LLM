@@ -56,19 +56,19 @@ std::string hostName()
     return buf;
 }
 
-//! The contents of a lender's file, or nullopt when the file is gone: the lender withdrew after the directory was
-//! listed. Any other read failure throws.
+//! The contents of a lender's file, or nullopt when it cannot be read: the lender withdrew after the directory was
+//! listed, or the file is unreadable, which only passes over that lender until the next refresh.
 std::optional<std::string> readLenderFile(std::filesystem::path const& path)
 {
     std::ifstream file(path, std::ios::binary);
     if (!file)
     {
         std::error_code ec;
-        if (!std::filesystem::exists(path, ec) && !ec)
+        if (std::filesystem::exists(path, ec) || ec)
         {
-            return std::nullopt;
+            TLLM_LOG_WARNING("KVCM2 remote level: cannot read %s; passing over its lender", path.c_str());
         }
-        throw RemoteMemError("KVCM2 remote level: cannot read " + path.string());
+        return std::nullopt;
     }
     return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
 }
