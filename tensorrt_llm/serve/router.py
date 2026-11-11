@@ -38,6 +38,7 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
     KV_CACHE_HASH_ALGO_V2_SHA256_64, KV_CACHE_HASH_ALGOS, BlockHash,
     BlockHashMixin, OpenAIRequest, block_key_hasher, get_request_num_tokens,
     hash_v1_block_key, responses_request_text, truncate_sha256_hash_to_int64)
+from tensorrt_llm.serve.seat_pool import SeatPool, priority_or_default
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
 # Retries ride out a burst that fills the coordinator's accept queue; select is
@@ -50,6 +51,8 @@ COORDINATOR_FINISH_TIMEOUT_S = 5.0
 COORDINATOR_FINISH_WORKERS = 16
 COORDINATOR_FINISH_QUEUE_SIZE = 4096
 COORDINATOR_FINISH_DRAIN_TIMEOUT_S = 5.0
+# A fleet worker's bound on a pooled generation /select, which waits for a free seat.
+POOLED_SELECT_TIMEOUT_S = 3600.0
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
@@ -847,6 +850,187 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
             num_tokens = self._coord_request_tokens.pop(req_id, 0)
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load_by(num_tokens)
+
+
+class PooledLoadBalancingRouter(LoadBalancingRouter):
+    """Generation router that queues requests until a server has a free seat.
+
+    Built for ``load_balancing`` with ``max_requests_per_server`` (generation only). A
+    server with fewer active requests than that has a free seat. With a free seat and
+    nobody waiting, a request is placed at once by the parent's rule (least loaded,
+    round-robin among ties); otherwise it waits in one queue (:class:`SeatPool`), and
+    each finished request gives its seat to the first waiter in order: the highest
+    request priority first, ties in arrival order, and with ``max_queue_wait_s`` the
+    requests that waited that long first. In disaggregated serving the coordinator owns
+    the queue; its ``select`` waits for the seat outside the reservation lock.
+    """
+
+    pooled = True
+
+    def __init__(self,
+                 server_role: ServerRole,
+                 servers: List[str] = None,
+                 metadata_server_cfg: MetadataServerConfig = None,
+                 metadata_server: JsonDictionary = None,
+                 use_tokens: bool = False,
+                 max_requests_per_server: int = 1,
+                 max_queue_wait_s: Optional[float] = None,
+                 **kwargs):
+        if server_role != ServerRole.GENERATION:
+            raise ValueError(
+                "max_requests_per_server is a generation router option")
+        if use_tokens:
+            raise ValueError(
+                "max_requests_per_server counts requests; it cannot be "
+                "combined with use_tokens")
+        super().__init__(server_role,
+                         servers,
+                         metadata_server_cfg,
+                         metadata_server,
+                         use_tokens=False,
+                         **kwargs)
+        self._pool = SeatPool(max_requests_per_server, max_queue_wait_s)
+        logger.info(f"PooledLoadBalancingRouter: "
+                    f"{self._pool.describe(len(self._servers))}")
+
+    def routing_key(self, request: OpenAIRequest) -> dict:
+        """The parent's key plus the request priority, the queue's order."""
+        key = super().routing_key(request)
+        key["priority"] = priority_or_default(getattr(request, "priority",
+                                                      None))
+        return key
+
+    def _on_servers_updated(self, old_servers, new_servers):
+        super()._on_servers_updated(old_servers, new_servers)
+        if len(self._pool):
+            # New servers may seat waiters; called with the lock held.
+            try:
+                asyncio.get_running_loop().create_task(self._redispatch())
+            except RuntimeError:
+                pass
+
+    async def _redispatch(self) -> None:
+        async with self._lock:
+            await self._dispatch_locked()
+
+    def _active_servers(self) -> List[str]:
+        return [s for s in self._servers if s in self._server_state]
+
+    async def _dispatch_locked(self) -> None:
+        """Give free seats to waiters, best first. Called with ``self._lock`` held."""
+        while len(self._pool):
+            free = [
+                s for s in self._active_servers()
+                if self._get_server_load(s) < self._pool.seats
+            ]
+            picked = self._pool.pick(free)
+            if picked is None:
+                break
+            waiter, candidates = picked
+            loads = {s: self._get_server_load(s) for s in candidates}
+            min_load = min(loads.values())
+            tied = [s for s in candidates if loads[s] == min_load]
+            server = tied[self._rr_counter % len(tied)]
+            self._rr_counter += 1
+            await self._server_state[server].increment_load_by(0)
+            self._req_routing_table[waiter.rid] = server
+            self._pool.record_grant(waiter)
+            if not waiter.future.done():
+                waiter.future.set_result(server)
+        servers = self._active_servers()
+        self._pool.maybe_log_stats(
+            sum(self._get_server_load(s) for s in servers),
+            self._pool.seats * len(servers))
+
+    async def _acquire(self, rid: int, priority,
+                       exclude_server: Optional[str]) -> str:
+        """Wait for a seat and return its server.
+
+        A repeated call for a request that holds a seat returns that seat; one for a
+        waiting request shares its place in the queue.
+        """
+        async with self._lock:
+            server = self._req_routing_table.get(rid)
+            if server is not None:
+                return server
+            waiter = self._pool.waiter(rid)
+            if waiter is None:
+                waiter = self._pool.add(
+                    rid, priority, exclude_server,
+                    asyncio.get_running_loop().create_future())
+            waiter.holders += 1
+            await self._dispatch_locked()
+            waiter.arriving = False
+        try:
+            return await asyncio.shield(waiter.future)
+        except asyncio.CancelledError:
+            async with self._lock:
+                waiter.holders -= 1
+                if waiter.holders <= 0:
+                    if (waiter.future.done() and not waiter.future.cancelled()
+                            and waiter.future.exception() is None):
+                        # Placed, but nobody will use the seat: give it back.
+                        await self._release_locked(rid)
+                    elif self._pool.remove(rid) is not None:
+                        waiter.future.cancel()
+            raise
+
+    async def _release_locked(self, rid: int) -> None:
+        server = self._req_routing_table.pop(rid, None)
+        if server is None:
+            # Finished before its placement: drop it from the queue.
+            waiter = self._pool.remove(rid)
+            if waiter is not None and not waiter.future.done():
+                waiter.future.set_exception(
+                    ValueError(
+                        "generation request finished while waiting for a seat"))
+            return
+        if server in self._server_state:
+            await self._server_state[server].decrement_load_by(0)
+        await self._dispatch_locked()
+
+    async def get_next_server(self,
+                              request: OpenAIRequest,
+                              exclude_server: Optional[str] = None,
+                              req_id: Optional[int] = None) -> tuple[str, dict]:
+        del req_id
+        self._validate_servers_available()
+        server = await self._acquire(id(request),
+                                     getattr(request, "priority", None),
+                                     exclude_server)
+        return server, {"server_info": self._server_info.get(server, {})}
+
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None,
+                             success: bool = True,
+                             req_id: Optional[int] = None):
+        del session, success, req_id
+        async with self._lock:
+            await self._release_locked(id(request))
+
+    async def get_next_server_by_key(self,
+                                     routing_key,
+                                     exclude_server=None,
+                                     req_id=None):
+        if req_id is None:
+            raise ValueError(
+                "Pooled generation routing through the coordinator requires a "
+                "request ID")
+        self._validate_servers_available()
+        server = await self._acquire(req_id, (routing_key
+                                              or {}).get("priority"),
+                                     exclude_server)
+        return server, {
+            "server_info": self._server_info.get(server, {})
+        }, req_id
+
+    async def finish_request_by_id(self, req_id, success=True):
+        del success
+        if req_id is None:
+            return
+        async with self._lock:
+            await self._release_locked(req_id)
 
 
 class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
@@ -1937,6 +2121,9 @@ class CoordinatorDelegatingRouter(Router):
         self._local = local_router
         self._role = role  # "context" | "generation"
         self._request_timeout_s = request_timeout_s
+        # A pooled router's /select waits in the coordinator for a free seat.
+        self._select_timeout_s = (POOLED_SELECT_TIMEOUT_S if getattr(
+            local_router, "pooled", False) else request_timeout_s)
         self._session: Optional[aiohttp.ClientSession] = None
         self._finish_queue: asyncio.Queue[tuple[int, bool]] = asyncio.Queue(
             maxsize=COORDINATOR_FINISH_QUEUE_SIZE)
@@ -2074,7 +2261,7 @@ class CoordinatorDelegatingRouter(Router):
                         f"{self._coordinator_url}/select",
                         data=data,
                         headers=_MSGPACK_HEADERS,
-                        timeout=self._request_timeout_s) as resp:
+                        timeout=self._select_timeout_s) as resp:
                     body = msgpack.unpackb(await resp.read(), raw=False)
                     if resp.status != 200:
                         raise ValueError(
@@ -2238,6 +2425,11 @@ def create_router(
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
     extra_args = router_config.args if router_config else {}
+    if extra_args.get("max_requests_per_server") is not None:
+        if router_class is not LoadBalancingRouter:
+            raise ValueError("max_requests_per_server needs the load_balancing "
+                             f"router, not {router_type}")
+        router_class = PooledLoadBalancingRouter
     extra_args["disagg_node_id"] = disagg_node_id
 
     return router_class(router_config.server_role if router_config else None,

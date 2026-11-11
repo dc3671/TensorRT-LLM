@@ -320,6 +320,10 @@ The three resulting topologies:
 The fleet delegates `load_balancing`, `kv_cache_aware`, and `conversation` routing to the coordinator, so their placement and in-flight load state are globally consistent across workers. `round_robin` remains local to each worker and does not make a coordinator round-trip.
 ```
 
+#### Generation admission by predicted output length
+
+With `output_length_prediction: {predictor: ridge_gbm}` (or `ridge`, which needs no scikit-learn) at the top level of the disaggregated config, the coordinator learns each conversation's reply lengths online and the orchestrator sets every generation request's `priority` from the predicted length (shorter first; `max_tokens` is never read). Generation servers order their waiting queue by it with `scheduler_config: {waiting_queue_policy: priority, waiting_queue_max_wait_s: 60}`; the cap lets a request that waited that long go first. `generation_servers.router: {type: load_balancing, max_requests_per_server: 1, max_queue_wait_s: 60}` additionally holds generation requests in the orchestrator until a server has a free seat, in the same order.
+
 #### Example: implicit coordinator + 4-worker fleet
 
 Extend the `disagg_config.yaml` from the [trtllm-serve](#trtllm-serve) example with `num_workers` and a router type:
