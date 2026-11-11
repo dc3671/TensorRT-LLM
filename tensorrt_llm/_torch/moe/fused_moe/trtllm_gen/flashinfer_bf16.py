@@ -52,9 +52,9 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
     """``flashinfer.trtllm_gen.fused_moe.none`` -- the unquantized path.
 
     The only FlashInfer leaf: ``trtllm_bf16_moe`` has no counterpart in
-    TRT-LLM's own cubins, so there is no native leaf for this format. It is
-    also the only leaf whose kernel does not route internally, which is what
-    ``_requires_separated_routing`` below says.
+    TRT-LLM's own cubins, so there is no native leaf for this format. Its
+    kernel takes host-side top-k (``_requires_separated_routing``) unless the
+    model declares ``MoEDecodeOptions.bf16_logits_routing``.
     """
 
     descriptor = trtllm_gen_descriptor(
@@ -63,11 +63,12 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         "FlashInfer's TRTLLM-Gen bf16 fused MoE, unquantized, SM100 family.",
     )
 
-    #: Declared by the model (``MoEDecodeOptions.bf16_logits_routing``): plain Renormalize routes inside the op from
-    #: the router logits (TopK -> Softmax), without the host-side top-k and pack launches.
+    #: Declared by the model (``MoEDecodeOptions.bf16_logits_routing``), for every BF16 FlashInfer MoE layer it builds:
+    #: plain Renormalize routes inside the op from the router logits (TopK -> Softmax), without the host-side top-k
+    #: and pack launches.
     routes_from_logits: bool = False
-    #: Declared by the model (``MoEDecodeOptions.bf16_draft_engine``): un-finalized logits-routed SwiGLU runs of up to
-    #: 32 rows take the one-launch BF16 decode MoE engine (decode_moe_bf16.py).
+    #: Declared by the model (``MoEDecodeOptions.bf16_draft_engine``), for every such layer: un-finalized
+    #: logits-routed SwiGLU runs of up to 32 rows take the one-launch BF16 decode MoE engine (decode_moe_bf16.py).
     use_draft_engine: bool = False
     #: The engine's call state, created with the weights (``cache_derived_state``).
     _draft_engine_state: torch.Tensor | None = None
