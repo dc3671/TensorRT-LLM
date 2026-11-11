@@ -4276,7 +4276,8 @@ def _create_kv_cache_manager(
             mamba_manager_extra_kwargs["pretrained_config"] = config
         if (issubclass(kv_cache_manager_cls,
                        (CppMambaHybridCacheManager, MambaHybridCacheManagerV2))
-                and model_engine is not None):
+                and model_engine is not None
+                and isinstance(model_engine.model, torch.nn.Module)):
             from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
             mamba_manager_extra_kwargs["gdn_fused_verify"] = any(
                 module.fused_verify for module in model_engine.model.modules()
