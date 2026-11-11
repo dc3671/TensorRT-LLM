@@ -61,7 +61,12 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     copy_batch_block_offsets_to_device,
     gather_base_page_rows,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig, RemoteCacheConfig
+from tensorrt_llm.llmapi.llm_args import (
+    KvCacheConfig,
+    KVEventsConfig,
+    RemoteCacheConfig,
+    SparseKvCacheOffloadConfig,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
@@ -1983,8 +1988,6 @@ def _withdraws_remote_lend_on_error(init):
 
 class KVCacheManagerV2(BaseResourceManager):
     gen_preemption_headroom: int = 0
-    # Sparse managers attach a metadata batch during initialization.
-    sparse_metadata_batch: Batch | None = None
     # Host memory this rank lends to remote cache levels (remote_cache_config.lend_size); closed by shutdown().
     _remote_lender: Optional["RemoteLender"] = None
     # The remote config of a lend this manager owns, started or not; a failure leaves its marker.
@@ -2774,17 +2777,17 @@ class KVCacheManagerV2(BaseResourceManager):
             # co-located ranks each reserving a device-quota-sized block can
             # OOM the host (observed on GB300 NVL72 with 4 ranks/node and
             # ~170GiB device quota each on a 975GiB node).
-            local_ranks = max(1, Distributed.get(mapping).local_world_size)
-
             remote_config = kv_cache_config.remote_cache_config
             lend_started = remote_lender is not None
             if lend_started:
                 # The co-located ranks started their lends as early as this one: measure with them resident.
                 remote_lender.wait_started()
-            try:
-                mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
-            except (ValueError, OSError):
-                mem_available = float("inf")
+            local_ranks, mem_available, memlock_limit = get_host_memory_limits(mapping)
+            # Every rank on the node also pins its host-backed sparse pools and
+            # its sparse Batch's staging copy.
+            offload_pinned_bytes = self._host_history_budget + self._sparse_batch_staging_bytes
+            mem_available = max(0.0, mem_available - local_ranks * offload_pinned_bytes)
+            memlock_limit = max(0.0, memlock_limit - offload_pinned_bytes)
             if remote_config is not None and remote_config.lend_size and not lend_started:
                 # Every co-located rank lends this much more, faulted in after this sizing.
                 lent = local_ranks * remote_config.lend_size
@@ -2796,11 +2799,6 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                 else:
                     mem_available -= lent
-            try:
-                _soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
-                memlock_limit = _soft if _soft != resource.RLIM_INFINITY else float("inf")
-            except (ValueError, OSError):
-                memlock_limit = float("inf")
             host_quota = _compute_auto_host_tier_quota(
                 quota,
                 local_ranks,
@@ -2867,6 +2865,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._add_remote_level(kv_cache_config.remote_cache_config, cache_tiers)
             except Exception as error:
                 remote_init_error = error
+        if self._sparse_kv_offload is not None:
+            self._warn_if_lower_tiers_cannot_take_history(cache_tiers)
 
         self.vocab_size = vocab_size
 
@@ -8438,10 +8438,14 @@ class KVCacheManagerV2(BaseResourceManager):
             and request.is_generation_only_request
             and not pin_on_release
             and not request.is_dummy
+            # Host history reservations back admission; keep their release with the close.
+            and self._host_history_reservations is None
             and request.py_request_id not in _RESERVED_REQUEST_IDS
             and self._defer_remove_kv_cache(request.py_request_id)
         ):
             return
+        if self._host_history_reservations is not None:
+            self._host_history_reservations.release(request.py_request_id)
         self._remove_kv_cache(request.py_request_id)
 
     def _after_shrink(self, request_id: int, kv_cache: _KVCache) -> None:
@@ -8771,6 +8775,8 @@ class KVCacheManagerV2(BaseResourceManager):
     def _shutdown_caches(self) -> None:
         # impl.shutdown() raises while any cache is open, deferred ones included.
         self.enable_deferred_close(False)
+        # Before the caches close: a lender waiting on a lease has to be told to stop while
+        # the caches it lent against are still alive.
         if self._sharing is not None:
             self._sharing._on_shutdown()
         for kv_cache in self.kv_cache_map.values():

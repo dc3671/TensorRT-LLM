@@ -49,6 +49,7 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from ..pyexecutor.sampler.watermark import WatermarkSpecState
 from .fused_accept import (MAX_DRAFT_LEN, fused_strict_accept,
                            sample_and_strict_accept)
 from .greedy_argmax import greedy_argmax
@@ -2349,8 +2350,9 @@ class SpecWorkerBase(nn.Module, ABC):
         """The sharded temperature sample (``_sample_sharded_temperature``)
         and the strict acceptance below as one launch, or None where the
         launches below run: another sampling mode, a ragged verify, the eager
-        warmup of a forced run, a shape the launch does not take."""
+        warmup of a forced run, a shape the launch does not take, watermarking."""
         if (spec_metadata is None or spec_metadata.is_ragged_verify
+                or _watermark_active(spec_metadata)
                 or not isinstance(logits, torch.Tensor)
                 or spec_metadata.is_all_greedy_sample
                 or not spec_metadata.sharded_target_logits

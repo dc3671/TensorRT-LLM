@@ -692,6 +692,8 @@ class PyExecutor:
     _defer_generation_only_release = False
     # Whether the model forward runs under torch.compile; read once at construction.
     _uses_torch_compile = False
+    # Whether the KV cache manager is a KVCacheManagerV2; set at construction.
+    _is_kv_manager_v2 = False
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
 
