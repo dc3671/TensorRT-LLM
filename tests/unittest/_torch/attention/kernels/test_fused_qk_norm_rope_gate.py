@@ -300,7 +300,8 @@ def test_output_gate_fallback_flattens_fused_gate():
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("scale", (0.13, 32.0))
+# 2e-3 takes most gated values past the E4M3 maximum (448), so the saturation is compared too.
+@pytest.mark.parametrize("scale", (0.13, 32.0, 2e-3))
 @pytest.mark.parametrize("num_tokens", (1, 37, 1024, 2049))
 @pytest.mark.parametrize("strided_gate", (False, True))
 def test_fused_sigmoid_mul_fp8_matches_gate_then_static_quantize(scale, num_tokens, strided_gate):
