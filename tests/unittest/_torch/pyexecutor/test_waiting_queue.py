@@ -23,10 +23,11 @@ This module tests the waiting queue functionality including:
 - create_waiting_queue factory function
 """
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
+import tensorrt_llm.llmapi.llm_args as llm_args_mod
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
@@ -38,7 +39,12 @@ from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import (
     ShortestDecodeFirstWaitingQueue,
 )
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
-from tensorrt_llm.llmapi.llm_args import SchedulerConfig, WaitingQueuePolicy
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig,
+    SchedulerConfig,
+    TorchLlmArgs,
+    WaitingQueuePolicy,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -773,3 +779,27 @@ class TestShortestDecodeFirstWaitingQueue:
         for bad in (float("inf"), float("nan"), 0.0):
             with pytest.raises(ValueError):
                 SchedulerConfig(waiting_queue_policy=sdf, waiting_queue_max_wait_s=bad)
+
+    @pytest.mark.parametrize(
+        "max_wait_s, timeout_ms, warns",
+        [(60.0, 60000, False), (30.0, 60000, False), (120.0, 60000, True), (60.0, 30000, True)],
+        ids=["defaults", "shorter_cap", "longer_cap", "shorter_timeout"],
+    )
+    def test_max_wait_above_transfer_timeout_warns(self, tmp_path, max_wait_s, timeout_ms, warns):
+        """Only a cap longer than the KV transfer timeout warns: the defaults are equal and stay quiet."""
+        with patch.object(llm_args_mod.logger, "warning") as warning:
+            TorchLlmArgs(
+                model=tmp_path,
+                gpus_per_node=1,
+                scheduler_config=SchedulerConfig(
+                    waiting_queue_policy=WaitingQueuePolicy.SHORTEST_DECODE_FIRST,
+                    waiting_queue_max_wait_s=max_wait_s,
+                ),
+                cache_transceiver_config=CacheTransceiverConfig(
+                    backend="NIXL", kv_transfer_timeout_ms=timeout_ms
+                ),
+            )
+        warned = any(
+            "waiting_queue_max_wait_s" in str(call.args[0]) for call in warning.call_args_list
+        )
+        assert warned == warns

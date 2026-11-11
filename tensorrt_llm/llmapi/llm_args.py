@@ -4715,8 +4715,9 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
             "that has waited this many seconds since it reached the server "
             "(in disaggregated serving, the orchestrator) goes ahead of every "
             "request that has not, oldest first. None disables the cap. Keep "
-            "it below the context servers' "
-            "cache_transceiver_config.kv_transfer_timeout_ms. Other policies "
+            "it at or below the context servers' "
+            "cache_transceiver_config.kv_transfer_timeout_ms, whose clock "
+            "starts later (after prefill). Other policies "
             "accept only the default."),
         status="prototype")
 
@@ -8098,10 +8099,10 @@ class TorchLlmArgs(BaseLlmArgs):
                 and transceiver is not None
                 and transceiver.kv_transfer_timeout_ms is not None
                 and scheduler.waiting_queue_max_wait_s * 1000
-                >= transceiver.kv_transfer_timeout_ms):
+                > transceiver.kv_transfer_timeout_ms):
             logger.warning(
                 "scheduler_config.waiting_queue_max_wait_s "
-                f"({scheduler.waiting_queue_max_wait_s} s) is not below "
+                f"({scheduler.waiting_queue_max_wait_s} s) exceeds "
                 "cache_transceiver_config.kv_transfer_timeout_ms "
                 f"({transceiver.kv_transfer_timeout_ms} ms): a request passed "
                 "over that long may find its context server's KV transfer "

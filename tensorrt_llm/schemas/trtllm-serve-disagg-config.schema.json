@@ -8674,7 +8674,7 @@
             }
           ],
           "default": 60.0,
-          "description": "With waiting_queue_policy='shortest_decode_first': a request that has waited this many seconds since it reached the server (in disaggregated serving, the orchestrator) goes ahead of every request that has not, oldest first. None disables the cap. Keep it below the context servers' cache_transceiver_config.kv_transfer_timeout_ms. Other policies accept only the default.",
+          "description": "With waiting_queue_policy='shortest_decode_first': a request that has waited this many seconds since it reached the server (in disaggregated serving, the orchestrator) goes ahead of every request that has not, oldest first. None disables the cap. Keep it at or below the context servers' cache_transceiver_config.kv_transfer_timeout_ms, whose clock starts later (after prefill). Other policies accept only the default.",
           "status": "prototype",
           "title": "Waiting Queue Max Wait S"
         },
