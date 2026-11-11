@@ -25,21 +25,28 @@ whole chunks of it with O_EXCL claim files and moves cold pages itself, so the l
   ``short_bytes``. Lenders on one host take turns at reclaim-and-compact passes per NUMA node by flock on
   ``compact.<host>.node<N>.lock``.
 
-A lender that cannot start leaves ``lender.<name>.failed``, which clients ignore and capacity checks count. In a
-serving process ``start_lend`` starts the lend (``remote_cache_config.lend_size``) before the KV cache estimation, and
-the final ``KVCacheManagerV2`` owns it.
+A lender that cannot start, or whose owner fails, leaves ``lender.<name>.failed``, which clients ignore and capacity
+checks count. In a serving process ``start_lend`` starts the lend (``remote_cache_config.lend_size``) before the KV
+cache estimation, and the final ``KVCacheManagerV2`` owns it.
+
+Trust model: the directory is private to the job's user (``ensure_rendezvous_directory``) and every file in it is
+0600, since lender files hold NIXL memory registration keys and fabric handles; use one directory per job.
 """
 
 import contextlib
 import ctypes
+import errno
 import fcntl
 import mmap
 import os
 import socket
 import threading
 import time
+import uuid
+import weakref
 from typing import TYPE_CHECKING, Optional
 
+from tensorrt_llm._torch.mmap_utils import madvise_range
 from tensorrt_llm.llmapi.llm_args import REMOTE_CACHE_CHUNK_BYTES, REMOTE_CACHE_LEND_RESERVE_BYTES
 from tensorrt_llm.logger import logger
 
@@ -104,30 +111,53 @@ def _log(message: str) -> None:
     logger.info(f"KVCM2 remote lender: {message}")
 
 
+def ensure_rendezvous_directory(directory: str) -> None:
+    """Create `directory` as 0700, or accept an existing one only if this user owns it and nobody else can write it."""
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    st = os.stat(directory)
+    if st.st_uid != os.geteuid() or st.st_mode & 0o022:
+        raise PermissionError(
+            f"KVCM2 remote rendezvous directory {directory} must be owned by uid {os.geteuid()} and not writable by "
+            f"group or others (owner uid {st.st_uid}, mode {st.st_mode & 0o777:o})"
+        )
+
+
 def _write_atomically(path: str, data: bytes) -> None:
     tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, "wb") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, "wb") as f:
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
 
 
+def _withdraw_unowned(published: list, failed_path: str, marker: bytes) -> None:
+    """Finalizer of a lender nobody closed: withdraw its files and leave the failure marker."""
+    for path in reversed(published):
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+    published.clear()
+    with contextlib.suppress(OSError):
+        _write_atomically(failed_path, marker)
+
+
 # Linux values (asm-generic, so x86_64 and aarch64 alike); Python's mmap module lacks some of them before 3.13.
 _MAP_NORESERVE = 0x4000
 _MADV_HUGEPAGE = 14
-_MADV_POPULATE_WRITE = 23  # Linux 5.14+
 _POPULATE_SLICE = 64 << 20
 
 
-def _populate(region: mmap.mmap, nbytes: int) -> None:
-    """Make every page of `region` resident: huge pages where the kernel has them (MADV_HUGEPAGE is set first), 4 KiB
-    pages elsewhere. MADV_POPULATE_WRITE does it in the kernel; without it, zero the region slice by slice."""
+def _populate(region: mmap.mmap, address: int, nbytes: int) -> None:
+    """Make every page of `region` (at `address`) resident: huge pages where the kernel has them (MADV_HUGEPAGE is set
+    first), 4 KiB pages elsewhere. MADV_POPULATE_WRITE does it in the kernel without holding the GIL; a kernel without
+    it gets the region zeroed slice by slice. Any other madvise error (ENOMEM, EHWPOISON) raises."""
     try:
-        region.madvise(_MADV_POPULATE_WRITE)
+        madvise_range(address, nbytes, "populate_write")
         return
-    except (OSError, ValueError):
-        pass
+    except OSError as error:
+        if error.errno not in (errno.EINVAL, errno.ENOSYS):
+            raise
     zeros = bytes(_POPULATE_SLICE)
     view = memoryview(region)
     try:
@@ -267,7 +297,7 @@ def _compact_node(node: int, gib: float) -> None:
             region.madvise(_MADV_HUGEPAGE)
         except OSError:
             pass
-        _populate(region, nbytes)
+        _populate(region, address, nbytes)
     finally:
         region.close()
 
@@ -278,7 +308,7 @@ def _node_compaction_lock(directory: str, host: str, node: int):
     file system refuses it (no pass may then run on the node)."""
     path = os.path.join(directory, f"compact.{host}.node{node}.lock")
     try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     except OSError as error:
         _log(f"cannot open {path} ({error}); no reclaim-and-compact pass on node {node}")
         yield False
@@ -507,7 +537,8 @@ class RemoteLender:
 
     With ``transport="fabric"`` the region is Grace DRAM allocated on NUMA node ``numa_node`` (default: the node of
     CUDA device ``device``), leaving ``reserve_bytes`` free per node, and published as CUDA fabric handles;
-    ``ucx_devices`` applies to ``"nixl"`` only."""
+    ``ucx_devices`` (``{GPU}`` resolved at start) applies to ``"nixl"`` only. A lender collected or left at exit
+    without ``close()`` withdraws its files and leaves the failure marker."""
 
     directory: str = ""
     nbytes: int = 0
@@ -532,6 +563,8 @@ class RemoteLender:
     _start_thread: Optional[threading.Thread] = None
     # Serializes close(): a failed background start closes on its own thread.
     _close_lock: Optional[threading.Lock] = None
+    # Withdraws the files of a lender nobody closed; close() detaches it.
+    _finalizer: Optional[weakref.finalize] = None
 
     def __init__(
         self,
@@ -560,7 +593,8 @@ class RemoteLender:
         self.transport = transport
         self.ucx_devices = ucx_devices
         host = socket.gethostname().split(".")[0]
-        self.name = name or f"kvcm2-lender-{host}-{os.getpid()}-{id(self) & 0xFFFF:04x}"
+        # Unique per lender, also within one process: clients never take claims from a withdrawn name again.
+        self.name = name or f"kvcm2-lender-{host}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self.host = host
         self._map: Optional[mmap.mmap] = None
         self._address = 0
@@ -572,6 +606,7 @@ class RemoteLender:
         self._fabric_device = None
         self._start_thread = None
         self._close_lock = threading.Lock()
+        self._finalizer = None
 
     @property
     def address(self) -> int:
@@ -638,17 +673,25 @@ class RemoteLender:
         nothing raises."""
         from cuda.bindings import driver as drv
 
-        os.makedirs(self.directory, exist_ok=True)
+        ensure_rendezvous_directory(self.directory)
         _cuda_check(drv.cuInit(0))
         device = _cuda_check(drv.cuDeviceGet(0 if self.device is None else self.device))
         self._fabric_ctx = _cuda_check(drv.cuDevicePrimaryCtxRetain(device))
         self._fabric_device = device
-        _cuda_check(drv.cuCtxPushCurrent(self._fabric_ctx))
+        # cuMemCreate and the export may run while the serving thread captures a CUDA graph in global mode.
+        capture_mode = _cuda_check(
+            drv.cuThreadExchangeStreamCaptureMode(
+                drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
+            )
+        )
         handles = []
         planned = self.nbytes
         chunk_gib = self.chunk_bytes / _GIB
         reserve_gib = self.reserve_bytes / _GIB
+        pushed = started = False
         try:
+            _cuda_check(drv.cuCtxPushCurrent(self._fabric_ctx))
+            pushed = True
             numa = self.numa_node if self.numa_node is not None else _host_numa_node_of(drv, device)
             nodes = [numa] + [n for n in _host_numa_nodes() if n != numa]
             props = {n: self._fabric_prop(drv, n) for n in nodes}
@@ -695,12 +738,13 @@ class RemoteLender:
                     f"no NUMA node can hold a {chunk_gib:.2f} GiB fabric chunk and keep its "
                     f"{reserve_gib:.0f} GiB reserve"
                 )
+            started = True
         except BaseException:
             # Nothing is published: release what was made.
             self._release_fabric()
             raise
         finally:
-            _cuda_check(drv.cuCtxPopCurrent())
+            self._leave_fabric_context(drv, capture_mode, pop=pushed, raise_errors=started)
         self.nbytes = len(handles) * self.chunk_bytes
         short = planned - self.nbytes
         placement = ",".join(f"{n}:{c}" for n, c in per_node.items() if c)
@@ -723,28 +767,52 @@ class RemoteLender:
             f"{t1 - t0:.1f} s",
         )
 
+    def _failure_text(self, error: BaseException) -> bytes:
+        return "\n".join(
+            [
+                "version 1",
+                f"name {self.name}",
+                f"host {self.host}",
+                f"pid {os.getpid()}",
+                f"transport {self.transport}",
+                f"planned_bytes {self.nbytes}",
+                f"error {error!r}".replace("\n", " "),
+                "",
+            ]
+        ).encode()
+
+    def _leave_fabric_context(self, drv, capture_mode, *, pop: bool, raise_errors: bool) -> None:
+        """Pop the fabric context (if `pop`) and restore the thread's capture mode. A failure raises only after a
+        successful start, so it never replaces the start error."""
+        steps = [lambda: drv.cuThreadExchangeStreamCaptureMode(capture_mode)]
+        if pop:
+            steps.append(drv.cuCtxPopCurrent)
+        for step in steps:
+            try:
+                _cuda_check(step())
+            except RuntimeError as error:
+                if raise_errors:
+                    raise
+                _log(f"{self.name}: leaving the fabric context failed: {error}")
+
     def publish_failure(self, error: BaseException) -> None:
         """Leave lender.<name>.failed (planned bytes and the error) so capacity checks count this lender as reported
         instead of waiting for it. Clients ignore the file: they list only .ready lenders."""
         try:
-            os.makedirs(self.directory, exist_ok=True)
-            text = "\n".join(
-                [
-                    "version 1",
-                    f"name {self.name}",
-                    f"host {self.host}",
-                    f"pid {os.getpid()}",
-                    f"transport {self.transport}",
-                    f"planned_bytes {self.nbytes}",
-                    f"error {error!r}".replace("\n", " "),
-                    "",
-                ]
-            )
-            _write_atomically(self._path("failed"), text.encode())
+            ensure_rendezvous_directory(self.directory)
+            _write_atomically(self._path("failed"), self._failure_text(error))
         except OSError as write_error:
             _log(f"{self.name}: cannot write its failure marker: {write_error}")
 
     def start(self) -> None:
+        if self._finalizer is None:
+            self._finalizer = weakref.finalize(
+                self,
+                _withdraw_unowned,
+                self._published,
+                self._path("failed"),
+                self._failure_text(RuntimeError("the lender's owner exited without closing it")),
+            )
         if self.transport == "fabric":
             self._start_fabric()
             return
@@ -756,7 +824,8 @@ class RemoteLender:
             NixlTransferAgent,
         )
 
-        os.makedirs(self.directory, exist_ok=True)
+        ensure_rendezvous_directory(self.directory)
+        ucx_devices = resolve_ucx_devices(self.ucx_devices, self.device)
         t0 = time.monotonic()
         flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_NORESERVE
         self._map = mmap.mmap(-1, self.nbytes, flags=flags)
@@ -771,7 +840,7 @@ class RemoteLender:
             _log(f"libnuma unavailable; {self.name} relies on first touch for NUMA placement")
         # Fault every page in now: registration does not pin memory where the NIC pages on demand, and a resident
         # lend fails here rather than mid-run and never makes a remote write wait on a page fault.
-        _populate(self._map, self.nbytes)
+        _populate(self._map, self._address, self.nbytes)
         t1 = time.monotonic()
 
         config = BaseAgentConfig()
@@ -780,8 +849,8 @@ class RemoteLender:
         config.multi_thread = False
         config.use_listen_thread = False
         # This agent's own UCX devices; the process-wide UCX_NET_DEVICES stays as the serving process needs it.
-        if self.ucx_devices:
-            config.backend_params = {"ucx_devices": self.ucx_devices}
+        if ucx_devices:
+            config.backend_params = {"ucx_devices": ucx_devices}
         self._agent = NixlTransferAgent(config)
         self._agent.register_memory(
             MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, self.nbytes, 0)])
@@ -801,8 +870,7 @@ class RemoteLender:
             self.start()
         except Exception as error:  # noqa: BLE001 - a failed lender only removes capacity
             logger.warning(f"KVCM2 remote lender: {self.name} failed to start: {error!r}")
-            self.close()
-            self.publish_failure(error)
+            self.close(error)
 
     def start_in_background(self) -> None:
         """``start_or_report()`` on a thread, so the caller does not wait for the memory to be faulted in and
@@ -818,14 +886,19 @@ class RemoteLender:
         if thread is not None and thread is not threading.current_thread():
             thread.join()
 
-    def close(self) -> None:
-        """Wait for a background start, then withdraw the files, the registration and the memory. NIXL clients still
-        holding chunks fail their next transfer at the NIC instead of reading stale bytes."""
+    def close(self, error: Optional[BaseException] = None) -> None:
+        """Wait for a background start, then withdraw the files, the registration and the memory; with `error`, leave
+        the failure marker too. NIXL clients still holding chunks fail their next transfer at the NIC instead of
+        reading stale bytes."""
         thread, self._start_thread = self._start_thread, None
         if thread is not None and thread is not threading.current_thread():
             thread.join()
         with self._close_lock:
+            if self._finalizer is not None:
+                self._finalizer.detach()
             self._withdraw()
+        if error is not None:
+            self.publish_failure(error)
 
     def _withdraw(self) -> None:
         for path in reversed(self._published):
@@ -876,20 +949,30 @@ class RemoteLender:
             self._map = None
 
 
-def start_lend(remote_config: "RemoteCacheConfig", device: int) -> RemoteLender:
-    """Start lending ``remote_config.lend_size`` bytes of host memory near CUDA device `device`, in the background."""
-    directory = os.path.expandvars(os.path.expanduser(remote_config.directory))
-    lender = RemoteLender(
-        directory,
+def _lender_for(remote_config: "RemoteCacheConfig", device: Optional[int]) -> RemoteLender:
+    return RemoteLender(
+        os.path.expandvars(os.path.expanduser(remote_config.directory)),
         remote_config.lend_size,
         transport=remote_config.transport,
-        ucx_devices=resolve_ucx_devices(remote_config.ucx_devices, device),
+        ucx_devices=remote_config.ucx_devices,
         reserve_bytes=remote_config.lend_reserve_size,
         device=device,
     )
+
+
+def start_lend(remote_config: "RemoteCacheConfig", device: int) -> RemoteLender:
+    """Start lending ``remote_config.lend_size`` bytes of host memory near CUDA device `device`, in the background.
+    Every start error, ``{GPU}`` resolution included, surfaces as the lender's failure marker."""
+    lender = _lender_for(remote_config, device)
+    directory = lender.directory
     lender.start_in_background()
     logger.info(
         f"KV cache manager v2 lends {remote_config.lend_size / _GIB:.2f}GiB of host memory "
         f"to remote cache levels via {directory} ({remote_config.transport})"
     )
     return lender
+
+
+def publish_lend_failure(remote_config: "RemoteCacheConfig", error: BaseException) -> None:
+    """Leave the failure marker of a lend this rank planned but never started, so peers stop waiting for it."""
+    _lender_for(remote_config, None).publish_failure(error)

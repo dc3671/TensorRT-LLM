@@ -22,6 +22,9 @@ last lender reports with a shortfall, pass as soon as the offer covers the need,
 """
 
 import contextlib
+import errno
+import gc
+import mmap
 import os
 import shutil
 import sys
@@ -248,6 +251,89 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertEqual(depths, [1, 1])
         start_threads[0].join(10)  # it still writes the failure marker after its close
         self.assertFalse(start_threads[0].is_alive())
+
+    def _started(self, name):
+        lender = RemoteLender(self.dir, 4 * _GIB, chunk_bytes=_GIB, transport="fabric", name=name)
+        with mock.patch.object(
+            RemoteLender, "_start_fabric", lambda self: self._publish([], ["segment 0 1"], "test")
+        ):
+            lender.start()
+        return lender
+
+    def test_a_lender_nobody_closed_withdraws_and_leaves_a_marker(self):
+        # E.g. startup failed between the lend start and the manager that would own it.
+        lender = self._started("orphan")
+        ready = os.path.join(self.dir, "lender.orphan.ready")
+        self.assertTrue(os.path.exists(ready))
+        del lender
+        gc.collect()
+        self.assertFalse(os.path.exists(ready))
+        _, failed = scan_lenders(self.dir)
+        self.assertEqual([f["name"] for f in failed], ["orphan"])
+
+    def test_a_closed_lender_leaves_no_marker(self):
+        lender = self._started("done")
+        lender.close()
+        del lender
+        gc.collect()
+        self.assertEqual(scan_lenders(self.dir), ([], []))
+
+    def test_close_with_an_error_leaves_a_marker(self):
+        lender = self._started("aborted")
+        lender.close(RuntimeError("initialization failed on another rank"))
+        _, failed = scan_lenders(self.dir)
+        self.assertIn("another rank", failed[0]["error"])
+
+    def test_lender_names_are_unique_within_a_process(self):
+        names = {RemoteLender(self.dir, _GIB, chunk_bytes=_GIB).name for _ in range(64)}
+        self.assertEqual(len(names), 64)
+
+
+class TestRendezvousPermissions(unittest.TestCase):
+    """Lender files hold NIXL registration keys and fabric handles: the directory and its files are the user's."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="kvcm2_perm_")
+
+    def tearDown(self):
+        os.chmod(self.dir, 0o700)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_new_directory_is_private(self):
+        path = os.path.join(self.dir, "rendezvous")
+        remote_lender.ensure_rendezvous_directory(path)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o700)
+
+    def test_a_directory_others_can_write_is_refused(self):
+        os.chmod(self.dir, 0o777)
+        with self.assertRaises(PermissionError):
+            remote_lender.ensure_rendezvous_directory(self.dir)
+        os.chmod(self.dir, 0o755)
+        remote_lender.ensure_rendezvous_directory(self.dir)
+
+    def test_lender_files_are_private(self):
+        RemoteLender(self.dir, _GIB, chunk_bytes=_GIB, name="x").publish_failure(RuntimeError("e"))
+        self.assertEqual(os.stat(os.path.join(self.dir, "lender.x.failed")).st_mode & 0o077, 0)
+
+
+class TestPopulate(unittest.TestCase):
+    """MADV_POPULATE_WRITE runs without the GIL; only a kernel without it falls back to zeroing the region."""
+
+    def _populate_with(self, error):
+        region = mmap.mmap(-1, 1 << 20, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+        try:
+            with mock.patch.object(remote_lender, "madvise_range", side_effect=error):
+                remote_lender._populate(region, 0, 1 << 20)
+        finally:
+            region.close()
+
+    def test_a_kernel_without_populate_write_falls_back(self):
+        self._populate_with(OSError(errno.EINVAL, "EINVAL"))
+
+    def test_other_errors_raise(self):
+        for code in (errno.ENOMEM, getattr(errno, "EHWPOISON", 133)):
+            with self.assertRaises(OSError):
+                self._populate_with(OSError(code, os.strerror(code)))
 
 
 class TestPlaceChunks(unittest.TestCase):
