@@ -92,7 +92,6 @@ def _compiled_two_shot(
     moe_topk: int,
     fc2_row: int,
     l2pf: bool = False,
-    fc2_lamport: bool = False,
 ):
     import cuda.bindings.driver as cuda
     import cutlass
@@ -113,7 +112,6 @@ def _compiled_two_shot(
         fc2_row=fc2_row,
         tpc=tpc,
         l2pf=l2pf,
-        fc2_lamport=fc2_lamport,
     )
     x, gate, w, scale, q, table = _example_operands(hidden, nranks)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -492,14 +490,13 @@ class MnnvlAllReduceNorm:
             l2pf, pf_ptr, pf_bytes, pf_per = _l2pf_args(
                 l2_prefetch, -(-m // tpc) if tpc > 1 else m * ctas
             )
-            if lamport and tpc != 1:
+            if lamport:
                 raise RuntimeError(
-                    f"Lamport FC2 rows: the two-shot fold is implemented for one token per CTA "
-                    f"({m} rows give {tpc})"
+                    f"Lamport FC2 rows are folded by the slot kernel, up to {SLOT_MAX_ROWS} rows ({m} given)"
                 )
             fn = _compiled_two_shot(
                 hidden, float(eps), nranks, ctas, tpc, self._pdl,
-                folds, norm_out, scale is not None, topk, fc2_row, l2pf, lamport,
+                folds, norm_out, scale is not None, topk, fc2_row, l2pf,
             )  # fmt: skip
             fn(
                 *operands,

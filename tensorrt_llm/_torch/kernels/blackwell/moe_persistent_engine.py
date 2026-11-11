@@ -229,12 +229,12 @@ class PersistentMoeEngine:
             cute.arch.mbarrier_init_fence()
 
     @cute.jit
-    def wait_dependency(self, state_addr):
-        """The grid dependency wait (and the release, if ``AFTER_WAIT``); returns gen. Read after the wait: a PDL
-        launch of the next call can start before this one's last CTA advanced gen, and every CTA must see the same
-        parity."""
+    def wait_dependency(self, state_addr, release_bar=None):
+        """The grid dependency wait (and the release, if ``AFTER_WAIT`` without ``release_bar``); returns gen. Read
+        after the wait: a PDL launch of the next call can start before this one's last CTA advanced gen, and every CTA
+        must see the same parity."""
         cute.arch.griddepcontrol_wait()
-        if cutlass.const_expr(self.release == Release.AFTER_WAIT):
+        if cutlass.const_expr(self.release == Release.AFTER_WAIT and release_bar is None):
             cute.arch.griddepcontrol_launch_dependents()
         return _ld_relaxed_u32(state_addr)
 
@@ -313,13 +313,20 @@ class PersistentMoeEngine:
                 ready = Int32(1)
 
     @cute.jit
-    def scheduler(self, s_q, q_full, n1, u1, u2, bidx, gdx, pool_addr, cnt_base, lane):
-        """Warp 3, lane 0: this CTA's FC1 units, then FC2 tickets (claimed one ahead), then the end marker."""
+    def scheduler(
+        self, s_q, q_full, n1, u1, u2, bidx, gdx, pool_addr, cnt_base, lane, release_bar=None
+    ):
+        """Warp 3, lane 0: this CTA's FC1 units, then FC2 tickets (claimed one ahead), then the end marker.
+        ``release_bar``: an mbarrier that completes once this CTA's outputs read by the dependents without their
+        dependency wait are written; the dependents are released only after it (also for ``AFTER_WAIT``)."""
         if lane == 0:
             k = Int32(0)
             for j in cutlass.range(n1, unroll=1):
                 self._push(s_q, q_full, k, bidx + j * gdx)
                 k = k + 1
+            if cutlass.const_expr(release_bar is not None and self.release == Release.AFTER_WAIT):
+                cute.arch.mbarrier_wait(release_bar, 0)
+                cute.arch.griddepcontrol_launch_dependents()
             t = u2
             if u2 > 0:
                 t = _atom_add_relaxed(pool_addr, Int32(1))
@@ -328,6 +335,8 @@ class PersistentMoeEngine:
                 if cutlass.const_expr(self.release == Release.POOL_SPENT):
                     if tn >= u2:
                         # the pool is spent and t is this CTA's last ticket: one thread's trigger counts for the CTA
+                        if cutlass.const_expr(release_bar is not None):
+                            cute.arch.mbarrier_wait(release_bar, 0)
                         cute.arch.griddepcontrol_launch_dependents()
                 if cutlass.const_expr(self.fc2_wait_in_scheduler):
                     self.wait_fc1_done(cnt_base, t // self.m2_tiles)

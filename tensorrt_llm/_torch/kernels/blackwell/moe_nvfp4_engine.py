@@ -202,6 +202,10 @@ def _bar_arrive(bar_id, n: int) -> None:
     cute.arch.inline_ptx(f"bar.arrive {{$r0}}, {n};", read_only_args=[bar_id])
 
 
+def _fence_gpu() -> None:
+    cute.arch.inline_ptx("fence.acq_rel.gpu;")
+
+
 def _fence_cta_after(dep) -> None:
     """fence.acq_rel.cta, issued once dep is computed."""
     cute.arch.inline_ptx(
@@ -574,6 +578,17 @@ class MoeNvfp4Engine(PersistentMoeEngine):
             )
         sb_base = sB.iterator.toint()
         sfb_base = sSFB.iterator.toint()
+        route_done = None
+        if cutlass.const_expr(self.route):
+            # Completes once every epilogue thread wrote its routing outputs, which the MoE-output all-reduce reads
+            # before (Lamport FC2) or without its dependency wait: the scheduler releases the dependents after it.
+            route_done = smem.allocate_tensor(
+                cutlass.Int64, cute.make_layout(1), byte_alignment=8
+            ).iterator
+            if warp_idx == 0:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(route_done, 128 * EPI_GROUPS)
+                cute.arch.mbarrier_init_fence()
         pipeline_init_arrive(cluster_shape_mn=None, is_relaxed=True)
         pipeline_init_wait(cluster_shape_mn=None)
 
@@ -589,7 +604,7 @@ class MoeNvfp4Engine(PersistentMoeEngine):
                     s_c[ei] = _ld_nc_f32(scale_c_addr + Int64(ei) * 4)
                     s_a2[ei] = _ld_nc_f32(alpha2_addr + Int64(ei) * 4)
         # gen is loaded here and used after the table scan, so its latency overlaps the scan's loads
-        gen = self.wait_dependency(state_addr)
+        gen = self.wait_dependency(state_addr, route_done)
 
         # tiles per n_max rows: an expert splits iff the tile RT after its first is still its own
         RT = (
@@ -800,7 +815,9 @@ class MoeNvfp4Engine(PersistentMoeEngine):
                 u1,
             )
         elif warp_idx == 3:
-            self.scheduler(s_q, q_full, n1, u1, u2, bidx, gdx, pool_addr, cnt_base, lane)
+            self.scheduler(
+                s_q, q_full, n1, u1, u2, bidx, gdx, pool_addr, cnt_base, lane, route_done
+            )
         elif warp_idx >= EPI_WARP0:
             if cutlass.const_expr(self.route):
                 self._route_deferred(
@@ -823,6 +840,8 @@ class MoeNvfp4Engine(PersistentMoeEngine):
                     bidx,
                     gdx,
                 )
+                _fence_gpu()
+                cute.arch.mbarrier_arrive(route_done)
             self.epilogue(
                 acc_full,
                 acc_empty,

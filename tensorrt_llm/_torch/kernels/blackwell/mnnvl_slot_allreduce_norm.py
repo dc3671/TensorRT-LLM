@@ -102,6 +102,40 @@ def _ld_cg_s32(addr: Int64, *, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
+def _ld_relaxed_s32(addr: Int64, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.relaxed.gpu.global.b32 $0, [$1];",
+            "=r,l,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_relaxed_u16(addr: Int64, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b16 h;\n\tld.relaxed.gpu.global.b16 h, [$1];\n\tcvt.u32.u16 $0, h;\n\t}",
+            "=r,l,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _mbar_init(addr: Int32, count: Int32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
@@ -375,11 +409,18 @@ class MnnvlSlotAllReduceNormKernel:
         r0, r1, r2, r3 = _ld_v4(Int64(gRes.iterator.toint()) + row_off)
         if const_expr(self.se_fold):
             if const_expr(topk > 0):
-                # routing outputs of this step: only after the dependency wait (RAW)
+                # routing outputs of this step: after the dependency wait (RAW), or, with fc2_lamport, written before
+                # the dependency released this launch (an engine that routes releases it only after its tables)
                 kbase = Int64(tok) * Int64(topk)
                 for k in cutlass.range_constexpr(topk):
-                    pk[k] = _ld_s32(perm_ptr + (kbase + Int64(k)) * Int64(4))
-                    wk[k] = _ld_u16(topw_ptr + (kbase + Int64(k)) * Int64(2))
+                    pa = perm_ptr + (kbase + Int64(k)) * Int64(4)
+                    wa = topw_ptr + (kbase + Int64(k)) * Int64(2)
+                    if const_expr(self.fc2_lamport):
+                        pk[k] = _ld_relaxed_s32(pa)
+                        wk[k] = _ld_relaxed_u16(wa)
+                    else:
+                        pk[k] = _ld_s32(pa)
+                        wk[k] = _ld_u16(wa)
             else:
                 f0, f1, f2, f3 = _ld_v4(Int64(gRouted.iterator.toint()) + row_off)
             h0, h1, h2, h3 = _ld_v4(Int64(gShared.iterator.toint()) + row_off)

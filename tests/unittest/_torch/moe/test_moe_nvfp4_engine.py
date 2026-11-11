@@ -756,7 +756,9 @@ def _poisoned_routing(m, tile, poison):
     return flat, ids, wts
 
 
-def _engine_on(ex, xq, xsf, views, tile, state, poison, **route):
+def _engine_on(
+    ex, xq, xsf, views, tile, state, poison, sync=True, release_after_wait=False, **route
+):
     """The engine with the decode hook's n_max / K tile on tables ``views`` (``prerouted_table_views``); with
     ``route`` (candidates, ids, weights, local start) it writes them itself."""
     from tensorrt_llm._torch.kernels.blackwell.moe_nvfp4_engine import moe_nvfp4_engine
@@ -793,9 +795,11 @@ def _engine_on(ex, xq, xsf, views, tile, state, poison, **route):
         tile=tile,
         n_max=n_max,
         tile_k=tile_k_for(n_max, H, INTER),
+        release_after_wait=release_after_wait,
         **route,
     )
-    torch.cuda.synchronize()
+    if sync:
+        torch.cuda.synchronize()
     return out
 
 
@@ -878,6 +882,90 @@ def test_engine_routes_bit_for_bit(m, ls, tile, dup, state):
             local_start=ls,
         )
         _check_routed((ids, wts, views, out), ref[2:], tag)
+
+
+def _pdl_table_reader():
+    """A PDL dependent that copies e2p (int32) and the BF16 weights (as u16) into ``out`` [n, 2] int32 as soon as it
+    starts, without its dependency wait, with the loads of the MoE-output all-reduce's Lamport fold."""
+    import cutlass.cute as cute
+    from cutlass import Int32, Int64
+
+    from tensorrt_llm._torch.kernels.blackwell.mnnvl_slot_allreduce_norm import (
+        _ld_relaxed_s32,
+        _ld_relaxed_u16,
+    )
+    from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import _st_global_b32
+
+    class Reader:
+        @cute.jit
+        def __call__(self, e2p: Int64, wts: Int64, out: Int64, n: Int32, stream) -> None:
+            self.kernel(e2p, wts, out, n).launch(
+                grid=[1, 1, 1], block=[1024, 1, 1], stream=stream, use_pdl=True
+            )
+
+        @cute.kernel
+        def kernel(self, e2p: Int64, wts: Int64, out: Int64, n: Int32) -> None:
+            tidx, _, _ = cute.arch.thread_idx()
+            if tidx < n:
+                o = out + Int64(tidx) * Int64(8)
+                _st_global_b32(o, _ld_relaxed_s32(e2p + Int64(tidx) * Int64(4)))
+                _st_global_b32(o + Int64(4), _ld_relaxed_u16(wts + Int64(tidx) * Int64(2)))
+
+    return Reader()
+
+
+@pytest.mark.parametrize("release_after_wait", [False, True])
+@pytest.mark.parametrize("m", [35, 56, 63])
+def test_engine_routes_before_releasing_its_dependents(m, release_after_wait, state):
+    """``route``: a dependent launched right behind the engine (PDL, no dependency wait, as the Lamport fold) reads
+    the e2p table and the weights the engine wrote, never the poison they started from, with few active experts (most
+    CTAs have no FC1 unit and reach the release point first)."""
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    from cutlass import Int32, Int64
+
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_front import (
+        RouteFrontRouterGemm,
+        prerouted_table_views,
+    )
+
+    ex = _experts()
+    x, w, gs = _router_inputs(m, ex, seed=71 + m)
+    x = x.abs()
+    w = torch.full_like(w, -0.02)
+    w[: TOPK + 2] = 0.02  # every token routes to 10 of 12 experts
+    _, cand, xq, xsf = RouteFrontRouterGemm(engine_route=True)(x, w, gs)
+    n = m * TOPK
+    got = torch.empty((n, 2), dtype=torch.int32, device="cuda")
+    reader = _pdl_table_reader()
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fn = cute.compile(reader, Int64(0), Int64(0), Int64(0), Int32(0), stream)
+    for it, poison in enumerate((-7, 0x2AAA) * 8):
+        flat, ids, wts = _poisoned_routing(m, 8, poison)
+        views = prerouted_table_views(flat, m, TOPK, E_LOCAL, 8)
+        got.fill_(poison)
+        torch.cuda.synchronize()
+        _engine_on(
+            ex, xq, xsf, views, 8, state, poison, sync=False,
+            release_after_wait=release_after_wait,
+            candidates=cand, topk_ids=ids, topk_weights=wts, local_start=0,
+        )  # fmt: skip
+        fn(
+            Int64(views[0].data_ptr()),
+            Int64(wts.data_ptr()),
+            Int64(got.data_ptr()),
+            Int32(n),
+            stream,
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(got[:, 0], views[0].reshape(-1)[:n]), (m, release_after_wait, it, "e2p")
+        assert torch.equal(got[:, 1], wts.view(torch.int16).reshape(-1).to(torch.int32) & 0xFFFF), (
+            m,
+            release_after_wait,
+            it,
+            "weights",
+        )
 
 
 def test_runner_routes_in_the_engine(monkeypatch):
