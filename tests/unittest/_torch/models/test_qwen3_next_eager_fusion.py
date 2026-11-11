@@ -372,6 +372,31 @@ def test_decode_kernels_follow_the_model_declaration(monkeypatch, declared, blac
     assert MoEDecodeOptions.of(config.extra_attrs).tuning is (declared and blackwell)
 
 
+@pytest.mark.parametrize("sm", [90, 100, 103, 107, 120])
+def test_decode_kernels_need_blackwell_datacenter(monkeypatch, sm) -> None:
+    """The declared decode paths run on SM 10.0 / 10.3 only (not SM 10.7, 12.x or Hopper)."""
+    import tensorrt_llm._utils as utils
+    from tensorrt_llm._torch.models import modeling_qwen3_next as m
+
+    def stop(model_config):
+        raise _StopInit
+
+    monkeypatch.setattr(utils, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(m, "Qwen3NextModel", stop)
+    model_cls = type("_Declared", (Qwen3NextForCausalLM,), {"decode_kernels": True})
+    config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(model_type="qwen3_next"),
+        extra_attrs={},
+        spec_config=None,
+        cuda_graph_batch_sizes=[1, 2],
+        mapping=SimpleNamespace(enable_attention_dp=False, dp_size=1),
+    )
+    with pytest.raises(_StopInit):
+        model_cls(config)
+    assert utils.is_blackwell_datacenter() is (sm in (100, 103))
+    assert m._uses_decode_kernels(config) is (sm in (100, 103))
+
+
 def test_next_layer_l2_prefetch_rows() -> None:
     """The MoE-output all-reduce prefetches the next projection's weight from l2_prefetch_min_rows rows, except in
     the rows the resident-weight GEMM takes it."""
