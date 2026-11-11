@@ -883,8 +883,8 @@ class _GqaKvReplicaFmha(GqaDecodeFmha):
 class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
     """KV-replica split with the fused partial attention kernel (gqa_kv_replica_fused.py)."""
 
-    # Per token count: whether the RoPE kernel's q all-gather grid stays resident (decided once per count).
-    _rope_gather_resident: Optional[Dict[int, bool]] = None
+    # Per (token count, q_len): whether the RoPE kernel's q all-gather grid stays resident (decided once per shape).
+    _rope_gather_resident: Optional[Dict[Tuple[int, int], bool]] = None
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
@@ -928,7 +928,8 @@ class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
         if plan is not None:
             if self._multi_processor_count is None:
                 self._multi_processor_count = self._get_multi_processor_count(plan.seq_lens.device)
-            if self._takes(plan.num_requests, plan.q_len, metadata):
+            # Only for calls this library takes (_is_supported), so the exchange calls stay identical on every member.
+            if plan.num_requests >= 2 and self._takes(plan.num_requests, plan.q_len, metadata):
                 plan.rope_gather = self._rope_gather(self.attn, num_tokens)
         return plan
 
@@ -975,9 +976,10 @@ class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
         attn = self.attn
         gather = plan.rope_gather
         num_tokens = qkv.shape[0]
-        if gather is not None and num_tokens not in self._rope_gather_resident:
-            # Triton specializes the kernel on the token count, so the bound is taken per count.
-            self._rope_gather_resident[num_tokens] = num_tokens <= rope_gather_max_tokens(
+        shape = (num_tokens, plan.q_len)
+        if gather is not None and shape not in self._rope_gather_resident:
+            # Triton specializes the kernel on the token count and q_len, so the bound is taken per shape.
+            self._rope_gather_resident[shape] = num_tokens <= rope_gather_max_tokens(
                 qkv,
                 q_weight,
                 k_weight,
@@ -992,7 +994,7 @@ class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
                 plan,
                 gather,
             )
-        if gather is None or not self._rope_gather_resident[num_tokens]:
+        if gather is None or not self._rope_gather_resident[shape]:
             return super().run_prologue(
                 plan, qkv, q_weight, k_weight, cos_sin, positions, eps, rotary_dim, mrope_section
             )

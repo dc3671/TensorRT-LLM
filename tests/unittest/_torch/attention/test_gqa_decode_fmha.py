@@ -700,21 +700,24 @@ def test_rope_gather_grid_residency_comes_from_the_compiled_kernel(
 ) -> None:
     """The fused q all-gather takes a grid only while all of it stays resident: at most min(occupancy of the compiled
     kernel, GATHER_MAX_PROGRAMS_PER_SM) programs per SM. At a TEP8 Qwen3.5 layer (4 q heads, 1 KV head, group of 4)
-    the occupancy is above the cap, so the cap decides the token bound."""
+    the occupancy is above the cap, so the cap decides the token bound. Every member of the group compiles the same
+    kernel, so every member takes the same bound."""
     from tensorrt_llm._torch.attention.kernels import fused_qk_norm_rope_gate as K
 
     hq, hkv, d, rot, q_len, group = 4, 1, HEAD_DIM, 64, 7, 4
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     occupancy = []
+    kernels = []
     resident = K._resident_programs_per_sm
 
     def spy(kernel):
+        kernels.append(kernel)
         occupancy.append(resident(kernel))
         return occupancy[-1]
 
     monkeypatch.setattr(K, "_resident_programs_per_sm", spy)
 
-    def resident_tokens(num_tokens: int) -> int:
+    def resident_tokens(num_tokens: int, grank: int = 0) -> int:
         b = num_tokens // q_len
         dev = "cuda"
         plan = KvAppendPlan(
@@ -745,7 +748,7 @@ def test_rope_gather_grid_residency_comes_from_the_compiled_kernel(
             (
                 torch.zeros(group, dtype=torch.int64, device=dev),
                 torch.zeros(num_tokens * hq, dtype=torch.int32, device=dev),
-                0,
+                grank,
                 group,
                 1 << 16,
                 True,
@@ -756,6 +759,9 @@ def test_rope_gather_grid_residency_comes_from_the_compiled_kernel(
     assert resident_tokens(q_len) == bound
     assert resident_tokens(16 * q_len) == bound
     assert occupancy and min(occupancy) >= K.GATHER_MAX_PROGRAMS_PER_SM
+    kernels.clear()
+    assert [resident_tokens(q_len, grank) for grank in range(group)] == [bound] * group
+    assert all(k is kernels[0] for k in kernels)
 
 
 @pytest.mark.parametrize("folded", [False, True])
@@ -763,7 +769,7 @@ def test_rope_gather_launches_only_with_a_resident_grid(
     monkeypatch: pytest.MonkeyPatch, folded: bool
 ) -> None:
     """GqaKvReplicaFusedFmha's prologue (the module's unfolded one, and the folded call's fallback) all-gathers q in
-    the RoPE kernel only for token counts within rope_gather_max_tokens, taken once per count; otherwise, and
+    the RoPE kernel only for token counts within rope_gather_max_tokens, taken once per shape; otherwise, and
     without the plan's gather arguments, the plain kernel runs and plan.q_gathered stays None."""
     from tensorrt_llm._torch.attention.kernels import fused_qk_norm_rope_gate as K
 

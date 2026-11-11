@@ -457,7 +457,9 @@ def _fp8_like_cxx(x_bf16_as_f32, scale_bf16_as_f32):
     return (x_bf16_as_f32 * scale_bf16_as_f32).to(tl.bfloat16).to(tl.float32).to(tl.float8e4nv)
 
 
-@triton.jit
+# ga_grank is not specialized: every member of the KV group compiles the same kernel, so the residency bound of
+# rope_gather_max_tokens (and with it the decision to gather) is the same on every member.
+@triton.jit(do_not_specialize=["ga_grank"])
 def _qkv_rope_gate_fp8_append_kernel(
     qkv_ptr,
     qkv_out_ptr,
