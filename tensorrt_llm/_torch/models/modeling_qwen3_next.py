@@ -79,7 +79,6 @@ from ..moe.fused_moe.impl_contract import MOE_DECODE_OPTIONS, MoEDecodeOptions
 from ..moe.fused_moe.trtllm_gen.decode_front import (FUSED_FRONT_MAX_TOKENS,
                                                      ROUTER_MAX_TOKENS,
                                                      DecodeFront,
-                                                     engine_route_steps,
                                                      route_front_steps)
 from ..moe.fused_moe.trtllm_gen.decode_moe import LamportFc2Buffer
 from ..speculative import SpecMetadata
@@ -152,30 +151,6 @@ _EXPERT_PREFETCH_MAX_ROWS = TWO_SHOT_ROWS - 1
 # tcgen05 kernel and the decode MoE engine leaves SMs to the shared expert
 # running beside it.
 _LARGE_STEP_MIN_REQUESTS = 64
-
-
-def _mid_decode_layout(model_config: ModelConfig) -> bool:
-    """Whether the largest CUDA-graph decode step is in the route front's
-    range below the all-reduces' two-shot rows: the MTP draft loop takes its
-    small-batch glue there."""
-    return FUSED_FRONT_MAX_TOKENS < _decode_step_rows(
-        model_config) < TWO_SHOT_ROWS
-
-
-# Small decode layouts: every CUDA-graph decode step above the one-launch
-# front's rows holds at most this many requests. There the expert prefetch
-# ranks the experts by routed rows and stops issuing after a per-layer-kind
-# budget (GDN / full-attention layers, ns).
-_SMALL_LAYOUT_MAX_REQUESTS = 5
-_EXPERT_PREFETCH_BUDGET_NS = (18500, 12500)
-
-
-def _small_decode_layout(model_config: ModelConfig) -> bool:
-    """Whether the largest CUDA-graph decode step is above the one-launch
-    front's rows and holds at most _SMALL_LAYOUT_MAX_REQUESTS requests."""
-    rows = _decode_step_rows(model_config)
-    return (FUSED_FRONT_MAX_TOKENS < rows <=
-            _SMALL_LAYOUT_MAX_REQUESTS * _rows_per_request(model_config))
 
 
 def _large_step_rows(model_config: ModelConfig) -> int:
@@ -668,12 +643,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                           1) if _uses_tp_decode_kernels(model_config) else
                 ROUTER_MAX_TOKENS + 1),
             decode_kernels=_uses_decode_kernels(model_config),
-            # Below the two-shot all-reduce's rows, the decode engine routes
-            # from the router GEMM's per-tile candidates.
-            engine_route_steps=engine_route_steps(
-                model_config.cuda_graph_batch_sizes,
-                spec_config.tokens_per_gen_step if spec_config is not None else
-                1) if _uses_tp_decode_kernels(model_config) else frozenset())
+            # The decode engine routes the steps it takes from the router
+            # GEMM's per-tile candidates.
+            engine_route=_uses_tp_decode_kernels(model_config))
 
         self.shared_expert = GatedMLP(
             hidden_size=self.hidden_dim,
@@ -1219,12 +1191,9 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
                       spec_metadata, lora_params, all_reduce_params, **kwargs):
         raise NotImplementedError
 
-    def set_expert_prefetch(self,
-                            prefetch: ExpertL2Prefetch,
-                            issue_budget_ns: int = 0) -> None:
+    def set_expert_prefetch(self, prefetch: ExpertL2Prefetch) -> None:
         """Prefetch the routed experts this layer used at the previous decode
-        step into L2, early in the layer (the mixer's own hook point), issuing
-        for at most ``issue_budget_ns`` (0: no limit)."""
+        step into L2, early in the layer (the mixer's own hook point)."""
         mlp = self.mlp
         if not isinstance(mlp, Qwen3NextSparseMoeBlock):
             return
@@ -1232,7 +1201,7 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
         experts = mlp.experts
         prefetch.register(
             self.layer_idx, experts.backend if isinstance(
-                experts, ConfigurableMoE) else experts, issue_budget_ns)
+                experts, ConfigurableMoE) else experts)
         mlp._decode_front.set_expert_prefetch(prefetch, self.layer_idx)
         self._attach_expert_prefetch(prefetch)
 
@@ -1635,9 +1604,8 @@ class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
     def promotes_target_state_beside(model_config: ModelConfig) -> bool:
         """Whether the target's recurrent-state promotion after acceptance runs
         beside the draft loop: this layer (full attention + MoE) reads no
-        recurrent state; the TP decode kernels at a mid decode layout."""
-        return (_uses_tp_decode_kernels(model_config)
-                and _mid_decode_layout(model_config))
+        recurrent state; with the TP decode kernels."""
+        return _uses_tp_decode_kernels(model_config)
 
     def cache_derived_state(self) -> None:
         fc = self.fc
@@ -1871,21 +1839,15 @@ class Qwen3NextModel(DecoderModel):
         """The routed-expert L2 prefetch of the TP decode layouts, attached to every MoE layer."""
         self.aux_stream_dict[
             AuxStreamType.MoeExpertPrefetch] = torch.cuda.Stream()
-        small = _small_decode_layout(model_config)
         self.expert_prefetch = ExpertL2Prefetch(
             self.num_hidden_layers,
             min_rows=_EXPERT_PREFETCH_MIN_REQUESTS *
             _rows_per_request(model_config),
             max_rows=_EXPERT_PREFETCH_MAX_ROWS,
             top_k=model_config.pretrained_config.num_experts_per_tok,
-            stream=self.aux_stream_dict[AuxStreamType.MoeExpertPrefetch],
-            rank_by_rows=small)
-        gdn_budget, attn_budget = (_EXPERT_PREFETCH_BUDGET_NS if small else
-                                   (0, 0))
+            stream=self.aux_stream_dict[AuxStreamType.MoeExpertPrefetch])
         for layer in self.layers:
-            layer.set_expert_prefetch(
-                self.expert_prefetch, gdn_budget if isinstance(
-                    layer, Qwen3NextLinearDecoderLayer) else attn_budget)
+            layer.set_expert_prefetch(self.expert_prefetch)
 
     def share_lamport_fc2(self, layers) -> None:
         """Hand ``lamport_fc2`` to the MoE blocks of ``layers``."""
@@ -2048,10 +2010,8 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                 bf16_logits_routing=no_adp,
                 bf16_draft_engine=no_adp)
             if no_adp:
-                # At a mid decode layout its temperature verify steps sample and accept in one launch.
-                model_config.extra_attrs[
-                    "spec_fused_sample_accept"] = _mid_decode_layout(
-                        model_config)
+                # Its temperature verify steps sample and accept in one launch where that launch takes the step.
+                model_config.extra_attrs["spec_fused_sample_accept"] = True
             logger.info("Qwen3.5 decode kernels enabled")
         if (model_config.spec_config is not None
                 and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):

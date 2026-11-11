@@ -83,19 +83,6 @@ def route_front_steps(
     )
 
 
-def engine_route_steps(cuda_graph_batch_sizes, tokens_per_gen_step: int) -> frozenset:
-    """Token counts whose un-finalized MoE call the decode MoE engine routes (``DecodeFront``'s
-    ``engine_route_steps``): the CUDA-graph decode steps (``route_front_steps``) above ``ROUTER_MAX_TOKENS`` and
-    below the MoE-output all-reduce's ``TWO_SHOT_ROWS``, where the largest step (largest batch x
-    ``tokens_per_gen_step``) is below ``TWO_SHOT_ROWS`` too; none otherwise."""
-    from ....distributed.mnnvl_fused_allreduce import TWO_SHOT_ROWS
-
-    sizes = list(cuda_graph_batch_sizes)
-    if not sizes or max(sizes) * tokens_per_gen_step >= TWO_SHOT_ROWS:
-        return frozenset()
-    return frozenset(m for m in route_front_steps(sizes, tokens_per_gen_step) if m < TWO_SHOT_ROWS)
-
-
 @triton.jit
 def _rcp_approx(x):
     return tl.inline_asm_elementwise(
@@ -1144,20 +1131,20 @@ class DecodeFront:
     ``decode_kernels`` (declared by the model): the route front steps run the CuTe router GEMM above
     ``ROUTER_MAX_TOKENS`` rows and the lean route front, and the steps the one-launch front takes run it
     (``fused_only``: the race picks among its warp splits only).
-    ``engine_route_steps`` (``engine_route_steps``, within ``route_steps``): an un-finalized call of these token
-    counts whose MoE runs the decode engine (``decode_moe.engine_routes``) runs the router GEMM with each token's
-    per-tile candidates and NVFP4 x in its epilogue, and the engine routes (``PreroutedRouting.candidates``).
+    ``engine_route`` (declared by the model): an un-finalized route front call whose rows the routing engine and
+    its router GEMM epilogue take (``decode_moe.engine_routes``, ``RouteFrontRouterGemm``) runs the router GEMM with
+    each token's per-tile candidates and NVFP4 x in its epilogue, and the engine routes
+    (``PreroutedRouting.candidates``).
     """
 
     fused_only: bool = False
-    engine_route_steps: frozenset = frozenset()
     engine_router: Optional[RouteFrontRouterGemm] = None
 
     def __init__(
         self,
         route_steps: frozenset,
         decode_kernels: bool = False,
-        engine_route_steps: frozenset = frozenset(),
+        engine_route: bool = False,
     ):
         self.route_steps = route_steps
         self.fused_only = decode_kernels
@@ -1166,8 +1153,7 @@ class DecodeFront:
         self.fused = FusedFront()
         self.route_front = RouteFront(lean=decode_kernels)
         self.route_front_router = RouteFrontRouterGemm() if decode_kernels else None
-        self.engine_route_steps = engine_route_steps
-        if engine_route_steps:
+        if engine_route:
             self.engine_router = RouteFrontRouterGemm(engine_route=True)
         # Per token count: the MoE op's tactic, and per (token count, tile) the table buffer. A buffer first made
         # during CUDA-graph capture comes from the graph's pool and stays with the layer.
@@ -1190,9 +1176,9 @@ class DecodeFront:
         return tactic
 
     def _engine_routes(self, backend, m: int, top_k: int, num_experts: int, moe_kwargs) -> bool:
-        """Whether this call routes in the decode MoE engine: an ``engine_route_steps`` token count, un-finalized,
-        on a backend whose call takes the routing engine."""
-        if m not in self.engine_route_steps or moe_kwargs.get("do_finalize", True):
+        """Whether this call routes in the decode MoE engine: declared, un-finalized, on a backend whose call of
+        ``m`` rows takes the routing engine (the router GEMM may still decline the rows, then the route front runs)."""
+        if self.engine_router is None or moe_kwargs.get("do_finalize", True):
             return False
         from .decode_moe import engine_routes
 
@@ -1339,8 +1325,8 @@ class DecodeFront:
         )
         if self._expert_prefetch is not None and not moe_kwargs.get("do_finalize", True):
             prefetch, layer_idx = self._expert_prefetch
-            _, _, batch, limit, nct, _ = prerouted_table_views(flat, m, top_k, num_local, tile)
-            prefetch.record(layer_idx, batch, limit, nct, tile, num_local, flat, rows=m)
+            _, _, batch, _, nct, _ = prerouted_table_views(flat, m, top_k, num_local, tile)
+            prefetch.record(layer_idx, batch, nct, num_local, flat, rows=m)
         return out
 
 
@@ -1352,7 +1338,6 @@ __all__ = [
     "ROUTE_FRONT_MAX_TOKENS",
     "ROUTER_GEMM_MAX_TOKENS",
     "ROUTER_MAX_TOKENS",
-    "engine_route_steps",
     "front_eligible",
     "nvfp4_quant_rows",
     "prerouted_table_sizes",

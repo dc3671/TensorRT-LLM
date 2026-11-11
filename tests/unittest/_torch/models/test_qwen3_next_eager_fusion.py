@@ -676,28 +676,23 @@ def test_mtp_forward_returns_the_kept_rows(monkeypatch, compact) -> None:
 
 
 @pytest.mark.parametrize(
-    "batch,attention_dp,large_rows,kept_rows,mid_layout",
+    "batch,attention_dp,large_rows,kept_rows",
     [
         # (largest CUDA-graph decode batch, attention DP): reference GEN layouts at 7 rows per request
-        (1, False, 448, False, False),  # TEP16 b1
-        (2, False, 448, True, False),  # TEP8 b2
-        (4, False, 448, True, True),
-        (5, False, 448, True, True),  # TEP8 b5
-        (8, False, 448, True, True),  # TEP8 b8
-        (16, False, 448, True, False),  # TEP8 b16
-        (32, False, 448, True, False),
-        (64, False, 448, True, False),  # TEP8 b64: 448 rows from full steps
-        (128, False, 448, True, False),
-        (52, True, 448, True, False),  # DEP4 b52: 364 rows per rank, below 448
+        (1, False, 448, False),  # TEP16 b1
+        (2, False, 448, True),  # TEP8 b2
+        (5, False, 448, True),  # TEP8 b5
+        (8, False, 448, True),  # TEP8 b8
+        (16, False, 448, True),  # TEP8 b16
+        (64, False, 448, True),  # TEP8 b64: 448 rows from full steps
+        (128, False, 448, True),
+        (52, True, 448, True),  # DEP4 b52: 364 rows per rank, below 448
     ],
 )
-def test_decode_layout_decisions(
-    monkeypatch, batch, attention_dp, large_rows, kept_rows, mid_layout
-) -> None:
+def test_decode_layout_decisions(monkeypatch, batch, attention_dp, large_rows, kept_rows) -> None:
     """Where the Qwen3.5 decode paths engage, derived from the layout (MTP rows per request, CUDA-graph batch
     sizes, attention DP): the large-step rows (tcgen05 GDN verify, the MoE engine's spare SMs), pass 0's kept rows,
-    the mid-layout glue (state promotion beside the draft loop, sample + accept in one launch) and the small layouts
-    (budgeted expert prefetch)."""
+    and the state promotion beside the draft loop (TP decode kernels, every layout)."""
     from tensorrt_llm._torch.models import modeling_qwen3_next as m
 
     monkeypatch.setattr(m, "_uses_decode_kernels", lambda model_config: True)
@@ -710,8 +705,4 @@ def test_decode_layout_decisions(
     # tcgen05 GDN verify: every step under attention DP, large steps with TP attention
     assert m._verify_tcgen05_min_rows(model_config) == (7 if attention_dp else large_rows)
     assert m.Qwen3NextMTP.takes_kept_rows(model_config) == kept_rows
-    assert m._mid_decode_layout(model_config) == mid_layout
-    assert m.Qwen3NextMTP.promotes_target_state_beside(model_config) == (
-        mid_layout and not attention_dp
-    )
-    assert m._small_decode_layout(model_config) == (batch in (4, 5))
+    assert m.Qwen3NextMTP.promotes_target_state_beside(model_config) == (not attention_dp)

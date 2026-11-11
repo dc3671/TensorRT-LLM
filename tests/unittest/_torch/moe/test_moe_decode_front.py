@@ -259,8 +259,8 @@ def _engine_route_gemm(x, w, gs, poison: int, top_k: int = K):
     return logits, cand, xq, xsf
 
 
-# The steps the MoE engine routes (above the router GEMM's 32 rows, below the two-shot all-reduce's 64): MTP-6 decode
-# at CUDA-graph batches 5..8 (35..56 rows) and the bounds.
+# Steps the MoE engine routes (above the router GEMM's 32 rows, up to the engine's 64): MTP-6 decode at CUDA-graph
+# batches 5..9 (35..63 rows) and the bounds.
 @pytest.mark.parametrize(
     "m,dup", [(33, False), (35, False), (42, True), (49, False), (56, False), (63, False)]
 )
@@ -315,15 +315,6 @@ def test_engine_route_router_gemm_rejects():
     assert MoeRouterGemmKernel.supports(
         **dict(shape, num_experts=1024, token_tile=64), route_top_k=K
     )
-
-
-@pytest.mark.parametrize(
-    "cap,steps", [(2, ()), (4, ()), (5, (35,)), (8, (35, 42, 49, 56)), (16, ())]
-)
-def test_engine_route_steps(cap, steps):
-    """MTP-6 (7 rows per request) CUDA-graph batches 1..cap: the steps above 32 rows the engine routes, only where
-    the largest step is below the two-shot all-reduce's 64 rows."""
-    assert df.engine_route_steps(range(1, cap + 1), 7) == frozenset(steps)
 
 
 @pytest.mark.parametrize("m", [1, 7, 32])
@@ -973,27 +964,27 @@ def test_engine_routes_top_k_and_lists(top_k: int, num_experts: int, routes: boo
 
 
 @pytest.mark.parametrize(
-    "steps,finalize,backend_kw,path",
+    "engine_route,finalize,backend_kw,path",
     [
-        ((35,), False, {}, ["engine_router", "moe"]),
-        ((35,), True, {}, _TODAY),
-        ((42,), False, {}, _TODAY),
-        ((35,), False, dict(engine_state=False), _TODAY),
-        ((35,), False, dict(decode_tuning=False), _TODAY),
-        ((35,), False, dict(num_local=256), _TODAY),
+        (True, False, {}, ["engine_router", "moe"]),
+        (True, True, {}, _TODAY),
+        (False, False, {}, _TODAY),
+        (True, False, dict(engine_state=False), _TODAY),
+        (True, False, dict(decode_tuning=False), _TODAY),
+        (True, False, dict(num_local=256), _TODAY),
     ],
-    ids=["engine", "finalized", "other_count", "no_engine_state", "no_decode_tuning", "256_local"],
+    ids=["engine", "finalized", "not_declared", "no_engine_state", "no_decode_tuning", "256_local"],
 )
 def test_decode_front_engine_route_gate(
     monkeypatch: pytest.MonkeyPatch,
-    steps: tuple[int, ...],
+    engine_route: bool,
     finalize: bool,
     backend_kw: dict,
     path: list[str],
 ) -> None:
     """A step of 35 rows routes in the MoE engine (the epilogue router GEMM, then the MoE with the candidates and no
-    route launch) only as an ``engine_route_steps`` count whose call is un-finalized and runs the engine; otherwise the
-    route front steps' CuTe router GEMM and the route front, without candidates."""
+    route launch) only where the front declares ``engine_route`` and the call is un-finalized and runs the engine;
+    otherwise the route front steps' CuTe router GEMM and the route front, without candidates."""
     m = 35
     calls: list[str] = []
     seen: list[PreroutedRouting] = []
@@ -1036,12 +1027,11 @@ def test_decode_front_engine_route_gate(
             return "front"
 
     monkeypatch.setattr(df, "front_eligible", lambda moe, x, max_tokens: True)
-    front = df.DecodeFront(
-        frozenset({35, 42}), decode_kernels=True, engine_route_steps=frozenset(steps)
-    )
+    front = df.DecodeFront(frozenset({35, 42}), decode_kernels=True, engine_route=engine_route)
     front.route_front = RouteFront()
     front.route_front_router = launch("router_gemm", logits)
-    front.engine_router = launch("engine_router", (logits, cand, xq, xsf))
+    if engine_route:
+        front.engine_router = launch("engine_router", (logits, cand, xq, xsf))
     x = torch.zeros((m, H), dtype=torch.bfloat16)
     out = front(Gate(), Moe(), x, do_finalize=finalize)
     assert out == "front" and calls == path, calls
