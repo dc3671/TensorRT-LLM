@@ -1347,7 +1347,8 @@ void lamport_initialize_kernel_launcher(void* buffer, size_t size, cudaStream_t 
 // Residual add + RMSNorm + per-tensor E4M3 quantize, one CTA per token and one 16-byte pack per thread; bitwise
 // equal to rms_norm_kernel followed by scaleMatrixPerTensorVec. WriteNorm also stores the T norm output.
 template <typename T, bool Residual, bool WriteNorm>
-__global__ void rms_norm_quant_fp8_kernel(AllReduceParams params, __nv_fp8_e4m3* quant_out, float const* scale)
+__global__ void __launch_bounds__(details::kMaxCtaSize)
+    rms_norm_quant_fp8_kernel(AllReduceParams params, __nv_fp8_e4m3* quant_out, float const* scale)
 {
     static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(T);
     using PackedStruct = typename PackedOn16Bytes<T>::Type;
@@ -1406,8 +1407,13 @@ void rms_norm_quant_fp8_launch(
     AllReduceParams& params, __nv_fp8_e4m3* quant_out, float const* scale, cudaStream_t stream)
 {
     static constexpr int kPackedSize = details::kBytesPerAccess / sizeof(__nv_bfloat16);
+    auto const tokens = static_cast<unsigned int>(params.elts_total / params.fusion_params.hidden_size);
+    if (tokens == 0)
+    {
+        return;
+    }
     cudaLaunchConfig_t config = {0};
-    config.gridDim = static_cast<unsigned int>(params.elts_total / params.fusion_params.hidden_size);
+    config.gridDim = tokens;
     config.blockDim = params.fusion_params.hidden_size / kPackedSize;
     config.dynamicSmemBytes = 0;
     config.stream = stream;

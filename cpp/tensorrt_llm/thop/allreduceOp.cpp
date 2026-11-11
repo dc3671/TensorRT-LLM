@@ -886,13 +886,22 @@ private:
         auto const hidden_size = input.size(-1);
         auto const stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-        torch::Tensor norm_out = torch::empty_like(input);
+        // RESIDUAL_RMS_NORM_[OUT_]QUANT_FP8 with a float per-tensor scale on the device: residual + norm + FP8
+        // quantization in one kernel, bitwise equal to residualRmsNorm + the static per-tensor quantize.
+        bool const fusedQuantFp8 = (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
+                                       || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8)
+            && scale && scale.value().is_cuda() && scale.value().scalar_type() == torch::kFloat32 && norm_weight
+            && !bias && tensorrt_llm::kernels::residualRmsNormQuantFp8Supported(mType, static_cast<int>(hidden_size));
+        bool const fusedNormOut = fusedQuantFp8 && mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8;
+
+        // The fused QUANT_FP8 path does not return the norm output, so it does not allocate one.
+        torch::Tensor norm_out = (!fusedQuantFp8 || fusedNormOut) ? torch::empty_like(input) : torch::Tensor();
 
         tensorrt_llm::kernels::AllReduceParams params;
         params.fusion_params.bias_buffer = bias ? bias.value().data_ptr() : nullptr;
         params.fusion_params.residual_buffer = residual ? residual.value().data_ptr() : nullptr;
         params.fusion_params.weight_buffer = norm_weight ? norm_weight.value().data_ptr() : nullptr;
-        params.local_output_buffer_ptr = norm_out.mutable_data_ptr();
+        params.local_output_buffer_ptr = norm_out.defined() ? norm_out.mutable_data_ptr() : nullptr;
         params.elts_total = size;
 
         params.fusion_params.hidden_size = hidden_size;
@@ -908,20 +917,12 @@ private:
             return {norm_out};
         }
 
-        // RESIDUAL_RMS_NORM_[OUT_]QUANT_FP8 with a float per-tensor scale: residual + norm + FP8 quantization in one
-        // kernel, bitwise equal to residualRmsNorm + the static per-tensor quantize; the norm output is written only
-        // when the op returns it.
-        if ((mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
-                || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8)
-            && scale && scale.value().scalar_type() == torch::kFloat32 && norm_weight && !bias
-            && tensorrt_llm::kernels::residualRmsNormQuantFp8Supported(mType, static_cast<int>(hidden_size)))
+        if (fusedQuantFp8)
         {
-            bool const out_norm = mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8;
             torch::Tensor quant_out = torch::empty(input.sizes(), input.options().dtype(torch::kFloat8_e4m3fn));
-            params.local_output_buffer_ptr = out_norm ? norm_out.mutable_data_ptr() : nullptr;
             tensorrt_llm::kernels::residualRmsNormQuantFp8(
-                params, mType, quant_out.mutable_data_ptr(), scale.value().data_ptr<float>(), out_norm, stream);
-            if (out_norm)
+                params, mType, quant_out.mutable_data_ptr(), scale.value().data_ptr<float>(), fusedNormOut, stream);
+            if (fusedNormOut)
             {
                 return {norm_out, quant_out, reduce_output};
             }

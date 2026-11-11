@@ -330,7 +330,7 @@ def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize("seq_len", [1, 7, 300], ids=lambda x: f"seqlen:{x}")
-@pytest.mark.parametrize("hidden_size", [128, 4096, 7168],
+@pytest.mark.parametrize("hidden_size", [128, 256, 4096, 7168, 8192],
                          ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("fusion_op", [
     pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
@@ -374,6 +374,41 @@ def test_nccl_residual_rms_norm_quant_fp8_bitwise(seq_len, hidden_size,
     assert torch.equal(outputs[-2].view(torch.uint8),
                        ref_quant.view(torch.uint8))
     assert torch.equal(outputs[-1], residual_out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("fusion_op", [
+    pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
+                 id="residual_rms_norm_quant_fp8"),
+    pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
+                 id="residual_rms_norm_out_quant_fp8"),
+])
+@torch.inference_mode()
+def test_nccl_residual_rms_norm_quant_fp8_no_tokens(fusion_op):
+    """The NCCL fallback's fused residual + RMSNorm + FP8 quantize returns empty outputs for an empty input."""
+    hidden_size = 4096
+    x = torch.empty((0, hidden_size), dtype=torch.bfloat16, device="cuda")
+    outputs = torch.ops.trtllm.allreduce(input=x,
+                                         residual=torch.empty_like(x),
+                                         norm_weight=torch.ones(
+                                             (hidden_size, ),
+                                             dtype=torch.bfloat16,
+                                             device="cuda"),
+                                         scale=torch.tensor(1.0,
+                                                            dtype=torch.float32,
+                                                            device="cuda"),
+                                         bias=None,
+                                         workspace=None,
+                                         group=[0],
+                                         strategy=AllReduceStrategy.NCCL,
+                                         op=fusion_op,
+                                         eps=1e-5,
+                                         trigger_completion_at_end=True)
+    torch.cuda.synchronize()
+    expected = 3 if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8 else 2
+    assert len(outputs) == expected
+    assert all(o.shape == (0, hidden_size) for o in outputs)
+    assert outputs[-2].dtype == torch.float8_e4m3fn
 
 
 @torch.inference_mode()
