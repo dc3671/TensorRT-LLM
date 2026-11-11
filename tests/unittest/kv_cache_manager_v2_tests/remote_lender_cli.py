@@ -29,7 +29,7 @@ import threading
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.remote_lender import (
     TRANSPORTS,
-    RemoteLender,
+    make_lender,
     resolve_ucx_devices,
 )
 from tensorrt_llm.llmapi.llm_args import REMOTE_CACHE_CHUNK_BYTES
@@ -68,15 +68,19 @@ def main(argv=None) -> int:
     )
     args = parser.parse_args(argv)
     nbytes = args.bytes if args.bytes is not None else int(args.gib * (1 << 30))
-    lender = RemoteLender(
+    # The transport's own options: only NIXL takes UCX devices.
+    options = {}
+    if args.ucx_devices is not None:
+        options["ucx_devices"] = resolve_ucx_devices(args.ucx_devices, args.device)
+    lender = make_lender(
         args.dir,
         nbytes,
         transport=args.transport,
-        ucx_devices=resolve_ucx_devices(args.ucx_devices, args.device),
         chunk_bytes=int(args.chunk_mib * (1 << 20)),
         name=args.name,
         numa_node=args.numa_node,
         device=args.device,
+        **options,
     )
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -95,7 +99,7 @@ def main(argv=None) -> int:
         lender.close()
         lender.publish_failure(error)
         raise
-    print(f"READY {lender.name} {lender.address} {lender.nbytes}", flush=True)
+    print(f"READY {lender.name} {lender.transport} {lender.nbytes}", flush=True)
     try:
         stop.wait(args.seconds)
     finally:

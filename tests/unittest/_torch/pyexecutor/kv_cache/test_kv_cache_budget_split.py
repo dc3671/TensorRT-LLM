@@ -1305,15 +1305,17 @@ class TestRemoteLevelOwnership:
     """
 
     @staticmethod
-    def _add_remote_level(is_draft, tmp_path, monkeypatch):
+    def _add_remote_level(is_draft, tmp_path, monkeypatch, transport="nixl"):
         from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, remote_lender
 
-        lender_cls = Mock()
-        monkeypatch.setattr(remote_lender, "RemoteLender", lender_cls)
+        lender_cls = Mock(options_from=remote_lender.LENDERS[transport].options_from)
+        monkeypatch.setitem(remote_lender.LENDERS, transport, lender_cls)
         monkeypatch.setattr(kv_cache_manager_v2, "RemoteCacheTierConfig", Mock())
         monkeypatch.setattr(kv_cache_manager_v2.torch.cuda, "current_device", lambda: 0)
         manager = SimpleNamespace(is_draft=is_draft, _remote_lender=None)
-        config = RemoteCacheConfig(directory=str(tmp_path), cache_size=4 * GB, lend_size=4 * GB)
+        config = RemoteCacheConfig(
+            directory=str(tmp_path), cache_size=4 * GB, lend_size=4 * GB, transport=transport
+        )
         tiers = []
         KVCacheManagerV2._add_remote_level(manager, config, tiers)
         return manager, tiers, lender_cls
@@ -1322,8 +1324,18 @@ class TestRemoteLevelOwnership:
         manager, tiers, lender_cls = self._add_remote_level(False, tmp_path, monkeypatch)
         assert len(tiers) == 1
         lender_cls.assert_called_once()
-        assert lender_cls.call_args.kwargs["reserve_bytes"] == 24 * GB  # lend_reserve_size default
         manager._remote_lender.start_in_background.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "transport, options",
+        [("nixl", {"ucx_devices": None}), ("fabric", {"reserve_bytes": 24 * GB})],
+    )
+    def test_each_lender_gets_its_transport_options(
+        self, transport, options, tmp_path, monkeypatch
+    ):
+        _, _, lender_cls = self._add_remote_level(False, tmp_path, monkeypatch, transport)
+        kwargs = lender_cls.call_args.kwargs
+        assert {key: kwargs[key] for key in kwargs if key != "device"} == options
 
     def test_target_takes_over_a_lend_started_before_it(self, tmp_path, monkeypatch):
         from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, remote_lender

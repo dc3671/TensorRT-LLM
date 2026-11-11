@@ -36,7 +36,8 @@ from unittest import mock
 
 from tensorrt_llm._torch.pyexecutor.kv_cache import remote_lender
 from tensorrt_llm._torch.pyexecutor.kv_cache.remote_lender import (
-    RemoteLender,
+    FabricLender,
+    NixlLender,
     check_remote_capacity,
     scan_lenders,
 )
@@ -83,7 +84,7 @@ class TestCapacityCheck(unittest.TestCase):
     def test_scan_counts_whole_chunks_and_failures(self):
         _publish(self.dir, "a", 160)
         _publish(self.dir, "b", 100, short_gib=60)
-        lender = RemoteLender(self.dir, 160 * _GIB, chunk_bytes=_GIB, name="c")
+        lender = NixlLender(self.dir, 160 * _GIB, chunk_bytes=_GIB, name="c")
         lender.publish_failure(RuntimeError("CUDA_ERROR_OUT_OF_MEMORY"))
         open(os.path.join(self.dir, "claim.a.0"), "w").close()  # claims are not lenders
         published, failed = scan_lenders(self.dir)
@@ -105,7 +106,7 @@ class TestCapacityCheck(unittest.TestCase):
         for i in range(5):
             _publish(self.dir, f"ok{i}", 160)
         for i in range(3):
-            RemoteLender(self.dir, 160 * _GIB, chunk_bytes=_GIB, name=f"bad{i}").publish_failure(
+            NixlLender(self.dir, 160 * _GIB, chunk_bytes=_GIB, name=f"bad{i}").publish_failure(
                 RuntimeError("CUDA_ERROR_OUT_OF_MEMORY")
             )
         t0 = time.monotonic()
@@ -204,7 +205,7 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertEqual(result["offered_bytes"], 200 * _GIB)
 
     def test_failure_marker_survives_close(self):
-        lender = RemoteLender(self.dir, 4 * _GIB, chunk_bytes=_GIB, name="gone")
+        lender = NixlLender(self.dir, 4 * _GIB, chunk_bytes=_GIB, name="gone")
         lender.close()
         lender.publish_failure(RuntimeError("boom\nsecond line"))
         path = os.path.join(self.dir, "lender.gone.failed")
@@ -215,7 +216,7 @@ class TestCapacityCheck(unittest.TestCase):
 
     def test_close_waits_for_a_failed_background_start_closing_itself(self):
         # The start thread closes the lender itself on failure; a concurrent close() must not withdraw alongside it.
-        lender = RemoteLender(self.dir, 4 * _GIB, chunk_bytes=_GIB, name="racy")
+        lender = NixlLender(self.dir, 4 * _GIB, chunk_bytes=_GIB, name="racy")
         entered, release = threading.Event(), threading.Event()
         active, depths = [0], []
         real_withdraw = lender._withdraw
@@ -253,9 +254,11 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertFalse(start_threads[0].is_alive())
 
     def _started(self, name):
-        lender = RemoteLender(self.dir, 4 * _GIB, chunk_bytes=_GIB, transport="fabric", name=name)
+        lender = FabricLender(self.dir, 4 * _GIB, chunk_bytes=_GIB, name=name)
         with mock.patch.object(
-            RemoteLender, "_start_fabric", lambda self: self._publish([], ["segment 0 1"], "test")
+            FabricLender,
+            "_start_transport",
+            lambda self: self._publish([], ["segment 0 1"], "test"),
         ):
             lender.start()
         return lender
@@ -285,7 +288,7 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertIn("another rank", failed[0]["error"])
 
     def test_lender_names_are_unique_within_a_process(self):
-        names = {RemoteLender(self.dir, _GIB, chunk_bytes=_GIB).name for _ in range(64)}
+        names = {NixlLender(self.dir, _GIB, chunk_bytes=_GIB).name for _ in range(64)}
         self.assertEqual(len(names), 64)
 
 
@@ -312,7 +315,7 @@ class TestRendezvousPermissions(unittest.TestCase):
         remote_lender.ensure_rendezvous_directory(self.dir)
 
     def test_lender_files_are_private(self):
-        RemoteLender(self.dir, _GIB, chunk_bytes=_GIB, name="x").publish_failure(RuntimeError("e"))
+        NixlLender(self.dir, _GIB, chunk_bytes=_GIB, name="x").publish_failure(RuntimeError("e"))
         self.assertEqual(os.stat(os.path.join(self.dir, "lender.x.failed")).st_mode & 0o077, 0)
 
 
@@ -625,13 +628,12 @@ class TestFabricPlacement(unittest.TestCase):
         return remote_lender._meta_fields(os.path.join(self.dir, f"lender.{lender.name}.meta"))
 
     def test_full_preferred_node_spills_to_the_other(self):
-        lender = RemoteLender(
+        lender = FabricLender(
             self.dir,
             4 * self.CHUNK,
             chunk_bytes=self.CHUNK,
             numa_node=0,
             device=0,
-            transport="fabric",
         )
         fake = lambda n: self._full(n) if n == 0 else self.real(n)  # noqa: E731
         with mock.patch.object(remote_lender, "_node_meminfo", fake):
@@ -647,13 +649,12 @@ class TestFabricPlacement(unittest.TestCase):
             lender.close()
 
     def test_lend_that_only_partly_fits_is_published_short(self):
-        lender = RemoteLender(
+        lender = FabricLender(
             self.dir,
             4 * self.CHUNK,
             chunk_bytes=self.CHUNK,
             numa_node=0,
             device=0,
-            transport="fabric",
         )
         # Node 0 is full, node 1 has room for two chunks.
         fake = lambda n: self._full(n) if n == 0 or len(lender._fabric) >= 2 else self.real(n)  # noqa: E731
@@ -670,23 +671,22 @@ class TestFabricPlacement(unittest.TestCase):
 
     def test_refused_chunks_are_retried_with_real_allocations(self):
         # The driver refuses two calls (chunk 1's first try and its first retry); the lend still completes on node 0.
-        real_create = RemoteLender._try_create
+        real_create = FabricLender._try_create
         calls = [0]
 
         def flaky(lender, drv, prop):
             calls[0] += 1
             return None if calls[0] in (2, 3) else real_create(lender, drv, prop)
 
-        lender = RemoteLender(
+        lender = FabricLender(
             self.dir,
             4 * self.CHUNK,
             chunk_bytes=self.CHUNK,
             numa_node=0,
             device=0,
-            transport="fabric",
         )
         with (
-            mock.patch.object(RemoteLender, "_try_create", flaky),
+            mock.patch.object(FabricLender, "_try_create", flaky),
             mock.patch.object(remote_lender, "_FABRIC_RETRY_S", 0.5),
         ):
             lender.start()
@@ -700,7 +700,7 @@ class TestFabricPlacement(unittest.TestCase):
     def test_a_real_reclaim_pass_recovers_a_refusal(self):
         # Refuse until one real reclaim-and-compact pass (64 chunks of 16 MiB, libnuma-bound, huge pages) has run on
         # node 0.
-        real_create = RemoteLender._try_create
+        real_create = FabricLender._try_create
         real_compact = remote_lender._compact_node
         passes = []
 
@@ -711,16 +711,15 @@ class TestFabricPlacement(unittest.TestCase):
         def refusing(lender, drv, prop):
             return real_create(lender, drv, prop) if passes or not lender._fabric else None
 
-        lender = RemoteLender(
+        lender = FabricLender(
             self.dir,
             3 * self.CHUNK,
             chunk_bytes=self.CHUNK,
             numa_node=0,
             device=0,
-            transport="fabric",
         )
         with (
-            mock.patch.object(RemoteLender, "_try_create", refusing),
+            mock.patch.object(FabricLender, "_try_create", refusing),
             mock.patch.object(remote_lender, "_compact_node", counted),
             mock.patch.object(remote_lender, "_FABRIC_RETRY_S", 0.2),
         ):
@@ -733,7 +732,7 @@ class TestFabricPlacement(unittest.TestCase):
             lender.close()
 
     def test_no_room_anywhere_leaves_a_failure_marker(self):
-        lender = RemoteLender(self.dir, 4 * self.CHUNK, transport="fabric", chunk_bytes=self.CHUNK)
+        lender = FabricLender(self.dir, 4 * self.CHUNK, chunk_bytes=self.CHUNK)
         with mock.patch.object(remote_lender, "_node_meminfo", self._full):
             lender.start_or_report()
         self.assertFalse(os.path.exists(os.path.join(self.dir, f"lender.{lender.name}.ready")))

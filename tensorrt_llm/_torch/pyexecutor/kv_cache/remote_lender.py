@@ -18,11 +18,14 @@ A lender publishes host memory in a rendezvous directory on a shared file system
 (``KvCacheConfig.remote_cache_config``; C++ ``storage/remoteMem.h``, which also describes the directory layout) claims
 whole chunks of it with O_EXCL claim files and moves cold pages itself, so the lender does no work after publishing.
 
-* ``nixl``: anonymous memory registered with a NIXL agent; ``lender.<name>.desc`` holds the agent's ``AgentDesc``.
-* ``fabric``: Grace DRAM allocated with cuMemCreate (``CU_MEM_LOCATION_TYPE_HOST_NUMA``), one allocation per chunk
-  because an imported fabric allocation maps only whole; ``lender.<name>.fabric`` holds one 64-byte handle per chunk.
-  Chunks fill the GPU's host NUMA node first, then the other nodes; a lend that only partly fits is published with
-  ``short_bytes``. Lenders on one host take turns at reclaim-and-compact passes per NUMA node by flock on
+``RemoteLender`` holds what every transport shares (the files, the failure marker, start and close); each transport
+allocates and publishes the memory its own way:
+
+* ``NixlLender``: anonymous memory registered with a NIXL agent; ``lender.<name>.desc`` holds the agent's ``AgentDesc``.
+* ``FabricLender``: Grace DRAM allocated with cuMemCreate (``CU_MEM_LOCATION_TYPE_HOST_NUMA``), one allocation per
+  chunk because an imported fabric allocation maps only whole; ``lender.<name>.fabric`` holds one 64-byte handle per
+  chunk. Chunks fill the GPU's host NUMA node first, then the other nodes; a lend that only partly fits is published
+  with ``short_bytes``. Lenders on one host take turns at reclaim-and-compact passes per NUMA node by flock on
   ``compact.<host>.node<N>.lock``.
 
 A lender that cannot start, or whose owner fails, leaves ``lender.<name>.failed``, which clients ignore and capacity
@@ -52,8 +55,6 @@ from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import RemoteCacheConfig
-
-TRANSPORTS = ("nixl", "fabric")
 
 
 def _nvml_gpu_index(device: int) -> int:
@@ -533,32 +534,23 @@ def check_remote_capacity(
 
 
 class RemoteLender:
-    """One lent region: mapped, registered and published by ``start()``, withdrawn by ``close()``.
+    """One lent region: allocated, registered and published by ``start()``, withdrawn by ``close()``.
 
-    With ``transport="fabric"`` the region is Grace DRAM allocated on NUMA node ``numa_node`` (default: the node of
-    CUDA device ``device``), leaving ``reserve_bytes`` free per node, and published as CUDA fabric handles;
-    ``ucx_devices`` (``{GPU}`` resolved at start) applies to ``"nixl"`` only. A lender collected or left at exit
-    without ``close()`` withdraws its files and leaves the failure marker."""
+    The rendezvous files, the failure marker and the start / close lifecycle are common to every transport; a transport
+    (``NixlLender``, ``FabricLender``; ``make_lender`` picks one) allocates and publishes the memory in
+    ``_start_transport`` and frees it in ``_release_transport``. A lender collected or left at exit without
+    ``close()`` withdraws its files and leaves the failure marker."""
 
+    # The transport's name, as written to the lender's files; set by each transport.
+    transport: str = ""
     directory: str = ""
     nbytes: int = 0
     chunk_bytes: int = REMOTE_CACHE_CHUNK_BYTES
-    reserve_bytes: int = REMOTE_CACHE_LEND_RESERVE_BYTES
     numa_node: Optional[int] = None
     device: Optional[int] = None
-    transport: str = "nixl"
-    ucx_devices: Optional[str] = None
     name: str = ""
     host: str = ""
-    _map: Optional[mmap.mmap] = None
-    _address: int = 0
-    _agent = None
-    _registered: bool = False
     _published: Optional[list] = None  # paths written, withdrawn by close()
-    _fabric: Optional[list] = None  # a fabric lend's cuMemCreate handles, one per chunk
-    _fabric_ctx = None
-    # The device whose primary context _fabric_ctx retains; close() releases it.
-    _fabric_device = None
     # start_in_background()'s thread, joined by close().
     _start_thread: Optional[threading.Thread] = None
     # Serializes close(): a failed background start closes on its own thread.
@@ -571,46 +563,39 @@ class RemoteLender:
         directory: str,
         nbytes: int,
         *,
-        transport: str = "nixl",
-        ucx_devices: Optional[str] = None,
         chunk_bytes: int = REMOTE_CACHE_CHUNK_BYTES,
-        reserve_bytes: int = REMOTE_CACHE_LEND_RESERVE_BYTES,
         name: Optional[str] = None,
         numa_node: Optional[int] = None,
         device: Optional[int] = None,
     ):
         if nbytes < chunk_bytes:
             raise ValueError(f"lend size {nbytes} is below one chunk ({chunk_bytes})")
-        if transport not in TRANSPORTS:
-            raise ValueError(f"transport {transport!r} is not one of {TRANSPORTS}")
         self.directory = directory
         # Whole chunks only: a client never sees a partial chunk.
         self.nbytes = nbytes - nbytes % chunk_bytes
         self.chunk_bytes = chunk_bytes
-        self.reserve_bytes = reserve_bytes
         self.numa_node = numa_node
         self.device = device
-        self.transport = transport
-        self.ucx_devices = ucx_devices
         host = socket.gethostname().split(".")[0]
         # Unique per lender, also within one process: clients never take claims from a withdrawn name again.
         self.name = name or f"kvcm2-lender-{host}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self.host = host
-        self._map: Optional[mmap.mmap] = None
-        self._address = 0
-        self._agent = None
-        self._registered = False
         self._published = []
-        self._fabric = []  # a fabric lend's cuMemCreate handles, one per chunk
-        self._fabric_ctx = None
-        self._fabric_device = None
         self._start_thread = None
         self._close_lock = threading.Lock()
         self._finalizer = None
 
-    @property
-    def address(self) -> int:
-        return self._address
+    @classmethod
+    def options_from(cls, remote_config: "RemoteCacheConfig") -> dict:
+        """The constructor options of this transport that ``remote_config`` sets."""
+        return {}
+
+    def _start_transport(self) -> None:
+        """Allocate and register the lend, then publish it (``_publish``)."""
+        raise NotImplementedError
+
+    def _release_transport(self) -> None:
+        """Free what ``_start_transport`` made; teardown keeps going past errors."""
 
     def _path(self, suffix: str) -> str:
         return os.path.join(self.directory, f"lender.{self.name}.{suffix}")
@@ -638,6 +623,218 @@ class RemoteLender:
             f"{self.name} lends {self.nbytes / (1 << 30):.2f} GiB in {self.nbytes // self.chunk_bytes} chunk(s) "
             f"of {self.chunk_bytes / (1 << 30):.2f} GiB via {self.directory} ({timing})"
         )
+
+    def _failure_text(self, error: BaseException) -> bytes:
+        return "\n".join(
+            [
+                "version 1",
+                f"name {self.name}",
+                f"host {self.host}",
+                f"pid {os.getpid()}",
+                f"transport {self.transport}",
+                f"planned_bytes {self.nbytes}",
+                f"error {error!r}".replace("\n", " "),
+                "",
+            ]
+        ).encode()
+
+    def publish_failure(self, error: BaseException) -> None:
+        """Leave lender.<name>.failed (planned bytes and the error) so capacity checks count this lender as reported
+        instead of waiting for it. Clients ignore the file: they list only .ready lenders."""
+        try:
+            ensure_rendezvous_directory(self.directory)
+            _write_atomically(self._path("failed"), self._failure_text(error))
+        except OSError as write_error:
+            _log(f"{self.name}: cannot write its failure marker: {write_error}")
+
+    def start(self) -> None:
+        if self._finalizer is None:
+            self._finalizer = weakref.finalize(
+                self,
+                _withdraw_unowned,
+                self._published,
+                self._path("failed"),
+                self._failure_text(RuntimeError("the lender's owner exited without closing it")),
+            )
+        self._start_transport()
+
+    def start_or_report(self) -> None:
+        """``start()``; on failure, release what was made and leave the failure marker (``publish_failure``)."""
+        try:
+            self.start()
+        except Exception as error:  # noqa: BLE001 - a failed lender only removes capacity
+            logger.warning(f"KVCM2 remote lender: {self.name} failed to start: {error!r}")
+            self.close(error)
+
+    def start_in_background(self) -> None:
+        """``start_or_report()`` on a thread, so the caller does not wait for the memory to be faulted in and
+        registered; clients wait for the ``.ready`` file."""
+        self._start_thread = threading.Thread(
+            target=self.start_or_report, name="kvcm2-remote-lender", daemon=True
+        )
+        self._start_thread.start()
+
+    def wait_started(self) -> None:
+        """Wait for a background start to publish or fail."""
+        thread = self._start_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+
+    def close(self, error: Optional[BaseException] = None) -> None:
+        """Wait for a background start, then withdraw the files and the transport's memory; with `error`, leave the
+        failure marker too. Clients still holding chunks fail their next transfer instead of reading stale bytes."""
+        thread, self._start_thread = self._start_thread, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        with self._close_lock:
+            if self._finalizer is not None:
+                self._finalizer.detach()
+            self._withdraw()
+        if error is not None:
+            self.publish_failure(error)
+
+    def _withdraw(self) -> None:
+        for path in reversed(self._published):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._published.clear()
+        self._release_transport()
+
+
+class NixlLender(RemoteLender):
+    """Anonymous memory registered with this lender's own NIXL agent; ``lender.<name>.desc`` holds the agent's
+    ``AgentDesc``. ``ucx_devices`` (``{GPU}`` resolved at start) selects the agent's UCX devices."""
+
+    transport = "nixl"
+    ucx_devices: Optional[str] = None
+    _map: Optional[mmap.mmap] = None
+    _address: int = 0
+    _agent = None
+    _registered: bool = False
+
+    def __init__(self, directory: str, nbytes: int, *, ucx_devices: Optional[str] = None, **kwargs):
+        super().__init__(directory, nbytes, **kwargs)
+        self.ucx_devices = ucx_devices
+        self._map = None
+        self._address = 0
+        self._agent = None
+        self._registered = False
+
+    @classmethod
+    def options_from(cls, remote_config: "RemoteCacheConfig") -> dict:
+        return {"ucx_devices": remote_config.ucx_devices}
+
+    @property
+    def address(self) -> int:
+        return self._address
+
+    def _start_transport(self) -> None:
+        from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
+            BaseAgentConfig,
+            MemoryDesc,
+            MemoryDescs,
+            MemoryType,
+            NixlTransferAgent,
+        )
+
+        ensure_rendezvous_directory(self.directory)
+        ucx_devices = resolve_ucx_devices(self.ucx_devices, self.device)
+        t0 = time.monotonic()
+        flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_NORESERVE
+        self._map = mmap.mmap(-1, self.nbytes, flags=flags)
+        self._address = ctypes.addressof(ctypes.c_char.from_buffer(self._map))
+        try:
+            self._map.madvise(_MADV_HUGEPAGE)
+        except OSError:
+            pass
+        if self.numa_node is not None and not _bind_to_numa_node(
+            self._address, self.nbytes, self.numa_node
+        ):
+            _log(f"libnuma unavailable; {self.name} relies on first touch for NUMA placement")
+        # Fault every page in now: registration does not pin memory where the NIC pages on demand, and a resident
+        # lend fails here rather than mid-run and never makes a remote write wait on a page fault.
+        _populate(self._map, self._address, self.nbytes)
+        t1 = time.monotonic()
+
+        config = BaseAgentConfig()
+        config.name = self.name
+        config.use_prog_thread = True
+        config.multi_thread = False
+        config.use_listen_thread = False
+        # This agent's own UCX devices; the process-wide UCX_NET_DEVICES stays as the serving process needs it.
+        if ucx_devices:
+            config.backend_params = {"ucx_devices": ucx_devices}
+        self._agent = NixlTransferAgent(config)
+        self._agent.register_memory(
+            MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, self.nbytes, 0)])
+        )
+        self._registered = True
+        t2 = time.monotonic()
+        desc = self._agent.get_local_agent_desc().serialize()
+        self._publish(
+            [("desc", desc)],
+            [f"segment {self._address} {self.nbytes}"],
+            f"map + populate {t1 - t0:.1f} s, register {t2 - t1:.1f} s",
+        )
+
+    def _release_transport(self) -> None:
+        # Clients still holding chunks fail their next transfer at the NIC.
+        if self._agent is not None and self._registered:
+            from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
+                MemoryDesc,
+                MemoryDescs,
+                MemoryType,
+            )
+
+            try:
+                self._agent.deregister_memory(
+                    MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, self.nbytes, 0)])
+                )
+            except Exception as error:  # noqa: BLE001 - teardown keeps going
+                _log(f"{self.name}: deregistering failed: {error}")
+            self._registered = False
+        self._agent = None
+        if self._map is not None:
+            try:
+                self._map.close()
+            except BufferError:
+                pass
+            self._map = None
+
+
+class FabricLender(RemoteLender):
+    """Grace DRAM allocated with cuMemCreate (``CU_MEM_LOCATION_TYPE_HOST_NUMA``), one allocation per chunk because an
+    imported fabric allocation maps only whole, published as one 64-byte CUDA fabric handle per chunk in
+    ``lender.<name>.fabric``. Chunks fill NUMA node ``numa_node`` (default: the node of CUDA device ``device``) first,
+    then the other nodes, leaving ``reserve_bytes`` free per node; a lend that only partly fits is published with
+    ``short_bytes``."""
+
+    transport = "fabric"
+    reserve_bytes: int = REMOTE_CACHE_LEND_RESERVE_BYTES
+    _fabric: Optional[list] = None  # the cuMemCreate handles, one per chunk
+    _fabric_ctx = None
+    # The device whose primary context _fabric_ctx retains; close() releases it.
+    _fabric_device = None
+
+    def __init__(
+        self,
+        directory: str,
+        nbytes: int,
+        *,
+        reserve_bytes: int = REMOTE_CACHE_LEND_RESERVE_BYTES,
+        **kwargs,
+    ):
+        super().__init__(directory, nbytes, **kwargs)
+        self.reserve_bytes = reserve_bytes
+        self._fabric = []
+        self._fabric_ctx = None
+        self._fabric_device = None
+
+    @classmethod
+    def options_from(cls, remote_config: "RemoteCacheConfig") -> dict:
+        return {"reserve_bytes": remote_config.lend_reserve_size}
 
     def _release_fabric(self) -> None:
         from cuda.bindings import driver as drv
@@ -667,10 +864,9 @@ class RemoteLender:
                 return None
             raise
 
-    def _start_fabric(self) -> None:
-        """Allocate the lend as Grace DRAM (cuMemCreate, HOST_NUMA), one allocation per chunk placed by _place_chunks,
-        and publish their fabric handles in chunk order. What fits is published with short_bytes; a lender that fits
-        nothing raises."""
+    def _start_transport(self) -> None:
+        """Allocate the lend one chunk at a time, placed by _place_chunks, and publish their fabric handles in chunk
+        order. What fits is published with short_bytes; a lender that fits nothing raises."""
         from cuda.bindings import driver as drv
 
         ensure_rendezvous_directory(self.directory)
@@ -767,20 +963,6 @@ class RemoteLender:
             f"{t1 - t0:.1f} s",
         )
 
-    def _failure_text(self, error: BaseException) -> bytes:
-        return "\n".join(
-            [
-                "version 1",
-                f"name {self.name}",
-                f"host {self.host}",
-                f"pid {os.getpid()}",
-                f"transport {self.transport}",
-                f"planned_bytes {self.nbytes}",
-                f"error {error!r}".replace("\n", " "),
-                "",
-            ]
-        ).encode()
-
     def _leave_fabric_context(self, drv, capture_mode, *, pop: bool, raise_errors: bool) -> None:
         """Pop the fabric context (if `pop`) and restore the thread's capture mode. A failure raises only after a
         successful start, so it never replaces the start error."""
@@ -795,118 +977,7 @@ class RemoteLender:
                     raise
                 _log(f"{self.name}: leaving the fabric context failed: {error}")
 
-    def publish_failure(self, error: BaseException) -> None:
-        """Leave lender.<name>.failed (planned bytes and the error) so capacity checks count this lender as reported
-        instead of waiting for it. Clients ignore the file: they list only .ready lenders."""
-        try:
-            ensure_rendezvous_directory(self.directory)
-            _write_atomically(self._path("failed"), self._failure_text(error))
-        except OSError as write_error:
-            _log(f"{self.name}: cannot write its failure marker: {write_error}")
-
-    def start(self) -> None:
-        if self._finalizer is None:
-            self._finalizer = weakref.finalize(
-                self,
-                _withdraw_unowned,
-                self._published,
-                self._path("failed"),
-                self._failure_text(RuntimeError("the lender's owner exited without closing it")),
-            )
-        if self.transport == "fabric":
-            self._start_fabric()
-            return
-        from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
-            BaseAgentConfig,
-            MemoryDesc,
-            MemoryDescs,
-            MemoryType,
-            NixlTransferAgent,
-        )
-
-        ensure_rendezvous_directory(self.directory)
-        ucx_devices = resolve_ucx_devices(self.ucx_devices, self.device)
-        t0 = time.monotonic()
-        flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_NORESERVE
-        self._map = mmap.mmap(-1, self.nbytes, flags=flags)
-        self._address = ctypes.addressof(ctypes.c_char.from_buffer(self._map))
-        try:
-            self._map.madvise(_MADV_HUGEPAGE)
-        except OSError:
-            pass
-        if self.numa_node is not None and not _bind_to_numa_node(
-            self._address, self.nbytes, self.numa_node
-        ):
-            _log(f"libnuma unavailable; {self.name} relies on first touch for NUMA placement")
-        # Fault every page in now: registration does not pin memory where the NIC pages on demand, and a resident
-        # lend fails here rather than mid-run and never makes a remote write wait on a page fault.
-        _populate(self._map, self._address, self.nbytes)
-        t1 = time.monotonic()
-
-        config = BaseAgentConfig()
-        config.name = self.name
-        config.use_prog_thread = True
-        config.multi_thread = False
-        config.use_listen_thread = False
-        # This agent's own UCX devices; the process-wide UCX_NET_DEVICES stays as the serving process needs it.
-        if ucx_devices:
-            config.backend_params = {"ucx_devices": ucx_devices}
-        self._agent = NixlTransferAgent(config)
-        self._agent.register_memory(
-            MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, self.nbytes, 0)])
-        )
-        self._registered = True
-        t2 = time.monotonic()
-        desc = self._agent.get_local_agent_desc().serialize()
-        self._publish(
-            [("desc", desc)],
-            [f"segment {self._address} {self.nbytes}"],
-            f"map + populate {t1 - t0:.1f} s, register {t2 - t1:.1f} s",
-        )
-
-    def start_or_report(self) -> None:
-        """``start()``; on failure, release what was made and leave the failure marker (``publish_failure``)."""
-        try:
-            self.start()
-        except Exception as error:  # noqa: BLE001 - a failed lender only removes capacity
-            logger.warning(f"KVCM2 remote lender: {self.name} failed to start: {error!r}")
-            self.close(error)
-
-    def start_in_background(self) -> None:
-        """``start_or_report()`` on a thread, so the caller does not wait for the memory to be faulted in and
-        registered; clients wait for the ``.ready`` file."""
-        self._start_thread = threading.Thread(
-            target=self.start_or_report, name="kvcm2-remote-lender", daemon=True
-        )
-        self._start_thread.start()
-
-    def wait_started(self) -> None:
-        """Wait for a background start to publish or fail."""
-        thread = self._start_thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join()
-
-    def close(self, error: Optional[BaseException] = None) -> None:
-        """Wait for a background start, then withdraw the files, the registration and the memory; with `error`, leave
-        the failure marker too. NIXL clients still holding chunks fail their next transfer at the NIC instead of
-        reading stale bytes."""
-        thread, self._start_thread = self._start_thread, None
-        if thread is not None and thread is not threading.current_thread():
-            thread.join()
-        with self._close_lock:
-            if self._finalizer is not None:
-                self._finalizer.detach()
-            self._withdraw()
-        if error is not None:
-            self.publish_failure(error)
-
-    def _withdraw(self) -> None:
-        for path in reversed(self._published):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        self._published.clear()
+    def _release_transport(self) -> None:
         if self._fabric_ctx is not None:
             from cuda.bindings import driver as drv
 
@@ -926,37 +997,27 @@ class RemoteLender:
             self._fabric_ctx = None
             self._fabric_device = None
         self._fabric = []
-        if self._agent is not None and self._registered:
-            from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
-                MemoryDesc,
-                MemoryDescs,
-                MemoryType,
-            )
 
-            try:
-                self._agent.deregister_memory(
-                    MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, self.nbytes, 0)])
-                )
-            except Exception as error:  # noqa: BLE001 - teardown keeps going
-                _log(f"{self.name}: deregistering failed: {error}")
-            self._registered = False
-        self._agent = None
-        if self._map is not None:
-            try:
-                self._map.close()
-            except BufferError:
-                pass
-            self._map = None
+
+# The lender of each RemoteCacheConfig.transport.
+LENDERS = {"nixl": NixlLender, "fabric": FabricLender}
+TRANSPORTS = tuple(LENDERS)
+
+
+def make_lender(directory: str, nbytes: int, transport: str = "nixl", **kwargs) -> RemoteLender:
+    """A lender of `transport` (one of ``TRANSPORTS``); `kwargs` go to its constructor."""
+    if transport not in LENDERS:
+        raise ValueError(f"transport {transport!r} is not one of {TRANSPORTS}")
+    return LENDERS[transport](directory, nbytes, **kwargs)
 
 
 def _lender_for(remote_config: "RemoteCacheConfig", device: Optional[int]) -> RemoteLender:
-    return RemoteLender(
+    lender_cls = LENDERS[remote_config.transport]
+    return lender_cls(
         os.path.expandvars(os.path.expanduser(remote_config.directory)),
         remote_config.lend_size,
-        transport=remote_config.transport,
-        ucx_devices=remote_config.ucx_devices,
-        reserve_bytes=remote_config.lend_reserve_size,
         device=device,
+        **lender_cls.options_from(remote_config),
     )
 
 

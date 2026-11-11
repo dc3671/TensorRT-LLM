@@ -47,7 +47,7 @@ def fabric_available() -> bool:
     from cuda.bindings import driver as drv
 
     from tensorrt_llm._torch.pyexecutor.kv_cache.remote_lender import (
-        RemoteLender,
+        FabricLender,
         _host_numa_node_of,
     )
 
@@ -61,7 +61,7 @@ def fabric_available() -> bool:
         return False
     drv.cuCtxPushCurrent(ctx)
     try:
-        prop = RemoteLender._fabric_prop(drv, _host_numa_node_of(drv, device))
+        prop = FabricLender._fabric_prop(drv, _host_numa_node_of(drv, device))
         err, gran = drv.cuMemGetAllocationGranularity(
             prop, drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
         )
