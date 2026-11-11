@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <limits>
 #include <linux/limits.h>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <regex>
@@ -41,6 +42,7 @@
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
 #include "cubin/kernelMetaInfo.h"
+#include "cubin/kernelMetaInfoStageKv.h"
 #include "fmhaReduction.h"
 #include "fmhaRunnerParams.h"
 #include "prepareCustomMask.h"
@@ -156,11 +158,21 @@ public:
     using FmhaConfig = fmha::FmhaConfig;
     using FmhaData = fmha::FmhaData;
     using KernelParams = fmha::KernelParams;
+    using StageKvKernelMeta = TllmGenFmhaStageKvKernelMetaInfo;
 
+private:
+    struct KernelInfo
+    {
+        KernelMeta const* mMeta;
+        CUfunction mDeviceFunction;
+    };
+
+public:
     // Ctor.
     TllmGenFmhaKernel(KernelMeta const* pMetaStart, unsigned int nMetaCount, Data_type dtypeQ, Data_type dtypeK,
         Data_type dtypeV, Data_type dtypeOut, unsigned int smArch, int numEltsPerSageAttnBlkQ = 0,
-        int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0)
+        int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0,
+        StageKvKernelMeta const* pStageKvMetaStart = nullptr, unsigned int nStageKvMetaCount = 0)
         : mDtypeQ(dtypeQ)
         , mDtypeK(dtypeK)
         , mDtypeV(dtypeV)
@@ -168,6 +180,8 @@ public:
         , mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
         , mKernelMeta(pMetaStart)
         , mKernelMetaCount(nMetaCount)
+        , mStageKvKernelMeta(pStageKvMetaStart)
+        , mStageKvKernelMetaCount(nStageKvMetaCount)
         , mSM(smArch)
         , mNumEltsPerSageAttnBlkQ(numEltsPerSageAttnBlkQ)
         , mNumEltsPerSageAttnBlkK(numEltsPerSageAttnBlkK)
@@ -182,77 +196,94 @@ public:
         for (unsigned int i = 0; i < mKernelMetaCount; ++i)
         {
             auto const& kernelMeta = mKernelMeta[i];
-            if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ
-                && kernelMeta.mDataTypeK == mDtypeK && kernelMeta.mDataTypeV == mDtypeV
-                && kernelMeta.mDataTypeO == mDtypeOut && kernelMeta.mNumEltsPerSageAttnBlkQ == mNumEltsPerSageAttnBlkQ
-                && kernelMeta.mNumEltsPerSageAttnBlkK == mNumEltsPerSageAttnBlkK
-                && kernelMeta.mNumEltsPerSageAttnBlkP == mNumEltsPerSageAttnBlkP
-                && kernelMeta.mNumEltsPerSageAttnBlkV == mNumEltsPerSageAttnBlkV)
+            KernelInfo funcInfo;
+            if (!loadKernel(kernelMeta, funcInfo))
             {
-                // Load CUmodules
-                CUmodule hmod{0};
-                auto findModuleIter = mModules.find(kernelMeta.mCubin);
-                if (findModuleIter != mModules.end())
+                continue;
+            }
+            // Make sure the hashIds are not duplicated.
+            // Except for the case where we have both family version and specific version of the same config.
+            auto const hash = hashID(kernelMeta);
+            auto& functions = getFunctions(kernelMeta.mFusesDsv4InvRopeFp8Quant, kernelMeta.mUsesDsv4Ue8m0ScaleO);
+            auto it = functions.find(hash);
+            if (it != functions.end())
+            {
+                auto const& existingKernelMeta = *it->second.mMeta;
+                TLLM_CHECK_WITH_INFO(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
+                    "The kernel's hashId conflicts with another kernel in the same variant: existing=%s, new=%s.",
+                    existingKernelMeta.mFuncName, kernelMeta.mFuncName);
+                // Prefer specific SM version over family version
+                if (existingKernelMeta.mSM == kSM_100f)
                 {
-                    hmod = findModuleIter->second;
-                }
-                else
-                {
-                    TLLM_CU_CHECK(mDriver->cuModuleLoadData(&hmod, kernelMeta.mCubin));
-                    mModules.insert(std::make_pair(kernelMeta.mCubin, hmod));
-                }
-                // Build a hash map, which maps from kernel meta info to kernel index
-                KernelInfo funcInfo;
-                funcInfo.mMetaInfoIndex = i;
-                TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 13040
-                if (kernelMeta.mSharedMemBytes + 1024 > 228 * 1024)
-                {
-                    TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
-                        CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE, CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY));
-                }
-                else
-#endif
-                    if (kernelMeta.mSharedMemBytes >= 48 * 1024)
-                {
-                    auto const result = mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
-                        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes);
-                    if (result != CUDA_SUCCESS)
-                    {
-                        char const* errorName = nullptr;
-                        char const* errorString = nullptr;
-                        mDriver->cuGetErrorName(result, &errorName);
-                        mDriver->cuGetErrorString(result, &errorString);
-                        TLLM_LOG_WARNING("Skipping FMHA kernel due to cuFuncSetAttribute failure: "
-                            + std::string(kernelMeta.mFuncName) + ", smem=" + std::to_string(kernelMeta.mSharedMemBytes)
-                            + ", error=" + std::string(errorName != nullptr ? errorName : "unknown") + ": "
-                            + std::string(errorString != nullptr ? errorString : "unknown"));
-                        continue;
-                    }
-                }
-                // Make sure the hashIds are not duplicated.
-                // Except for the case where we have both family version and specific version of the same config.
-                auto const hash = hashID(kernelMeta);
-                auto& functions = getFunctions(kernelMeta.mFusesDsv4InvRopeFp8Quant, kernelMeta.mUsesDsv4Ue8m0ScaleO);
-                auto it = functions.find(hash);
-                if (it != functions.end())
-                {
-                    auto const& existingKernelMeta = mKernelMeta[it->second.mMetaInfoIndex];
-                    TLLM_CHECK_WITH_INFO(isFamilySpecificSMPair(existingKernelMeta.mSM, kernelMeta.mSM),
-                        "The kernel's hashId conflicts with another kernel in the same variant: existing=%s, new=%s.",
-                        existingKernelMeta.mFuncName, kernelMeta.mFuncName);
-                    // Prefer specific SM version over family version
-                    if (existingKernelMeta.mSM == kSM_100f)
-                    {
-                        it->second = funcInfo;
-                    }
-                }
-                else
-                {
-                    functions[hash] = funcInfo;
+                    it->second = funcInfo;
                 }
             }
+            else
+            {
+                functions[hash] = funcInfo;
+            }
         }
+        // Kernels generated for a caller-fixed head dim per K/V stage, keyed by (hash, stage): the hash does not
+        // cover the stage, so they are only found by callers that fix it (RunnerParams::mHeadDimPerStageKv).
+        for (unsigned int i = 0; i < mStageKvKernelMetaCount; ++i)
+        {
+            auto const& stageKvMeta = mStageKvKernelMeta[i];
+            KernelInfo funcInfo;
+            if (!loadKernel(stageKvMeta.mMeta, funcInfo))
+            {
+                continue;
+            }
+            auto const key = std::make_pair(hashID(stageKvMeta.mMeta), stageKvMeta.mHeadDimPerStageKv);
+            TLLM_CHECK_WITH_INFO(mStageKvFunctions.emplace(key, funcInfo).second,
+                "Two stage-KV FMHA kernels share a hashId and head dim per K/V stage: %s.",
+                stageKvMeta.mMeta.mFuncName);
+        }
+    }
+
+    // Options the caller fixes, applied before the autotuner (marked as set, so it keeps them) and again after it.
+    static void applyCallerOptions(
+        RunnerParams const& params, FmhaOptions& options, FmhaOptionsFromArgs& optionsFromArgs)
+    {
+        if (params.mHeadDimPerStageKv > 0)
+        {
+            options.mHeadDimPerStageKv = params.mHeadDimPerStageKv;
+            optionsFromArgs.mIsHeadDimPerStageKvSet = true;
+        }
+    }
+
+    // NVRTC for the configurations shouldUseNvrtc picks and for caller-fixed options the cubin tables do not hold.
+    bool usesNvrtc(RunnerParams const& params, FmhaOptions const& options) const
+    {
+        if (shouldUseNvrtc(options))
+        {
+            return true;
+        }
+        return params.mHeadDimPerStageKv > 0 && findCubinKernel(options, params.mHeadDimPerStageKv) == nullptr;
+    }
+
+    // Whether a stage-KV table kernel matches the caller-fixed stage and the static shape of these params (layout,
+    // mask, kernel type, head dims, tokens per page).
+    bool hasStageKvKernel(RunnerParams const& params) const
+    {
+        for (auto const& [key, funcInfo] : mStageKvFunctions)
+        {
+            auto const& meta = *funcInfo.mMeta;
+            if (key.second == params.mHeadDimPerStageKv && meta.mQkvLayout == static_cast<int>(params.mQkvLayout)
+                && meta.mMaskType == static_cast<int>(params.mMaskType)
+                && meta.mKernelType == static_cast<int>(params.mKernelType) && meta.mHeadDimQk == params.mHeadDimQk
+                && meta.mHeadDimV == params.mHeadDimV && meta.mNumTokensPerPage == params.mNumTokensPerPage)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The NVRTC configuration run() compiles for these params (also used offline to export the generated kernel).
+    FmhaConfig nvrtcConfig(RunnerParams const& params) const
+    {
+        auto const [options, ctaDim, grid] = selectOptions(params);
+        return makeNvrtcConfig(options, ctaDim, grid);
     }
 
     bool shouldUseNvrtc(FmhaOptions const& options) const
@@ -329,10 +360,12 @@ public:
         FmhaOptions options;
         FmhaOptionsFromArgs optionsFromArgs;
         parseOptionsFromRunnerParams(params, options);
+        applyCallerOptions(params, options, optionsFromArgs);
         options.mCudaArch = intToCudaArch(mSM);
 
         std::tie(options, optionsFromArgs, ctaDim)
             = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
+        applyCallerOptions(params, options, optionsFromArgs);
 
         // Check if the options are valid or not.
         checkFmhaOptions(options, optionsFromArgs);
@@ -344,7 +377,7 @@ public:
         // dimension.
         computeNumCtas(options, params.mMultiProcessorCount);
 
-        if (shouldUseNvrtc(options))
+        if (usesNvrtc(params, options))
         {
             // For the NVRTC path, we return supported as long as autotuner successfully selected a kernel config.
             return std::make_pair(true, "NVRTC path is supported");
@@ -352,11 +385,8 @@ public:
 
         // Check if a precompiled cubin exists for this configuration (same lookup as run()).
         // If not, return (false, info) so the dispatcher can fall back to unfused MHA like on main.
-        algoFilterForCubinPath(options);
-        auto [hashId, info] = hashFromFmhaOptions(options);
-
-        auto const& functions = getFunctions(options.mFusesDsv4InvRopeFp8Quant, options.mUsesDsv4Ue8m0ScaleO);
-        if (functions.find(hashId) == functions.end())
+        std::string info;
+        if (findCubinKernel(options, params.mHeadDimPerStageKv, &info) == nullptr)
         {
             TLLM_LOG_WARNING("Trtllm-gen kernels not found: " + info);
             return std::make_pair(false, info);
@@ -429,23 +459,20 @@ private:
         return candidateSizes;
     }
 
-    void warmupOneKernel(RunnerParams const& params)
+    // The options, CTA size and grid run() selects for these params.
+    std::tuple<FmhaOptions, int32_t, tg::CudaRunner::Grid> selectOptions(RunnerParams const& params) const
     {
-        if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
-            || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
-        {
-            return;
-        }
-
         int32_t ctaDim = 512;
         FmhaOptions options;
         FmhaOptionsFromArgs optionsFromArgs;
         parseOptionsFromRunnerParams(params, options);
+        applyCallerOptions(params, options, optionsFromArgs);
         options.mCudaArch = intToCudaArch(mSM);
 
         std::tie(options, optionsFromArgs, ctaDim)
             = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
-        // Same override as run(), so the warmed config matches the dispatched one.
+        applyCallerOptions(params, options, optionsFromArgs);
+        // Same override as run(), so the selected config matches the dispatched one.
         if (mNumEltsPerSageAttnBlkP + mNumEltsPerSageAttnBlkV > 0)
         {
             options.mTileScheduler = TileScheduler::Static;
@@ -456,21 +483,22 @@ private:
         checkTrtllmSkipCorrThreshold(options, params.mSkipCorrThreshold);
 
         auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
-        tg::CudaRunner::Grid grid{numCtasX, numCtasY, numCtasZ};
+        return {options, ctaDim, tg::CudaRunner::Grid{numCtasX, numCtasY, numCtasZ}};
+    }
 
-        if (shouldUseNvrtc(options))
+    void warmupOneKernel(RunnerParams const& params)
+    {
+        if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
+            || (!isContextKernel(params.mKernelType) && params.mMaxSeqLenKv == 0))
+        {
+            return;
+        }
+
+        auto const [options, ctaDim, grid] = selectOptions(params);
+        if (usesNvrtc(params, options))
         {
             // Compile exactly what run() compiles (same target arch), so the warmed kernel is the one run() hits.
-            FmhaOptions const nvrtcOptions = nvrtcCompileOptions(options);
-            FmhaConfig fmhaConfig;
-            fmhaConfig.mOptions = nvrtcOptions;
-            std::ostringstream sstream;
-            populateJsonConfig(nvrtcOptions, sstream);
-            fmhaConfig.mGenCfgJsonStr = sstream.str();
-
-            fmhaConfig.mExecPath = getExecPath().c_str();
-            fmhaConfig.mCtaDim = ctaDim;
-            fmhaConfig.mGrid = grid;
+            FmhaConfig fmhaConfig = makeNvrtcConfig(options, ctaDim, grid);
             auto const compileStart = std::chrono::steady_clock::now();
             mFmhaInterface.generateAndCompileKernel(fmhaConfig);
             auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
@@ -639,10 +667,12 @@ public:
         FmhaOptions options;
         FmhaOptionsFromArgs optionsFromArgs;
         parseOptionsFromRunnerParams(params, options);
+        applyCallerOptions(params, options, optionsFromArgs);
         options.mCudaArch = intToCudaArch(mSM);
 
         std::tie(options, optionsFromArgs, ctaDim)
             = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
+        applyCallerOptions(params, options, optionsFromArgs);
 
         // Overwrite AutoTuner decision: SageAttention with SfsPV is known to cause regression to persistent scheduler.
         // Remove this overwritten once we refresh the cubin kernels that containing the related fix.
@@ -692,20 +722,10 @@ public:
         setFmhaData(params, options, fmhaData);
         fmha::checkSkipCorrThreshold(options, fmhaData.mMetaData.skipCorrThreshold);
 
-        if (shouldUseNvrtc(options))
+        if (usesNvrtc(params, options))
         {
             // nvrtc path - uses mFmhaInterface member for kernel caching
-            FmhaOptions const nvrtcOptions = nvrtcCompileOptions(options);
-
-            FmhaConfig fmhaConfig;
-            fmhaConfig.mOptions = nvrtcOptions;
-            std::ostringstream sstream;
-            populateJsonConfig(nvrtcOptions, sstream);
-            fmhaConfig.mGenCfgJsonStr = sstream.str();
-
-            fmhaConfig.mExecPath = getExecPath().c_str();
-            fmhaConfig.mCtaDim = ctaDim;
-            fmhaConfig.mGrid = grid;
+            FmhaConfig fmhaConfig = makeNvrtcConfig(options, ctaDim, grid);
             auto const compileStart = std::chrono::steady_clock::now();
             mFmhaInterface.generateAndCompileKernel(fmhaConfig);
             auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
@@ -723,16 +743,15 @@ public:
         else
         {
             algoFilterForCubinPath(options);
-            auto [hashId, info] = hashFromFmhaOptions(options);
 
             // load from cubin
-            auto const& functions = getFunctions(options.mFusesDsv4InvRopeFp8Quant, options.mUsesDsv4Ue8m0ScaleO);
-            auto const findIter = functions.find(hashId);
+            std::string info;
+            KernelInfo const* kernelInfo = findCubinKernel(options, params.mHeadDimPerStageKv, &info);
             // Add debug info when kernels are not found.
-            TLLM_CHECK_WITH_INFO(findIter != functions.end(), "Trtllm-gen kernels not found: " + info);
+            TLLM_CHECK_WITH_INFO(kernelInfo != nullptr, "Trtllm-gen kernels not found: " + info);
 
-            auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
-            const CUfunction func = findIter->second.mDeviceFunction;
+            auto const& kernelMeta = *kernelInfo->mMeta;
+            const CUfunction func = kernelInfo->mDeviceFunction;
 
             // mGroupsHeadsQ, mGroupsTokensHeadsQ, and mNumInsts{Q,Kv} are part of the hashID, so the
             // matched cubin already agrees with the AutoTuner decision. Re-assign from kernelMeta
@@ -800,6 +819,95 @@ private:
         }
 #endif // TLLM_RUBIN_FEATURES
         return nvrtcOptions;
+    }
+
+    // The NVRTC config for the selected options; shared by run() and warmupOneKernel() so both produce the same kernel.
+    FmhaConfig makeNvrtcConfig(FmhaOptions const& options, int32_t ctaDim, tg::CudaRunner::Grid const& grid) const
+    {
+        FmhaOptions const nvrtcOptions = nvrtcCompileOptions(options);
+        FmhaConfig fmhaConfig;
+        fmhaConfig.mOptions = nvrtcOptions;
+        std::ostringstream sstream;
+        populateJsonConfig(nvrtcOptions, sstream);
+        fmhaConfig.mGenCfgJsonStr = sstream.str();
+        fmhaConfig.mExecPath = getExecPath().c_str();
+        fmhaConfig.mCtaDim = ctaDim;
+        fmhaConfig.mGrid = grid;
+        return fmhaConfig;
+    }
+
+    // Loads the kernel of a table entry that matches this runner's SM and data types; false if it does not apply.
+    bool loadKernel(KernelMeta const& kernelMeta, KernelInfo& funcInfo)
+    {
+        if (!(isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ
+                && kernelMeta.mDataTypeK == mDtypeK && kernelMeta.mDataTypeV == mDtypeV
+                && kernelMeta.mDataTypeO == mDtypeOut && kernelMeta.mNumEltsPerSageAttnBlkQ == mNumEltsPerSageAttnBlkQ
+                && kernelMeta.mNumEltsPerSageAttnBlkK == mNumEltsPerSageAttnBlkK
+                && kernelMeta.mNumEltsPerSageAttnBlkP == mNumEltsPerSageAttnBlkP
+                && kernelMeta.mNumEltsPerSageAttnBlkV == mNumEltsPerSageAttnBlkV))
+        {
+            return false;
+        }
+        // Load CUmodules
+        CUmodule hmod{0};
+        auto findModuleIter = mModules.find(kernelMeta.mCubin);
+        if (findModuleIter != mModules.end())
+        {
+            hmod = findModuleIter->second;
+        }
+        else
+        {
+            TLLM_CU_CHECK(mDriver->cuModuleLoadData(&hmod, kernelMeta.mCubin));
+            mModules.insert(std::make_pair(kernelMeta.mCubin, hmod));
+        }
+        funcInfo.mMeta = &kernelMeta;
+        TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 13040
+        if (kernelMeta.mSharedMemBytes + 1024 > 228 * 1024)
+        {
+            TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction, CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE,
+                CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY));
+        }
+        else
+#endif
+            if (kernelMeta.mSharedMemBytes >= 48 * 1024)
+        {
+            auto const result = mDriver->cuFuncSetAttribute(
+                funcInfo.mDeviceFunction, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes);
+            if (result != CUDA_SUCCESS)
+            {
+                char const* errorName = nullptr;
+                char const* errorString = nullptr;
+                mDriver->cuGetErrorName(result, &errorName);
+                mDriver->cuGetErrorString(result, &errorString);
+                TLLM_LOG_WARNING("Skipping FMHA kernel due to cuFuncSetAttribute failure: "
+                    + std::string(kernelMeta.mFuncName) + ", smem=" + std::to_string(kernelMeta.mSharedMemBytes)
+                    + ", error=" + std::string(errorName != nullptr ? errorName : "unknown") + ": "
+                    + std::string(errorString != nullptr ? errorString : "unknown"));
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // The precompiled kernel for the selected options, or nullptr. A caller-fixed head dim per K/V stage is only
+    // matched against the kernels generated for exactly that stage.
+    KernelInfo const* findCubinKernel(FmhaOptions options, int headDimPerStageKv, std::string* info = nullptr) const
+    {
+        algoFilterForCubinPath(options);
+        auto [hashId, hashInfo] = hashFromFmhaOptions(options);
+        if (info != nullptr)
+        {
+            *info = hashInfo + ", headDimPerStageKv=" + std::to_string(headDimPerStageKv);
+        }
+        if (headDimPerStageKv > 0)
+        {
+            auto const it = mStageKvFunctions.find(std::make_pair(hashId, headDimPerStageKv));
+            return it == mStageKvFunctions.end() ? nullptr : &it->second;
+        }
+        auto const& functions = getFunctions(options.mFusesDsv4InvRopeFp8Quant, options.mUsesDsv4Ue8m0ScaleO);
+        auto const it = functions.find(hashId);
+        return it == functions.end() ? nullptr : &it->second;
     }
 
     // Autotuner entry for checkIfKernelExist, warmupOneKernel, and run. SM107 may select
@@ -1648,18 +1756,14 @@ private:
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
     KernelMeta const* mKernelMeta;
     unsigned int mKernelMetaCount;
+    StageKvKernelMeta const* mStageKvKernelMeta;
+    unsigned int mStageKvKernelMetaCount;
     unsigned int mSM;
     int mNumEltsPerSageAttnBlkQ;
     int mNumEltsPerSageAttnBlkK;
     int mNumEltsPerSageAttnBlkP;
     int mNumEltsPerSageAttnBlkV;
     std::unordered_map<unsigned char const*, CUmodule> mModules;
-
-    struct KernelInfo
-    {
-        unsigned int mMetaInfoIndex;
-        CUfunction mDeviceFunction;
-    };
 
     using KernelMap = std::unordered_map<uint64_t, KernelInfo>;
 
@@ -1691,6 +1795,8 @@ private:
     KernelMap mFunctions;
     KernelMap mDsv4FusedFunctions;
     KernelMap mDsv4FusedUe8m0Functions;
+    // Kernels for a caller-fixed head dim per K/V stage, keyed by (hashId, headDimPerStageKv).
+    std::map<std::pair<uint64_t, int>, KernelInfo> mStageKvFunctions;
 
     FmhaInterface mFmhaInterface{false, 1};
 };
@@ -1718,8 +1824,10 @@ public:
         auto const findIter = mKernels.find(id);
         if (findIter == mKernels.end())
         {
+            auto const& stageKvKernels = getTllmGenFmhaStageKvKernelMetaInfos();
             KernelType* newKernel = new KernelType{pKernelList, nbKernels, dtypeQ, dtypeK, dtypeV, dtypeOut, sm,
-                numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV};
+                numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV,
+                stageKvKernels.data(), static_cast<unsigned int>(stageKvKernels.size())};
             newKernel->loadKernels();
             mKernels.insert(std::make_pair(id, std::unique_ptr<KernelType>(newKernel)));
             return newKernel;

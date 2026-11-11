@@ -44,6 +44,10 @@ public:
     // Check if fmha is supported with additional info.
     std::pair<bool, std::string> isSupportedWithInfo(TllmGenFmhaRunnerParams const& runnerParams) const;
 
+    // Whether a precompiled kernel exists for the caller-fixed head dim per K/V stage (mHeadDimPerStageKv) and the
+    // static shape of the params; without one, run() compiles the kernel with NVRTC.
+    bool hasStageKvKernel(TllmGenFmhaRunnerParams const& runnerParams) const;
+
     // Get the total device memory.
     size_t getTotalDeviceMemory() const;
 

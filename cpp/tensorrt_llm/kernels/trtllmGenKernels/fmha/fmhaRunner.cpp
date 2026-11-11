@@ -104,6 +104,13 @@ std::pair<bool, std::string> TllmGenFmhaRunner::isSupportedWithInfo(TllmGenFmhaR
     return mKernel->checkIfKernelExist(runnerParams);
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+bool TllmGenFmhaRunner::hasStageKvKernel(TllmGenFmhaRunnerParams const& runnerParams) const
+{
+    return mKernel != nullptr && mKernel->hasStageKvKernel(runnerParams);
+}
+
 size_t TllmGenFmhaRunner::getTotalDeviceMemory() const
 {
     return mTotalDeviceMemory;
