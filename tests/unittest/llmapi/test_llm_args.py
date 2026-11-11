@@ -2156,6 +2156,18 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
         },
                       disk_cache_size=1,
                       disk_cache_path=str(tmp_path))
+    # A rebalance would claim lender chunks inside adjust(), which holds every request.
+    with pytest.raises(ValidationError, match="enable_kv_pool_rebalance"):
+        KvCacheConfig(remote_cache_config={
+            "directory": str(tmp_path),
+            "cache_size": 1
+        },
+                      enable_kv_pool_rebalance=True)
+    assert KvCacheConfig(remote_cache_config={
+        "directory": str(tmp_path),
+        "lend_size": 1 << 30
+    },
+                         enable_kv_pool_rebalance=True).enable_kv_pool_rebalance
 
 
 @pytest.mark.cpu_only
@@ -2672,6 +2684,20 @@ def test_gen_preemption_rejects_pp_and_attention_dp(parallel) -> None:
     with pytest.raises(ValueError, match="does not support"):
         TorchLlmArgs(model=llama_model_path, scheduler_config=on, **parallel)
     TorchLlmArgs(model=llama_model_path, **parallel)  # off: no restriction
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("loop", [{
+    "pipeline_parallel_size": 2
+}, {
+    "disable_overlap_scheduler": True
+}])
+def test_defer_generation_only_release_needs_the_overlap_loop(loop) -> None:
+    """Rejected at parse time, before any rank loads the checkpoint."""
+    defer = KvCacheConfig(defer_generation_only_release=True)
+    with pytest.raises(ValueError, match="overlap scheduler loop"):
+        TorchLlmArgs(model=llama_model_path, kv_cache_config=defer, **loop)
+    TorchLlmArgs(model=llama_model_path, kv_cache_config=defer)
 
 
 @pytest.mark.cpu_only

@@ -1118,12 +1118,19 @@ class KvCacheCreator:
                     f"{self._kv_cache_manager_cls.__name__} was selected. Set "
                     "kv_cache_config.use_kv_cache_manager_v2=True and disable "
                     "features that fall back to V1.")
+        # TorchLlmArgs rejects the same at parse time; this sees the resolved values.
         if kv_cache_config.defer_generation_only_release and (
                 llm_args.disable_overlap_scheduler or mapping.pp_size > 1):
             raise ValueError(
                 "kv_cache_config.defer_generation_only_release is used only "
                 "by the overlap scheduler loop, which needs "
                 "disable_overlap_scheduler=False and pipeline parallel size 1.")
+        if kv_cache_config.defer_generation_only_release and not self._is_disagg:
+            logger.warning(
+                "kv_cache_config.defer_generation_only_release has no effect "
+                "without a cache transceiver: only the generation-only "
+                "requests of a disaggregated generation server are released "
+                "late.")
 
     def _get_model_kv_cache_manager_cls(
         self,

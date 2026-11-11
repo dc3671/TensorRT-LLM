@@ -5985,6 +5985,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 "kv_cache_config.remote_cache_config.cache_size and "
                 "disk_cache_size cannot both be set: the remote level takes the "
                 "disk level's place")
+        if remote.cache_size and self.enable_kv_pool_rebalance:
+            raise ValueError(
+                "kv_cache_config.remote_cache_config.cache_size and "
+                "enable_kv_pool_rebalance cannot both be set: a rebalance "
+                "would claim lender chunks while every request waits")
         return self
 
     @model_validator(mode='after')
@@ -8101,6 +8106,17 @@ class TorchLlmArgs(BaseLlmArgs):
                 f"({transceiver.kv_transfer_timeout_ms} ms): a request passed "
                 "over that long may find its context server's KV transfer "
                 "timed out.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_defer_generation_only_release(self) -> 'TorchLlmArgs':
+        if self.kv_cache_config.defer_generation_only_release and (
+                self.disable_overlap_scheduler
+                or self.pipeline_parallel_size > 1):
+            raise ValueError(
+                "kv_cache_config.defer_generation_only_release is used only "
+                "by the overlap scheduler loop, which needs "
+                "disable_overlap_scheduler=False and pipeline_parallel_size=1.")
         return self
 
     @model_validator(mode="after")
