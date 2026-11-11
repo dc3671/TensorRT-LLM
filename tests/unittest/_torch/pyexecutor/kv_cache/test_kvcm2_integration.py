@@ -1720,6 +1720,90 @@ def test_peer_init_failure_discards_local_candidate() -> None:
     local_impl.shutdown.assert_called_once_with()
 
 
+class TestRemoteTierInitStatus:
+    """A remote tier's failure on one rank goes through the cross-rank init status, and the lend is withdrawn.
+
+    Without the sync, the rank raises alone and its peers wait in the first collective.
+    """
+
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
+
+    @staticmethod
+    def _config(tmp_path, **remote) -> KvCacheConfig:
+        return KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            remote_cache_config={"directory": str(tmp_path), **remote},
+        )
+
+    @staticmethod
+    def _starting_lender(error=None):
+        """An _add_remote_level that starts a lender, then raises `error` if given."""
+        lender = Mock()
+
+        def add_remote_level(self, remote_config, cache_tiers):
+            self._remote_lender = lender
+            if error is not None:
+                raise error
+
+        return lender, add_remote_level
+
+    @pytest.mark.cpu_only
+    def test_local_failure_aborts_every_rank_and_closes_the_lender(self, tmp_path) -> None:
+        lender, add_remote_level = self._starting_lender(RuntimeError("capacity check failed"))
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ) as sync,
+            pytest.raises(RuntimeError, match="capacity check failed"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, cache_size=1 << 30, lend_size=1 << 30), [Mock()]
+            )
+        assert sync.call_args.args[0] == _KVCacheManagerInitStatus.ABORT
+        lender.close.assert_called_once_with()
+
+    @pytest.mark.cpu_only
+    def test_peer_failure_discards_the_cache_and_closes_the_lender(self, tmp_path) -> None:
+        lender, add_remote_level = self._starting_lender()
+        local_impl = Mock()
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                return_value=_KVCacheManagerInitStatus.ABORT,
+            ) as sync,
+            pytest.raises(RuntimeError, match="failed on another rank"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, lend_size=1 << 30), [local_impl]
+            )
+        assert sync.call_args.args[0] == _KVCacheManagerInitStatus.OK
+        local_impl.shutdown.assert_called_once_with()
+        lender.close.assert_called_once_with()
+
+    @pytest.mark.cpu_only
+    def test_lend_without_host_memory_left_aborts_through_the_sync(self, tmp_path) -> None:
+        config = KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            remote_cache_config={"directory": str(tmp_path), "lend_size": 1 << 50},
+        )
+        add_remote_level = Mock()
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ) as sync,
+            pytest.raises(ValueError, match="host_cache_size"),
+        ):
+            _make_manager_for_cache_tier_test(config, [Mock()])
+        assert sync.call_args.args[0] == _KVCacheManagerInitStatus.ABORT
+        add_remote_level.assert_not_called()
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("peer_failed", [False, True])
 def test_agg_helix_gpu_only_init_syncs_status_across_ranks(peer_failed: bool) -> None:

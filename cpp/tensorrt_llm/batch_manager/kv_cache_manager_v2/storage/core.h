@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/cudaVirtMem.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/storage/config.h"
+#include "kv_cache_manager_v2/storage/remoteMem.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -366,6 +367,10 @@ class DiskSlotPool : public SlotPoolBase
 public:
     // directory: path under which to create the temp file.
     DiskSlotPool(std::string const& directory, size_t slotSize, SlotCount numSlots);
+    //! A pool whose slots live in host memory lent by other processes and reached through `remote` (see
+    //! remoteMem.h) instead of a local file. Its slot addresses carry kRemoteFileDescriptor and are not file offsets:
+    //! callers move its pages through remoteRange(), never with file I/O.
+    DiskSlotPool(std::shared_ptr<RemoteMemClient> remote, size_t slotSize, SlotCount numSlots);
     ~DiskSlotPool() override;
 
     SlotCount numSlots() const noexcept override;
@@ -388,6 +393,12 @@ public:
         return mFd;
     }
 
+    //! The remote slots of a remote-backed pool; null for a file-backed one.
+    [[nodiscard]] RemoteRange* remoteRange() const noexcept
+    {
+        return mRemote.get();
+    }
+
 private:
     int mFd = kBadFileDescriptor;
     // Tracks the file size, which only resize() changes: the file is created unlinked and owned
@@ -395,7 +406,12 @@ private:
     // slotAddress() bounds-checks against it on every call, and querying the file would make that
     // an lseek per page of a migration.
     SlotCount mNumSlots{0};
+    std::unique_ptr<RemoteRange> mRemote;
 };
+
+//! The fd a remote-backed disk pool puts in its slot addresses, so that file I/O on one fails instead of reading a
+//! file.
+inline constexpr FileDescriptor kRemoteFileDescriptor = -2;
 
 // ---------------------------------------------------------------------------
 // PoolGroupBase — manages multiple pools with mirrored slot allocation.
@@ -601,12 +617,17 @@ public:
 class DiskPoolGroup : public PoolGroupBase
 {
 public:
-    DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory);
+    //! `remote` set: every pool of the group keeps its slots in lent remote memory instead of a file in `directory`.
+    DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory,
+        std::shared_ptr<RemoteMemClient> remote = nullptr);
 
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
         return CacheTier::DISK;
     }
+
+    //! The remote slots of pool `poolIdx`, or null where the group is file-backed.
+    [[nodiscard]] RemoteRange* remoteRange(PoolIndex poolIdx) const;
 };
 
 //! A second medium's budget over a disjoint subset of each pool group's pools.
@@ -948,8 +969,11 @@ private:
 class DiskCacheLevelStorage : public CacheLevelStorage
 {
 public:
+    //! `remote` set: the level keeps its slots in memory lent through that client, and `directory` is the rendezvous
+    //! directory the lenders publish into (remoteMem.h) rather than where files go.
     DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory);
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory,
+        std::shared_ptr<RemoteMemClient> remote = nullptr);
 
     CacheTier cacheTier() const noexcept override
     {
@@ -961,15 +985,26 @@ public:
         return mDirectory;
     }
 
+    //! The client of a remote-backed level; null for a file-backed one.
+    [[nodiscard]] std::shared_ptr<RemoteMemClient> const& remoteClient() const noexcept
+    {
+        return mRemote;
+    }
+
+    //! The remote slots of one pool of a remote-backed level.
+    [[nodiscard]] RemoteRange& remoteRange(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
+
 private:
     std::string mDirectory;
+    std::shared_ptr<RemoteMemClient> mRemote;
 };
 
 // Factory: create appropriate CacheLevelStorage for a given tier config.
-// `sparseReservation` applies to a GPU tier only; see GpuPoolGroup.
+// `sparseReservation` applies to a GPU tier only; see GpuPoolGroup. `remoteClient` is required by, and only used for,
+// a remote-backed disk tier (DiskCacheTierConfig::remote).
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
     PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, HostMemBackingOptions const& options = {},
-    std::optional<size_t> sparseReservation = std::nullopt);
+    std::optional<size_t> sparseReservation = std::nullopt, std::shared_ptr<RemoteMemClient> remoteClient = nullptr);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

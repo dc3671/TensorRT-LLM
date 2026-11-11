@@ -1016,6 +1016,11 @@ class KvCacheCreator:
     _joint_kv_cache_reuse = False
     _gen_preemption_headroom: int = 0
 
+    # This rank's lend (remote_cache_config.lend_size), started before the
+    # estimation so that clients do not wait out the warmup; the final target
+    # manager takes it over.
+    _remote_lender = None
+
     def __init__(
         self,
         *,
@@ -1087,6 +1092,7 @@ class KvCacheCreator:
                     "ranks only in the chunked-context path. Set "
                     "enable_chunked_prefill=True on a GPU that supports it "
                     "for MLA.")
+        self._reject_unused_v2_only_fields(mapping, llm_args)
         self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
@@ -1094,6 +1100,30 @@ class KvCacheCreator:
         # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
         self._fp8_ctx_mla_kv_len_cap = None
+
+    def _reject_unused_v2_only_fields(self, mapping: Mapping,
+                                      llm_args: TorchLlmArgs) -> None:
+        """Raise for KV cache fields the resolved manager or executor loop would ignore."""
+        kv_cache_config = self._kv_cache_config
+        used_fields = {
+            "remote_cache_config":
+            kv_cache_config.remote_cache_config is not None,
+            "defer_generation_only_release":
+            kv_cache_config.defer_generation_only_release,
+        }
+        for field, is_set in used_fields.items():
+            if is_set and not self._is_kv_cache_manager_v2:
+                raise ValueError(
+                    f"kv_cache_config.{field} requires KVCacheManagerV2, but "
+                    f"{self._kv_cache_manager_cls.__name__} was selected. Set "
+                    "kv_cache_config.use_kv_cache_manager_v2=True and disable "
+                    "features that fall back to V1.")
+        if kv_cache_config.defer_generation_only_release and (
+                llm_args.disable_overlap_scheduler or mapping.pp_size > 1):
+            raise ValueError(
+                "kv_cache_config.defer_generation_only_release is used only "
+                "by the overlap scheduler loop, which needs "
+                "disable_overlap_scheduler=False and pipeline parallel size 1.")
 
     def _get_model_kv_cache_manager_cls(
         self,
@@ -2193,6 +2223,7 @@ class KvCacheCreator:
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
         cold_page_codec_provider: Optional[object] = None,
+        remote_lender=None,
     ) -> KVCacheManager:
         mapping = self._mapping
         assert self._model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
@@ -2250,6 +2281,7 @@ class KvCacheCreator:
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
             layer_specs=unified_layer_specs,
             shared_draft_block_width=shared_draft_block_width,
+            remote_lender=remote_lender,
         )
 
         if not self._skip_est:
@@ -3504,7 +3536,9 @@ class KvCacheCreator:
         Host sizing then falls to the V2 auto host tier policy, which matches
         the tier to the manager's own device quota; V1 builds no secondary pool.
         The disk tier is V2 only and has no auto policy, so dropping its budget
-        leaves the tier out.
+        leaves the tier out; so does dropping the remote cache config: the
+        lend starts beside the probe (_start_remote_lend), the claim waits for
+        the final build.
         """
         if kv_cache_config is None:
             return kv_cache_config
@@ -3513,6 +3547,8 @@ class KvCacheCreator:
             for attr in cls._OFFLOAD_TIER_BUDGET_ATTRS
             if getattr(kv_cache_config, attr)
         }
+        if kv_cache_config.remote_cache_config is not None:
+            dropped["remote_cache_config"] = None
         if not dropped:
             return kv_cache_config
         return kv_cache_config.model_copy(update=dropped)
@@ -3552,6 +3588,8 @@ class KvCacheCreator:
                 self_kv_cache_config)
             cross_kv_cache_config = self._drop_explicit_offload_tier_budgets(
                 cross_kv_cache_config)
+            if not self._skip_est:
+                self._start_remote_lend()
 
         # Split combined KV cache budgets before creating managers.
         draft_kv_cache_config = None
@@ -3594,7 +3632,10 @@ class KvCacheCreator:
             estimating_kv_cache,
             kv_cache_config_override=self_kv_cache_config,
             cold_page_codec_provider=cold_page_codec_provider,
+            remote_lender=None if estimating_kv_cache else self._remote_lender,
         )
+        if not estimating_kv_cache:
+            self._remote_lender = None  # the manager owns it now
 
         # Carry the fp8 context-MLA workspace admission cap (computed in configure_kv_cache_capacity) onto
         # the real KV manager so the scheduler reads it directly instead of re-deriving from pool layout.
@@ -3632,6 +3673,22 @@ class KvCacheCreator:
                 and compression_manager.uses_iteration_lifecycle):
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
                 compression_manager)
+
+    def _start_remote_lend(self) -> None:
+        """Start this rank's lend for the final target manager, once."""
+        remote_config = self._kv_cache_config.remote_cache_config
+        if (remote_config is None or not remote_config.lend_size
+                or self._remote_lender is not None):
+            return
+        from .kv_cache.remote_lender import start_lend
+        self._remote_lender = start_lend(remote_config,
+                                         torch.cuda.current_device())
+
+    def close_remote_lender(self) -> None:
+        """Withdraw a lend that no manager took over (startup failed before the final build)."""
+        if self._remote_lender is not None:
+            self._remote_lender.close()
+            self._remote_lender = None
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model, draft model, and cross pool."""
@@ -3760,6 +3817,7 @@ def _create_kv_cache_manager(
         max_cuda_graph_batch_size: Optional[int] = None,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         shared_draft_block_width: Optional[int] = None,
+        remote_lender=None,
         gen_preemption_headroom: int = 0) -> KVCacheManager:
     """
     Returns:
@@ -3921,6 +3979,7 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["layer_specs"] = layer_specs
         manager_extra_kwargs[
             "shared_draft_block_width"] = shared_draft_block_width
+        manager_extra_kwargs["remote_lender"] = remote_lender
         # Vocab size also enables multimodal event decoding and its per-block
         # digest scan. Leave it unset for text-only engines. Without an engine
         # (e.g. separate one-model draft caches), preserve config resolution:
@@ -5035,6 +5094,8 @@ def create_py_executor_instance(
         enable_kv_pool_rebalance,
         kv_pool_rebalance_check_interval=llm_args.kv_cache_config.
         kv_pool_rebalance_config.check_interval,
+        defer_generation_only_release=llm_args.kv_cache_config.
+        defer_generation_only_release,
         enable_adp_dummy_fixes=should_enable_adp_dummy_fixes(mapping),
         enable_scheduler_aware_adp_dummy=should_enable_scheduler_aware_adp_dummy(
             getattr(config, "model_type", None), mapping,

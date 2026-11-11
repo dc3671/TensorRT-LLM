@@ -53,10 +53,12 @@
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -1750,9 +1752,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
 
     nb::class_<kv::DiskCacheTierConfig>(m, "DiskCacheTierConfig")
-        .def(nb::init<size_t, std::string>(), nb::arg("quota"), nb::arg("path"))
+        .def(nb::init<size_t, std::string, bool, int64_t, int64_t, uint32_t, bool, std::string, std::vector<double>>(),
+            nb::arg("quota"), nb::arg("path"), nb::arg("remote") = false, nb::arg("remote_wait_timeout_ms") = 0,
+            nb::arg("remote_transfer_timeout_ms") = 0, nb::arg("remote_expected_lenders") = 0,
+            nb::arg("remote_fabric") = false, nb::arg("remote_ucx_devices") = std::string{},
+            nb::arg("remote_pool_ratio") = std::vector<double>{})
         .def_rw("quota", &kv::DiskCacheTierConfig::quota)
         .def_rw("path", &kv::DiskCacheTierConfig::path)
+        .def_rw("remote", &kv::DiskCacheTierConfig::remote)
+        .def_rw("remote_wait_timeout_ms", &kv::DiskCacheTierConfig::remoteWaitTimeoutMs)
+        .def_rw("remote_transfer_timeout_ms", &kv::DiskCacheTierConfig::remoteTransferTimeoutMs)
+        .def_rw("remote_expected_lenders", &kv::DiskCacheTierConfig::remoteExpectedLenders)
+        .def_rw("remote_fabric", &kv::DiskCacheTierConfig::remoteFabric)
+        .def_rw("remote_ucx_devices", &kv::DiskCacheTierConfig::remoteUcxDevices)
+        .def_rw("remote_pool_ratio", &kv::DiskCacheTierConfig::remotePoolRatio)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
@@ -2727,6 +2740,34 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return std::move(utilization.raw());
         },
         nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "level_pool_groups",
+        [](kv::KvCacheManager& manager, int cacheLevel)
+        {
+            // Per pool group of one cache level: slot count, bytes per slot, and the layer groups it holds.
+            auto const& storage = manager.storage();
+            kv::CacheLevel const level{cacheLevel};
+            if (cacheLevel < 0 || level >= storage.numCacheLevels())
+            {
+                throw std::invalid_argument("cache_level " + std::to_string(cacheLevel) + " is out of range");
+            }
+            std::vector<std::tuple<int64_t, size_t, std::vector<int>>> groups(
+                static_cast<size_t>(storage.numPoolGroups(level).value()));
+            for (kv::PoolGroupIndex pg{0}; pg < storage.numPoolGroups(level); ++pg)
+            {
+                auto const& sizes = storage.slotSize(level, pg);
+                auto& group = groups[static_cast<size_t>(pg.value())];
+                std::get<0>(group) = static_cast<int64_t>(storage.numSlots(pg, level));
+                std::get<1>(group) = std::accumulate(sizes.begin(), sizes.end(), size_t{0});
+            }
+            for (kv::LifeCycleId lc{0}; lc < storage.numLifeCycles(); ++lc)
+            {
+                std::get<2>(groups[static_cast<size_t>(storage.getPoolGroupIndex(level, lc).value())])
+                    .push_back(lc.value());
+            }
+            return groups;
+        },
+        nb::arg("manager"), nb::arg("cache_level"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "grains_for_slots",
         [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity,

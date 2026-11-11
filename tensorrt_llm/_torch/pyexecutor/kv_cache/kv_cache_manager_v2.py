@@ -60,7 +60,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     copy_batch_block_offsets_to_device,
     gather_base_page_rows,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig, SparseKvCacheOffloadConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig, RemoteCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
@@ -154,6 +154,8 @@ from .sparse_offload_memory import (
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+
+    from .remote_lender import RemoteLender
 
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
@@ -1962,6 +1964,10 @@ class _BasePageTableMaterializer:
 
 class KVCacheManagerV2(BaseResourceManager):
     gen_preemption_headroom: int = 0
+    # Sparse managers attach a metadata batch during initialization.
+    sparse_metadata_batch: Batch | None = None
+    # Host memory this rank lends to remote cache levels (remote_cache_config.lend_size); closed by shutdown().
+    _remote_lender: Optional["RemoteLender"] = None
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -1977,6 +1983,10 @@ class KVCacheManagerV2(BaseResourceManager):
     inforward_snapshot_rows: int = 0
     # Block width of a drafter whose layers share this manager, else 0.
     _shared_draft_block_width: int = 0
+    # Deferred KvCache closes of finished generation-only requests (enable_deferred_close);
+    # __init__ gives each instance its own queue.
+    _defer_close_enabled: bool = False
+    _deferred_closes: "deque[tuple[int, _KVCache]] | tuple[()]" = ()
 
     @property
     def _kv_alloc_extra_tokens(self) -> int:
@@ -2093,9 +2103,12 @@ class KVCacheManagerV2(BaseResourceManager):
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         sparse_kv_offload_config: Optional[SparseKvCacheOffloadConfig] = None,
         shared_draft_block_width: Optional[int] = None,
+        remote_lender: Optional["RemoteLender"] = None,
         gen_preemption_headroom: int = 0,
         **kwargs,
     ) -> None:
+        # A lend started before this manager (remote_lender.start_lend); owned from here, closed by shutdown().
+        self._remote_lender = remote_lender
         self.mapping = mapping
         self.gen_preemption_headroom = gen_preemption_headroom
         self.dtype = dtype
@@ -2682,6 +2695,8 @@ class KVCacheManagerV2(BaseResourceManager):
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
+        # A remote-tier failure on one rank, raised once every rank has agreed on the init status.
+        remote_init_error: Optional[Exception] = None
         # A capacity-only connector registers nothing for migration to
         # invalidate, so it keeps the tier the scheduler spills to. The
         # rejection of non-GPU tiers in `PyExecutor` exempts it to match.
@@ -2725,12 +2740,33 @@ class KVCacheManagerV2(BaseResourceManager):
             # co-located ranks each reserving a device-quota-sized block can
             # OOM the host (observed on GB300 NVL72 with 4 ranks/node and
             # ~170GiB device quota each on a 975GiB node).
-            local_ranks, mem_available, memlock_limit = get_host_memory_limits(mapping)
-            # Every rank on the node also pins its host-backed sparse pools and
-            # its sparse Batch's staging copy.
-            offload_pinned_bytes = self._host_history_budget + self._sparse_batch_staging_bytes
-            mem_available = max(0.0, mem_available - local_ranks * offload_pinned_bytes)
-            memlock_limit = max(0.0, memlock_limit - offload_pinned_bytes)
+            local_ranks = max(1, Distributed.get(mapping).local_world_size)
+
+            remote_config = kv_cache_config.remote_cache_config
+            lend_started = remote_lender is not None
+            if lend_started:
+                # The co-located ranks started their lends as early as this one: measure with them resident.
+                remote_lender.wait_started()
+            try:
+                mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+            except (ValueError, OSError):
+                mem_available = float("inf")
+            if remote_config is not None and remote_config.lend_size and not lend_started:
+                # Every co-located rank lends this much more, faulted in after this sizing.
+                lent = local_ranks * remote_config.lend_size
+                if lent >= mem_available:
+                    remote_init_error = ValueError(
+                        f"remote_cache_config.lend_size x {local_ranks} rank(s) leaves none of the "
+                        f"{mem_available / (1 << 30):.2f}GiB available host memory to the automatic "
+                        "host tier; set kv_cache_config.host_cache_size."
+                    )
+                else:
+                    mem_available -= lent
+            try:
+                _soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+                memlock_limit = _soft if _soft != resource.RLIM_INFINITY else float("inf")
+            except (ValueError, OSError):
+                memlock_limit = float("inf")
             host_quota = _compute_auto_host_tier_quota(
                 quota,
                 local_ranks,
@@ -2792,8 +2828,11 @@ class KVCacheManagerV2(BaseResourceManager):
             logger.info(
                 f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
-        if self._sparse_kv_offload is not None:
-            self._warn_if_lower_tiers_cannot_take_history(cache_tiers)
+        if kv_cache_config.remote_cache_config is not None and remote_init_error is None:
+            try:
+                self._add_remote_level(kv_cache_config.remote_cache_config, cache_tiers)
+            except Exception as error:
+                remote_init_error = error
 
         self.vocab_size = vocab_size
 
@@ -2842,8 +2881,13 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         # Aggregated helix CP ranks need a common verdict even without a host
         # tier: a rank that fails to allocate would otherwise leave its peers
-        # waiting in the first collective.
-        sync_init_status = has_host_cache_tier or (self._has_cp_helix and not is_disagg)
+        # waiting in the first collective. So do ranks with a remote tier,
+        # whose lend and claims can fail on one rank.
+        sync_init_status = (
+            has_host_cache_tier
+            or kv_cache_config.remote_cache_config is not None
+            or (self._has_cp_helix and not is_disagg)
+        )
         if not sync_init_status:
             candidate = self._allocate_cache_pools(
                 config,
@@ -2852,24 +2896,28 @@ class KVCacheManagerV2(BaseResourceManager):
                 max_gpu_total_bytes=kv_cache_config.max_gpu_total_bytes,
             )
         else:
-            init_error: Optional[Exception] = None
+            init_error: Optional[Exception] = remote_init_error
             local_init_status = _KVCacheManagerInitStatus.OK
-            try:
-                candidate = self._allocate_cache_pools(
-                    config,
-                    event_manager=event_sink,
-                    cold_page_codec=create_cold_page_codec(config),
-                    max_gpu_total_bytes=kv_cache_config.max_gpu_total_bytes,
-                )
-            except Exception as error:
-                init_error = error.with_traceback(None)
+            if init_error is not None:
                 local_init_status = _KVCacheManagerInitStatus.ABORT
+            else:
+                try:
+                    candidate = self._allocate_cache_pools(
+                        config,
+                        event_manager=event_sink,
+                        cold_page_codec=create_cold_page_codec(config),
+                        max_gpu_total_bytes=kv_cache_config.max_gpu_total_bytes,
+                    )
+                except Exception as error:
+                    init_error = error.with_traceback(None)
+                    local_init_status = _KVCacheManagerInitStatus.ABORT
 
             init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
 
             if init_status == _KVCacheManagerInitStatus.ABORT:
                 if candidate is not None:
                     candidate.shutdown()
+                self._close_remote_lender()
                 if init_error is not None:
                     raise init_error
                 raise RuntimeError("KV cache manager initialization failed on another rank")
@@ -3026,6 +3074,10 @@ class KVCacheManagerV2(BaseResourceManager):
             index_mapper_capacity, max_beam_width, self.max_copy_beam_width
         )
         self._early_freed_index_requests: set[int] = set()
+        # Finished generation-only requests whose KvCache.close() (a host-side
+        # page release) waits for flush_deferred_closes, oldest first.
+        self._defer_close_enabled = False
+        self._deferred_closes: deque[tuple[int, _KVCache]] = deque()
         # Requests whose pages a connector is still reading from, so the
         # release half of `preempt_request` has to wait.
         self._pending_preemption: Dict[int, LlmRequest] = {}
@@ -8212,6 +8264,93 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             self.index_mapper.remove_sequence(request_id)
 
+    def _add_remote_level(self, remote_config: RemoteCacheConfig, cache_tiers: list) -> None:
+        """Start this rank's lend, unless it was started before, and append the remote cache level to
+        `cache_tiers`.
+
+        Both happen once per rank, in the target manager; a draft manager only counts the
+        lend in its automatic host tier."""
+        if self.is_draft:
+            return
+        from .remote_lender import check_remote_capacity, resolve_ucx_devices, start_lend
+
+        remote_dir = os.path.expandvars(os.path.expanduser(remote_config.directory))
+        os.makedirs(remote_dir, exist_ok=True)
+        ucx_devices = resolve_ucx_devices(remote_config.ucx_devices)
+        if remote_config.lend_size and self._remote_lender is None:
+            # This rank's memory joins the pool before its own cache exists: clients wait for lenders.
+            self._remote_lender = start_lend(remote_config, torch.cuda.current_device())
+        if remote_config.cache_size:
+            if remote_config.expected_num_lenders is not None:
+                check_remote_capacity(
+                    remote_dir,
+                    remote_config.expected_num_lenders,
+                    remote_config.expected_claim_size,
+                    timeout_s=remote_config.lender_wait_timeout_s,
+                    log=logger.info,
+                )
+            # The remote level takes the disk level's place below the host tier.
+            cache_tiers.append(
+                DiskCacheTierConfig(
+                    quota=remote_config.cache_size,
+                    path=remote_dir,
+                    remote=True,
+                    remote_wait_timeout_ms=int(remote_config.lender_wait_timeout_s * 1000),
+                    remote_transfer_timeout_ms=int(remote_config.transfer_timeout_s * 1000),
+                    remote_expected_lenders=remote_config.expected_num_lenders or 0,
+                    remote_fabric=remote_config.transport == "fabric",
+                    remote_ucx_devices=ucx_devices or "",
+                    remote_pool_ratio=list(remote_config.pool_ratio or []),
+                )
+            )
+            logger.info(
+                f"KV cache manager v2 remote cache quota set to "
+                f"{remote_config.cache_size / (1 << 30):.2f}GiB via {remote_dir} ({remote_config.transport})"
+            )
+
+    def _close_remote_lender(self) -> None:
+        """Withdraw this rank's lend: clients still holding its chunks fail their next transfer."""
+        if self._remote_lender is not None:
+            self._remote_lender.close()
+            self._remote_lender = None
+
+    def enable_deferred_close(self, enabled: bool) -> None:
+        """Turn the deferred close of finished generation-only requests on or off
+        (the overlap executor's switch). Turning it off runs any closes still pending."""
+        if not enabled:
+            self.flush_deferred_closes()
+        self._defer_close_enabled = bool(enabled) and not self.is_draft
+
+    def _defer_remove_kv_cache(self, request_id: int) -> bool:
+        """`_remove_kv_cache` except for the close, which `flush_deferred_closes` runs later.
+
+        The index slot is released now (detached first, so the close never writes a reused row);
+        the pages are not. Returns False when there is nothing to defer."""
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is None:
+            return False
+        if request_id not in self._early_freed_index_requests:
+            self.release_index_slot(request_id)
+        self.kv_cache_map.pop(request_id, None)
+        kv_cache.discard_pending_stats()
+        self._deferred_closes.append((request_id, kv_cache))
+        return True
+
+    def flush_deferred_closes(self) -> None:
+        """Close the KvCaches `_defer_remove_kv_cache` left open, oldest first.
+
+        A close that raises leaves the later ones queued; its own request is forgotten all the same.
+        """
+        while self._deferred_closes:
+            request_id, kv_cache = self._deferred_closes.popleft()
+            try:
+                if self._sharing is not None:
+                    self._sharing._on_free(request_id, kv_cache)
+                kv_cache.close()
+            finally:
+                self.impl.clear_stats_excluded(request_id)
+                self._early_freed_index_requests.discard(request_id)
+
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
         # its saves drain, and a dead entry here would block every later
@@ -8248,8 +8387,16 @@ class KVCacheManagerV2(BaseResourceManager):
         self._disagg_receive_ready.pop(request.py_request_id, None)
         self._on_allocation_stream.discard(request.py_request_id)
         self._allocation_ready.pop(request.py_request_id, None)
-        if self._host_history_reservations is not None:
-            self._host_history_reservations.release(request.py_request_id)
+        # Dummies reuse request ids, so their closes stay immediate.
+        if (
+            self._defer_close_enabled
+            and request.is_generation_only_request
+            and not pin_on_release
+            and not request.is_dummy
+            and request.py_request_id not in _RESERVED_REQUEST_IDS
+            and self._defer_remove_kv_cache(request.py_request_id)
+        ):
+            return
         self._remove_kv_cache(request.py_request_id)
 
     def _after_shrink(self, request_id: int, kv_cache: _KVCache) -> None:
@@ -8564,8 +8711,8 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
-        # Before the caches close: a lender waiting on a lease has to be told to stop while
-        # the caches it lent against are still alive.
+        # impl.shutdown() raises while any cache is open, deferred ones included.
+        self.enable_deferred_close(False)
         if self._sharing is not None:
             self._sharing._on_shutdown()
         for kv_cache in self.kv_cache_map.values():
@@ -8587,6 +8734,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # After the runtime's shutdown, which raises while any cache is open, in the map or not;
             # a poisoned runtime returns at once, and a close then does nothing.
             self._sharing._on_caches_closed()
+        self._close_remote_lender()
         # Shut the streaming event manager down last so removals emitted during
         # cache / impl teardown (via the radix tree's own event-manager
         # reference) are still flushed before the publisher stops. Do not null
@@ -9480,6 +9628,8 @@ class KVCacheManagerV2(BaseResourceManager):
         *,
         on_cleared: Optional[Callable[[], None]] = None,
     ):
+        # A deferred close commits its pages for reuse, which must not outlive the clear.
+        self.flush_deferred_closes()
         try:
             self.impl.clear_reusable_blocks()
             if on_cleared is not None:

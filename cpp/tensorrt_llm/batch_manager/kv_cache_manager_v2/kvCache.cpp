@@ -2363,6 +2363,36 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                 existingPage = nullptr;
             }
             bool isLocked = std::holds_alternative<SharedPageLock>(bp);
+            if (existingPage != nullptr && existingPage->cacheLevel != kHotLevel
+                && mManager->storage().hasRemoteLevel())
+            {
+                // The tree's copy is cold and ours, with the same tokens, is on the GPU: ours supersedes it. Moving the
+                // copy back would read it and take a GPU slot whose eviction can reach the remote level, synchronous
+                // transfers either way. A request still holding the cold copy keeps it until it lets go.
+                if (auto* lock = std::get_if<SharedPageLock>(&bp))
+                {
+                    auto up = dynamicPointerCast<UncommittedPage>(lock->page());
+                    if (up && up->cacheLevel == kHotLevel)
+                    {
+                        CacheLevel const coldLevel = existingPage->cacheLevel;
+                        auto* superseded = newBlock->unlinkPage(lc, existingPage);
+                        existingPage = nullptr;
+                        if (superseded != nullptr && superseded->scheduledForEviction())
+                        {
+                            // May drop the eviction list's last reference and destroy the page.
+                            superseded->manager->excludeFromEviction(*superseded);
+                        }
+                        bp = std::monostate{};
+                        auto committed = up->convertToCommitted(newBlock, finishEvent(), numTokens);
+                        if (newBlock->eventSink)
+                        {
+                            newBlock->eventSink->addCacheLevelUpdated(newBlock->key, coldLevel, kHotLevel, lc);
+                        }
+                        bp = BlockPage{committed->lock(*this, kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc)};
+                        continue;
+                    }
+                }
+            }
             if (existingPage == nullptr)
             {
                 // Existing page gone — put our uncommitted page into the tree block.

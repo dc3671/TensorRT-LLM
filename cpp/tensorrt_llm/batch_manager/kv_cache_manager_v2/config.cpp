@@ -103,6 +103,19 @@ void DiskCacheTierConfig::validate() const
     {
         throw std::invalid_argument("DiskCacheTierConfig: path '" + path + "' is not a directory");
     }
+    if (remote && (remoteWaitTimeoutMs <= 0 || remoteTransferTimeoutMs <= 0))
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: remote timeouts must be positive");
+    }
+    if (!remote && (remoteFabric || !remoteUcxDevices.empty() || !remotePoolRatio.empty()))
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: remote options are set on a file-backed level");
+    }
+    if (std::any_of(remotePoolRatio.begin(), remotePoolRatio.end(),
+            [](double weight) { return !std::isfinite(weight) || weight <= 0.0; }))
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: remote pool ratio entries must be positive and finite");
+    }
 }
 
 namespace

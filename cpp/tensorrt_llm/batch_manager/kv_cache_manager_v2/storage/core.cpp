@@ -456,6 +456,13 @@ DiskSlotPool::DiskSlotPool(std::string const& directory, size_t slotSize, SlotCo
     resize(numSlots);
 }
 
+DiskSlotPool::DiskSlotPool(std::shared_ptr<RemoteMemClient> remote, size_t slotSize, SlotCount numSlots)
+    : SlotPoolBase(slotSize)
+    , mRemote(std::make_unique<RemoteRange>(std::move(remote), slotSize))
+{
+    resize(numSlots);
+}
+
 DiskSlotPool::~DiskSlotPool()
 {
     destroy();
@@ -473,11 +480,21 @@ void DiskSlotPool::destroy()
         ::close(mFd);
         mFd = kBadFileDescriptor;
     }
+    // Returns the chunks to the process's client; the claims stay with it.
+    mRemote.reset();
     mNumSlots = SlotCount{0};
 }
 
 void DiskSlotPool::resize(SlotCount newNumSlots)
 {
+    if (mRemote)
+    {
+        // Growing claims more chunks and throws without resizing if none can be had; shrinking keeps them.
+        mRemote->reserve(newNumSlots);
+        mNumSlots = newNumSlots;
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(mFd != kBadFileDescriptor, "DiskSlotPool::resize after destroy");
     // Recorded only once the file really changed size: resizeFile throws without resizing.
     resizeFile(mFd, slotCountToSizeT(newNumSlots) * mSlotSize);
     mNumSlots = newNumSlots;
@@ -489,7 +506,7 @@ Address DiskSlotPool::slotAddress(SlotId slot) const
     size_t const byteOffset = toSizeT(slot) * mSlotSize;
     TLLM_CHECK_DEBUG_WITH_INFO(byteOffset <= static_cast<size_t>(std::numeric_limits<ssize_t>::max()),
         "DiskSlotPool::slotAddress: byte offset out of range");
-    return DiskAddress{mFd, static_cast<ssize_t>(byteOffset)};
+    return DiskAddress{mRemote ? kRemoteFileDescriptor : mFd, static_cast<ssize_t>(byteOffset)};
 }
 
 // ---------------------------------------------------------------------------
@@ -710,14 +727,26 @@ HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> con
 // DiskPoolGroup
 // ---------------------------------------------------------------------------
 
-DiskPoolGroup::DiskPoolGroup(
-    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, std::string const& directory)
+DiskPoolGroup::DiskPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+    std::string const& directory, std::shared_ptr<RemoteMemClient> remote)
     : PoolGroupBase(numSlots)
 {
     for (size_t sz : slotSizeList)
     {
-        mPools.push_back(std::make_unique<DiskSlotPool>(directory, sz, numSlots));
+        if (remote)
+        {
+            mPools.push_back(std::make_unique<DiskSlotPool>(remote, sz, numSlots));
+        }
+        else
+        {
+            mPools.push_back(std::make_unique<DiskSlotPool>(directory, sz, numSlots));
+        }
     }
+}
+
+RemoteRange* DiskPoolGroup::remoteRange(PoolIndex poolIdx) const
+{
+    return static_cast<DiskSlotPool const&>(*mPools.at(poolIdx)).remoteRange();
 }
 
 // ---------------------------------------------------------------------------
@@ -799,16 +828,25 @@ HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
 // ---------------------------------------------------------------------------
 
 DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
-    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory)
+    TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory,
+    std::shared_ptr<RemoteMemClient> remote)
     : mDirectory(std::move(directory))
+    , mRemote(std::move(remote))
 {
     TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "DiskCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
-        mPoolGroups.push_back(
-            std::make_unique<DiskPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mDirectory));
+        mPoolGroups.push_back(std::make_unique<DiskPoolGroup>(
+            slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mDirectory, mRemote));
     }
+}
+
+RemoteRange& DiskCacheLevelStorage::remoteRange(PoolGroupIndex pgIdx, PoolIndex poolIdx) const
+{
+    RemoteRange* const range = static_cast<DiskPoolGroup const&>(*mPoolGroups.at(pgIdx)).remoteRange(poolIdx);
+    TLLM_CHECK_WITH_INFO(range != nullptr, "DiskCacheLevelStorage::remoteRange on a file-backed level");
+    return *range;
 }
 
 // ---------------------------------------------------------------------------
@@ -818,7 +856,7 @@ DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
     PooledPhysMemAllocator* gpuPhysMemAllocator, HostMemBackingOptions const& options,
-    std::optional<size_t> sparseReservation)
+    std::optional<size_t> sparseReservation, std::shared_ptr<RemoteMemClient> remoteClient)
 {
     TLLM_CHECK((cacheTierOf(tierCfg) == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
     return std::visit(
@@ -836,6 +874,13 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
             }
             else
             {
+                if (cfg.remote)
+                {
+                    TLLM_CHECK_WITH_INFO(remoteClient != nullptr && remoteClient->directory() == cfg.path,
+                        "A remote-backed cache level needs the client of its rendezvous directory");
+                    return std::make_unique<DiskCacheLevelStorage>(
+                        slotDescList, slotCountList, cfg.path, std::move(remoteClient));
+                }
                 return std::make_unique<DiskCacheLevelStorage>(slotDescList, slotCountList, cfg.path);
             }
         },

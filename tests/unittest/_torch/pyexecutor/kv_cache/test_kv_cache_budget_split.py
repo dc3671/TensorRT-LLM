@@ -20,6 +20,7 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor._util import (
     _STANDALONE_DRAFT_TOKENS_PER_BLOCK,
@@ -35,6 +36,7 @@ from tensorrt_llm.llmapi.llm_args import (
     Eagle3DecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
+    RemoteCacheConfig,
 )
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -1106,6 +1108,148 @@ class TestBuildManagersBudgetGates:
         assert getattr(target_config, budget_attr) is None
         assert getattr(draft_config, budget_attr) is None
 
+    @pytest.mark.parametrize("estimating_kv_cache", [False, True])
+    def test_only_final_managers_get_the_remote_config(
+        self, estimating_kv_cache, tmp_path, monkeypatch
+    ):
+        """A probe neither claims remote memory nor lends. The final draft manager gets the config for its host
+        tier sizing only (TestRemoteLevelOwnership)."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_lender
+
+        monkeypatch.setattr(remote_lender, "start_lend", Mock())
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._kv_cache_config = KvCacheConfig(
+            max_gpu_total_bytes=10 * GB,
+            host_cache_size=20 * GB,
+            remote_cache_config={
+                "directory": str(tmp_path),
+                "cache_size": 4 * GB,
+                "lend_size": 4 * GB,
+            },
+        )
+
+        c.build_managers({}, estimating_kv_cache=estimating_kv_cache)
+
+        for config in self._configs_passed_to_managers(c):
+            assert (config.remote_cache_config is None) == estimating_kv_cache
+
+    def _gen_style_lend(self, tmp_path, monkeypatch):
+        """A lend-only (GEN-style) creator whose lend start and manager constructions are recorded in order."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_lender
+
+        events = []
+        lender = Mock()
+        monkeypatch.setattr(
+            remote_lender, "start_lend", lambda config, device: events.append("lend") or lender
+        )
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._kv_cache_config = KvCacheConfig(
+            max_gpu_total_bytes=10 * GB,
+            host_cache_size=0,
+            remote_cache_config={"directory": str(tmp_path), "lend_size": 4 * GB},
+        )
+        c._create_kv_cache_manager.side_effect = lambda *args, **kwargs: (
+            events.append(("target", kwargs["remote_lender"])) or Mock()
+        )
+        return c, lender, events
+
+    def test_lend_starts_before_the_estimation_and_moves_to_the_final_manager(
+        self, tmp_path, monkeypatch
+    ):
+        """Clients wait for lenders, so the lend must not wait for the estimation's warmup.
+
+        It starts before the estimation probe exists, survives the probe's teardown and goes to the final target
+        manager, which owns it from then on: one lend per rank, never closed in between."""
+        c, lender, events = self._gen_style_lend(tmp_path, monkeypatch)
+        resources = {}
+
+        c.build_managers(resources, estimating_kv_cache=True)
+        assert events == ["lend", ("target", None)]
+        c.teardown_managers(resources)
+        c.build_managers(resources, estimating_kv_cache=False)
+
+        assert events == ["lend", ("target", None), ("target", lender)]
+        assert "remote_lender" not in c._create_one_model_draft_kv_cache_manager.call_args.kwargs
+        assert c._remote_lender is None
+        c.close_remote_lender()
+        lender.close.assert_not_called()
+
+    def test_lend_is_placed_before_the_estimation_takes_host_memory(self, tmp_path, monkeypatch):
+        """A GEN node of two 176 GiB fabric lends (xb2): the second one fits at the default 24 GiB reserve only
+        before the estimation takes 44 GiB of the node's host memory; started after it, it is 44 GiB short."""
+        import contextlib
+
+        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_lender
+
+        node_gib = 176.0 + 176.0 + 24.0
+        room = {0: node_gib - 176.0}  # the co-located rank's lend is placed already
+
+        def place(n_chunks):
+            def create(node):
+                room[node] -= 1.0
+                return object()
+
+            handles, _ = remote_lender._place_chunks(
+                n_chunks,
+                [0],
+                create,
+                chunk_gib=1.0,
+                reserve_gib=24.0,
+                node_lock=lambda node: contextlib.nullcontext(True),
+                meminfo=lambda node: {"MemFree": room[node]},
+                compact=Mock(),
+                contiguous=lambda node: 0.0,
+                sleep=lambda seconds: None,
+                clock=lambda: 0.0,
+            )
+            return len(handles)
+
+        placed = []
+        monkeypatch.setattr(
+            remote_lender, "start_lend", lambda config, device: placed.append(place(176)) or Mock()
+        )
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._kv_cache_config = KvCacheConfig(
+            max_gpu_total_bytes=10 * GB,
+            host_cache_size=0,
+            remote_cache_config={"directory": str(tmp_path), "lend_size": 176 * GB},
+        )
+
+        def manager(*args, **kwargs):
+            if args[0]:  # the estimation probe and its warmup
+                room[0] -= 44.0
+            return Mock()
+
+        c._create_kv_cache_manager.side_effect = manager
+        resources = {}
+        c.build_managers(resources, estimating_kv_cache=True)
+        c.teardown_managers(resources)
+        c.build_managers(resources, estimating_kv_cache=False)
+
+        assert placed == [176]
+        # The same lend placed after the estimation comes up 44 GiB short.
+        room[0] = node_gib - 176.0 - 44.0
+        assert place(176) == 132
+
+    def test_lend_no_manager_took_over_is_closed(self, tmp_path, monkeypatch):
+        c, lender, _ = self._gen_style_lend(tmp_path, monkeypatch)
+        c.build_managers({}, estimating_kv_cache=True)
+
+        c.close_remote_lender()
+
+        lender.close.assert_called_once_with()
+        assert c._remote_lender is None
+
+    def test_without_estimation_the_manager_starts_the_lend(self, tmp_path, monkeypatch):
+        c, _, events = self._gen_style_lend(tmp_path, monkeypatch)
+
+        c.build_managers({}, estimating_kv_cache=False)
+
+        assert events == [("target", None)]
+
     def test_gpu_budget_split_stays_skipped_during_estimation(self, tmp_path):
         """Estimation sizes GPU pools from max_tokens, so it keeps the budget whole."""
         c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
@@ -1115,6 +1259,55 @@ class TestBuildManagersBudgetGates:
         target_config, _ = self._configs_passed_to_managers(c)
         assert target_config.max_gpu_total_bytes == 10 * GB
         c._needs_gpu_kv_cache_budget_split.assert_not_called()
+
+
+class TestRemoteLevelOwnership:
+    """One claim and one lend per rank: the target manager makes both, a separate draft manager neither.
+
+    A draft that claimed too would take a second ``cache_size`` from lenders sized for one per rank.
+    """
+
+    @staticmethod
+    def _add_remote_level(is_draft, tmp_path, monkeypatch):
+        from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, remote_lender
+
+        lender_cls = Mock()
+        monkeypatch.setattr(remote_lender, "RemoteLender", lender_cls)
+        monkeypatch.setattr(kv_cache_manager_v2, "DiskCacheTierConfig", Mock())
+        monkeypatch.setattr(kv_cache_manager_v2.torch.cuda, "current_device", lambda: 0)
+        manager = SimpleNamespace(is_draft=is_draft, _remote_lender=None)
+        config = RemoteCacheConfig(directory=str(tmp_path), cache_size=4 * GB, lend_size=4 * GB)
+        tiers = []
+        KVCacheManagerV2._add_remote_level(manager, config, tiers)
+        return manager, tiers, lender_cls
+
+    def test_target_claims_and_lends(self, tmp_path, monkeypatch):
+        manager, tiers, lender_cls = self._add_remote_level(False, tmp_path, monkeypatch)
+        assert len(tiers) == 1
+        lender_cls.assert_called_once()
+        assert lender_cls.call_args.kwargs["reserve_bytes"] == 24 * GB  # lend_reserve_size default
+        manager._remote_lender.start_in_background.assert_called_once_with()
+
+    def test_target_takes_over_a_lend_started_before_it(self, tmp_path, monkeypatch):
+        from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2, remote_lender
+
+        start_lend = Mock()
+        monkeypatch.setattr(remote_lender, "start_lend", start_lend)
+        monkeypatch.setattr(kv_cache_manager_v2, "DiskCacheTierConfig", Mock())
+        early = Mock()
+        manager = SimpleNamespace(is_draft=False, _remote_lender=early)
+        config = RemoteCacheConfig(directory=str(tmp_path), cache_size=4 * GB, lend_size=4 * GB)
+        tiers = []
+        KVCacheManagerV2._add_remote_level(manager, config, tiers)
+        start_lend.assert_not_called()
+        assert manager._remote_lender is early
+        assert len(tiers) == 1
+
+    def test_draft_neither_claims_nor_lends(self, tmp_path, monkeypatch):
+        manager, tiers, lender_cls = self._add_remote_level(True, tmp_path, monkeypatch)
+        assert tiers == []
+        lender_cls.assert_not_called()
+        assert manager._remote_lender is None
 
 
 class TestExternalDrafterKvDtype:

@@ -23,6 +23,8 @@
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
+#include "kv_cache_manager_v2/storage/remoteMem.h"
+#include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -34,10 +36,12 @@
 #include <cstddef>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <string>
 #include <tuple>
 #include <utility>
+#include <variant>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -105,14 +109,15 @@ PoolGroupIndex LifeCyclePoolGroupMapping::numPoolGroups() const noexcept
 CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cl,
     CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
     TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator,
-    HostMemBackingOptions const& options, std::optional<size_t> sparseReservation)
+    HostMemBackingOptions const& options, std::optional<size_t> sparseReservation,
+    std::shared_ptr<RemoteMemClient> remoteClient)
     : cacheLevel(cl)
     , cacheTier(CacheTier(tierConfig.index()))
     , controller(lifeCycleGrouping, cl)
 {
     TLLM_CHECK((cacheTier == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
-    storage = createCacheLevelStorage(
-        tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator, options, sparseReservation);
+    storage = createCacheLevelStorage(tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator, options,
+        sparseReservation, std::move(remoteClient));
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +130,36 @@ namespace
 bool isGpuAccessibleMemory(CacheTier tier) noexcept
 {
     return tier == CacheTier::GPU_MEM || tier == CacheTier::HOST_MEM;
+}
+
+bool isRemoteTier(CacheTierConfig const& tier) noexcept
+{
+    auto const* disk = std::get_if<DiskCacheTierConfig>(&tier);
+    return disk != nullptr && disk->remote;
+}
+
+//! A remote level's own split of its quota across layer groups (DiskCacheTierConfig::remotePoolRatio), normalized;
+//! nullopt where the level follows the hot level's ratio. Throws when the entry count is not one per layer group.
+std::optional<TypedVec<LifeCycleId, float>> remotePoolRatioOf(CacheTierConfig const& tier, LifeCycleId numLifeCycles)
+{
+    auto const* disk = std::get_if<DiskCacheTierConfig>(&tier);
+    if (disk == nullptr || !disk->remote || disk->remotePoolRatio.empty())
+    {
+        return std::nullopt;
+    }
+    auto const& weights = disk->remotePoolRatio;
+    if (weights.size() != toSizeT(numLifeCycles))
+    {
+        throw std::invalid_argument("remote pool ratio: " + std::to_string(weights.size()) + " entries for "
+            + std::to_string(toSizeT(numLifeCycles)) + " layer groups");
+    }
+    double const sum = std::accumulate(weights.begin(), weights.end(), 0.0);
+    TypedVec<LifeCycleId, float> ratio(numLifeCycles, 0.F);
+    for (LifeCycleId lc{0}; lc < numLifeCycles; ++lc)
+    {
+        ratio[lc] = static_cast<float>(weights[toSizeT(lc)] / sum);
+    }
+    return ratio;
 }
 
 // The host sparse pool quota an unset configuration gets: 80% of the host memory the host
@@ -375,6 +410,14 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
 
     auto const hotRatio = toPoolGroupRatio(kHotLevel, lifeCycleRatio);
 
+    // Checked before any level exists, so a malformed ratio fails construction before remote memory is claimed.
+    mHasRemoteLevel = std::any_of(config.cacheTiers.begin(), config.cacheTiers.end(), isRemoteTier);
+    TypedVec<CacheLevel, std::optional<TypedVec<LifeCycleId, float>>> remotePoolRatios;
+    for (auto const& tier : config.cacheTiers)
+    {
+        remotePoolRatios.push_back(remotePoolRatioOf(tier, numLifeCycles()));
+    }
+
     mLevels.reserve(config.cacheTiers.size());
 
     // A sparse pool's hot pages are host memory. Its bytes are excluded from the GPU quota
@@ -503,10 +546,24 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         }
     }
 
+    // A remote level with its own pool ratio takes that share of its own bytes per layer group (layer groups that
+    // share a cold pool group add up); it is a ratio of this level's bytes, so it is not projected from the hot level.
+    auto const levelShareRatio = [this](CacheLevel level, TypedVec<LifeCycleId, float> const& shares)
+    {
+        TypedVec<PoolGroupIndex, double> weights(numPoolGroups(level), 0.0);
+        for (LifeCycleId lc{0}; lc < numLifeCycles(); ++lc)
+        {
+            weights[getPoolGroupIndex(level, lc)] += static_cast<double>(shares[lc]);
+        }
+        return normalizeToRatio(weights);
+    };
+
     for (CacheLevel level{1}; level < config.cacheTiers.size(); ++level)
     {
         TLLM_CHECK(appendLevelSlotDescList(coldSlotDescList) == level);
-        auto const coldRatio = projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio);
+        auto const& remotePoolRatio = remotePoolRatios[level];
+        auto const coldRatio = remotePoolRatio.has_value() ? levelShareRatio(level, *remotePoolRatio)
+                                                           : projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio);
         // No second budget: a cold group is a single pool holding whatever the codec packs
         // into it, dense and sparse buffers alike, so its quota pays for all of it.
         auto slotCounts = computeSlotCountForLevel(
@@ -514,7 +571,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         auto* gpuPhysMemAllocator
             = cacheTierOf(config.cacheTiers[level]) == CacheTier::GPU_MEM ? mGpuPhysMemAllocator.get() : nullptr;
         mLevels.emplace_back(lifeCycleGrouping(level), level, config.cacheTiers[level], slotDescList(level), slotCounts,
-            gpuPhysMemAllocator, tierBackingOptions(config.cacheTiers[level], gpuGranularity));
+            gpuPhysMemAllocator, tierBackingOptions(config.cacheTiers[level], gpuGranularity), std::nullopt,
+            remoteClientFor(config.cacheTiers[level]));
     }
 
     for (CacheLevel level{0}; level < mLevels.size(); ++level)
@@ -530,6 +588,93 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     }
 
     mCopyEngine = std::make_unique<CopyEngine>(mPageStagingManager.get());
+
+    // A remote-backed level moves its pages between the page staging buffer and remote memory, so the staging buffer
+    // is registered with each client once, for the life of this manager.
+    for (auto const& client : mRemoteClients)
+    {
+        TLLM_CHECK_WITH_INFO(mPageStagingManager != nullptr, "A remote-backed cache level needs page staging");
+        client->registerLocal(mPageStagingManager->baseAddress(), mPageStagingManager->totalSize());
+    }
+}
+
+std::shared_ptr<RemoteMemClient> StorageManager::remoteClientFor(CacheTierConfig const& tier)
+{
+    auto const* disk = std::get_if<DiskCacheTierConfig>(&tier);
+    if (disk == nullptr || !disk->remote)
+    {
+        return nullptr;
+    }
+    RemoteMemOptions options{disk->path, disk->remoteWaitTimeoutMs, disk->remoteTransferTimeoutMs, disk->remoteFabric,
+        disk->remoteUcxDevices, disk->remoteExpectedLenders};
+    for (auto const& client : mRemoteClients)
+    {
+        if (client->directory() != disk->path)
+        {
+            continue;
+        }
+        auto const& held = client->options();
+        if (held.waitTimeoutMs != options.waitTimeoutMs || held.transferTimeoutMs != options.transferTimeoutMs
+            || held.fabric != options.fabric || held.ucxDevices != options.ucxDevices
+            || held.expectedLenders != options.expectedLenders)
+        {
+            throw std::invalid_argument("remote cache levels sharing rendezvous directory '" + disk->path
+                + "' must use the same timeouts, transport, devices and expected lenders");
+        }
+        return client;
+    }
+    return mRemoteClients.emplace_back(std::make_shared<RemoteMemClient>(std::move(options)));
+}
+
+DiskCacheLevelStorage* StorageManager::remoteLevel(CacheLevel level) const
+{
+    auto* const disk = dynamic_cast<DiskCacheLevelStorage*>(mLevels.at(level).storage.get());
+    return disk != nullptr && disk->remoteClient() != nullptr ? disk : nullptr;
+}
+
+bool StorageManager::remoteLevelFailed(CacheLevel level) const
+{
+    // One flag per client while none has failed: this runs whenever a page is scheduled for eviction.
+    if (std::none_of(mRemoteClients.begin(), mRemoteClients.end(), [](auto const& client) { return client->failed(); }))
+    {
+        return false;
+    }
+    auto const* const remote = remoteLevel(level);
+    return remote != nullptr && remote->remoteClient()->failed();
+}
+
+void StorageManager::dropPagesOfFailedRemoteLevels()
+{
+    for (CacheLevel level{1}; level < numCacheLevels(); ++level)
+    {
+        if (!remoteLevelFailed(level))
+        {
+            continue;
+        }
+        auto& controller = mLevels.at(level).controller;
+        std::vector<SharedPtr<Page>> dropped;
+        for (PoolGroupIndex pgIdx{0}; pgIdx < controller.numPoolGroups(); ++pgIdx)
+        {
+            auto next = controller.pageGenerator(pgIdx);
+            while (auto const* page = next())
+            {
+                if ((*page)->status() == PageStatus::DROPPABLE)
+                {
+                    dropped.push_back(*page);
+                }
+            }
+        }
+        for (auto const& page : dropped)
+        {
+            excludeFromEviction(*page);
+        }
+        if (!dropped.empty())
+        {
+            TLLM_LOG_WARNING(
+                "KVCM2 remote level %d failed: dropped its %zu cached page(s)", level.value(), dropped.size());
+        }
+        // `dropped` holds the last references: the pages leave the radix tree and release their slots here.
+    }
 }
 
 StorageManager::~StorageManager()
@@ -539,6 +684,14 @@ StorageManager::~StorageManager()
 
 void StorageManager::destroy()
 {
+    // Before the levels go: the last level holding a client destroys it, and the staging must be deregistered first,
+    // after every stream-ordered transfer that uses it has finished.
+    for (auto const& client : mRemoteClients)
+    {
+        client->drain();
+        client->deregisterLocal(mPageStagingManager->baseAddress(), mPageStagingManager->totalSize());
+    }
+    mRemoteClients.clear();
     for (auto& lvl : mLevels)
     {
         TLLM_CHECK_DEBUG(lvl.storage);
@@ -671,6 +824,11 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
 
     if (srcIsHot == dstIsHot)
     {
+        if (!srcIsHot && (remoteLevel(srcLevel) != nullptr || remoteLevel(dstLevel) != nullptr))
+        {
+            submitRemoteColdMigration(dstLevel, srcLevel, dstPgIdx, srcPgIdx, pageIndices, numPages, stream);
+            return;
+        }
         auto const srcSizes = slotSize(srcLevel, srcPgIdx);
         TLLM_CHECK_DEBUG(srcSizes == slotSize(dstLevel, dstPgIdx));
         for (PoolIndex poolIdx{0}; poolIdx < srcSizes.size(); ++poolIdx)
@@ -737,6 +895,92 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     thread_local std::vector<PageIndexPair> stagingPageIndices;
     size_t remaining = numPages;
     size_t offset = 0;
+
+    if (auto* const remote = remoteLevel(coldLevel))
+    {
+        // Remote-backed level: the codec runs against the page staging buffer, and the bytes move between staging and
+        // the remote slots, on the stream (fabric) or synchronously (NIXL: a failure throws before _batchedMigrate
+        // points any page at its new slot).
+        RemoteRange& range = remote->remoteRange(coldPgIdx, PoolIndex{0});
+        bool const streamOrdered = range.client().fabric();
+        std::vector<RemoteIo> ios;
+        while (remaining > 0)
+        {
+            size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / coldPageBytes
+                ? std::numeric_limits<size_t>::max()
+                : coldPageBytes * remaining;
+            ios.clear();
+            if (srcIsHot)
+            {
+                // Hot -> remote: encode into staging on the stream, then WRITE once the encode is done.
+                StagingBuffer staging
+                    = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16, stream);
+                size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
+                stagingPageIndices.resize(batchSize);
+                for (size_t index = 0; index < batchSize; ++index)
+                {
+                    stagingPageIndices[index]
+                        = PageIndexPair{static_cast<int32_t>(index), pageIndices[offset + index].src};
+                }
+                TLLM_CHECK_WITH_INFO(encodeBatch(reinterpret_cast<void*>(staging.address()), stagingPageIndices.data(),
+                                         batchSize, stream),
+                    "Cold-page codec rejected a migration batch");
+                for (size_t index = 0; index < batchSize; ++index)
+                {
+                    auto const [lender, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].dst));
+                    ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, lender, remoteAddr});
+                }
+                if (streamOrdered)
+                {
+                    // The WRITE starts when the stream has encoded the batch; the lease retires after it.
+                    range.client().transferOnStream(/*write=*/true, ios, coldPageBytes, stream);
+                }
+                else
+                {
+                    cuCheck(cuStreamSynchronize(stream));
+                    range.client().transfer(/*write=*/true, ios, coldPageBytes);
+                }
+                offset += batchSize;
+                remaining -= batchSize;
+            }
+            else
+            {
+                // Remote -> hot: READ into staging, then decode on the stream. Stream-ordered, the lease is the
+                // stream's from the start and the READ begins when the stream reaches it; synchronous, the lease is
+                // host-synchronous and moves to the stream only after the READ has finished.
+                StagingBuffer staging = mPageStagingManager->acquire(coldPageBytes, maxStagingBytes, coldPageBytes, 16,
+                    streamOrdered ? std::optional<CUstream>{stream} : std::nullopt);
+                size_t const batchSize = std::min(remaining, staging.size() / coldPageBytes);
+                for (size_t index = 0; index < batchSize; ++index)
+                {
+                    auto const [lender, remoteAddr] = range.locate(toSlotId(pageIndices[offset + index].src));
+                    ios.push_back(RemoteIo{staging.address() + index * coldPageBytes, lender, remoteAddr});
+                }
+                if (streamOrdered)
+                {
+                    range.client().transferOnStream(/*write=*/false, ios, coldPageBytes, stream);
+                }
+                else
+                {
+                    range.client().transfer(/*write=*/false, ios, coldPageBytes);
+                    staging.setStream(stream);
+                }
+                stagingPageIndices.resize(batchSize);
+                for (size_t index = 0; index < batchSize; ++index)
+                {
+                    stagingPageIndices[index]
+                        = PageIndexPair{pageIndices[offset + index].dst, static_cast<int32_t>(index)};
+                }
+                TLLM_CHECK_WITH_INFO(decodeBatch(reinterpret_cast<void const*>(staging.address()),
+                                         stagingPageIndices.data(), batchSize, stream),
+                    "Cold-page codec rejected a migration batch");
+                offset += batchSize;
+                remaining -= batchSize;
+            }
+        }
+        return;
+    }
+
     while (remaining > 0)
     {
         size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / coldPageBytes
@@ -798,6 +1042,128 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     }
 }
 
+void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel srcLevel, PoolGroupIndex dstPgIdx,
+    PoolGroupIndex srcPgIdx, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+{
+    TLLM_CHECK_WITH_INFO(mPageStagingManager != nullptr, "A remote-backed cache level needs page staging");
+    auto* const srcRemote = remoteLevel(srcLevel);
+    auto* const dstRemote = remoteLevel(dstLevel);
+    auto const sizes = slotSize(srcLevel, srcPgIdx);
+    TLLM_CHECK_DEBUG(sizes == slotSize(dstLevel, dstPgIdx));
+    auto& srcGroup = poolGroup(srcLevel, srcPgIdx);
+    auto& dstGroup = poolGroup(dstLevel, dstPgIdx);
+    auto toSlotId = [](int32_t pageIndex)
+    {
+        TLLM_CHECK_DEBUG(pageIndex >= 0);
+        return SlotId{pageIndex};
+    };
+    // Cold levels hold one pool per group (the codec's single cold page), but nothing here depends on it.
+    for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
+    {
+        size_t const pageBytes = sizes.at(poolIdx);
+        RemoteRange* const srcRange = srcRemote != nullptr ? &srcRemote->remoteRange(srcPgIdx, poolIdx) : nullptr;
+        RemoteRange* const dstRange = dstRemote != nullptr ? &dstRemote->remoteRange(dstPgIdx, poolIdx) : nullptr;
+        // The local side is copied to or from staging by the GPU's batched copy kernel, which needs memory the GPU
+        // can address (the host level's pinned pages are).
+        TLLM_CHECK_WITH_INFO(srcRange != nullptr || isGpuAccessibleMemory(poolMedium(srcLevel, srcPgIdx, poolIdx)),
+            "Remote-backed level: unsupported source medium");
+        TLLM_CHECK_WITH_INFO(dstRange != nullptr || isGpuAccessibleMemory(poolMedium(dstLevel, dstPgIdx, poolIdx)),
+            "Remote-backed level: unsupported destination medium");
+        // Stream-ordered only if every remote side is fabric: the legs (and the local copies) then follow one another
+        // on the stream.
+        bool const streamOrdered = (srcRange == nullptr || srcRange->client().fabric())
+            && (dstRange == nullptr || dstRange->client().fabric());
+        std::vector<RemoteIo> ios;
+        std::vector<Task<MemAddress, MemAddress>> tasks;
+        size_t remaining = numPages;
+        size_t offset = 0;
+        while (remaining > 0)
+        {
+            size_t const maxStagingBytes = remaining > std::numeric_limits<size_t>::max() / pageBytes
+                ? std::numeric_limits<size_t>::max()
+                : pageBytes * remaining;
+            // Stream-ordered: the stream's lease, so every leg below is ordered after the range's previous users.
+            // Synchronous: a host-synchronous lease, nothing else is using this range of staging once acquire returns.
+            StagingBuffer staging = mPageStagingManager->acquire(pageBytes, maxStagingBytes, pageBytes, 16,
+                streamOrdered ? std::optional<CUstream>{stream} : std::nullopt);
+            size_t const batchSize = std::min(remaining, staging.size() / pageBytes);
+            MemAddress const base = staging.address();
+
+            // 1. Source pages into staging.
+            if (srcRange != nullptr)
+            {
+                ios.clear();
+                for (size_t index = 0; index < batchSize; ++index)
+                {
+                    auto const [lender, remoteAddr] = srcRange->locate(toSlotId(pageIndices[offset + index].src));
+                    ios.push_back(RemoteIo{base + index * pageBytes, lender, remoteAddr});
+                }
+                if (streamOrdered)
+                {
+                    srcRange->client().transferOnStream(/*write=*/false, ios, pageBytes, stream);
+                }
+                else
+                {
+                    srcRange->client().transfer(/*write=*/false, ios, pageBytes);
+                }
+            }
+            else
+            {
+                tasks.clear();
+                for (size_t index = 0; index < batchSize; ++index)
+                {
+                    tasks.push_back({base + index * pageBytes,
+                        std::get<MemAddress>(
+                            srcGroup.slotAddress(toSlotId(pageIndices[offset + index].src)).at(poolIdx))});
+                }
+                // The stream already waits for the source pages' writers; the copy kernel reads host memory over C2C.
+                staging.setStream(stream);
+                cuCheck(copyHostToDevice(tasks, static_cast<ssize_t>(pageBytes), stream));
+                if (!streamOrdered)
+                {
+                    cuCheck(cuStreamSynchronize(stream));
+                }
+            }
+
+            // 2. Staging into the destination pages.
+            if (dstRange != nullptr)
+            {
+                ios.clear();
+                for (size_t index = 0; index < batchSize; ++index)
+                {
+                    auto const [lender, remoteAddr] = dstRange->locate(toSlotId(pageIndices[offset + index].dst));
+                    ios.push_back(RemoteIo{base + index * pageBytes, lender, remoteAddr});
+                }
+                if (streamOrdered)
+                {
+                    // Starts when the stream has the source bytes in staging.
+                    dstRange->client().transferOnStream(/*write=*/true, ios, pageBytes, stream);
+                }
+                else
+                {
+                    dstRange->client().transfer(/*write=*/true, ios, pageBytes);
+                }
+            }
+            else
+            {
+                tasks.clear();
+                for (size_t index = 0; index < batchSize; ++index)
+                {
+                    tasks.push_back({std::get<MemAddress>(
+                                         dstGroup.slotAddress(toSlotId(pageIndices[offset + index].dst)).at(poolIdx)),
+                        base + index * pageBytes});
+                }
+                // Synchronous: the READ above has finished, so handing the lease to the stream needs no
+                // synchronization. Stream-ordered: the lease is the stream's already, and the copy waits for the READ.
+                staging.setStream(stream);
+                cuCheck(copyHostToDevice(tasks, static_cast<ssize_t>(pageBytes), stream));
+            }
+            offset += batchSize;
+            remaining -= batchSize;
+        }
+    }
+}
+
 void StorageManager::copySlotData(LifeCycleId lifeCycle, CacheLevel dstLevel, CacheLevel srcLevel, SlotId dstSlotId,
     SlotId srcSlotId, CUstream stream)
 {
@@ -856,7 +1222,8 @@ bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> lev
 
 void StorageManager::scheduleForEviction(Page& page)
 {
-    if (isEvictable(page))
+    // A droppable page on a failed remote level is left unscheduled, so it drops with its last reference.
+    if (isEvictable(page) && !(page.status() == PageStatus::DROPPABLE && remoteLevelFailed(page.cacheLevel)))
     {
         mLevels.at(page.cacheLevel).controller.scheduleForEviction(page);
         scheduleRetentionExpiry(page);
@@ -967,6 +1334,7 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
     MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
     refreshRetention();
+    dropPagesOfFailedRemoteLevels();
     _prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
 }
 
@@ -1105,6 +1473,8 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     auto& storage = *lvl.storage;
     auto& ctrl = lvl.controller;
     bool const isLast = isLastLevel(lvlId);
+    // A failed remote level counts as full with nothing to evict: pages fall past it, or drop after the last level.
+    bool const isFailed = remoteLevelFailed(lvlId);
     auto const& grouping = poolGroupMapping(lvlId);
 
     auto countPages = [&](PoolGroupIndex pgIdx, PagesByLifeCycle const& pagesByLifeCycle)
@@ -1122,8 +1492,8 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     {
         SlotCount const goal = goals.at(lvlId).at(pgIdx);
         SlotCount const fallen = countPages(pgIdx, fallenPages);
-        SlotCount const oldFree = storage.numFreeSlots(pgIdx);
-        SlotCount const evictableCount = ctrl.numEvictablePages(pgIdx);
+        SlotCount const oldFree = isFailed ? 0 : storage.numFreeSlots(pgIdx);
+        SlotCount const evictableCount = isFailed ? 0 : ctrl.numEvictablePages(pgIdx);
         SlotCount const required = goal + fallen;
         SlotCount const shortage = required > oldFree ? required - oldFree : 0;
         numToEvict.at(pgIdx) = std::min(shortage, evictableCount);
@@ -1202,7 +1572,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
     {
         auto& ev = evicted.at(pgIdx);
-        SlotCount const oldFree = storage.numFreeSlots(pgIdx);
+        SlotCount const oldFree = isFailed ? 0 : storage.numFreeSlots(pgIdx);
         SlotCount const numEvicted = slotCountValueFromSize(ev.size());
         SlotCount freeAfterEviction{};
 
@@ -1217,7 +1587,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             }
             ev.clear();
 
-            freeAfterEviction = storage.numFreeSlots(pgIdx);
+            freeAfterEviction = isFailed ? 0 : storage.numFreeSlots(pgIdx);
             TLLM_CHECK_DEBUG(freeAfterEviction >= numEvicted + oldFree);
             TLLM_CHECK_DEBUG_WITH_INFO(
                 countPages(pgIdx, heldPages) <= freeAfterEviction, "held_pages count exceeds new free slot count");

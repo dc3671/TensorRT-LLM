@@ -1,0 +1,785 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""KV cache manager v2 with a remote-backed cold level (``DiskCacheTierConfig(remote=True)``).
+
+The level keeps its slots in host memory that lender processes (``remote_lender.py``) publish in a rendezvous
+directory, and moves pages with NIXL READ / WRITE or over NVLink fabric memory (``storage/remoteMem.h``). Every test
+class runs once per transport; a transport this machine lacks (remote_test_utils) is skipped.
+"""
+
+import gc
+import glob
+import itertools
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from dataclasses import replace
+from typing import cast
+
+import cuda.bindings.driver as drv
+import pytest
+from parameterized import parameterized_class
+
+_TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+_ADDED_TEST_DIR = _TEST_DIR not in sys.path
+if _ADDED_TEST_DIR:
+    sys.path.insert(0, _TEST_DIR)
+try:
+    import test_kv_cache_manager_v2 as base  # the suite's fixtures, helpers and imports
+    from remote_test_utils import available_transports, gpu_count
+finally:
+    if _ADDED_TEST_DIR:
+        sys.path.remove(_TEST_DIR)
+
+AttentionLayerConfig = base.AttentionLayerConfig
+BufferConfig = base.BufferConfig
+CacheLevel = base.CacheLevel
+CudaStream = base.CudaStream
+DataRole = base.DataRole
+DiskCacheTierConfig = base.DiskCacheTierConfig
+FakeEngine = base.FakeEngine
+GpuCacheTierConfig = base.GpuCacheTierConfig
+HostCacheTierConfig = base.HostCacheTierConfig
+KVCacheManager = base.KVCacheManager
+KVCacheManagerConfig = base.KVCacheManagerConfig
+LayerId = base.LayerId
+SsmLayerConfig = base.SsmLayerConfig
+Step = base.Step
+TokenId = base.TokenId
+_introspection = base._introspection
+
+
+def _sync_device() -> None:
+    """Wait for all device work, and with it every fabric copy queued behind it."""
+    (err,) = drv.cuCtxSynchronize()
+    assert err == drv.CUresult.CUDA_SUCCESS, err
+
+
+_TRANSPORTS = available_transports()
+pytestmark = pytest.mark.skipif(
+    not _TRANSPORTS, reason="needs a GPU and the NIXL or fabric transport"
+)
+# One concrete class per transport: <Class>_0_nixl, <Class>_1_fabric.
+_per_transport = parameterized_class(("transport",), [("nixl",), ("fabric",)])
+_LENDER_BYTES = 4 << 30
+_CHUNK_BYTES = 8 << 20
+_counter = itertools.count()
+_NIXL_DEATH_ONLY = (
+    "fabric: a dead lender's effect is the driver's; this test checks NIXL's fail-stop"
+)
+
+
+class _Lender:
+    """A lender in its own process, as on a GEN tray.
+
+    Inside a Slurm step the subprocess joins the step's PMIx job (`import tensorrt_llm` runs MPI_Init), so it is
+    stopped with SIGTERM and exits normally: a SIGKILLed lender makes Slurm abort the whole step. A stopped lender has
+    deregistered its memory and destroyed its NIXL agent, which is what a client sees of a dead one.
+    """
+
+    def __init__(
+        self, directory: str, nbytes: int, transport: str, chunk_bytes: int = _CHUNK_BYTES
+    ):
+        self.directory = directory
+        self.name = f"test-lender-{os.getpid()}-{next(_counter)}"
+        self.log_path = os.path.join(directory, f"lender_{self.name}.log")
+        self._log = open(self.log_path, "w")
+        self.proc = subprocess.Popen(
+            [
+                sys.executable,
+                os.path.join(_TEST_DIR, "remote_lender_cli.py"),
+                "--dir",
+                directory,
+                "--bytes",
+                str(nbytes),
+                "--chunk-mib",
+                str(chunk_bytes / (1 << 20)),
+                "--name",
+                self.name,
+                "--transport",
+                transport,
+                # The last GPU, so that on a multi-GPU node lender and client sit on different devices.
+                "--device",
+                str(gpu_count() - 1),
+            ],
+            stdout=self._log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        ready = os.path.join(directory, f"lender.{self.name}.ready")
+        deadline = time.monotonic() + 300
+        while not os.path.exists(ready):
+            if self.proc.poll() is not None:
+                raise RuntimeError(
+                    f"lender exited early (rc {self.proc.returncode}):\n{self._tail()}"
+                )
+            if time.monotonic() > deadline:
+                self.stop()
+                raise TimeoutError(f"lender did not publish within 300 s:\n{self._tail()}")
+            time.sleep(0.2)
+
+    def _tail(self, n: int = 40) -> str:
+        self._log.flush()
+        with open(self.log_path) as f:
+            return "".join(f.readlines()[-n:])
+
+    def stop(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                # Last resort only: inside a Slurm step this aborts the step.
+                self.proc.kill()
+                self.proc.wait(timeout=60)
+        self._log.close()
+
+
+# Per transport: the rendezvous directory of the module's lender, and the lender.
+_module_dirs: "dict[str, str]" = {}
+_module_lenders: "list[_Lender]" = []
+
+
+def setUpModule() -> None:
+    for transport in _TRANSPORTS:
+        _module_dirs[transport] = tempfile.mkdtemp(prefix=f"kvcm2_remote_{transport}_")
+        _module_lenders.append(_Lender(_module_dirs[transport], _LENDER_BYTES, transport))
+
+
+def tearDownModule() -> None:
+    for lender in _module_lenders:
+        lender.stop()
+        shutil.rmtree(lender.directory, ignore_errors=True)
+
+
+class _Transport:
+    """A test class's transport (set per class by _per_transport), its module directory and its remote tier."""
+
+    transport: str = "nixl"
+
+    def setUp(self) -> None:
+        if self.transport not in _TRANSPORTS:
+            self.skipTest(f"the {self.transport} transport is unavailable here")
+        super().setUp()
+
+    @property
+    def module_dir(self) -> str:
+        return _module_dirs[self.transport]
+
+    def remote_tier(
+        self,
+        quota: int,
+        directory: "str | None" = None,
+        transfer_timeout_ms: int = 30_000,
+        pool_ratio: "list[float] | None" = None,
+        wait_timeout_ms: int = 60_000,
+        expected_lenders: int = 0,
+    ):
+        return DiskCacheTierConfig(
+            quota=quota,
+            path=directory or self.module_dir,
+            remote=True,
+            remote_wait_timeout_ms=wait_timeout_ms,
+            remote_transfer_timeout_ms=transfer_timeout_ms,
+            remote_expected_lenders=expected_lenders,
+            remote_fabric=self.transport == "fabric",
+            remote_pool_ratio=pool_ratio or [],
+        )
+
+
+@_per_transport
+class TestRemoteLender(_Transport, unittest.TestCase):
+    def test_lender_publishes_whole_chunks_and_withdraws_them(self) -> None:
+        directory = tempfile.mkdtemp(prefix="kvcm2_lender_")
+        try:
+            lender = _Lender(
+                directory, (64 << 20) + (3 << 20), self.transport, chunk_bytes=16 << 20
+            )
+            meta = open(os.path.join(directory, f"lender.{lender.name}.meta")).read().split("\n")
+            fields = dict(line.split(" ", 1) for line in meta if line)
+            self.assertEqual(fields["version"], "1")
+            self.assertEqual(fields["name"], lender.name)
+            self.assertEqual(int(fields["chunk_bytes"]), 16 << 20)
+            base_address, nbytes = (int(x) for x in fields["segment"].split())
+            self.assertEqual(nbytes, 64 << 20)  # the partial fifth chunk is not lent
+            if self.transport == "fabric":
+                # Each chunk is its own fabric allocation: one 64-byte handle per chunk, in chunk order.
+                self.assertEqual(fields.get("transport"), "fabric")
+                self.assertEqual(base_address, 0)
+                self.assertEqual(
+                    os.path.getsize(os.path.join(directory, f"lender.{lender.name}.fabric")), 4 * 64
+                )
+            else:
+                self.assertGreater(base_address, 0)
+                self.assertGreater(
+                    os.path.getsize(os.path.join(directory, f"lender.{lender.name}.desc")), 0
+                )
+            lender.stop()
+            self.assertEqual(glob.glob(os.path.join(directory, f"lender.{lender.name}.*")), [])
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+@_per_transport
+class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
+    """Attention pages and recurrent state go to the remote level and come back bit-exact.
+
+    FakeEngine checks every reused page and the SSM slot.
+    """
+
+    tokens_per_block = 32
+    buf_size = 256 << 10  # per block per buffer: a block of 2 attention layers x (K, V) is 1 MiB
+
+    def setUp(self) -> None:
+        super().setUp()
+        base.init_cuda_once()
+        self._token_ids = itertools.count(1_000_000 * (os.getpid() % 1000))
+        gc.collect()
+        gc.disable()
+
+    def tearDown(self) -> None:
+        gc.enable()
+        if hasattr(self, "manager"):
+            try:
+                self.manager.shutdown()
+            finally:
+                del self.manager
+
+    def _config(
+        self,
+        with_host: bool,
+        directory: "str | None" = None,
+        transfer_timeout_ms: int = 30_000,
+        remote_quota: int = 512 << 20,
+        wait_timeout_ms: int = 60_000,
+        expected_lenders: int = 0,
+    ):
+        layers = []
+        for lid in range(2):
+            layers.append(
+                AttentionLayerConfig(
+                    layer_id=LayerId(lid),
+                    buffers=[
+                        BufferConfig(role=DataRole("key"), size=self.buf_size),
+                        BufferConfig(role=DataRole("value"), size=self.buf_size),
+                    ],
+                )
+            )
+        for lid in range(2, 4):
+            layers.append(
+                SsmLayerConfig(
+                    layer_id=LayerId(lid),
+                    buffers=[BufferConfig(role=DataRole("ssm_state"), size=self.buf_size)],
+                )
+            )
+        tiers = [GpuCacheTierConfig(quota=32 << 20)]
+        if with_host:
+            tiers.append(HostCacheTierConfig(quota=16 << 20))
+        tiers.append(
+            self.remote_tier(
+                remote_quota,
+                directory,
+                transfer_timeout_ms,
+                wait_timeout_ms=wait_timeout_ms,
+                expected_lenders=expected_lenders,
+            )
+        )
+        return KVCacheManagerConfig(
+            tokens_per_block=self.tokens_per_block,
+            cache_tiers=tiers,
+            layers=layers,
+            enable_partial_reuse=False,
+            commit_min_snapshot=True,
+        )
+
+    def _prompt(self, length: int):
+        return [TokenId(next(self._token_ids)) for _ in range(length)]
+
+    def _prefill(self, prompt, stream) -> None:
+        kv = self.manager.create_kv_cache()
+        self.assertTrue(kv.resume(stream))
+        kv.capacity = len(prompt)
+        kv.history_length = len(prompt)
+        self.engine.execute([Step(kv, prompt, [])], stream)
+        kv.commit(prompt)
+        kv.stop_committing()
+        kv.close()
+
+    def _residency(self, prompt) -> list:
+        kv = self.manager.create_kv_cache(input_tokens=prompt)
+        try:
+            return list(kv.cached_tokens_by_level)
+        finally:
+            kv.close()
+
+    def _push_to_last_level(self, prompt, stream) -> list:
+        """Prefill unrelated prompts until every cached token of `prompt` sits on the last level."""
+        last = len(self.cfg.cache_tiers) - 1
+        for _ in range(64):
+            levels = self._residency(prompt)
+            if sum(levels) > 0 and levels[last] == sum(levels):
+                return levels
+            self._prefill(self._prompt(256), stream)
+        self.fail(f"pages never reached level {last}: {self._residency(prompt)}")
+
+    def _reuse_and_check(self, prompt, stream) -> list:
+        kv = self.manager.create_kv_cache(input_tokens=prompt)
+        levels = list(kv.cached_tokens_by_level)
+        self.assertTrue(kv.resume(stream))
+        kv.capacity = len(prompt)
+        kv.history_length = len(prompt)
+        # Reads every reused attention page and the SSM slot and compares them with what the prefill wrote.
+        self.engine.execute([Step(kv, [], prompt)], stream)
+        history = list(prompt)
+        for _ in range(4):
+            kv.capacity = len(history) + 1
+            token = TokenId(next(self._token_ids))
+            self.engine.execute([Step(kv, [token], history)], stream)
+            history.append(token)
+            kv.history_length = len(history)
+        kv.close()
+        return levels
+
+    def _round_trip(self, with_host: bool) -> None:
+        self.cfg = self._config(with_host)
+        self.manager = KVCacheManager(self.cfg)
+        self.engine = FakeEngine(self.cfg)
+        stream_holder = base.CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        self.assertTrue(
+            glob.glob(os.path.join(self.module_dir, "claim.*")), "no remote chunk was claimed"
+        )
+
+        prompt = self._prompt(4 * self.tokens_per_block)
+        self._prefill(prompt, stream)
+        before = self._push_to_last_level(prompt, stream)
+        self.assertGreater(before[-1], 0)
+        levels = self._reuse_and_check(prompt, stream)
+        self.assertEqual(levels, before)
+        # The pages were promoted on reuse: the prompt is cached on the GPU now.
+        after = self._residency(prompt)
+        self.assertGreater(after[0], 0, after)
+
+    def test_round_trip_through_host_and_remote(self) -> None:
+        """GPU -> host -> remote on eviction (codec encode, host-to-remote WRITE), remote -> GPU on reuse."""
+        self._round_trip(with_host=True)
+
+    def test_round_trip_without_host(self) -> None:
+        """GPU -> remote and back directly (encode into staging + WRITE, READ + decode)."""
+        self._round_trip(with_host=False)
+
+    def test_rebase_onto_remote_copies_keeps_the_fresh_pages(self) -> None:
+        """Rebasing onto remote copies installs the request's own GPU pages, and reuse reads them correctly.
+
+        The request computes a prompt whose blocks the tree holds on the remote level (it did not reuse them).
+        """
+        self.cfg = self._config(with_host=True)
+        self.manager = KVCacheManager(self.cfg)
+        self.engine = FakeEngine(self.cfg)
+        stream_holder = base.CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = self._prompt(4 * self.tokens_per_block)
+        self._prefill(prompt, stream)
+        self._push_to_last_level(prompt, stream)
+        # Same tokens, no reuse: committing meets the tree's full blocks, whose attention pages are remote.
+        self._prefill(prompt, stream)
+        # Still reusable in full. (The level reported follows the SSM snapshot as well, which may sit on the host.)
+        levels = self._residency(prompt)
+        self.assertEqual(sum(levels), len(prompt), levels)
+        # FakeEngine reads every reused page (now the second request's attention pages) and the SSM slot.
+        self._reuse_and_check(prompt, stream)
+
+    def test_rebase_onto_remote_copies_reads_nothing(self) -> None:
+        """The same rebase with the lender gone: moving a remote copy back would fail the commit."""
+        if self.transport == "fabric":
+            self.skipTest(_NIXL_DEATH_ONLY)
+        directory = tempfile.mkdtemp(prefix="kvcm2_rebase_")
+        lender = _Lender(directory, 1 << 30, self.transport)
+        try:
+            self.cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=10_000)
+            self.manager = KVCacheManager(self.cfg)
+            self.engine = FakeEngine(self.cfg)
+            stream_holder = base.CachedCudaStream()
+            stream = cast(CudaStream, stream_holder.handle)
+            prompt = self._prompt(4 * self.tokens_per_block)
+            self._prefill(prompt, stream)
+            self._push_to_last_level(prompt, stream)
+            # Take the second request's GPU pages while the lender still serves the evictions that frees.
+            kv = self.manager.create_kv_cache()
+            self.assertTrue(kv.resume(stream))
+            kv.capacity = len(prompt)
+            kv.history_length = len(prompt)
+            _sync_device()
+            lender.stop()
+            self.engine.execute([Step(kv, prompt, [])], stream)
+            # Rebasing must not move the remote copies back to the GPU here: making room for them would evict to the
+            # remote level and read the copies from it, so the commit would fail on a WRITE to the gone lender.
+            kv.commit(prompt)
+            kv.stop_committing()
+            kv.close()
+            del kv
+        finally:
+            lender.stop()
+            if hasattr(self, "manager"):
+                try:
+                    self.manager.shutdown()
+                except Exception:
+                    pass
+                del self.manager
+            gc.collect()
+            base.take_poison()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_dead_lender_fails_the_promotion_instead_of_reusing(self) -> None:
+        """The promotion itself raises."""
+        if self.transport == "fabric":
+            self.skipTest(_NIXL_DEATH_ONLY)
+        directory = tempfile.mkdtemp(prefix="kvcm2_dead_")
+        lender = _Lender(directory, 1 << 30, self.transport)
+        try:
+            self.cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=10_000)
+            self.manager = KVCacheManager(self.cfg)
+            self.engine = FakeEngine(self.cfg)
+            stream_holder = base.CachedCudaStream()
+            stream = cast(CudaStream, stream_holder.handle)
+            prompt = self._prompt(4 * self.tokens_per_block)
+            self._prefill(prompt, stream)
+            self._push_to_last_level(prompt, stream)
+            # The lender goes away with its memory registration and agent (its files go too; this client has loaded
+            # it already), so the next READ of the prompt's pages has nowhere to go.
+            lender.stop()
+            kv = self.manager.create_kv_cache(input_tokens=prompt)
+            message = ""
+            try:
+                kv.resume(stream)
+            except Exception as error:  # noqa: BLE001 - the failure itself is what this test checks
+                message = str(error)
+            self.assertIn("remote level", message, "a promotion from a dead lender did not fail")
+            try:
+                kv.close()
+            except Exception:
+                pass
+            del kv
+        finally:
+            lender.stop()
+            if hasattr(self, "manager"):
+                try:
+                    self.manager.shutdown()
+                except Exception:
+                    pass
+                del self.manager
+            # Fail-stop: after a failed transfer the manager is not expected to tear down cleanly. Collect what is
+            # left now, so a destructor's poison lands here and is cleared, not in the next test.
+            gc.collect()
+            base.take_poison()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_failed_level_drops_its_pages_and_takes_no_more(self) -> None:
+        """After a failed transfer the level is retired instead of failing every later request.
+
+        Its pages leave the tree, and evictions go past it (here: they drop, since it is the last level).
+        """
+        if self.transport == "fabric":
+            self.skipTest(_NIXL_DEATH_ONLY)
+        directory = tempfile.mkdtemp(prefix="kvcm2_retired_")
+        lender = _Lender(directory, 1 << 30, self.transport)
+        try:
+            self.cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=10_000)
+            self.manager = KVCacheManager(self.cfg)
+            self.engine = FakeEngine(self.cfg)
+            stream_holder = base.CachedCudaStream()
+            stream = cast(CudaStream, stream_holder.handle)
+            prompt = self._prompt(4 * self.tokens_per_block)
+            self._prefill(prompt, stream)
+            self._push_to_last_level(prompt, stream)
+            lender.stop()
+            kv = self.manager.create_kv_cache(input_tokens=prompt)
+            with self.assertRaisesRegex(Exception, "remote level"):
+                kv.resume(stream)
+            kv.close()
+            del kv
+            self.assertEqual(self._residency(prompt)[-1], 0, "the failed level still offers pages")
+            # Prefills evict through the host level and past the failed one; a fresh prompt round-trips.
+            for _ in range(8):
+                self._prefill(self._prompt(256), stream)
+            fresh = self._prompt(2 * self.tokens_per_block)
+            self._prefill(fresh, stream)
+            self._reuse_and_check(fresh, stream)
+            self.assertEqual(self._residency(prompt)[-1], 0)
+        finally:
+            lender.stop()
+            if hasattr(self, "manager"):
+                try:
+                    self.manager.shutdown()
+                except Exception:
+                    pass
+                del self.manager
+            gc.collect()
+            base.take_poison()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_withdrawn_lender_takes_no_new_claims(self) -> None:
+        """Growing the level after its lender withdrew claims nothing from it, though the client knew its chunks."""
+        directory = tempfile.mkdtemp(prefix="kvcm2_withdrawn_")
+        lender = _Lender(directory, 128 << 20, self.transport)
+        try:
+            self.cfg = self._config(
+                with_host=False, directory=directory, remote_quota=32 << 20, wait_timeout_ms=2_000
+            )
+            self.manager = KVCacheManager(self.cfg)
+            claims = sorted(glob.glob(os.path.join(directory, f"claim.{lender.name}.*")))
+            self.assertTrue(claims, "no chunk was claimed")
+            lender.stop()
+            last = cast(CacheLevel, CacheLevel(len(self.cfg.cache_tiers) - 1))
+            self.assertFalse(self.manager.resize(last, 96 << 20), "grew on a withdrawn lender")
+            self.assertEqual(
+                sorted(glob.glob(os.path.join(directory, f"claim.{lender.name}.*"))), claims
+            )
+        finally:
+            lender.stop()
+            if hasattr(self, "manager"):
+                self.manager.shutdown()
+                del self.manager
+            gc.collect()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_claims_stop_once_every_expected_lender_reported(self) -> None:
+        """With every expected lender reported (published or failed) and no free chunk, a claim fails at once."""
+        directory = tempfile.mkdtemp(prefix="kvcm2_reported_")
+        lender = _Lender(directory, 128 << 20, self.transport)
+        with open(os.path.join(directory, "lender.gone.failed"), "w") as f:
+            f.write("version 1\nname gone\n")
+        try:
+            self.cfg = self._config(
+                with_host=False,
+                directory=directory,
+                wait_timeout_ms=600_000,
+                expected_lenders=2,
+            )
+            start = time.monotonic()
+            with self.assertRaisesRegex(Exception, "expected lenders reported"):
+                self.manager = KVCacheManager(self.cfg)
+            self.assertLess(time.monotonic() - start, 120)
+        finally:
+            lender.stop()
+            gc.collect()
+            base.take_poison()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_crashed_lender_is_passed_over(self) -> None:
+        """A lender that died without withdrawing (its files stay) gets no claims; the next lender serves them."""
+        if self.transport != "fabric":
+            self.skipTest("a dead NIXL lender shows at its first transfer, not at the claim")
+        directory = tempfile.mkdtemp(prefix="kvcm2_crashed_")
+        dead = _Lender(directory, 128 << 20, self.transport)
+        files = sorted(glob.glob(os.path.join(directory, f"lender.{dead.name}.*")))
+        contents = {path: open(path, "rb").read() for path in files}
+        dead.stop()
+        for path in sorted(files, key=lambda path: path.endswith(".ready")):  # .ready last
+            with open(path, "wb") as f:
+                f.write(contents[path])
+        # The live lender publishes while the client already waits, so the client meets the dead one first.
+        live = []
+        thread = threading.Thread(
+            target=lambda: live.append(_Lender(directory, 128 << 20, self.transport))
+        )
+        thread.start()
+        try:
+            self.cfg = self._config(
+                with_host=False, directory=directory, remote_quota=32 << 20, wait_timeout_ms=300_000
+            )
+            self.manager = KVCacheManager(self.cfg)
+            thread.join()
+            self.assertEqual(glob.glob(os.path.join(directory, f"claim.{dead.name}.*")), [])
+            self.assertTrue(glob.glob(os.path.join(directory, f"claim.{live[0].name}.*")))
+        finally:
+            thread.join()
+            if hasattr(self, "manager"):
+                self.manager.shutdown()
+                del self.manager
+            for lender in live:
+                lender.stop()
+            gc.collect()
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+@_per_transport
+class TestRemotePoolRatio(_Transport, unittest.TestCase):
+    """DiskCacheTierConfig.remote_pool_ratio splits only the remote level's quota across layer groups.
+
+    The model has an attention layer group (a 1 MiB block) and an SSM group (a 512 KiB state), at initial_pool_ratio
+    0.5 / 0.5. Without the ratio, every cold level follows that split. With it, the remote level gives each layer
+    group the requested share of its own bytes, and the GPU and host levels keep their split.
+    """
+
+    buf_size = 256 << 10
+    remote_quota = 256 << 20
+
+    def setUp(self) -> None:
+        super().setUp()
+        base.init_cuda_once()
+
+    def _config(self, pool_ratio):
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(lid),
+                buffers=[
+                    BufferConfig(role=DataRole("key"), size=self.buf_size),
+                    BufferConfig(role=DataRole("value"), size=self.buf_size),
+                ],
+            )
+            for lid in range(2)
+        ]
+        layers += [
+            SsmLayerConfig(
+                layer_id=LayerId(lid),
+                buffers=[BufferConfig(role=DataRole("ssm_state"), size=self.buf_size)],
+            )
+            for lid in range(2, 4)
+        ]
+        return KVCacheManagerConfig(
+            tokens_per_block=32,
+            cache_tiers=[
+                GpuCacheTierConfig(quota=32 << 20),
+                HostCacheTierConfig(quota=64 << 20),
+                self.remote_tier(self.remote_quota, pool_ratio=pool_ratio),
+            ],
+            layers=layers,
+            enable_partial_reuse=False,
+            commit_min_snapshot=True,
+            initial_pool_ratio=[0.5, 0.5],
+        )
+
+    def _levels(self, pool_ratio: "list[float] | None"):
+        """Build a manager whose remote level has `pool_ratio` (None: unset); return its levels' pool groups."""
+        manager = KVCacheManager(self._config(pool_ratio))
+        try:
+            levels = [_introspection.level_pool_groups(manager, level) for level in range(3)]
+            ssm = _introspection.ssm_life_cycle_id(manager)
+        finally:
+            manager.shutdown()
+            gc.collect()
+        self.assertIsNotNone(ssm)
+        return levels, ssm
+
+    @staticmethod
+    def _bytes(groups) -> int:
+        return sum(slots * slot_bytes for slots, slot_bytes, _ in groups)
+
+    @classmethod
+    def _share(cls, groups, life_cycle: int) -> float:
+        """The share of a level's bytes held by the pool group of `life_cycle`."""
+        held = sum(slots * slot_bytes for slots, slot_bytes, lcs in groups if life_cycle in lcs)
+        return held / cls._bytes(groups)
+
+    def test_unset_keeps_the_hot_split_on_every_cold_level(self) -> None:
+        (_, host, remote), ssm = self._levels(None)
+        self.assertAlmostEqual(self._share(remote, ssm), self._share(host, ssm), delta=0.05)
+        self.assertGreater(self._share(remote, ssm), 0.3)
+
+    def test_override_splits_only_the_remote_level(self) -> None:
+        (gpu0, host0, remote0), ssm = self._levels(None)
+        num_life_cycles = sum(len(lcs) for _, _, lcs in gpu0)
+        weights = [9.0] * num_life_cycles
+        weights[ssm] = 1.0
+        target = 1 / (1 + 9 * (num_life_cycles - 1))
+        (gpu1, host1, remote1), _ = self._levels(weights)
+        self.assertEqual(gpu1, gpu0)
+        self.assertEqual(host1, host0)
+        self.assertAlmostEqual(self._share(remote1, ssm), target, delta=0.05)
+        self.assertLess(self._share(remote1, ssm), self._share(remote0, ssm) - 0.2)
+        # The same quota, only split differently.
+        self.assertAlmostEqual(
+            self._bytes(remote1), self._bytes(remote0), delta=0.05 * self.remote_quota
+        )
+        # Weights are normalized.
+        (gpu2, host2, remote2), _ = self._levels([w / 10 for w in weights])
+        self.assertEqual((gpu2, host2, remote2), (gpu1, host1, remote1))
+
+    def test_malformed_values_fail_before_remote_memory_is_claimed(self) -> None:
+        claims = sorted(glob.glob(os.path.join(self.module_dir, "claim.*")))
+        for value in (
+            [0.5],
+            [0.5, 0.0],
+            [0.5, -1.0],
+            [float("nan"), 1.0],
+            [float("inf"), 1.0],
+            [1.0, 1.0, 1.0],
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "pool ratio"):
+                self._levels(value)
+        self.assertEqual(sorted(glob.glob(os.path.join(self.module_dir, "claim.*"))), claims)
+
+
+class TestRemoteBackedDisk(_Transport, base.TestKVCacheManagerV2):
+    """The suite's disk-level tests (reuse through eviction, out-of-pages, shrink, naive stress) on remote memory."""
+
+    Request = base.TestNoBatching.Request
+    new_request = base.TestNoBatching.new_request
+    run_request = base.TestNoBatching.run_request
+    run_naive = base.TestNoBatching.run_naive
+
+    def prepare(
+        self,
+        gpu_quota,
+        host_quota,
+        disk_quota,
+        num_layers,
+        window_size,
+        sink_tokens,
+        tokens_per_block=32,
+        kv_buf_size=8192,
+        block_quant_buf_size=None,
+    ) -> None:
+        cfg = base.create_config(
+            tokens_per_block,
+            gpu_quota,
+            host_quota,
+            disk_quota,
+            num_layers,
+            window_size,
+            sink_tokens,
+            kv_buf_size,
+            block_quant_buf_size,
+        )
+        cfg = replace(
+            cfg,
+            cache_tiers=[
+                self.remote_tier(t.quota) if isinstance(t, DiskCacheTierConfig) else t
+                for t in cfg.cache_tiers
+            ],
+        )
+        self.cfg = cfg
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+
+
+# Only the suite's tests whose pages reach the disk level (the parameterized ones under each generated name).
+for _name, _test in vars(base.TestNoBatching).items():
+    if (
+        _name.startswith(
+            ("test_cache_reuse", "test_sol_mem_utilization", "test_shrink_capacity", "test_naive_")
+        )
+        and not _name.startswith("test_naive_perf")
+        and callable(_test)
+    ):
+        setattr(TestRemoteBackedDisk, _name, _test)
+del _name, _test
+TestRemoteBackedDisk = _per_transport(TestRemoteBackedDisk)

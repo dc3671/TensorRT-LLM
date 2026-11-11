@@ -275,6 +275,13 @@ class HostCacheTierConfig:
 class DiskCacheTierConfig:
     quota: int
     path: str
+    remote: bool = False
+    remote_wait_timeout_ms: int = 0  # required with remote=True
+    remote_transfer_timeout_ms: int = 0  # required with remote=True
+    remote_expected_lenders: int = 0  # 0: unknown
+    remote_fabric: bool = False
+    remote_ucx_devices: str = ""
+    remote_pool_ratio: list[float] = ...  # empty: the hot level's split
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
