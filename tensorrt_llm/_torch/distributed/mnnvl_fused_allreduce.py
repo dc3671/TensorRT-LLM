@@ -51,10 +51,15 @@ SLOT_MAX_ROWS = 128
 
 def _ctas_per_token(rows: int, hidden: int, sms: int) -> int:
     """CTAs per token, as the library one-shot's ``adjustGridConfig`` picks them, so the norm's reduction
-    tree (and output) match the library bit for bit."""
+    tree (and output) match the library bit for bit: the CTA count shrinks for the grid to fit the SMs only while a
+    CTA stays within 1024 threads."""
     threads = hidden // 8
     ctas = 8
-    while ctas > 1 and (threads // ctas < 64 or (threads // ctas) % 32 or rows * ctas > sms):
+    while ctas > 1 and (
+        threads // ctas < 64
+        or (threads // ctas) % 32
+        or (rows * ctas > sms and threads // ctas <= 512)
+    ):
         ctas //= 2
     return ctas
 
@@ -311,7 +316,8 @@ class MnnvlAllReduceNorm:
     @staticmethod
     def is_supported(mapping, dtype: torch.dtype, hidden_size: int) -> bool:
         """BF16, TP 2 / 4 / 8 / 16 without attention DP, hidden sizes the slot kernel's 8 CTAs per token split
-        into whole warps; SM 10.0 / 10.3."""
+        into a power-of-two count of whole warps (its norm sum is a butterfly over them); SM 10.0 / 10.3."""
+        warps_per_cta = hidden_size // 2048
         return (
             IS_CUTLASS_DSL_AVAILABLE
             and is_blackwell_datacenter()
@@ -319,6 +325,7 @@ class MnnvlAllReduceNorm:
             and mapping.tp_size in (2, 4, 8, 16)
             and not mapping.enable_attention_dp
             and hidden_size % 2048 == 0
+            and warps_per_cta & (warps_per_cta - 1) == 0
             and hidden_size // 64 <= 1024
         )
 

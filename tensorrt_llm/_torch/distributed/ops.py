@@ -1303,11 +1303,12 @@ class MNNVLAllReduce(nn.Module):
             params: AllReduceParams) -> Optional[Tuple[torch.Tensor, ...]]:
         """Row-parallel FP8 GEMM ``input @ weight.T`` + this all-reduce + ``params``' residual RMSNorm fusion in one
         launch for the rows GemmTwoShotAllReduceNorm takes, or None. A BF16 input (the gated-attention o_proj) is
-        quantized with ``input_scale`` first, by the call FP8QDQLinearMethod.apply makes before cuBLAS."""
+        quantized with ``input_scale`` first, by the call FP8QDQLinearMethod.apply makes before cuBLAS. The kernel
+        exchanges BF16, so an E4M3-payload call (``params.fp8_payload``) stays on the library two-shot."""
         kern = self.gemm_twoshot
         outputs = self._FUSED_NORM_OUTPUTS.get(params.fusion_op)
         if (kern is None or outputs is None or params.bias is not None
-                or weight.shape[0] != kern.hidden):
+                or params.fp8_payload or weight.shape[0] != kern.hidden):
             return None
         if input.dtype == torch.bfloat16:
             if (input.dim() != 2 or input.shape[1] != weight.shape[-1]

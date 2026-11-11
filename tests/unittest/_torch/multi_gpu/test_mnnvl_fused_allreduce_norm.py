@@ -343,6 +343,15 @@ def _gemm_twoshot_cases(tp, k=1024):
             norm, res = out
             _check(norm, ref_norm, ("gemm two-shot norm", m, inp.dtype))
             _check(res, ref_res, ("gemm two-shot residual", m, inp.dtype))
+        # The kernel exchanges BF16: an E4M3-payload call stays on the library two-shot.
+        params = AllReduceParams(
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            residual=residual,
+            norm_weight=norm_weight,
+            eps=EPS,
+            fp8_payload=True,
+        )
+        assert ar.gemm_twoshot_allreduce_norm(xq, w, weight_scale, input_scale, params) is None, m
         params = AllReduceParams(
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
             residual=residual,
@@ -383,6 +392,48 @@ def test_gemm_twoshot_rows() -> None:
     assert not fits[2] and all(m <= 64 for m in fits[4])
     assert not kern.supports_hidden(2 * H, 8, sms)
     assert not kern.supports_hidden(H // 2, 8, sms)
+
+
+def test_slot_kernel_takes_every_supported_hidden_size() -> None:
+    """Every hidden size MnnvlAllReduceNorm.is_supported accepts builds the slot kernel at every row count it takes
+    (from TWO_SHOT_ROWS with the two-shot CTA split, which stays within 1024 threads per CTA as the library's), and
+    the others are rejected up front."""
+    from tensorrt_llm._torch.distributed.mnnvl_fused_allreduce import (
+        SLOT_MAX_ROWS,
+        TWO_SHOT_ROWS,
+        _ctas_per_token,
+    )
+    from tensorrt_llm._torch.kernels.blackwell.mnnvl_slot_allreduce_norm import (
+        MnnvlSlotAllReduceNormKernel,
+    )
+
+    mapping = Mapping(world_size=8, tp_size=8, rank=0)
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    assert _ctas_per_token(SLOT_MAX_ROWS, 16384, sms) == 2
+    assert not MnnvlAllReduceNorm.is_supported(mapping, torch.bfloat16, 6144)
+    for hidden in range(2048, 65536 + 1, 2048):
+        supported = MnnvlAllReduceNorm.is_supported(mapping, torch.bfloat16, hidden)
+        built = True
+        for m in range(1, SLOT_MAX_ROWS + 1):
+            ts = _ctas_per_token(m, hidden, sms) if m >= TWO_SHOT_ROWS else 0
+            try:
+                MnnvlSlotAllReduceNormKernel(
+                    hidden=hidden,
+                    norm_eps=EPS,
+                    nranks=8,
+                    ctas=MnnvlAllReduceNorm.SLOT_CTAS,
+                    use_pdl=True,
+                    se_fold=False,
+                    norm_out=True,
+                    quant=False,
+                    region_bytes=1,
+                    ts_ctas=ts,
+                )
+            except ValueError:
+                built = False
+        warps = hidden // 2048
+        assert supported == (warps & (warps - 1) == 0), hidden
+        assert not supported or built, hidden
 
 
 def _tp2_cases(tp, max_tokens=4096):
