@@ -23,7 +23,7 @@ differ, which the finalize does not depend on. The kernels serve ``KERNEL_NUM_EX
 hidden size (``router_front_supports``); other steps take the stock path.
 """
 
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -45,6 +45,11 @@ from ....modules.low_m_gemm import low_m_gemm_dispatcher
 from ....modules.low_m_mma_gemm import candidate_tactics
 from ....utils import Fp4QuantizedTensor
 from ..impl_contract import PreroutedRouting
+
+if TYPE_CHECKING:
+    from ....modules.expert_l2_prefetch import ExpertL2Prefetch
+    from ..configurable_moe import ConfigurableMoE
+    from .fp4_block_scale import TRTLLMGenFp4BlockScaleBase
 
 # Expert count and top-k the routing kernels are written for.
 KERNEL_NUM_EXPERTS = 512
@@ -814,7 +819,7 @@ _ROUTER_GEMM_COMPILED = {}
 
 def _router_gemm_compile(
     m: int, k: int, n: int, a_stride: int, use_pdl: bool, route_top_k: int = 0
-):
+) -> Optional[Callable]:
     key = (m, k, n, a_stride, use_pdl, route_top_k)
     if key in _ROUTER_GEMM_COMPILED:
         return _ROUTER_GEMM_COMPILED[key]  # None: the kernel does not take this shape
@@ -869,7 +874,7 @@ class RouteFrontRouterGemm:
 
     engine_route: bool = False
 
-    def __init__(self, engine_route: bool = False):
+    def __init__(self, engine_route: bool = False) -> None:
         self.engine_route = engine_route
 
     def __call__(
@@ -878,7 +883,7 @@ class RouteFrontRouterGemm:
         weight: torch.Tensor,
         global_scale: Optional[torch.Tensor] = None,
         top_k: int = 0,
-    ):
+    ) -> Union[None, torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         m, k = x.shape
         n = weight.shape[0]
         if (
@@ -1145,7 +1150,7 @@ class DecodeFront:
         route_steps: frozenset,
         decode_kernels: bool = False,
         engine_route: bool = False,
-    ):
+    ) -> None:
         self.route_steps = route_steps
         self.fused_only = decode_kernels
         self.route = RouteTables()
@@ -1164,10 +1169,10 @@ class DecodeFront:
         # (ExpertL2Prefetch, layer index): un-finalized calls record their experts for the next step's prefetch.
         self._expert_prefetch = None
 
-    def set_expert_prefetch(self, prefetch, layer_idx: int) -> None:
+    def set_expert_prefetch(self, prefetch: "ExpertL2Prefetch", layer_idx: int) -> None:
         self._expert_prefetch = (prefetch, layer_idx)
 
-    def _moe_tactic(self, backend, m: int) -> Optional[list]:
+    def _moe_tactic(self, backend: "TRTLLMGenFp4BlockScaleBase", m: int) -> Optional[list]:
         tactic = self._tactics.get(m)
         if tactic is None:
             tactic = backend.decode_tactic(m)
@@ -1175,7 +1180,14 @@ class DecodeFront:
                 self._tactics[m] = tactic
         return tactic
 
-    def _engine_routes(self, backend, m: int, top_k: int, num_experts: int, moe_kwargs) -> bool:
+    def _engine_routes(
+        self,
+        backend: "TRTLLMGenFp4BlockScaleBase",
+        m: int,
+        top_k: int,
+        num_experts: int,
+        moe_kwargs: Dict[str, Any],
+    ) -> bool:
         """Whether this call routes in the decode MoE engine: declared, un-finalized, on a backend whose call of
         ``m`` rows takes the routing engine (the router GEMM may still decline the rows, then the route front runs)."""
         if self.engine_router is None or moe_kwargs.get("do_finalize", True):
@@ -1184,7 +1196,9 @@ class DecodeFront:
 
         return engine_routes(backend, m, top_k, num_experts)
 
-    def _table_buffer(self, m: int, top_k: int, num_local: int, tile: int, device) -> torch.Tensor:
+    def _table_buffer(
+        self, m: int, top_k: int, num_local: int, tile: int, device: torch.device
+    ) -> torch.Tensor:
         flat = self._tables.get((m, tile))
         if flat is None:
             flat = torch.empty(
@@ -1195,7 +1209,7 @@ class DecodeFront:
             self._tables[(m, tile)] = flat
         return flat
 
-    def _front_runner(self, gate, moe) -> FrontRunner:
+    def _front_runner(self, gate: torch.nn.Module, moe: "ConfigurableMoE") -> FrontRunner:
         backend = moe.backend
         return FrontRunner(
             self,
@@ -1206,7 +1220,9 @@ class DecodeFront:
             lambda m: (t[0] if (t := self._moe_tactic(backend, m)) is not None else None),
         )
 
-    def _front_tactic(self, gate, moe, x: torch.Tensor, gs: torch.Tensor) -> int:
+    def _front_tactic(
+        self, gate: torch.nn.Module, moe: "ConfigurableMoE", x: torch.Tensor, gs: torch.Tensor
+    ) -> int:
         """The raced FrontRunner tactic for x's token count (0 until the race has run)."""
         m = x.shape[0]
         tactic = self._front_tactics.get(m)
@@ -1219,7 +1235,9 @@ class DecodeFront:
             self._front_tactics[m] = tactic
         return tactic
 
-    def _tune(self, gate, moe, x: torch.Tensor, **moe_kwargs):
+    def _tune(
+        self, gate: torch.nn.Module, moe: "ConfigurableMoE", x: torch.Tensor, **moe_kwargs: Any
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """Autotuning step: the stock router GEMM and MoE (which tune their own races), then, once the router
         race covers the front's token counts, the race of the two fronts. Returns the stock output."""
         out = moe(x, gate(x), output_dtype=x.dtype, **moe_kwargs)
@@ -1238,7 +1256,9 @@ class DecodeFront:
             )
         return out
 
-    def __call__(self, gate, moe, x: torch.Tensor, **moe_kwargs):
+    def __call__(
+        self, gate: torch.nn.Module, moe: "ConfigurableMoE", x: torch.Tensor, **moe_kwargs: Any
+    ) -> Union[None, torch.Tensor, List[torch.Tensor]]:
         """Routed-expert output of ``moe`` for ``x`` through the decode front, or None when it does not apply
         (the caller then runs the stock path).
 

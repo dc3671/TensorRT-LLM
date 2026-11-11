@@ -130,7 +130,7 @@ class ExpertL2Prefetch:
 
     def __init__(
         self, num_layers: int, min_rows: int, max_rows: int, top_k: int, stream: torch.cuda.Stream
-    ):
+    ) -> None:
         self.num_layers = num_layers
         self.min_rows = min_rows
         self.max_rows = max_rows
