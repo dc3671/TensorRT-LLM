@@ -46,8 +46,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
 from ..attention.backends import AttentionMetadata
-from ..autotuner import AutoTuner
 from ..attention.backends.interface import PredefinedAttentionMask
+from ..autotuner import AutoTuner
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduceParams, allgather)
 from ..distributed.mnnvl_fused_allreduce import SLOT_MAX_ROWS, TWO_SHOT_ROWS
