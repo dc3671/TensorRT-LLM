@@ -5398,11 +5398,13 @@ class RemoteCacheConfig(StrictBaseModel):
     def validate_remote_cache(self) -> 'RemoteCacheConfig':
         if self.cache_size == 0 and self.donate_size == 0:
             raise ValueError(
-                "remote_cache_config needs a positive cache_size or donate_size")
+                "remote_cache_config needs a positive cache_size or donate_size"
+            )
         if 0 < self.donate_size < REMOTE_CACHE_CHUNK_BYTES:
             raise ValueError(
                 "remote_cache_config.donate_size must be 0 or at least one "
-                f"{REMOTE_CACHE_CHUNK_BYTES}-byte chunk, got {self.donate_size}")
+                f"{REMOTE_CACHE_CHUNK_BYTES}-byte chunk, got {self.donate_size}"
+            )
         # Fields off their defaults, so a dumped config validates again.
         given = {
             name
@@ -5414,21 +5416,20 @@ class RemoteCacheConfig(StrictBaseModel):
             # Read only by a rank with a remote cache level.
             ignored += [
                 name for name in ("pool_ratio", "expected_num_donors",
-                                  "expected_claim_size",
-                                  "donor_wait_timeout_s", "transfer_timeout_s")
-                if name in given
+                                  "expected_claim_size", "donor_wait_timeout_s",
+                                  "transfer_timeout_s") if name in given
             ]
         elif "transfer_timeout_s" in given and self.transport != "nixl":
             ignored.append("transfer_timeout_s")
         if "donor_reserve_size" in given and (self.donate_size == 0
-                                             or self.transport != "fabric"):
+                                              or self.transport != "fabric"):
             ignored.append("donor_reserve_size")
         if ignored:
             raise ValueError(
                 f"remote_cache_config sets {', '.join(ignored)}, which a rank "
                 "with this cache_size, donate_size and transport ignores")
         if (self.expected_num_donors is None) != (self.expected_claim_size
-                                                   is None):
+                                                  is None):
             raise ValueError("remote_cache_config.expected_num_donors and "
                              "expected_claim_size must be set together")
         if self.ucx_devices is not None and self.transport != "nixl":

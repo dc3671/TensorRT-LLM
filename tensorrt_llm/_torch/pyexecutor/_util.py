@@ -3721,12 +3721,11 @@ class KvCacheCreator:
             return
         from .kv_cache.remote_donor import start_donation
         self._remote_donor = start_donation(remote_config,
-                                         torch.cuda.current_device())
+                                            torch.cuda.current_device())
         # Placed before the estimation probe and its warmup take host memory, which would leave the donation short.
         self._remote_donor.wait_started()
 
-    def close_remote_donor(self,
-                            error: Optional[BaseException] = None) -> None:
+    def close_remote_donor(self, error: Optional[BaseException] = None) -> None:
         """Withdraw a donation that no manager took over, leaving its failure marker when `error` is given. With `error`,
         a donation already handed to the final target manager is withdrawn and marked too; its later close is a no-op."""
         donor, self._remote_donor = self._remote_donor, None

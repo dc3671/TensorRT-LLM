@@ -152,7 +152,7 @@ def resolve_remote_cache(worker_config, num_ranks, directory):
         if kv_cache_config.get('remote_cache_config'):
             remote[role] = kv_cache_config['remote_cache_config']
     num_donors = sum(num_ranks[role] for role, config in remote.items()
-                      if config.get('donate_size'))
+                     if config.get('donate_size'))
     claim_size = sum(num_ranks[role] * config.get('cache_size', 0)
                      for role, config in remote.items())
     for config in remote.values():
