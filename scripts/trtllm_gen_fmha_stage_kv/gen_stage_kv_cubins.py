@@ -49,6 +49,11 @@ REPO = Path(__file__).resolve().parents[2]
 FMHA_DIR = REPO / "cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha"
 CUBIN_DIR = FMHA_DIR / "cubin"
 META_HEADER = CUBIN_DIR / "kernelMetaInfoStageKv.h"
+# The kernel parameter block the cubins are compiled against; its hash is recorded per SM in META_HEADER and checked by
+# tests/unittest/_torch/attention/test_fmha_paged_context_fp8.py, so a changed layout forces a regeneration.
+KERNEL_PARAMS_HEADERS = [
+    FMHA_DIR / "trtllmGen_fmha_export" / name for name in ("KernelParams.h", "KernelParamsDecl.h")
+]
 
 # Context-warmup grid of fmhaKernels.h (kContextWarmup* / kDefaultWarmupSeqLenKvCandidates), up to 128k tokens.
 BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256]
@@ -213,6 +218,13 @@ TRTLLM_NAMESPACE_END
 
 def log(*args):
     print("[gen_stage_kv]", *args, flush=True)
+
+
+def kernel_params_sha256():
+    h = hashlib.sha256()
+    for path in KERNEL_PARAMS_HEADERS:
+        h.update(path.read_bytes())
+    return h.hexdigest()
 
 
 def fail(msg):
@@ -591,7 +603,7 @@ def write_header(sm, decls, entries):
             re.S,
         ):
             blocks[kind][int(m.group(1))] = m.group(2)
-    blocks["decls"][sm] = decls
+    blocks["decls"][sm] = f"// KernelParams sha256: {kernel_params_sha256()}\n" + decls
     blocks["entries"][sm] = entries
     render = {
         kind: "".join(
@@ -643,6 +655,9 @@ def main():
     )
     a = ap.parse_args()
 
+    # The runner launches these kernels with PDL unless TRTLLM_ENABLE_PDL=0, so they must wait on their grid
+    # dependency: generate them with PDL regardless of the caller's environment (read before the library loads).
+    os.environ["TRTLLM_ENABLE_PDL"] = "1"
     import torch
 
     major, minor = torch.cuda.get_device_capability()

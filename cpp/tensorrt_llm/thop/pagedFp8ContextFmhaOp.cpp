@@ -15,8 +15,8 @@
  * limitations under the License.
  */
 
-// Causal FP8 context attention over TRT-LLM's paged HND KV pool through the trtllm-gen FMHA runner, with an optional
-// caller-fixed head dimension per K/V stage (a stage-KV cubin when one matches, else NVRTC).
+// Causal FP8 context attention over TRT-LLM's paged HND KV pool through the trtllm-gen FMHA runner, with a caller-fixed
+// head dimension per K/V stage (a precompiled stage-KV kernel when one matches the selected config, else NVRTC).
 
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunner.h"
@@ -80,11 +80,13 @@ tk::TllmGenFmhaRunnerParams makeParams(int64_t headDim, int64_t tokensPerPage, i
 // q: e4m3 [T, Hq, D]; kv_pool: e4m3 [pages, Hkv, tokens_per_page, D]; block_tables: int32 [B, 2, max_pages] (K and V
 // page indices); seq_lens_kv: int32 [B]; cu_seqlens_q / cu_seqlens_kv: int32 [B + 1]; out: bf16 [T, Hq * D], written.
 // scale_bmm1: fp32 [2] on device, [softmax scale, softmax scale * log2(e)] with the Q / K descales folded in.
-// scale_out: fp32 [1] on device, the V descale. head_dim_per_stage_kv: 0 lets the autotuner choose.
-void fmha_paged_context_fp8(torch::Tensor const& q, torch::Tensor const& kv_pool, torch::Tensor const& block_tables,
+// scale_out: fp32 [1] on device, the V descale. head_dim_per_stage_kv: the head dim per K/V stage (> 0).
+// Returns false, launching nothing, when the kernel the runner selects for this call has no precompiled cubin and
+// allow_nvrtc is false (the caller then runs another kernel instead of compiling one inside the step).
+bool fmha_paged_context_fp8(torch::Tensor const& q, torch::Tensor const& kv_pool, torch::Tensor const& block_tables,
     torch::Tensor const& seq_lens_kv, torch::Tensor const& cu_seqlens_q, torch::Tensor const& cu_seqlens_kv,
     torch::Tensor& out, torch::Tensor const& scale_bmm1, torch::Tensor const& scale_out, int64_t max_q_len,
-    int64_t max_kv_len, int64_t head_dim_per_stage_kv)
+    int64_t max_kv_len, int64_t head_dim_per_stage_kv, bool allow_nvrtc)
 {
     TORCH_CHECK(q.scalar_type() == c10::ScalarType::Float8_e4m3fn && kv_pool.scalar_type() == q.scalar_type(),
         "fmha_paged_context_fp8: q and kv_pool must be float8_e4m3fn");
@@ -110,7 +112,7 @@ void fmha_paged_context_fp8(torch::Tensor const& q, torch::Tensor const& kv_pool
     TORCH_CHECK(scale_out.scalar_type() == c10::ScalarType::Float && scale_out.numel() >= 1,
         "fmha_paged_context_fp8: scale_out must be float32 [1]");
     TORCH_CHECK(max_q_len > 0 && max_kv_len >= max_q_len, "fmha_paged_context_fp8: invalid max sequence lengths");
-    TORCH_CHECK(head_dim_per_stage_kv >= 0, "fmha_paged_context_fp8: head_dim_per_stage_kv must be >= 0");
+    TORCH_CHECK(head_dim_per_stage_kv > 0, "fmha_paged_context_fp8: head_dim_per_stage_kv must be > 0");
     for (at::Tensor const* t : std::initializer_list<at::Tensor const*>{
              &kv_pool, &block_tables, &seq_lens_kv, &cu_seqlens_q, &cu_seqlens_kv, &out, &scale_bmm1, &scale_out})
     {
@@ -146,7 +148,7 @@ void fmha_paged_context_fp8(torch::Tensor const& q, torch::Tensor const& kv_pool
     p.mMaxSeqLenKv = static_cast<int>(max_kv_len);
     p.mMaxSeqLenCacheKv = static_cast<int>(max_kv_len);
     p.mSumOfSeqLensQ = static_cast<int>(numTokens);
-    p.mSumOfSeqLensKv = static_cast<int>(batch * max_kv_len);
+    p.mSumOfSeqLensKv = static_cast<int>(std::min<int64_t>(batch * max_kv_len, INT_MAX));
     p.mMaxNumPagesPerSeqKv = static_cast<int>(block_tables.size(2));
     p.mNumPagesInMemPool = static_cast<int>(std::min<int64_t>(kv_pool.size(0), INT_MAX));
     p.mChunkedAttentionSize = INT_MAX;
@@ -157,27 +159,13 @@ void fmha_paged_context_fp8(torch::Tensor const& q, torch::Tensor const& kv_pool
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
     p.mMultiProcessorCount = smCount;
     p.stream = at::cuda::getCurrentCUDAStream(device);
-    runnerFor(device).run(p);
-}
-
-// Whether a precompiled kernel serves fmha_paged_context_fp8 at this head dim, page size and fixed head dim per K/V
-// stage on the current device, so the call never compiles with NVRTC; never throws.
-bool fmha_paged_context_fp8_has_cubin(int64_t head_dim, int64_t tokens_per_page, int64_t head_dim_per_stage_kv)
-{
-    if (head_dim_per_stage_kv <= 0)
+    tk::TllmGenFmhaRunner& runner = runnerFor(device);
+    if (!allow_nvrtc && runner.usesNvrtc(p))
     {
         return false;
     }
-    try
-    {
-        return runnerFor(c10::cuda::current_device())
-            .hasStageKvKernel(makeParams(head_dim, tokens_per_page, head_dim_per_stage_kv));
-    }
-    catch (std::exception const&)
-    {
-        // No CUDA device, or an architecture the trtllm-gen runner does not support.
-        return false;
-    }
+    runner.run(p);
+    return true;
 }
 
 } // namespace torch_ext
@@ -189,16 +177,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "fmha_paged_context_fp8(Tensor q, Tensor kv_pool, Tensor block_tables, Tensor seq_lens_kv, "
         "Tensor cu_seqlens_q, Tensor cu_seqlens_kv, Tensor(a!) out, Tensor scale_bmm1, Tensor scale_out, "
-        "int max_q_len, int max_kv_len, int head_dim_per_stage_kv) -> ()");
-    m.def("fmha_paged_context_fp8_has_cubin(int head_dim, int tokens_per_page, int head_dim_per_stage_kv) -> bool");
+        "int max_q_len, int max_kv_len, int head_dim_per_stage_kv, bool allow_nvrtc=False) -> bool");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fmha_paged_context_fp8", &tensorrt_llm::torch_ext::fmha_paged_context_fp8);
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
-{
-    m.impl("fmha_paged_context_fp8_has_cubin", &tensorrt_llm::torch_ext::fmha_paged_context_fp8_has_cubin);
 }

@@ -38,6 +38,7 @@ struct TllmGenFmhaStageKvKernelMetaInfo
 // clang-format off
 // BEGIN decls sm100
 #ifndef EXCLUDE_SM_100
+// KernelParams sha256: 6cd4b1db15fd64e44acfcbd9cd596974b2b03845c0886bf28f9d1f2f7c2b6090
 extern unsigned char const FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin[];
 extern unsigned int const FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin_len;
 extern unsigned char const FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4_cubin[];
@@ -46,6 +47,7 @@ extern unsigned int const FmhaSm100aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64V
 // END decls sm100
 // BEGIN decls sm103
 #ifndef EXCLUDE_SM_103
+// KernelParams sha256: 6cd4b1db15fd64e44acfcbd9cd596974b2b03845c0886bf28f9d1f2f7c2b6090
 extern unsigned char const FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin[];
 extern unsigned int const FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128PersistentContextStageKv256E4_cubin_len;
 extern unsigned char const FmhaSm103aKernel_QkvE4m3OBfloat16H256PagedKvCausalP64VarSeqQ128Kv128StaticContextStageKv256E4_cubin[];

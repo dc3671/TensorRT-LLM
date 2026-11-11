@@ -27,6 +27,8 @@ pytestmark = skip_pre_blackwell
 
 _TOKENS_PER_PAGE = 64
 _HEAD_DIM = 256
+# The V descale (scale_out / bmm2_scale) of the calls, not 1 so that its application is checked.
+_SCALE_OUT = 0.75
 
 
 def _make_case(q_lens, kv_lens, num_heads_q, num_heads_kv, seed=0):
@@ -79,7 +81,7 @@ def _reference(q, pool, block_tables, q_lens, kv_lens, softmax_scale):
 
 
 # The K / V stage is always fixed: SM100 / SM103 run the precompiled stage-256 kernels of cubin/kernelMetaInfoStageKv.h,
-# every other stage (and arch) is generated with NVRTC.
+# every other stage (and arch) is generated with NVRTC (allow_nvrtc). The V descale (scale_out) is not 1.
 @pytest.mark.parametrize("head_dim_per_stage_kv", [128, 256])
 @pytest.mark.parametrize(
     "q_lens,kv_lens", [([300, 77], [428, 77]), ([1], [130]), ([1024, 64, 513], [1024, 4160, 600])]
@@ -90,7 +92,7 @@ def test_fmha_paged_context_fp8(head_dim_per_stage_kv, q_lens, kv_lens):
         q_lens, kv_lens, num_heads_q, num_heads_kv
     )
     out = torch.empty(q.shape[0], num_heads_q * _HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    torch.ops.trtllm.fmha_paged_context_fp8(
+    assert torch.ops.trtllm.fmha_paged_context_fp8(
         q,
         pool,
         block_tables,
@@ -99,12 +101,13 @@ def test_fmha_paged_context_fp8(head_dim_per_stage_kv, q_lens, kv_lens):
         cu_kv,
         out,
         scale_bmm1,
-        torch.ones(1, dtype=torch.float32, device="cuda"),
+        torch.full((1,), _SCALE_OUT, dtype=torch.float32, device="cuda"),
         max(q_lens),
         max(kv_lens),
         head_dim_per_stage_kv,
+        True,
     )
-    ref = _reference(q, pool, block_tables, q_lens, kv_lens, softmax_scale)
+    ref = _reference(q, pool, block_tables, q_lens, kv_lens, softmax_scale) * _SCALE_OUT
     torch.testing.assert_close(
         out.view(-1, num_heads_q, _HEAD_DIM).float(), ref, atol=3e-2, rtol=5e-2
     )
@@ -122,7 +125,7 @@ def test_fmha_paged_context_fp8_matches_flashinfer():
 
     def run_op(head_dim_per_stage_kv):
         out = torch.empty(q.shape[0], num_heads_q * _HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-        torch.ops.trtllm.fmha_paged_context_fp8(
+        assert torch.ops.trtllm.fmha_paged_context_fp8(
             q,
             pool,
             block_tables,
@@ -131,10 +134,11 @@ def test_fmha_paged_context_fp8_matches_flashinfer():
             cu_kv,
             out,
             scale_bmm1,
-            torch.ones(1, dtype=torch.float32, device="cuda"),
+            torch.full((1,), _SCALE_OUT, dtype=torch.float32, device="cuda"),
             max(q_lens),
             max(kv_lens),
             head_dim_per_stage_kv,
+            True,
         )
         return out
 
@@ -152,7 +156,7 @@ def test_fmha_paged_context_fp8_matches_flashinfer():
         max_q_len=max(q_lens),
         max_kv_len=max(kv_lens),
         bmm1_scale=scale_bmm1[:1],
-        bmm2_scale=1.0,
+        bmm2_scale=_SCALE_OUT,
         batch_size=len(q_lens),
         cum_seq_lens_q=cu_q,
         cum_seq_lens_kv=cu_kv,
@@ -181,7 +185,7 @@ def test_fmha_paged_context_fp8_last_rows_match_full_call(head_dim_per_stage_kv)
         out = torch.empty(
             query.shape[0], num_heads_q * _HEAD_DIM, dtype=torch.bfloat16, device="cuda"
         )
-        torch.ops.trtllm.fmha_paged_context_fp8(
+        assert torch.ops.trtllm.fmha_paged_context_fp8(
             query,
             pool,
             block_tables,
@@ -194,6 +198,7 @@ def test_fmha_paged_context_fp8_last_rows_match_full_call(head_dim_per_stage_kv)
             max_q,
             max(kv_lens),
             head_dim_per_stage_kv,
+            True,
         )
         return out
 
@@ -356,7 +361,7 @@ def test_fmha_paged_context_fp8_stage256_runs_precompiled_kernel():
     )
     out = torch.empty(q.shape[0], num_heads_q * _HEAD_DIM, dtype=torch.bfloat16, device="cuda")
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
-        torch.ops.trtllm.fmha_paged_context_fp8(
+        assert torch.ops.trtllm.fmha_paged_context_fp8(
             q,
             pool,
             block_tables,
@@ -379,18 +384,87 @@ def test_fmha_paged_context_fp8_stage256_runs_precompiled_kernel():
     torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="stage-256 cubins exist for SM100 / SM103",
 )
-def test_has_cubin_only_for_the_precompiled_page_size_and_stage():
-    """FlashInferTrtllmGenFmha takes the op only where a precompiled kernel matches: elsewhere the call would
-    compile its kernel with NVRTC."""
-    from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-        _has_paged_context_fp8_cubin,
+@pytest.mark.parametrize(
+    "tokens_per_page,head_dim_per_stage_kv,ran",
+    [(_TOKENS_PER_PAGE, _HEAD_DIM, True), (32, _HEAD_DIM, False), (_TOKENS_PER_PAGE, 128, False)],
+)
+def test_fmha_paged_context_fp8_declines_without_a_precompiled_kernel(
+    tokens_per_page, head_dim_per_stage_kv, ran
+):
+    """Without allow_nvrtc the op runs only a precompiled kernel: for a call whose selected kernel has none (another
+    page size or stage) it returns False and writes nothing, and FlashInferTrtllmGenFmha then runs FlashInfer's."""
+    q_lens, kv_lens = [300, 77], [428, 77]
+    num_heads_q, num_heads_kv = 16, 1
+    q, pool, block_tables, seq_lens, cu_q, cu_kv, scale_bmm1, _ = _make_case(
+        q_lens, kv_lens, num_heads_q, num_heads_kv
     )
+    # The same KV bytes in pages of tokens_per_page tokens.
+    pages_per_page = _TOKENS_PER_PAGE // tokens_per_page
+    pool = pool.view(pool.shape[0], num_heads_kv, pages_per_page, tokens_per_page, _HEAD_DIM)
+    pool = pool.permute(0, 2, 1, 3, 4).reshape(-1, num_heads_kv, tokens_per_page, _HEAD_DIM)
+    block_tables = (
+        block_tables[..., None] * pages_per_page
+        + torch.arange(pages_per_page, dtype=torch.int32, device="cuda")
+    ).flatten(2)
+    out = torch.full(
+        (q.shape[0], num_heads_q * _HEAD_DIM), 7.0, dtype=torch.bfloat16, device="cuda"
+    )
+    assert (
+        torch.ops.trtllm.fmha_paged_context_fp8(
+            q,
+            pool.contiguous(),
+            block_tables.contiguous(),
+            seq_lens,
+            cu_q,
+            cu_kv,
+            out,
+            scale_bmm1,
+            torch.ones(1, dtype=torch.float32, device="cuda"),
+            max(q_lens),
+            max(kv_lens),
+            head_dim_per_stage_kv,
+        )
+        is ran
+    )
+    torch.cuda.synchronize()
+    assert bool((out == 7.0).all()) is not ran
 
-    has_cubin = torch.ops.trtllm.fmha_paged_context_fp8_has_cubin
-    assert has_cubin(_HEAD_DIM, _TOKENS_PER_PAGE, _HEAD_DIM)
-    assert _has_paged_context_fp8_cubin(_HEAD_DIM, _TOKENS_PER_PAGE, _HEAD_DIM)
-    for page in (16, 32):
-        assert not has_cubin(_HEAD_DIM, page, _HEAD_DIM)
-    assert not has_cubin(_HEAD_DIM, _TOKENS_PER_PAGE, 128)
-    assert not has_cubin(128, _TOKENS_PER_PAGE, 128)
-    assert not has_cubin(_HEAD_DIM, _TOKENS_PER_PAGE, 0)
+
+def test_fmha_paged_context_fp8_needs_a_fixed_stage():
+    q, pool, block_tables, seq_lens, cu_q, cu_kv, scale_bmm1, _ = _make_case([1], [130], 16, 1)
+    out = torch.empty(1, 16 * _HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="head_dim_per_stage_kv must be > 0"):
+        torch.ops.trtllm.fmha_paged_context_fp8(
+            q,
+            pool,
+            block_tables,
+            seq_lens,
+            cu_q,
+            cu_kv,
+            out,
+            scale_bmm1,
+            torch.ones(1, dtype=torch.float32, device="cuda"),
+            1,
+            130,
+            0,
+        )
+
+
+def test_stage_kv_cubins_match_the_kernel_params_they_were_built_against():
+    """The stage-KV cubins are compiled against the trtllm-gen KernelParams headers; a changed header needs a
+    regeneration (scripts/trtllm_gen_fmha_stage_kv/gen_stage_kv_cubins.py), which records its hash per SM."""
+    import hashlib
+    import re
+    from pathlib import Path
+
+    fmha = Path(__file__).resolve().parents[4] / "cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha"
+    if not fmha.is_dir():
+        pytest.skip("needs the C++ sources")
+    h = hashlib.sha256()
+    for name in ("KernelParams.h", "KernelParamsDecl.h"):
+        h.update((fmha / "trtllmGen_fmha_export" / name).read_bytes())
+    recorded = re.findall(
+        r"// KernelParams sha256: ([0-9a-f]{64})",
+        (fmha / "cubin/kernelMetaInfoStageKv.h").read_text(),
+    )
+    assert recorded and set(recorded) == {h.hexdigest()}

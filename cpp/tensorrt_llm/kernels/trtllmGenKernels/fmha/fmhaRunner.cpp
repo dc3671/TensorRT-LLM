@@ -106,9 +106,13 @@ std::pair<bool, std::string> TllmGenFmhaRunner::isSupportedWithInfo(TllmGenFmhaR
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-bool TllmGenFmhaRunner::hasStageKvKernel(TllmGenFmhaRunnerParams const& runnerParams) const
+bool TllmGenFmhaRunner::usesNvrtc(TllmGenFmhaRunnerParams const& runnerParams)
 {
-    return mKernel != nullptr && mKernel->hasStageKvKernel(runnerParams);
+    if (mKernel == nullptr)
+    {
+        TLLM_THROW("TRTLLM-GEN: mKernel is null. Cannot select an FMHA kernel.");
+    }
+    return mKernel->usesNvrtc(runnerParams);
 }
 
 size_t TllmGenFmhaRunner::getTotalDeviceMemory() const

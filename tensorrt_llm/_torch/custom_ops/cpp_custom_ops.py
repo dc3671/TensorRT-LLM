@@ -1943,8 +1943,9 @@ def _register_fake():
         max_q_len: int,
         max_kv_len: int,
         head_dim_per_stage_kv: int,
-    ) -> None:
-        return None
+        allow_nvrtc: bool = False,
+    ) -> bool:
+        return True
 
     @torch.library.register_fake("trtllm::dit_v_amax")
     def _(qkv: torch.Tensor, num_heads: int, head_dim: int):

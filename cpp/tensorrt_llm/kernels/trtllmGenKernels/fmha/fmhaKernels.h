@@ -223,21 +223,39 @@ public:
                 functions[hash] = funcInfo;
             }
         }
-        // Kernels generated for a caller-fixed head dim per K/V stage, keyed by (hash, stage): the hash does not
-        // cover the stage, so they are only found by callers that fix it (RunnerParams::mHeadDimPerStageKv).
-        for (unsigned int i = 0; i < mStageKvKernelMetaCount; ++i)
-        {
-            auto const& stageKvMeta = mStageKvKernelMeta[i];
-            KernelInfo funcInfo;
-            if (!loadKernel(stageKvMeta.mMeta, funcInfo))
+    }
+
+    // Kernels generated for a caller-fixed head dim per K/V stage, keyed by (hash, stage): the hash does not cover
+    // the stage, so they are only found by callers that fix it (RunnerParams::mHeadDimPerStageKv). Loaded on the first
+    // such call; a kernel that fails to load is left to NVRTC.
+    void loadStageKvKernels()
+    {
+        std::call_once(mStageKvLoaded,
+            [this]
             {
-                continue;
-            }
-            auto const key = std::make_pair(hashID(stageKvMeta.mMeta), stageKvMeta.mHeadDimPerStageKv);
-            TLLM_CHECK_WITH_INFO(mStageKvFunctions.emplace(key, funcInfo).second,
-                "Two stage-KV FMHA kernels share a hashId and head dim per K/V stage: %s.",
-                stageKvMeta.mMeta.mFuncName);
-        }
+                for (unsigned int i = 0; i < mStageKvKernelMetaCount; ++i)
+                {
+                    auto const& stageKvMeta = mStageKvKernelMeta[i];
+                    KernelInfo funcInfo;
+                    try
+                    {
+                        if (!loadKernel(stageKvMeta.mMeta, funcInfo))
+                        {
+                            continue;
+                        }
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_WARNING(
+                            "Stage-KV FMHA kernel %s not loaded: %s", stageKvMeta.mMeta.mFuncName, e.what());
+                        continue;
+                    }
+                    auto const key = std::make_pair(hashID(stageKvMeta.mMeta), stageKvMeta.mHeadDimPerStageKv);
+                    TLLM_CHECK_WITH_INFO(mStageKvFunctions.emplace(key, funcInfo).second,
+                        "Two stage-KV FMHA kernels share a hashId and head dim per K/V stage: %s.",
+                        stageKvMeta.mMeta.mFuncName);
+                }
+            });
     }
 
     // Options the caller fixes, applied before the autotuner (marked as set, so it keeps them) and again after it.
@@ -261,22 +279,16 @@ public:
         return params.mHeadDimPerStageKv > 0 && findCubinKernel(options, params.mHeadDimPerStageKv) == nullptr;
     }
 
-    // Whether a stage-KV table kernel matches the caller-fixed stage and the static shape of these params (layout,
-    // mask, kernel type, head dims, tokens per page).
-    bool hasStageKvKernel(RunnerParams const& params) const
+    // Whether run() would compile the kernel it selects for these params (their batch, lengths and SM count) with
+    // NVRTC instead of launching a precompiled one.
+    bool usesNvrtc(RunnerParams const& params)
     {
-        for (auto const& [key, funcInfo] : mStageKvFunctions)
+        if (params.mHeadDimPerStageKv > 0)
         {
-            auto const& meta = *funcInfo.mMeta;
-            if (key.second == params.mHeadDimPerStageKv && meta.mQkvLayout == static_cast<int>(params.mQkvLayout)
-                && meta.mMaskType == static_cast<int>(params.mMaskType)
-                && meta.mKernelType == static_cast<int>(params.mKernelType) && meta.mHeadDimQk == params.mHeadDimQk
-                && meta.mHeadDimV == params.mHeadDimV && meta.mNumTokensPerPage == params.mNumTokensPerPage)
-            {
-                return true;
-            }
+            loadStageKvKernels();
         }
-        return false;
+        auto const [options, ctaDim, grid] = selectOptions(params);
+        return usesNvrtc(params, options);
     }
 
     // The NVRTC configuration run() compiles for these params (also used offline to export the generated kernel).
@@ -660,6 +672,10 @@ public:
         {
             TLLM_CHECK_WITH_INFO(params.mDsv4EpilogueFusion.cosSinCache != nullptr,
                 "SM107 DSV4 FMHA epilogue fusion requires a non-null inverse-RoPE cos/sin cache.");
+        }
+        if (params.mHeadDimPerStageKv > 0)
+        {
+            loadStageKvKernels();
         }
         runJITWarmupGridIfRequested(params);
 
@@ -1795,8 +1811,9 @@ private:
     KernelMap mFunctions;
     KernelMap mDsv4FusedFunctions;
     KernelMap mDsv4FusedUe8m0Functions;
-    // Kernels for a caller-fixed head dim per K/V stage, keyed by (hashId, headDimPerStageKv).
+    // Kernels for a caller-fixed head dim per K/V stage, keyed by (hashId, headDimPerStageKv); see loadStageKvKernels.
     std::map<std::pair<uint64_t, int>, KernelInfo> mStageKvFunctions;
+    std::once_flag mStageKvLoaded;
 
     FmhaInterface mFmhaInterface{false, 1};
 };

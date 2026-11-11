@@ -287,16 +287,6 @@ def trtllm_gen_paged_decode(
     )
 
 
-@lru_cache(maxsize=None)
-def _has_paged_context_fp8_cubin(
-    head_dim: int, tokens_per_page: int, head_dim_per_stage_kv: int
-) -> bool:
-    """Whether trtllm::fmha_paged_context_fp8 has a precompiled kernel for this shape (else it compiles with NVRTC)."""
-    return torch.ops.trtllm.fmha_paged_context_fp8_has_cubin(
-        head_dim, tokens_per_page, head_dim_per_stage_kv
-    )
-
-
 @lru_cache(maxsize=128)
 def _get_generation_workspace_layout(
     dtype: torch.dtype,
@@ -1024,10 +1014,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         window_left: int,
         output: torch.Tensor,
     ) -> bool:
-        """Whether a context call runs trtllm::fmha_paged_context_fp8 with the layer's declared
+        """Whether a context call offers trtllm::fmha_paged_context_fp8 the layer's declared
         ``context_fmha_head_dim_per_stage_kv``: causal E4M3 Q / KV (no KV scale factors, sinks or window), BF16
-        output, TRT-LLM's contiguous paged KV pool with separate K / V page indices, and a precompiled kernel for
-        the page size."""
+        output, TRT-LLM's contiguous paged KV pool with separate K / V page indices. The op declines a call whose
+        selected kernel has no precompiled cubin, which then runs FlashInfer's kernel."""
         return (
             self.attn.context_fmha_head_dim_per_stage_kv > 0
             and fp8_context_fmha
@@ -1044,9 +1034,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             and block_tables.size(1) == 2
             and output.dtype == torch.bfloat16
             and output.is_contiguous()
-            and _has_paged_context_fp8_cubin(
-                self.attn.head_dim, kv_pool.size(2), self.attn.context_fmha_head_dim_per_stage_kv
-            )
         )
 
     def run_context(
@@ -1157,21 +1144,20 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
 
         def fmha(query, out, cu_q, max_q):
-            if paged_context_fp8:
-                torch.ops.trtllm.fmha_paged_context_fp8(
-                    query,
-                    kv_pool,
-                    block_tables,
-                    params.sequence_lengths,
-                    cu_q,
-                    cu_kv_seqlens,
-                    out,
-                    bmm1_scale,
-                    bmm2_scale,
-                    max_q,
-                    max_kv_len,
-                    attn.context_fmha_head_dim_per_stage_kv,
-                )
+            if paged_context_fp8 and torch.ops.trtllm.fmha_paged_context_fp8(
+                query,
+                kv_pool,
+                block_tables,
+                params.sequence_lengths,
+                cu_q,
+                cu_kv_seqlens,
+                out,
+                bmm1_scale,
+                bmm2_scale,
+                max_q,
+                max_kv_len,
+                attn.context_fmha_head_dim_per_stage_kv,
+            ):
                 return
             flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                 query=query,
