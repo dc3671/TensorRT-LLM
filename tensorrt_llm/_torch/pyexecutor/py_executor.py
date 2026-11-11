@@ -690,6 +690,8 @@ class PyExecutor:
     # Whether the overlap loop defers the KV cache close of finished
     # generation-only requests (kv_cache_config.defer_generation_only_release).
     _defer_generation_only_release = False
+    # Whether the model forward runs under torch.compile; read once at construction.
+    _uses_torch_compile = False
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
 
@@ -817,6 +819,7 @@ class PyExecutor:
         self._profile_manager = PyExecutorProfileManager(self)
 
         self.model_engine = model_engine
+        self._uses_torch_compile = model_engine.uses_torch_compile
         hooks = runtime_hooks_of(model_engine.model)
         self._execution_stream_loop_armed = hooks.loop_on_execution_stream
         self._executor_events = hooks.executor_events
@@ -1994,14 +1997,14 @@ class PyExecutor:
         torch keeps each Dynamo config value per thread, so the limit set
         while the engine was built does not reach the worker thread.
         """
-        if self.model_engine.uses_torch_compile:
+        if self._uses_torch_compile:
             torch._dynamo.config.cache_size_limit = DYNAMO_RECOMPILE_LIMIT
 
     def _event_loop_wrapper(self) -> None:
         crashed = False
         self._event_loop_completed = False
-        self._apply_dynamo_recompile_limit()
         try:
+            self._apply_dynamo_recompile_limit()
             # Skip line profiler during warmup/memory estimation phase to avoid
             # saving incomplete results that would be overwritten anyway
             enable_profiler = bool(os.environ.get(

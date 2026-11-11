@@ -5190,7 +5190,7 @@ def test_dynamo_recompile_limit_is_reapplied_on_the_worker_thread():
     config = torch._dynamo.config
     original = config.cache_size_limit
     seen = {}
-    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(uses_torch_compile=True))
+    executor = types.SimpleNamespace(_uses_torch_compile=True)
 
     def worker():
         seen["inherited"] = config.cache_size_limit
