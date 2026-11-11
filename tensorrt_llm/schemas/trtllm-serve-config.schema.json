@@ -50,6 +50,30 @@
     },
     "AttentionDpConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kv_cache_routing_home_wait_rounds": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kv_cache_routing_home_wait_rounds"
+            ]
+          },
+          "then": {
+            "properties": {
+              "kv_cache_routing_conversation_affinity": {
+                "const": true
+              }
+            },
+            "required": [
+              "kv_cache_routing_conversation_affinity"
+            ]
+          }
+        }
+      ],
       "description": "Configuration for attention DP.",
       "properties": {
         "batching_wait_iters": {
@@ -3072,6 +3096,79 @@
     },
     "KvCacheConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "remote_cache_config": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "remote_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "defer_generation_only_release": {
+                "const": true
+              }
+            },
+            "required": [
+              "defer_generation_only_release"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "remote_cache_config": {
+                "properties": {
+                  "cache_size": {
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "cache_size"
+                ]
+              }
+            },
+            "required": [
+              "remote_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disk_cache_size": {
+                "enum": [
+                  0,
+                  null
+                ]
+              }
+            }
+          }
+        }
+      ],
       "description": "Configuration for the KV cache.",
       "properties": {
         "attention_dp_events_gather_period_ms": {
@@ -3134,7 +3231,7 @@
         },
         "defer_generation_only_release": {
           "default": false,
-          "description": "Release the KV cache of a finished generation-only request (disaggregated generation server) after the next forward is enqueued, so that the host-side release overlaps GPU work. The pages return one iteration later: the next iteration's scheduler cannot admit requests into them, so leave this off on generation servers bound by KV cache capacity. Requires KV cache manager v2 and the overlap scheduler without pipeline parallelism.",
+          "description": "Release the KV cache of a finished generation-only request (disaggregated generation server) after the next forward is enqueued, so that the host-side release overlaps GPU work. The pages return one iteration later: the next iteration's scheduler cannot admit requests into them, so leave this off on generation servers bound by KV cache capacity. Their KV cache events are published one iteration later too, or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler without pipeline parallelism.",
           "status": "prototype",
           "title": "Defer Generation Only Release",
           "type": "boolean"
@@ -5658,11 +5755,208 @@
     },
     "RemoteCacheConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "cache_size": {
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "cache_size"
+              ]
+            },
+            {
+              "properties": {
+                "lend_size": {
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "lend_size"
+              ]
+            }
+          ]
+        },
+        {
+          "if": {
+            "properties": {
+              "lend_size": {
+                "exclusiveMinimum": 0
+              }
+            },
+            "required": [
+              "lend_size"
+            ]
+          },
+          "then": {
+            "properties": {
+              "lend_size": {
+                "minimum": 1073741824
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "properties": {
+                "cache_size": {
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "cache_size"
+              ]
+            }
+          },
+          "then": {
+            "properties": {
+              "expected_claim_size": {
+                "const": null
+              },
+              "expected_num_lenders": {
+                "const": null
+              },
+              "lender_wait_timeout_s": {
+                "const": 900.0
+              },
+              "pool_ratio": {
+                "const": null
+              },
+              "transfer_timeout_s": {
+                "const": 30.0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "transport": {
+                "const": "fabric"
+              }
+            },
+            "required": [
+              "transport"
+            ]
+          },
+          "then": {
+            "properties": {
+              "transfer_timeout_s": {
+                "const": 30.0
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "not": {
+                  "properties": {
+                    "lend_size": {
+                      "minimum": 1
+                    }
+                  },
+                  "required": [
+                    "lend_size"
+                  ]
+                }
+              },
+              {
+                "not": {
+                  "properties": {
+                    "transport": {
+                      "const": "fabric"
+                    }
+                  },
+                  "required": [
+                    "transport"
+                  ]
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "lend_reserve_size": {
+                "const": 25769803776
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "expected_num_lenders": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "expected_num_lenders"
+            ]
+          },
+          "then": {
+            "properties": {
+              "expected_claim_size": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "expected_claim_size"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "expected_claim_size": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "expected_claim_size"
+            ]
+          },
+          "then": {
+            "properties": {
+              "expected_num_lenders": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "expected_num_lenders"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "ucx_devices": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "ucx_devices"
+            ]
+          },
+          "then": {
+            "properties": {
+              "transport": {
+                "const": "nixl"
+              }
+            }
+          }
+        }
+      ],
       "description": "KV cache manager v2 remote cache level in host memory that other ranks lend.\n\nA rank with ``cache_size`` gets a cache level below the host tier whose slots\nlive in memory that ranks with ``lend_size`` publish in ``directory``.",
       "properties": {
         "cache_size": {
           "default": 0,
-          "description": "Bytes of this rank's remote cache level. Pages are byte copies, so the level is lossless. It takes the disk level's place, so it cannot be combined with `disk_cache_size`.",
+          "description": "Bytes of this rank's remote cache level. Pages are stored as the cold tiers store them: byte copies, or encoded by a lossy cold-page codec (kv_cache_compression_config) when one is set. It takes the disk level's place, so it cannot be combined with `disk_cache_size`.",
           "minimum": 0,
           "status": "prototype",
           "title": "Cache Size",
@@ -5723,7 +6017,7 @@
         },
         "lender_wait_timeout_s": {
           "default": 900.0,
-          "description": "Seconds a rank with `cache_size` waits for lenders: for the expected lenders to report, and for a free chunk to claim. Lenders publish while their own servers start, so this bounds the job's startup skew.",
+          "description": "Seconds a rank with `cache_size` waits for lenders, applied to each wait on its own: for the expected lenders to report, and for each chunk claim. Lenders publish while their own servers start, so this bounds the job's startup skew per wait, not in total.",
           "exclusiveMinimum": 0,
           "status": "prototype",
           "title": "Lender Wait Timeout S",
@@ -6440,6 +6734,29 @@
     },
     "SchedulerConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "not": {
+              "properties": {
+                "waiting_queue_policy": {
+                  "const": "shortest_decode_first"
+                }
+              },
+              "required": [
+                "waiting_queue_policy"
+              ]
+            }
+          },
+          "then": {
+            "properties": {
+              "waiting_queue_max_wait_s": {
+                "const": 60.0
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "capacity_scheduler_policy": {
           "$ref": "#/$defs/CapacitySchedulerPolicy",
@@ -6519,7 +6836,7 @@
             }
           ],
           "default": 60.0,
-          "description": "With waiting_queue_policy='shortest_decode_first': a request that has waited this many seconds goes ahead of every request that has not, oldest first. None disables the cap. Other policies ignore it.",
+          "description": "With waiting_queue_policy='shortest_decode_first': a request that has waited this many seconds since it reached the server (in disaggregated serving, the orchestrator) goes ahead of every request that has not, oldest first. None disables the cap. Keep it below the context servers' cache_transceiver_config.kv_transfer_timeout_ms. Other policies accept only the default.",
           "status": "prototype",
           "title": "Waiting Queue Max Wait S"
         },

@@ -631,6 +631,167 @@ def test_dwdp_modes_match_runtime(
                 assert validator.is_valid({section: config}) == (error is None), section
 
 
+_GIB = 1 << 30
+
+
+@pytest.mark.parametrize(
+    ("section", "config", "valid"),
+    [
+        # RemoteCacheConfig
+        ("kv_cache_config", {"remote_cache_config": {"directory": "d", "cache_size": _GIB}}, True),
+        ("kv_cache_config", {"remote_cache_config": {"directory": "d", "lend_size": _GIB}}, True),
+        ("kv_cache_config", {"remote_cache_config": {"directory": "d"}}, False),
+        ("kv_cache_config", {"remote_cache_config": {"directory": "d", "lend_size": 1}}, False),
+        (
+            "kv_cache_config",
+            {"remote_cache_config": {"directory": "d", "lend_size": _GIB, "transfer_timeout_s": 5}},
+            False,
+        ),
+        (
+            "kv_cache_config",
+            {"remote_cache_config": {"directory": "d", "cache_size": 1, "expected_num_lenders": 2}},
+            False,
+        ),
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {
+                    "directory": "d",
+                    "cache_size": 1,
+                    "expected_num_lenders": 2,
+                    "expected_claim_size": _GIB,
+                }
+            },
+            True,
+        ),
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {
+                    "directory": "d",
+                    "cache_size": 1,
+                    "transport": "fabric",
+                    "ucx_devices": "mlx5_0:1",
+                }
+            },
+            False,
+        ),
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {
+                    "directory": "d",
+                    "cache_size": 1,
+                    "transport": "fabric",
+                    "transfer_timeout_s": 5,
+                }
+            },
+            False,
+        ),
+        (
+            "kv_cache_config",
+            {"remote_cache_config": {"directory": "d", "lend_size": _GIB, "lend_reserve_size": 0}},
+            False,
+        ),
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {
+                    "directory": "d",
+                    "lend_size": _GIB,
+                    "transport": "fabric",
+                    "lend_reserve_size": 0,
+                }
+            },
+            True,
+        ),
+        # KvCacheConfig
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {"directory": "d", "cache_size": 1},
+                "disk_cache_size": 1,
+                "disk_cache_path": str(_REPO_ROOT),
+            },
+            False,
+        ),
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {"directory": "d", "lend_size": _GIB},
+                "disk_cache_size": 1,
+                "disk_cache_path": str(_REPO_ROOT),
+            },
+            True,
+        ),
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {"directory": "d", "cache_size": 1},
+                "use_kv_cache_manager_v2": False,
+            },
+            False,
+        ),
+        ("kv_cache_config", {"defer_generation_only_release": True}, True),
+        (
+            "kv_cache_config",
+            {"defer_generation_only_release": True, "use_kv_cache_manager_v2": False},
+            False,
+        ),
+        # AttentionDpConfig
+        (
+            "attention_dp_config",
+            {
+                "kv_cache_routing_conversation_affinity": True,
+                "kv_cache_routing_home_wait_rounds": 4,
+            },
+            True,
+        ),
+        ("attention_dp_config", {"kv_cache_routing_home_wait_rounds": 4}, False),
+        # SchedulerConfig
+        (
+            "scheduler_config",
+            {"waiting_queue_policy": "shortest_decode_first", "waiting_queue_max_wait_s": 30},
+            True,
+        ),
+        (
+            "scheduler_config",
+            {"waiting_queue_policy": "shortest_decode_first", "waiting_queue_max_wait_s": None},
+            True,
+        ),
+        ("scheduler_config", {"waiting_queue_max_wait_s": 60}, True),
+        ("scheduler_config", {"waiting_queue_max_wait_s": 30}, False),
+        (
+            "scheduler_config",
+            {"waiting_queue_policy": "priority", "waiting_queue_max_wait_s": None},
+            False,
+        ),
+    ],
+)
+def test_cross_field_rules_match_runtime(
+    schemas: dict[str, dict], section: str, config: dict, valid: bool
+) -> None:
+    """Both schemas accept the remote cache, home-wait and waiting-queue options exactly when the models do."""
+    from tensorrt_llm.llmapi.llm_args import AttentionDpConfig, KvCacheConfig, SchedulerConfig
+
+    model = {
+        "kv_cache_config": KvCacheConfig,
+        "attention_dp_config": AttentionDpConfig,
+        "scheduler_config": SchedulerConfig,
+    }[section]
+    if valid:
+        model(**config)
+    else:
+        with pytest.raises(ValueError):
+            model(**config)
+
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid({section: config}) == valid, filename
+        if filename == generator.DISAGG_SCHEMA:
+            assert validator.is_valid({"generation_servers": {section: config}}) == valid
+
+
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
     """Check literal top-level config accesses, without tracing aliases or dynamic keys."""
     function = next(

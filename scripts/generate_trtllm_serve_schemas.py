@@ -193,8 +193,130 @@ def _dwdp_launch_rules() -> list[dict]:
     ]
 
 
+def _set(name: str, schema: dict) -> dict:
+    """``schema`` must hold for ``name`` when the mapping sets it."""
+    return {"properties": {name: schema}, "required": [name]}
+
+
+def _cross_field_rules(definitions: dict) -> None:
+    """Mirror the model validators of the KV cache, scheduler and attention-DP options.
+
+    They hold only for values the YAML sets; defaults are taken from the models.
+    """
+    from tensorrt_llm.llmapi.llm_args import (
+        REMOTE_CACHE_CHUNK_BYTES,
+        RemoteCacheConfig,
+        SchedulerConfig,
+        WaitingQueuePolicy,
+    )
+
+    def default(model: type, name: str) -> dict:
+        return {"const": model.model_fields[name].default}
+
+    def when(condition: dict, then: dict) -> dict:
+        return {"if": condition, "then": then}
+
+    unset_or_zero = {"not": _set("cache_size", {"minimum": 1})}
+    # RemoteCacheConfig.validate_remote_cache().
+    remote_unread = {
+        name: default(RemoteCacheConfig, name)
+        for name in (
+            "pool_ratio",
+            "expected_num_lenders",
+            "expected_claim_size",
+            "lender_wait_timeout_s",
+            "transfer_timeout_s",
+        )
+    }
+    definitions["RemoteCacheConfig"].setdefault("allOf", []).extend(
+        [
+            {"anyOf": [_set("cache_size", {"minimum": 1}), _set("lend_size", {"minimum": 1})]},
+            when(
+                _set("lend_size", {"exclusiveMinimum": 0}),
+                {"properties": {"lend_size": {"minimum": REMOTE_CACHE_CHUNK_BYTES}}},
+            ),
+            when(unset_or_zero, {"properties": remote_unread}),
+            when(
+                _set("transport", {"const": "fabric"}),
+                {
+                    "properties": {
+                        "transfer_timeout_s": default(RemoteCacheConfig, "transfer_timeout_s")
+                    }
+                },
+            ),
+            when(
+                {
+                    "anyOf": [
+                        {"not": _set("lend_size", {"minimum": 1})},
+                        {"not": _set("transport", {"const": "fabric"})},
+                    ]
+                },
+                {
+                    "properties": {
+                        "lend_reserve_size": default(RemoteCacheConfig, "lend_reserve_size")
+                    }
+                },
+            ),
+            when(
+                _set("expected_num_lenders", {"type": "integer"}),
+                _set("expected_claim_size", {"type": "integer"}),
+            ),
+            when(
+                _set("expected_claim_size", {"type": "integer"}),
+                _set("expected_num_lenders", {"type": "integer"}),
+            ),
+            when(
+                _set("ucx_devices", {"type": "string"}),
+                {"properties": {"transport": {"const": "nixl"}}},
+            ),
+        ]
+    )
+    # KvCacheConfig.validate_remote_cache_config() and validate_defer_generation_only_release().
+    kv_v2 = {"properties": {"use_kv_cache_manager_v2": {"not": {"const": False}}}}
+    definitions["KvCacheConfig"].setdefault("allOf", []).extend(
+        [
+            when(_set("remote_cache_config", {"type": "object"}), kv_v2),
+            when(_set("defer_generation_only_release", {"const": True}), kv_v2),
+            when(
+                _set("remote_cache_config", _set("cache_size", {"minimum": 1})),
+                {"properties": {"disk_cache_size": {"enum": [0, None]}}},
+            ),
+        ]
+    )
+    # AttentionDpConfig.validate_attention_dp_config().
+    definitions["AttentionDpConfig"].setdefault("allOf", []).append(
+        when(
+            _set("kv_cache_routing_home_wait_rounds", {"type": "integer"}),
+            _set("kv_cache_routing_conversation_affinity", {"const": True}),
+        )
+    )
+    # SchedulerConfig.validate_waiting_queue_max_wait_s().
+    definitions["SchedulerConfig"].setdefault("allOf", []).append(
+        when(
+            {
+                "not": _set(
+                    "waiting_queue_policy",
+                    {"const": WaitingQueuePolicy.SHORTEST_DECODE_FIRST.value},
+                )
+            },
+            {
+                "properties": {
+                    "waiting_queue_max_wait_s": default(SchedulerConfig, "waiting_queue_max_wait_s")
+                }
+            },
+        )
+    )
+
+
 def generate_serve_schema() -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
+    schema = _serve_schema()
+    _cross_field_rules(schema["$defs"])
+    return schema
+
+
+def _serve_schema() -> dict:
+    """The serve schema without ``_cross_field_rules``, so that later merges see unmodified definitions."""
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
     from tensorrt_llm.llmapi.llm_args import (
         SERVE_CONFIG_ALIASES,
@@ -315,7 +437,7 @@ def generate_disagg_schema() -> dict:
     )
     from tensorrt_llm.llmapi.llm_args import SERVE_CLI_CONFIG_FIELDS, TorchLlmArgs
 
-    schema = generate_serve_schema()
+    schema = _serve_schema()
     properties = schema["properties"]
     for config_name, aliases in SERVE_CLI_CONFIG_FIELDS.items():
         config = _schema_for(TorchLlmArgs.model_fields[config_name].annotation, schema)
@@ -353,6 +475,7 @@ def generate_disagg_schema() -> dict:
         "maximum": (1 << DISAGG_NODE_ID_BITS) - 1,
     }
     properties.update(orchestrator)
+    _cross_field_rules(schema["$defs"])
     return schema
 
 
