@@ -71,8 +71,8 @@ from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.multi_stream_utils import (do_multi_stream,
                                           maybe_execute_in_parallel)
 from ..modules.rms_norm import RMSNorm
-from ..moe.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
-                             RenormalizeMoeRoutingMethod,
+from ..moe.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
+                             MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
                              RenormalizeNaiveMoeRoutingMethod,
                              RoutingMethodType, create_moe)
 from ..moe.fused_moe.impl_contract import MOE_DECODE_OPTIONS, MoEDecodeOptions
@@ -925,6 +925,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                                     and lora_params is None):
             raise NotImplementedError(
                 "do_finalize=False needs experts that can defer the finalize")
+        if (not do_finalize and isinstance(self.experts, ConfigurableMoE)
+                and hidden_states.shape[0] > self.experts.moe_max_num_tokens):
+            # The MoE scheduler concatenates the outputs of its chunks, so a
+            # chunked call hands the fold its finalized output.
+            do_finalize = True
 
         # Context sizes: NVFP4 for the routed experts and E4M3 for the shared
         # expert's gate_up from one pass; the router and the shared-expert gate
