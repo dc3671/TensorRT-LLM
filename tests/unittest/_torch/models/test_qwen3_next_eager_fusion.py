@@ -692,7 +692,8 @@ def test_mtp_forward_returns_the_kept_rows(monkeypatch, compact) -> None:
 def test_decode_layout_decisions(monkeypatch, batch, attention_dp, large_rows, kept_rows) -> None:
     """Where the Qwen3.5 decode paths engage, derived from the layout (MTP rows per request, CUDA-graph batch
     sizes, attention DP): the large-step rows (tcgen05 GDN verify, the MoE engine's spare SMs), pass 0's kept rows,
-    and the state promotion beside the draft loop (TP decode kernels, every layout)."""
+    the state promotion beside the draft loop (TP decode kernels, every layout) and the expert prefetch's budgeted
+    steps."""
     from tensorrt_llm._torch.models import modeling_qwen3_next as m
 
     monkeypatch.setattr(m, "_uses_decode_kernels", lambda model_config: True)
@@ -706,3 +707,6 @@ def test_decode_layout_decisions(monkeypatch, batch, attention_dp, large_rows, k
     assert m._verify_tcgen05_min_rows(model_config) == (7 if attention_dp else large_rows)
     assert m.Qwen3NextMTP.takes_kept_rows(model_config) == kept_rows
     assert m.Qwen3NextMTP.promotes_target_state_beside(model_config) == (not attention_dp)
+    # Expert prefetch rank + issue budget per step: 3..5 requests (TEP8 b5's steady step, not b2's or b8's)
+    lo, hi = m._expert_prefetch_budget_rows(model_config)
+    assert [r for r in range(1, 10) if lo < 7 * r <= hi] == [3, 4, 5]

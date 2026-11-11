@@ -1345,8 +1345,8 @@ class DecodeFront:
         )
         if self._expert_prefetch is not None and not moe_kwargs.get("do_finalize", True):
             prefetch, layer_idx = self._expert_prefetch
-            _, _, batch, _, nct, _ = prerouted_table_views(flat, m, top_k, num_local, tile)
-            prefetch.record(layer_idx, batch, nct, num_local, flat, rows=m)
+            _, _, batch, limit, nct, _ = prerouted_table_views(flat, m, top_k, num_local, tile)
+            prefetch.record(layer_idx, batch, limit, nct, tile, num_local, flat, rows=m)
         return out
 
 

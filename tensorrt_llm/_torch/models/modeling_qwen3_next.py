@@ -147,10 +147,26 @@ _RESIDENT_MIN_REQUESTS = 2
 # more rows, its burst slows the layer chain more than the experts gain.
 _EXPERT_PREFETCH_MIN_REQUESTS = 2
 _EXPERT_PREFETCH_MAX_ROWS = TWO_SHOT_ROWS - 1
+# Steps above the one-launch front's rows of at most this many requests
+# rank the prefetched experts by routed rows and stop each layer's prefetch
+# after its issue budget: there the engine starts streaming soon after.
+_EXPERT_PREFETCH_BUDGET_MAX_REQUESTS = 5
+# Issue budget (ns) of a GDN layer's prefetch: measured at 3-5 requests, a
+# longer issue overlaps the layer's MoE front and costs chain time.
+_EXPERT_PREFETCH_GDN_BUDGET_NS = 18500
+# Same for a full-attention layer, whose mixer reaches the MoE front sooner.
+_EXPERT_PREFETCH_ATTN_BUDGET_NS = 12500
 # From this many requests of an MTP decode step, the GDN layers verify on the
 # tcgen05 kernel and the decode MoE engine leaves SMs to the shared expert
 # running beside it.
 _LARGE_STEP_MIN_REQUESTS = 64
+
+
+def _expert_prefetch_budget_rows(model_config: ModelConfig) -> Tuple[int, int]:
+    """Rows (exclusive, inclusive) of the steps whose expert prefetch ranks
+    by routed rows and stops after the layer's issue budget."""
+    return (FUSED_FRONT_MAX_TOKENS, _EXPERT_PREFETCH_BUDGET_MAX_REQUESTS *
+            _rows_per_request(model_config))
 
 
 def _large_step_rows(model_config: ModelConfig) -> int:
@@ -1191,9 +1207,12 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
                       spec_metadata, lora_params, all_reduce_params, **kwargs):
         raise NotImplementedError
 
-    def set_expert_prefetch(self, prefetch: ExpertL2Prefetch) -> None:
+    def set_expert_prefetch(self,
+                            prefetch: ExpertL2Prefetch,
+                            issue_budget_ns: int = 0) -> None:
         """Prefetch the routed experts this layer used at the previous decode
-        step into L2, early in the layer (the mixer's own hook point)."""
+        step into L2, early in the layer (the mixer's own hook point), issuing
+        for at most ``issue_budget_ns`` in budgeted steps (0: no limit)."""
         mlp = self.mlp
         if not isinstance(mlp, Qwen3NextSparseMoeBlock):
             return
@@ -1201,7 +1220,7 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
         experts = mlp.experts
         prefetch.register(
             self.layer_idx, experts.backend if isinstance(
-                experts, ConfigurableMoE) else experts)
+                experts, ConfigurableMoE) else experts, issue_budget_ns)
         mlp._decode_front.set_expert_prefetch(prefetch, self.layer_idx)
         self._attach_expert_prefetch(prefetch)
 
@@ -1845,9 +1864,13 @@ class Qwen3NextModel(DecoderModel):
             _rows_per_request(model_config),
             max_rows=_EXPERT_PREFETCH_MAX_ROWS,
             top_k=model_config.pretrained_config.num_experts_per_tok,
-            stream=self.aux_stream_dict[AuxStreamType.MoeExpertPrefetch])
+            stream=self.aux_stream_dict[AuxStreamType.MoeExpertPrefetch],
+            budget_rows=_expert_prefetch_budget_rows(model_config))
         for layer in self.layers:
-            layer.set_expert_prefetch(self.expert_prefetch)
+            layer.set_expert_prefetch(
+                self.expert_prefetch, _EXPERT_PREFETCH_GDN_BUDGET_NS
+                if isinstance(layer, Qwen3NextLinearDecoderLayer) else
+                _EXPERT_PREFETCH_ATTN_BUDGET_NS)
 
     def share_lamport_fc2(self, layers) -> None:
         """Hand ``lamport_fc2`` to the MoE blocks of ``layers``."""
