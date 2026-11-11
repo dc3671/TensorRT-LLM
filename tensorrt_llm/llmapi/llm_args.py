@@ -5688,7 +5688,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "so that the host-side release overlaps GPU work. The pages return one "
         "iteration later: the next iteration's scheduler cannot admit requests "
         "into them, so leave this off on generation servers bound by KV cache "
-        "capacity. Requires KV cache manager v2 and the overlap scheduler "
+        "capacity. Their KV cache events are published one iteration later too, "
+        "or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler "
         "without pipeline parallelism.")
 
     enable_kv_pool_rebalance: bool = Field(

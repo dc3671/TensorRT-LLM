@@ -7600,6 +7600,11 @@ class PyExecutor:
                 else:
                     self._enqueue_responses([])
 
+                if defer_kv_close and not self.active_requests:
+                    # Idle: no next forward to overlap with, so close now and
+                    # let the KV cache events below publish it.
+                    self.kv_cache_manager.flush_deferred_closes()
+
                 # KV-cache event flushing performs an attention-DP allgather.
                 # Keep it outside the rank-divergent previous-batch branch so
                 # every rank enters the collective in the same order.
@@ -7651,8 +7656,8 @@ class PyExecutor:
                     self._kv_connector_terminate_requests()
 
                 if defer_kv_close and not self.active_requests:
-                    # No next forward to overlap with; do not hold the pages
-                    # while the next fetch may block.
+                    # Requests terminated since the flush above: do not hold
+                    # their pages while the next fetch may block.
                     self.kv_cache_manager.flush_deferred_closes()
 
                 if not can_queue:
