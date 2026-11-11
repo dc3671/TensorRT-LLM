@@ -15,6 +15,7 @@
 """The remote-level lender makes all of its memory resident before it publishes it. Linux only, no GPU."""
 
 import ctypes
+import errno
 import mmap
 import sys
 import unittest
@@ -52,15 +53,17 @@ class TestPopulate(unittest.TestCase):
     def test_every_page_is_resident(self):
         region, address = self._region()
         self.assertEqual(_resident_bytes(address, _SIZE), 0)
-        remote_lender._populate(region, _SIZE)
+        remote_lender._populate(region, address, _SIZE)
         self.assertEqual(_resident_bytes(address, _SIZE), _SIZE)
 
     def test_fallback_without_madv_populate_write(self):
         region, address = self._region()
         self.assertEqual(_resident_bytes(address, _SIZE), 0)
-        # An advice value the kernel rejects (EINVAL) takes the zero-fill path.
-        with mock.patch.object(remote_lender, "_MADV_POPULATE_WRITE", 1 << 20):
-            remote_lender._populate(region, _SIZE)
+        # A kernel without MADV_POPULATE_WRITE (EINVAL) takes the zero-fill path.
+        with mock.patch.object(
+            remote_lender, "madvise_range", side_effect=OSError(errno.EINVAL, "EINVAL")
+        ):
+            remote_lender._populate(region, address, _SIZE)
         self.assertEqual(_resident_bytes(address, _SIZE), _SIZE)
 
 

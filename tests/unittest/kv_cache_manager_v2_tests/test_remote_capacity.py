@@ -317,7 +317,7 @@ class TestRendezvousPermissions(unittest.TestCase):
 
 
 class TestPopulate(unittest.TestCase):
-    """MADV_POPULATE_WRITE runs without the GIL; only a kernel without it falls back to zeroing the region."""
+    """Populate errors other than a missing MADV_POPULATE_WRITE (test_remote_lender_memory) raise."""
 
     def _populate_with(self, error):
         region = mmap.mmap(-1, 1 << 20, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
@@ -326,9 +326,6 @@ class TestPopulate(unittest.TestCase):
                 remote_lender._populate(region, 0, 1 << 20)
         finally:
             region.close()
-
-    def test_a_kernel_without_populate_write_falls_back(self):
-        self._populate_with(OSError(errno.EINVAL, "EINVAL"))
 
     def test_other_errors_raise(self):
         for code in (errno.ENOMEM, getattr(errno, "EHWPOISON", 133)):
