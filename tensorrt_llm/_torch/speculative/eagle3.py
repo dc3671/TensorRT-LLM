@@ -18,6 +18,7 @@ from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..attention.backends.sparse.params import MTPIndexShareMetadata
 from ..model_config import ModelConfig
+from ..modules.multi_stream_utils import do_multi_stream
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
@@ -652,9 +653,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             self._is_mamba_hybrid_cache = isinstance(
                 attn_metadata.kv_cache_manager, MambaHybridCacheManager)
         promoting = num_gens > 0 and self._is_mamba_hybrid_cache
-        if promoting and self._promotion_stream is not None:
-            # Beside the draft loop, which reads no target recurrent state; its
-            # inputs are not written before the join after the loop.
+        # Beside the draft loop (multi-stream steps), which reads no target
+        # recurrent state; its inputs are not written before the join.
+        beside = (promoting and self._promotion_stream is not None
+                  and do_multi_stream())
+        if beside:
             self._promotion_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._promotion_stream):
                 attn_metadata.kv_cache_manager.update_mamba_states(
@@ -668,71 +671,73 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 num_accepted_tokens=num_accepted_tokens,
                 state_indices=attn_metadata.mamba_metadata.state_indices)
 
-        sa_manager = getattr(spec_metadata.spec_resource_manager, 'sa_manager',
-                             None)
-        if self.sa_enhancer is not None and sa_manager is not None:
-            self.sa_enhancer.extend_and_prepare(
-                sa_manager=sa_manager,
-                request_ids=spec_metadata.request_ids,
-                accepted_tokens=accepted_tokens,
-                num_accepted_tokens=num_accepted_tokens,
-                num_gens=num_gens,
-                num_contexts=num_contexts,
-                max_draft_len=runtime_draft_len,
-            )
-
-        if self._uses_external_shared_target_kv:
-            next_new_tokens = None
-            next_draft_tokens = (
-                self._forward_external_shared_target_kv_draft_loop(
-                    position_ids=position_ids,
-                    hidden_states=hidden_states,
-                    attn_metadata=attn_metadata,
-                    spec_metadata=spec_metadata,
-                    draft_model=draft_model,
+        try:
+            sa_manager = getattr(spec_metadata.spec_resource_manager,
+                                 'sa_manager', None)
+            if self.sa_enhancer is not None and sa_manager is not None:
+                self.sa_enhancer.extend_and_prepare(
+                    sa_manager=sa_manager,
+                    request_ids=spec_metadata.request_ids,
                     accepted_tokens=accepted_tokens,
                     num_accepted_tokens=num_accepted_tokens,
+                    num_gens=num_gens,
                     num_contexts=num_contexts,
-                    batch_size=batch_size,
-                ))
-        else:
-            # The step-0 sequence lengths, before the draft loop rewrites them.
-            pre_draft_seq_lens = attn_metadata._seq_lens_cuda
-            # Save the old attn_metadata and spec_metadata
-            self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+                    max_draft_len=runtime_draft_len,
+                )
 
-            # Prepare inputs for the 1st draft model forward
-            position_ids = position_ids.squeeze(0)
-            inputs = self.prepare_1st_drafter_inputs(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                accepted_tokens=accepted_tokens,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                draft_model=draft_model)
+            if self._uses_external_shared_target_kv:
+                next_new_tokens = None
+                next_draft_tokens = (
+                    self._forward_external_shared_target_kv_draft_loop(
+                        position_ids=position_ids,
+                        hidden_states=hidden_states,
+                        attn_metadata=attn_metadata,
+                        spec_metadata=spec_metadata,
+                        draft_model=draft_model,
+                        accepted_tokens=accepted_tokens,
+                        num_accepted_tokens=num_accepted_tokens,
+                        num_contexts=num_contexts,
+                        batch_size=batch_size,
+                    ))
+            else:
+                # The step-0 sequence lengths, before the draft loop rewrites them.
+                pre_draft_seq_lens = attn_metadata._seq_lens_cuda
+                # Save the old attn_metadata and spec_metadata
+                self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
-            # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here
-            # so the post-loop restore (below) can put attn_metadata back into a
-            # state the target model expects.
-            original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+                # Prepare inputs for the 1st draft model forward
+                position_ids = position_ids.squeeze(0)
+                inputs = self.prepare_1st_drafter_inputs(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    accepted_tokens=accepted_tokens,
+                    attn_metadata=attn_metadata,
+                    spec_metadata=spec_metadata,
+                    draft_model=draft_model)
 
-            # Get the draft KV cache manager if using separate layouts
-            draft_kv_cache_manager = self.get_draft_kv_cache_manager(
-                resource_manager)
+                # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here
+                # so the post-loop restore (below) can put attn_metadata back into a
+                # state the target model expects.
+                original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
-            next_draft_tokens, next_new_tokens = self._forward_draft_loop(
-                inputs, attn_metadata, spec_metadata, draft_model,
-                draft_kv_cache_manager, num_contexts, num_gens, batch_size,
-                num_accepted_tokens, original_all_rank_num_tokens,
-                resource_manager, accepted_tokens, pre_draft_seq_lens)
-            # restore attn_metadata to support cuda graph
-            self._restore_attn_metadata_from_spec_dec(attn_metadata)
-            # restore all_rank_num_tokens for attention DP
-            if original_all_rank_num_tokens is not None:
-                attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
-        if promoting and self._promotion_stream is not None:
-            torch.cuda.current_stream().wait_event(self._promotion_done)
+                # Get the draft KV cache manager if using separate layouts
+                draft_kv_cache_manager = self.get_draft_kv_cache_manager(
+                    resource_manager)
+
+                next_draft_tokens, next_new_tokens = self._forward_draft_loop(
+                    inputs, attn_metadata, spec_metadata, draft_model,
+                    draft_kv_cache_manager, num_contexts, num_gens, batch_size,
+                    num_accepted_tokens, original_all_rank_num_tokens,
+                    resource_manager, accepted_tokens, pre_draft_seq_lens)
+                # restore attn_metadata to support cuda graph
+                self._restore_attn_metadata_from_spec_dec(attn_metadata)
+                # restore all_rank_num_tokens for attention DP
+                if original_all_rank_num_tokens is not None:
+                    attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+        finally:
+            if beside:
+                torch.cuda.current_stream().wait_event(self._promotion_done)
 
         # prepare next new tokens to support overlap scheduler; the draft loop
         # may have built them already as a view of its token buffer.
