@@ -26,26 +26,33 @@ conversation's earlier replies (keyed by ``conversation_params.conversation_id``
 phase's prompt length; the request's ``max_tokens`` is never read.
 
 Per conversation it keeps the recorded replies' count, last / EMA(0.5) / mean / max output tokens and
-the last prompt length. A request's 7 features: log1p of the history count, of its prompt tokens, and
+the last prompt length. A reply without a conversation id trains the global models (median, ridge,
+trees) with an empty history. A request's 7 features: log1p of the history count, of its prompt tokens, and
 of the last / EMA / mean / max output tokens (NaN without history), and the signed log1p of the tokens
 appended since the last reply (NaN without history). Rules: a history of exactly one reply with a
 prompt under 1,500 tokens is dropped when the next request appends over 10,000 tokens (a new prefix),
 and replies of at most 2 tokens (cache primers) are not learned.
 
 Predictors, each taking over at its first fit:
-  * a conversation with history gets its EMA(0.5); otherwise the running median of all learned
-    replies, or ``PRIOR_TOKENS`` before the first;
+  * a conversation with history gets its EMA(0.5); otherwise the median of the last
+    ``MEDIAN_WINDOW`` learned replies, or ``PRIOR_TOKENS`` before the first;
   * ``ridge``: a ridge regression of log1p(output tokens) on the features (NaN as -1 plus a missing
     indicator per feature), refit every ``RIDGE_REFIT_S`` on the replies learned so far;
   * ``ridge_gbm``: also a gradient-boosted tree ensemble on the same target (scikit-learn
-    ``HistGradientBoostingRegressor``), refit every ``GBM_REFIT_S`` in a separate Python process off
-    the request path; the coordinator evaluates its trees itself.
+    ``HistGradientBoostingRegressor``), refit every ``GBM_REFIT_S`` on the last ``GBM_MAX_ROWS``
+    learned replies in a separate Python process off the request path; the coordinator evaluates
+    its trees itself.
+
+In a fleet (``num_workers > 1``) a generation router placed by the coordinator gets the prediction
+from ``/select`` (the routing key carries ``OUTPUT_LENGTH_KEY``), so it costs no extra round trip;
+otherwise the frontend asks the coordinator's ``/output_length``. Finished replies go back in
+batches. Only requests with a ``priority`` field (completions and chat completions) are predicted;
+``/v1/responses`` requests are not.
 """
 
 from __future__ import annotations
 
 import asyncio
-import heapq
 import json
 import math
 import os
@@ -54,8 +61,9 @@ import sys
 import threading
 import time
 from array import array
-from collections import OrderedDict
-from typing import Any, AsyncIterator, Optional, Tuple
+from bisect import bisect_left, insort
+from collections import OrderedDict, deque
+from typing import Any, AsyncIterator, List, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -68,6 +76,13 @@ PRIOR_TOKENS = 375.77
 PREDICT_TIMEOUT_S = 1.0
 RECORD_TIMEOUT_S = 5.0
 STATS_LOG_PERIOD_S = 30.0
+# Routing-key and route-info entry of a /select that predicts the output length.
+OUTPUT_LENGTH_KEY = "output_length"
+# Finished replies go to the coordinator in batches: at most this many, at most this late.
+RECORD_BATCH_MAX = 512
+RECORD_FLUSH_S = 0.05
+# Warn if none of this many reported replies was learned.
+NOTHING_LEARNED_WARN_AFTER = 1000
 
 FEATURES = ("turn", "isl", "prev_out", "ema_out", "mean_out", "max_out", "appended")
 RESET_MAX_PREV_ISL = 1500.0
@@ -76,6 +91,8 @@ SKIP_MAX_OUT = 2.0
 MAX_CONVERSATIONS = 50000
 # Features of predicted requests whose reply has not been learned yet (the oldest are dropped).
 MAX_PENDING_ROWS = 200000
+# The median prior covers the last this many learned replies.
+MEDIAN_WINDOW = 10000
 
 RIDGE_REFIT_S = 120.0
 RIDGE_ALPHA = 1.0
@@ -84,6 +101,8 @@ GBM_REFIT_S = 300.0
 GBM_MIN_ROWS = 1000
 GBM_THREADS = 4
 GBM_FIT_TIMEOUT_S = 600.0
+# The tree ensemble is fitted on the last this many learned replies (8 doubles each).
+GBM_MAX_ROWS = 250000
 # A fitted ensemble goes live only if the coordinator's tree walk matches scikit-learn's predict.
 GBM_EXPORT_TOL = 1e-6
 GBM_PARAMS = {
@@ -103,9 +122,25 @@ NAN = float("nan")
 Snapshot = Tuple[float, float, float, float, float, float]
 
 
+def is_finite_nonneg(value: Any) -> bool:
+    """Whether ``value`` is a finite number >= 0 (not a bool)."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
 def priority_of(tokens: float) -> float:
-    """Map predicted output tokens into (0, 1], strictly decreasing: shorter replies go first."""
-    return 1.0 / (1.0 + max(float(tokens), 0.0) / PRIORITY_SCALE_TOKENS)
+    """Map predicted output tokens into [0, 1], decreasing: shorter replies go first.
+
+    A NaN prediction gets the prior's priority.
+    """
+    tokens = float(tokens)
+    if tokens != tokens:
+        tokens = PRIOR_TOKENS
+    return 1.0 / (1.0 + max(tokens, 0.0) / PRIORITY_SCALE_TOKENS)
 
 
 class _History:
@@ -239,33 +274,34 @@ class TreeEnsemble:
 
 
 class RunningMedian:
-    """Median of every value added so far (the mean of the two middle values for an even count)."""
+    """Median of the last ``window`` values added (the mean of the two middle values for an even count).
 
-    __slots__ = ("_lo", "_hi", "n")
+    ``n`` counts every value added.
+    """
 
-    def __init__(self) -> None:
-        self._lo: list = []  # max-heap of the lower half, negated
-        self._hi: list = []  # min-heap of the upper half
+    __slots__ = ("_recent", "_sorted", "window", "n")
+
+    def __init__(self, window: int = MEDIAN_WINDOW) -> None:
+        self.window = window
+        self._recent: deque = deque()
+        self._sorted: list = []
         self.n = 0
 
     def add(self, value: float) -> None:
         value = float(value)
-        if self._lo and value > -self._lo[0]:
-            heapq.heappush(self._hi, value)
-        else:
-            heapq.heappush(self._lo, -value)
-        if len(self._lo) > len(self._hi) + 1:
-            heapq.heappush(self._hi, -heapq.heappop(self._lo))
-        elif len(self._hi) > len(self._lo):
-            heapq.heappush(self._lo, -heapq.heappop(self._hi))
+        self._recent.append(value)
+        insort(self._sorted, value)
+        if len(self._recent) > self.window:
+            del self._sorted[bisect_left(self._sorted, self._recent.popleft())]
         self.n += 1
 
     def value(self) -> float:
-        if not self.n:
+        k = len(self._sorted)
+        if not k:
             return NAN
-        if len(self._lo) > len(self._hi):
-            return -self._lo[0]
-        return (-self._lo[0] + self._hi[0]) / 2.0
+        if k % 2:
+            return self._sorted[k // 2]
+        return (self._sorted[k // 2 - 1] + self._sorted[k // 2]) / 2.0
 
 
 def ridge_row(x: list) -> list:
@@ -351,17 +387,19 @@ class OnlineRidge:
         return self.intercept + sum(wi * zi for wi, zi in zip(self.coef, z))
 
 
-# The fit process: numpy + scikit-learn only. Rows come in on stdin, the trees go out as JSON on stdout,
-# with the largest difference between its tree walk and scikit-learn's predict on up to 2,000 rows.
+# The fit process: numpy + scikit-learn only. The header (with the server's sys.path, which -I drops)
+# is argv[1], the rows come in on stdin, the trees go out as JSON on stdout, with the largest difference
+# between its tree walk and scikit-learn's predict on up to 2,000 rows.
 _GBM_FIT_SCRIPT = r"""
 import json, os, sys, time
+header = json.loads(sys.argv[1])
+sys.path[:0] = header["sys_path"]
 try:
     os.nice(10)
 except OSError:
     pass
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingRegressor
-header = json.loads(sys.stdin.buffer.readline())
 n, d = header["n"], header["d"]
 data = np.frombuffer(sys.stdin.buffer.read(), dtype=np.float64).reshape(n, d + 1)
 X, y = data[:, :d], data[:, d]
@@ -396,11 +434,31 @@ json.dump({"baseline": baseline, "trees": trees, "n_iter": int(model.n_iter_), "
 """
 
 
+def child_sys_path() -> List[str]:
+    """The server's import path for a ``-I`` child: ``sys.path`` without the working directory.
+
+    ``-I`` ignores ``PYTHONPATH`` and the user site (where scikit-learn may be installed) and keeps
+    the working directory off the path; the child prepends this list instead.
+    """
+    cwd = os.getcwd()
+    return [
+        entry
+        for entry in sys.path
+        if entry and os.path.isabs(entry) and os.path.realpath(entry) != os.path.realpath(cwd)
+    ]
+
+
 def check_gbm_dependencies(python: Optional[str] = None) -> None:
     """Raise ImportError unless the fit process can import numpy and scikit-learn."""
     python = python or sys.executable
     result = subprocess.run(
-        [python, "-I", "-c", "import numpy, sklearn.ensemble"],
+        [
+            python,
+            "-I",
+            "-c",
+            "import json, sys; sys.path[:0] = json.loads(sys.argv[1]); import numpy, sklearn.ensemble",
+            json.dumps(child_sys_path()),
+        ],
         capture_output=True,
         timeout=120,
         check=False,
@@ -416,8 +474,8 @@ def check_gbm_dependencies(python: Optional[str] = None) -> None:
 class SubprocessGbmFitter:
     """Fits the tree ensemble off the request path, in a separate Python process.
 
-    ``start`` hands the rows to a background thread that runs the process; ``poll`` returns its result
-    once. ``sync=True`` fits inside ``start`` (tests).
+    ``start`` hands the rows to a background thread, which serializes them and runs the process;
+    ``poll`` returns its result once. ``sync=True`` fits inside ``start`` (tests).
     """
 
     def __init__(
@@ -439,25 +497,25 @@ class SubprocessGbmFitter:
         return self._thread is not None and self._thread.is_alive()
 
     def start(self, rows: array, n: int, meta: dict) -> None:
-        header = {"n": n, "d": len(FEATURES), "params": GBM_PARAMS}
-        payload = json.dumps(header).encode() + b"\n" + rows.tobytes()
+        """Fit on ``rows`` (``n`` rows of the features and the target; not modified afterwards)."""
+        header = {"n": n, "d": len(FEATURES), "params": GBM_PARAMS, "sys_path": child_sys_path()}
         if self.sync:
-            self._finish(self._run(payload), meta)
+            self._finish(self._run(header, rows), meta)
             return
         self._thread = threading.Thread(
-            target=lambda: self._finish(self._run(payload), meta),
+            target=lambda: self._finish(self._run(header, rows), meta),
             name="output-length-gbm-fit",
             daemon=True,
         )
         self._thread.start()
 
-    def _run(self, payload: bytes) -> dict:
+    def _run(self, header: dict, rows: array) -> dict:
         env = dict(os.environ)
         env.update(OMP_NUM_THREADS=str(self.threads), OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
         try:
             result = subprocess.run(
-                [self.python, "-I", "-c", _GBM_FIT_SCRIPT],
-                input=payload,
+                [self.python, "-I", "-c", _GBM_FIT_SCRIPT, json.dumps(header)],
+                input=rows.tobytes(),
                 capture_output=True,
                 timeout=self.timeout_s,
                 env=env,
@@ -490,6 +548,8 @@ class OnlineLengthPredictor:
 
     Events carry their time ``t`` (``time.monotonic()`` in the coordinator), so the same events give the
     same predictions, except that a tree ensemble goes live at the first event after its fit returns.
+    Its memory is bounded: ``MAX_CONVERSATIONS`` histories, ``MAX_PENDING_ROWS`` predicted rows,
+    ``MEDIAN_WINDOW`` replies for the median and ``GBM_MAX_ROWS`` training rows for the trees.
     """
 
     def __init__(self, predictor: str, gbm_fitter: Any = None) -> None:
@@ -504,7 +564,9 @@ class OnlineLengthPredictor:
         if self.gbm_on and self.gbm_fitter is None:
             check_gbm_dependencies()
             self.gbm_fitter = SubprocessGbmFitter()
+        # The last GBM_MAX_ROWS training rows (features + target), a ring once full.
         self.gbm_rows = array("d")
+        self.gbm_max_rows = GBM_MAX_ROWS
         self.gbm_n = 0
         self.gbm: Optional[TreeEnsemble] = None
         self.gbm_fits = 0
@@ -517,6 +579,10 @@ class OnlineLengthPredictor:
         self._pending: OrderedDict[int, list] = OrderedDict()
         self._next_key = 0
         self.unmatched = 0
+        self.learned = 0
+        self.without_conversation = 0
+        self.invalid = 0
+        self.reported = 0
         self.sources = {"prior": 0, "median": 0, "ema": 0, "ridge": 0, "gbm": 0}
         self._last_stats = time.monotonic()
 
@@ -534,19 +600,30 @@ class OnlineLengthPredictor:
                 self.ridge_fits += 1
             self.next_ridge_fit += RIDGE_REFIT_S
         while t >= self.next_gbm_fit:
-            if self.gbm_n >= GBM_MIN_ROWS:
+            rows = min(self.gbm_n, self.gbm_max_rows)
+            if rows >= GBM_MIN_ROWS:
                 if self.gbm_fitter.busy():
                     self.gbm_busy_skips += 1
                 else:
-                    meta = {"rows": self.gbm_n, "boundary_s": self.next_gbm_fit - self.t0}
-                    self.gbm_fitter.start(
-                        self.gbm_rows[: self.gbm_n * (len(FEATURES) + 1)], self.gbm_n, meta
-                    )
+                    meta = {"rows": rows, "boundary_s": self.next_gbm_fit - self.t0}
+                    # A bounded copy: later replies overwrite the ring while the fit runs.
+                    self.gbm_fitter.start(self.gbm_rows[: rows * (len(FEATURES) + 1)], rows, meta)
             self.next_gbm_fit += GBM_REFIT_S
         if self.gbm_on:
             result = self.gbm_fitter.poll()
             if result is not None:
                 self._install_gbm(result)
+
+    def _add_gbm_row(self, x: list, y: float) -> None:
+        width = len(FEATURES) + 1
+        row = array("d", x)
+        row.append(y)
+        if self.gbm_n < self.gbm_max_rows:
+            self.gbm_rows.extend(row)
+        else:
+            i = (self.gbm_n % self.gbm_max_rows) * width
+            self.gbm_rows[i : i + width] = row
+        self.gbm_n += 1
 
     def _install_gbm(self, result: dict) -> None:
         diff = result.get("export_max_abs_diff")
@@ -565,10 +642,16 @@ class OnlineLengthPredictor:
         )
 
     def predict(self, conv_id: Optional[str], isl: float, t: float) -> Tuple[float, int]:
-        """(predicted output tokens, key): the key goes back with the reply, so its features can be learned."""
+        """(predicted output tokens, key): the key goes back with the reply, so its features can be learned.
+
+        Raises ValueError unless ``isl`` is a finite number >= 0.
+        """
+        if not is_finite_nonneg(isl):
+            raise ValueError(f"prompt tokens must be a finite number >= 0, got {isl!r}")
         self._tick(t)
         snapshot = self.table.snapshot_for(conv_id, isl)
         x = features(snapshot, isl)
+        tokens, source = NAN, "prior"
         if self.gbm is not None:
             tokens, source = max(math.expm1(self.gbm.raw(x)), 0.0), "gbm"
         elif self.ridge.coef is not None:
@@ -577,7 +660,7 @@ class OnlineLengthPredictor:
             tokens, source = snapshot[2], "ema"
         elif self.median.n:
             tokens, source = self.median.value(), "median"
-        else:
+        if not math.isfinite(tokens):
             tokens, source = PRIOR_TOKENS, "prior"
         self.sources[source] += 1
         key = self._next_key
@@ -591,11 +674,28 @@ class OnlineLengthPredictor:
     def record(
         self, conv_id: Optional[str], isl: float, out: float, key: Optional[int], t: float
     ) -> bool:
-        """Learn a finished reply of ``out`` tokens; whether it was learned (see ConversationLengthTable.record)."""
+        """Learn a finished reply of ``out`` tokens; returns whether it was learned.
+
+        Not learned: a non-finite or negative ``isl`` / ``out``, and a reply of at most
+        ``SKIP_MAX_OUT`` tokens (a cache primer). A reply without a conversation id trains the
+        global models only.
+        """
         self._tick(t)
+        self.reported += 1
         x = self._pending.pop(key, None) if key is not None else None
-        if not self.table.record(conv_id, isl, out):
-            return False
+        if not (is_finite_nonneg(isl) and is_finite_nonneg(out)):
+            self.invalid += 1
+            return self._learned(False)
+        if out <= SKIP_MAX_OUT:
+            self.table.skipped += 1
+            return self._learned(False)
+        if conv_id is None:
+            self.without_conversation += 1
+            if x is None:
+                # Without a conversation the features never depend on history.
+                x = features(None, isl)
+        else:
+            self.table.record(conv_id, isl, out)
         self.median.add(out)
         if x is None:
             self.unmatched += 1
@@ -603,17 +703,26 @@ class OnlineLengthPredictor:
             y = math.log1p(out)
             self.ridge.add(ridge_row(x), y)
             if self.gbm_on:
-                self.gbm_rows.extend(x)
-                self.gbm_rows.append(y)
-                self.gbm_n += 1
+                self._add_gbm_row(x, y)
+        return self._learned(True)
+
+    def _learned(self, learned: bool) -> bool:
+        self.learned += learned
+        if self.reported == NOTHING_LEARNED_WARN_AFTER and not self.learned:
+            logger.warning(
+                f"[output_length] none of the first {self.reported} replies was learned "
+                f"({self.invalid} invalid, {self.table.skipped} of at most {SKIP_MAX_OUT:g} tokens): "
+                f"every generation request keeps the prior's priority"
+            )
         self._maybe_log_stats()
-        return True
+        return learned
 
     def stats_line(self) -> str:
         sources = ", ".join(f"{k} {v}" for k, v in self.sources.items() if v) or "none"
         line = (
             f"[output_length] {self.predictor}: {len(self.table)} conversations, replies learned "
-            f"{self.table.recorded} (skipped {self.table.skipped}, resets {self.table.resets}), median "
+            f"{self.learned} ({self.without_conversation} without a conversation id; skipped "
+            f"{self.table.skipped}, invalid {self.invalid}, resets {self.table.resets}), median "
             f"{self.median.value():.1f} tokens; predictions by source: {sources}; ridge fits {self.ridge_fits}"
         )
         if self.gbm_on:
@@ -647,23 +756,31 @@ def request_inputs(request: Any) -> Tuple[Optional[str], Optional[float]]:
 _USAGE_MARK = b'"completion_tokens"'
 
 
+def _sse_json(event: bytes) -> Optional[dict]:
+    """The JSON object of an SSE event's ``data:`` line, else None."""
+    for line in event.split(b"\n"):
+        line = line.strip()
+        if not line.startswith(b"data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == b"[DONE]":
+            return None
+        try:
+            obj = json.loads(payload)
+        except ValueError:
+            return None
+        return obj if isinstance(obj, dict) else None
+    return None
+
+
 def completion_tokens_in(data: bytes) -> Tuple[Optional[int], bool]:
     """Scan SSE ``data:`` lines for ``usage.completion_tokens``: (value, from a final usage-only chunk)."""
     if _USAGE_MARK not in data:
         return None, False
     found, final = None, False
     for line in data.split(b"\n"):
-        line = line.strip()
-        if not line.startswith(b"data:"):
-            continue
-        payload = line[5:].strip()
-        if not payload or payload == b"[DONE]":
-            continue
-        try:
-            obj = json.loads(payload)
-        except ValueError:
-            continue
-        usage = obj.get("usage") if isinstance(obj, dict) else None
+        obj = _sse_json(line)
+        usage = obj.get("usage") if obj is not None else None
         if isinstance(usage, dict) and usage.get("completion_tokens") is not None:
             found = int(usage["completion_tokens"])
             final = not obj.get("choices")
@@ -671,27 +788,48 @@ def completion_tokens_in(data: bytes) -> Tuple[Optional[int], bool]:
 
 
 class _Ticket:
-    __slots__ = ("conv_id", "isl", "key", "recorded")
+    __slots__ = ("conv_id", "isl", "key", "recorded", "via_select", "strip_usage")
 
     def __init__(self, conv_id: Optional[str], isl: float, key: Optional[int]) -> None:
         self.conv_id = conv_id
         self.isl = isl
         self.key = key
         self.recorded = False
+        # The prediction comes with the generation placement (/select).
+        self.via_select = False
+        # The client did not ask for streamed usage: drop the final usage-only chunk.
+        self.strip_usage = False
+
+
+def _throttled(count: int) -> bool:
+    return count <= 10 or count % 1000 == 0
 
 
 class OutputLengthPriority:
     """Frontend side: set the generation request's priority, then report its reply's length.
 
-    ``coordinator`` provides ``predict_output_length`` and ``record_output_length``
-    (:class:`~tensorrt_llm.serve.disagg_coordinator.DisaggCoordinator`).
+    ``coordinator`` provides ``predict_output_length`` and ``record_output_lengths``
+    (:class:`~tensorrt_llm.serve.disagg_coordinator.DisaggCoordinator`). With ``via_select``, a
+    request placed after :meth:`assign` gets its prediction from the generation placement
+    (:meth:`placed`) instead of a separate call. Replies are reported in batches of up to
+    ``RECORD_BATCH_MAX``, at most ``record_flush_s`` after the first of a batch.
     """
 
-    def __init__(self, coordinator: Any, predictor: str) -> None:
+    def __init__(
+        self,
+        coordinator: Any,
+        predictor: str,
+        via_select: bool = False,
+        record_flush_s: float = 0.0,
+    ) -> None:
         self._coordinator = coordinator
         self.predictor = predictor
+        self.via_select = via_select
+        self.record_flush_s = record_flush_s
         self.prior_priority = priority_of(PRIOR_TOKENS)
         self._tasks: set = set()
+        self._batch: List[Tuple[Optional[str], float, float, Optional[int]]] = []
+        self._flush_task: Optional[asyncio.Task] = None
         self.assigned = 0
         self.missing = 0
         self.recorded = 0
@@ -703,16 +841,20 @@ class OutputLengthPriority:
     def startup_line(self) -> str:
         return (
             f"[output_length] generation priority from the predicted output length ({self.predictor}, "
-            f"learned online in the coordinator): priority = 1 / (1 + tokens / {PRIORITY_SCALE_TOKENS:g}); "
+            f"learned online in the coordinator{', predicted in /select' if self.via_select else ''}): "
+            f"priority = 1 / (1 + tokens / {PRIORITY_SCALE_TOKENS:g}); "
             f"without a prediction, {PRIOR_TOKENS:g} tokens (priority {self.prior_priority:.4f}); max_tokens "
-            f"is never read"
+            f"is never read; /v1/responses requests are not predicted"
         )
 
-    async def assign(self, gen_req: Any) -> Optional[_Ticket]:
+    async def assign(self, gen_req: Any, placed_later: bool = False) -> Optional[_Ticket]:
         """Set ``gen_req.priority`` from the prediction; the ticket (None: nothing to learn) records the reply.
 
-        Never raises: without a prediction (no prompt tokens, a coordinator error or timeout) the request
-        gets the prior's priority.
+        With ``placed_later`` and ``via_select`` the prediction comes with the placement
+        (:meth:`placed`). A streamed request asks the generation server for its usage, which
+        :meth:`track` reads (and drops from the stream if the client did not ask for it).
+        Never raises: without a prediction (no prompt tokens, a coordinator error or timeout) the
+        request gets the prior's priority.
         """
         if "priority" not in getattr(type(gen_req), "model_fields", {}):
             return None
@@ -720,6 +862,11 @@ class OutputLengthPriority:
         if isl is None:
             self._miss(gen_req, "no prompt tokens")
             return None
+        ticket = _Ticket(conv_id, isl, None)
+        self._request_usage(gen_req, ticket)
+        if self.via_select and placed_later:
+            ticket.via_select = True
+            return ticket
         t0 = time.perf_counter()
         try:
             tokens, key = await asyncio.wait_for(
@@ -727,17 +874,44 @@ class OutputLengthPriority:
             )
         except Exception as e:  # noqa: BLE001  (an admission hint is never worth failing a request)
             self._miss(gen_req, f"{type(e).__name__}: {e}")
-            return _Ticket(conv_id, isl, None)
+            return ticket
         self._call_ms.append((time.perf_counter() - t0) * 1e3)
         gen_req.priority = priority_of(tokens)
+        ticket.key = key
         self.assigned += 1
         self._maybe_log_stats()
-        return _Ticket(conv_id, isl, key)
+        return ticket
+
+    @staticmethod
+    def _request_usage(gen_req: Any, ticket: _Ticket) -> None:
+        if not getattr(gen_req, "stream", False):
+            return
+        options = getattr(gen_req, "stream_options", None)
+        if options is not None and options.include_usage:
+            return
+        from tensorrt_llm.serve.openai_protocol import StreamOptions
+
+        # Without include_usage the client also gets no per-chunk usage.
+        gen_req.stream_options = StreamOptions(include_usage=True, continuous_usage_stats=False)
+        ticket.strip_usage = True
+
+    def placed(self, ticket: Optional[_Ticket], gen_req: Any, route_info: Any) -> None:
+        """Take the prediction from the generation placement's route info (``via_select``)."""
+        if ticket is None or not ticket.via_select:
+            return
+        prediction = route_info.get(OUTPUT_LENGTH_KEY) if isinstance(route_info, dict) else None
+        key = prediction.get("key") if isinstance(prediction, dict) else None
+        if not isinstance(key, int) or isinstance(key, bool):
+            self._miss(gen_req, "the generation placement returned no prediction")
+            return
+        ticket.key = key
+        self.assigned += 1
+        self._maybe_log_stats()
 
     def _miss(self, gen_req: Any, reason: str) -> None:
         self.missing += 1
         gen_req.priority = self.prior_priority
-        if self.missing <= 10 or self.missing % 1000 == 0:
+        if _throttled(self.missing):
             logger.warning(f"[output_length] no prediction #{self.missing}, prior used: {reason}")
 
     def _record(self, ticket: _Ticket, out: Optional[int]) -> None:
@@ -748,20 +922,39 @@ class OutputLengthPriority:
             self.no_usage += 1
             return
         self.recorded += 1
+        self._batch.append((ticket.conv_id, ticket.isl, float(out), ticket.key))
+        if len(self._batch) >= RECORD_BATCH_MAX:
+            self._send(self._take_batch())
+        elif self._flush_task is None:
+            self._flush_task = asyncio.get_running_loop().create_task(self._flush_later())
 
-        async def _send() -> None:
+    def _take_batch(self) -> list:
+        batch, self._batch = self._batch, []
+        return batch
+
+    async def _flush_later(self) -> None:
+        try:
+            await asyncio.sleep(self.record_flush_s)
+        finally:
+            self._flush_task = None
+        if self._batch:
+            self._send(self._take_batch())
+
+    def _send(self, batch: list) -> None:
+        async def _post() -> None:
             try:
                 await asyncio.wait_for(
-                    self._coordinator.record_output_length(
-                        ticket.conv_id, ticket.isl, float(out), ticket.key
-                    ),
-                    RECORD_TIMEOUT_S,
+                    self._coordinator.record_output_lengths(batch), RECORD_TIMEOUT_S
                 )
             except Exception as e:  # noqa: BLE001  (learning must not fail the request)
                 self.record_errors += 1
-                logger.warning(f"[output_length] recording a reply failed: {type(e).__name__}: {e}")
+                if _throttled(self.record_errors):
+                    logger.warning(
+                        f"[output_length] recording {len(batch)} replies failed "
+                        f"(#{self.record_errors}): {type(e).__name__}: {e}"
+                    )
 
-        task = asyncio.get_running_loop().create_task(_send())
+        task = asyncio.get_running_loop().create_task(_post())
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
@@ -777,25 +970,59 @@ class OutputLengthPriority:
         return response
 
     async def _track_stream(self, stream: AsyncIterator, ticket: _Ticket):
+        """Relay ``stream``; learn from its final usage-only chunk only (an interrupted stream is not learned).
+
+        With ``ticket.strip_usage`` the stream is relayed in whole SSE events, without that chunk.
+        """
         carry = b""
-        last_seen: Optional[int] = None
         try:
             async for chunk in stream:
-                if not ticket.recorded:
-                    data = chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode()
-                    scan = carry + bytes(data)
-                    newline = scan.rfind(b"\n")
-                    carry = scan[newline + 1 :][-4096:] if newline >= 0 else scan[-4096:]
-                    if newline >= 0:
-                        out, final = completion_tokens_in(scan[: newline + 1])
-                        if out is not None:
-                            last_seen = out
-                            if final:
-                                self._record(ticket, out)
+                if ticket.recorded and not ticket.strip_usage:
+                    yield chunk
+                    continue
+                data = chunk if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode()
+                scan = carry + bytes(data)
+                if ticket.strip_usage:
+                    end = scan.rfind(b"\n\n")
+                    if end < 0:
+                        carry = scan
+                        continue
+                    carry = scan[end + 2 :]
+                    events = scan[: end + 2]
+                    kept = self._drop_final_usage(events, ticket)
+                    if kept:
+                        yield kept
+                    continue
+                newline = scan.rfind(b"\n")
+                carry = scan[newline + 1 :][-4096:] if newline >= 0 else scan[-4096:]
+                if newline >= 0:
+                    out, final = completion_tokens_in(scan[: newline + 1])
+                    if out is not None and final:
+                        self._record(ticket, out)
                 yield chunk
+            if ticket.strip_usage and carry:
+                kept = self._drop_final_usage(carry, ticket)
+                carry = b""
+                if kept:
+                    yield kept
         finally:
             if not ticket.recorded:
-                self._record(ticket, last_seen)
+                self._record(ticket, None)
+
+    def _drop_final_usage(self, events: bytes, ticket: _Ticket) -> bytes:
+        """``events`` (whole SSE events) without the final usage-only chunk, which is recorded."""
+        if _USAGE_MARK not in events:
+            return events
+        kept = []
+        for event in events.split(b"\n\n"):
+            obj = _sse_json(event) if _USAGE_MARK in event else None
+            usage = obj.get("usage") if obj is not None else None
+            if isinstance(usage, dict) and not obj.get("choices"):
+                if usage.get("completion_tokens") is not None:
+                    self._record(ticket, int(usage["completion_tokens"]))
+                continue
+            kept.append(event)
+        return b"\n\n".join(kept)
 
     def _maybe_log_stats(self) -> None:
         now = time.monotonic()
@@ -807,6 +1034,6 @@ class OutputLengthPriority:
         p50 = ms[len(ms) // 2] if ms else NAN
         logger.info(
             f"[output_length] assigned {self.assigned}, missing {self.missing}, replies recorded {self.recorded} / "
-            f"without usage {self.no_usage} / record errors {self.record_errors}; coordinator call p50 "
+            f"without final usage {self.no_usage} / record errors {self.record_errors}; coordinator call p50 "
             f"{p50:.2f} ms, max {ms[-1] if ms else NAN:.2f} ms"
         )

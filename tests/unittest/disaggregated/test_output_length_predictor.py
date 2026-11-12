@@ -361,9 +361,9 @@ class _FakeCoordinator:
             raise self.error
         return self.tokens, 7
 
-    async def record_output_length(self, conv_id, isl, out, key):
-        self.recorded.append((conv_id, isl, out, key))
-        return True
+    async def record_output_lengths(self, records):
+        self.recorded.extend(records)
+        return len(records)
 
 
 @pytest.mark.asyncio
@@ -429,7 +429,7 @@ async def test_track_records_the_final_usage_before_relaying_it():
     async for chunk in frontend.track(stream(), ticket):
         out.append(chunk)
         assert ticket.recorded == (len(out) >= 3)
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)
     assert b"".join(out).endswith(b"[DONE]\n\n")
     assert coordinator.recorded == [("c1", 2000.0, 321.0, 7)]
 
@@ -444,6 +444,207 @@ async def test_track_non_streaming_response():
 
     response = Response()
     assert frontend.track(response, olp._Ticket("c", 10.0, 3)) is response
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.01)
     assert coordinator.recorded == [("c", 10.0, 55.0, 3)]
     assert frontend.track(response, None) is response
+
+
+# ---------------------------------------------------------------------------------- review fixes
+
+
+def test_non_finite_values_never_reach_the_models():
+    predictor = olp.OnlineLengthPredictor("ridge")
+    for bad in (float("nan"), float("inf"), -1.0):
+        _, key = predictor.predict("c", 1000, 0.0)
+        assert not predictor.record("c", 1000, bad, key, 0.0)
+        assert not predictor.record("c", bad, 100, None, 0.0)
+        with pytest.raises(ValueError, match="finite"):
+            predictor.predict("c", bad, 0.0)
+    assert predictor.invalid == 6 and predictor.learned == 0 and predictor.ridge.n == 0
+    assert predictor.median.n == 0 and len(predictor.table) == 0
+    _learn(predictor, olp.RIDGE_MIN_ROWS, 0.0)
+    tokens, _ = predictor.predict("x", 1000, olp.RIDGE_REFIT_S)
+    assert math.isfinite(tokens) and all(math.isfinite(w) for w in predictor.ridge.coef)
+    assert olp.priority_of(float("nan")) == pytest.approx(olp.priority_of(olp.PRIOR_TOKENS))
+    assert olp.priority_of(float("inf")) == 0.0
+
+
+def test_conversationless_replies_train_the_global_models():
+    predictor = olp.OnlineLengthPredictor("ridge")
+    for i in range(olp.RIDGE_MIN_ROWS):
+        _, key = predictor.predict(None, 1000 + i, 0.0)
+        assert predictor.record(None, 1000 + i, 300.0, key, 0.0)
+    assert predictor.learned == predictor.without_conversation == olp.RIDGE_MIN_ROWS
+    assert len(predictor.table) == 0 and predictor.median.value() == 300.0
+    assert predictor.predict(None, 1000, 1.0)[0] == 300.0  # the median, not the prior
+    # A conversation-less reply without its key still has its (history-free) features.
+    assert predictor.record(None, 1000, 300.0, None, 1.0) and predictor.unmatched == 0
+    predictor.predict(None, 1000, olp.RIDGE_REFIT_S)
+    assert predictor.ridge_fits == 1
+
+
+def test_nothing_learned_is_reported(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(olp.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+    monkeypatch.setattr(olp, "NOTHING_LEARNED_WARN_AFTER", 5)
+    predictor = olp.OnlineLengthPredictor("ridge")
+    for _ in range(5):
+        predictor.record("c", 1000, 1.0, None, 0.0)
+    assert any("none of the first 5 replies was learned" in w for w in warnings)
+
+
+def test_predictor_state_is_bounded():
+    median = olp.RunningMedian(window=3)
+    for v in (100, 1, 2, 3, 50):
+        median.add(v)
+    assert median.value() == 3 and median.n == 5 and len(median._sorted) == 3
+    fitter = _FakeFitter(_good_fit())
+    predictor = olp.OnlineLengthPredictor("ridge_gbm", gbm_fitter=fitter)
+    predictor.gbm_max_rows = olp.GBM_MIN_ROWS
+    width = len(olp.FEATURES) + 1
+    _learn(predictor, 3 * olp.GBM_MIN_ROWS, 0.0)
+    assert len(predictor.gbm_rows) == olp.GBM_MIN_ROWS * width
+    assert predictor.gbm_n == 3 * olp.GBM_MIN_ROWS
+    # The newest reply overwrote the oldest slot of the ring.
+    newest = 3 * olp.GBM_MIN_ROWS - 1
+    slot = (newest % olp.GBM_MIN_ROWS) * width
+    assert predictor.gbm_rows[slot + width - 1] == pytest.approx(math.log1p(50 + newest % 400))
+    predictor.predict("x", 1000, olp.GBM_REFIT_S)
+    assert fitter.started[0][:2] == (olp.GBM_MIN_ROWS, olp.GBM_MIN_ROWS * width)
+    assert olp.RunningMedian().window == olp.MEDIAN_WINDOW
+
+
+def test_fit_children_get_the_server_import_path(tmp_path, monkeypatch):
+    """-I drops PYTHONPATH and the user site; the children get the server's sys.path instead."""
+    extra = tmp_path / "site"
+    extra.mkdir()
+    monkeypatch.syspath_prepend(str(extra))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    paths = olp.child_sys_path()
+    assert str(extra) in paths and str(tmp_path) not in paths and "" not in paths
+    argv_file = tmp_path / "argv.json"
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"json.dump(sys.argv[1:], open({str(argv_file)!r}, 'w'))\n"
+    )
+    fake_python.chmod(0o755)
+    olp.check_gbm_dependencies(str(fake_python))
+    argv = json.loads(argv_file.read_text())
+    assert argv[0] == "-I" and str(extra) in json.loads(argv[-1])
+    fitter = olp.SubprocessGbmFitter(python=str(fake_python), sync=True)
+    fitter.start(olp.array("d", [0.0] * len(olp.FEATURES) + [1.0]), 1, {"rows": 1})
+    argv = json.loads(argv_file.read_text())
+    header = json.loads(argv[-1])
+    assert argv[0] == "-I" and header["n"] == 1 and str(extra) in header["sys_path"]
+    # A real -I child imports a module that only the server's path has.
+    (extra / "only_on_server_path.py").write_text("VALUE = 7\n")
+    import subprocess
+    import sys as _sys
+
+    result = subprocess.run(
+        [
+            _sys.executable,
+            "-I",
+            "-c",
+            "import json, sys; sys.path[:0] = json.loads(sys.argv[1]); "
+            "import only_on_server_path as m; print(m.VALUE)",
+            json.dumps(olp.child_sys_path()),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    assert result.stdout.strip() == b"7", result.stderr
+
+
+@pytest.mark.asyncio
+async def test_streams_ask_for_usage_and_drop_it_when_the_client_did_not():
+    coordinator = _FakeCoordinator()
+    frontend = olp.OutputLengthPriority(coordinator, "ridge")
+    request = _gen_request("c1", 2000)
+    request.stream = True
+    ticket = await frontend.assign(request)
+    assert (
+        request.stream_options.include_usage and not request.stream_options.continuous_usage_stats
+    )
+    assert ticket.strip_usage
+    final = _sse({"choices": [], "usage": {"completion_tokens": 321}})
+
+    async def stream():
+        yield _sse({"choices": [{"text": "a"}]})[:7]
+        yield _sse({"choices": [{"text": "a"}]})[7:] + final[:9]
+        yield final[9:] + b"data: [DONE]\n\n"
+
+    relayed = b"".join([chunk async for chunk in frontend.track(stream(), ticket)])
+    assert relayed == _sse({"choices": [{"text": "a"}]}) + b"data: [DONE]\n\n"
+    await asyncio.sleep(0.01)
+    assert coordinator.recorded == [("c1", 2000.0, 321.0, 7)]
+    # A client that asked for usage keeps the chunk.
+    asked = _gen_request("c1", 2000)
+    asked.stream = True
+    asked.stream_options = olp_stream_options(include_usage=True)
+    assert not (await frontend.assign(asked)).strip_usage
+
+
+def olp_stream_options(**kwargs):
+    from tensorrt_llm.serve.openai_protocol import StreamOptions
+
+    return StreamOptions(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_stream_is_not_learned():
+    """Continuous usage of a stream that ends before its final usage chunk is not a reply length."""
+    coordinator = _FakeCoordinator()
+    frontend = olp.OutputLengthPriority(coordinator, "ridge")
+    ticket = olp._Ticket("c1", 2000.0, 7)
+
+    async def stream():
+        yield _sse({"choices": [{"text": "a"}], "usage": {"completion_tokens": 5}})
+        raise ConnectionResetError("client went away")
+
+    with pytest.raises(ConnectionResetError):
+        async for _ in frontend.track(stream(), ticket):
+            pass
+    await asyncio.sleep(0.01)
+    assert coordinator.recorded == [] and frontend.no_usage == 1
+
+
+@pytest.mark.asyncio
+async def test_replies_are_reported_in_batches(monkeypatch):
+    monkeypatch.setattr(olp, "RECORD_BATCH_MAX", 3)
+    calls = []
+
+    class Coordinator(_FakeCoordinator):
+        async def record_output_lengths(self, records):
+            calls.append(list(records))
+            return len(records)
+
+    frontend = olp.OutputLengthPriority(Coordinator(), "ridge", record_flush_s=0.05)
+    for i in range(4):
+        frontend._record(olp._Ticket("c", 10.0, i), 50 + i)
+    await asyncio.sleep(0)
+    assert [len(c) for c in calls] == [3]
+    await asyncio.sleep(0.1)
+    assert [len(c) for c in calls] == [3, 1]
+
+
+@pytest.mark.asyncio
+async def test_prediction_from_the_generation_placement():
+    """In a fleet the prediction arrives with /select; no separate coordinator call."""
+    coordinator = _FakeCoordinator()
+    frontend = olp.OutputLengthPriority(coordinator, "ridge", via_select=True)
+    request = _gen_request("c1", 2000)
+    ticket = await frontend.assign(request, placed_later=True)
+    assert coordinator.predicted == [] and ticket.via_select
+    frontend.placed(ticket, request, {olp.OUTPUT_LENGTH_KEY: {"tokens": 9.0, "key": 11}})
+    assert ticket.key == 11 and frontend.assigned == 1
+    missing = _gen_request("c2", 2000)
+    ticket = await frontend.assign(missing, placed_later=True)
+    frontend.placed(ticket, missing, {})
+    assert frontend.missing == 1 and missing.priority == pytest.approx(frontend.prior_priority)
+    # A request placed before its context phase (conditional disaggregation) asks separately.
+    early = _gen_request("c3", 2000)
+    assert (await frontend.assign(early)).key == 7 and coordinator.predicted == [("c3", 2000.0)]
