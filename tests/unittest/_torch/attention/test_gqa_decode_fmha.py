@@ -894,6 +894,36 @@ def test_min_kv_split_stops_above_the_largest_graph_batch() -> None:
     )
 
 
+def test_min_kv_split_batch_is_the_largest_captured_graph_batch() -> None:
+    """ModelConfig.cuda_graph_batch_sizes (whose largest size bounds the forced split's scratch) holds the decode graph
+    sizes the engine captures: none above max_batch_size or max_num_tokens // tokens per request (plan_cuda_graphs)."""
+    from tensorrt_llm._torch.pyexecutor.engine.cuda_graph import plan_cuda_graphs
+    from tensorrt_llm._torch.pyexecutor.model_loader import captured_cuda_graph_batch_sizes
+    from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
+
+    spec = SimpleNamespace(tokens_per_gen_step=7)
+    for graphs, max_batch_size, max_num_tokens, largest in (
+        (CudaGraphConfig(), 32, 8192, 32),  # default sizes up to 128
+        (CudaGraphConfig(max_batch_size=512), 64, 8192, 64),
+        (CudaGraphConfig(max_batch_size=64), 128, 336, 32),  # 336 tokens: 48 requests of 7
+        (CudaGraphConfig(batch_sizes=[1, 2, 40], enable_padding=True), 32, 8192, 32),
+    ):
+        args = SimpleNamespace(cuda_graph_config=graphs, max_batch_size=max_batch_size)
+        sizes = captured_cuda_graph_batch_sizes(args, max_num_tokens, spec)
+        plan = plan_cuda_graphs(
+            graphs,
+            None,
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=4096,
+            decode_tokens_per_request=7,
+        )
+        assert list(sizes) == plan.batch_sizes and max(sizes) == largest, (graphs, sizes)
+        assert max(graphs.batch_sizes) > largest
+    no_graphs = SimpleNamespace(cuda_graph_config=None, max_batch_size=32)
+    assert captured_cuda_graph_batch_sizes(no_graphs, 8192, spec) == ()
+
+
 def test_min_kv_split_decode_is_flashinfer_decode_at_that_sm_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
