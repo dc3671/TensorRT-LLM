@@ -16,7 +16,7 @@
 import os
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -452,7 +452,6 @@ class FP4BlockScaleMoERunner(TunableRunner):
     decode_tuning = False
     decode_early_release_rows = 0
     decode_shared_expert_rows = 0
-    fine_grained_sync = False
 
     def __init__(self,
                  num_experts: int,
@@ -489,9 +488,6 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.decode_tuning = decode_tuning
         self.decode_early_release_rows = decode_early_release_rows
         self.decode_shared_expert_rows = decode_shared_expert_rows
-        # The C++ runner prefers its fine-grained-sync FC1 / FC2 pair (llm_args.use_fine_grained_sync).
-        self.fine_grained_sync = os.environ.get(
-            "TLLM_USE_FINE_GRAINED_SYNC") == "1"
 
         self.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts,
@@ -532,97 +528,115 @@ class FP4BlockScaleMoERunner(TunableRunner):
         another rank), so the kernels run an all-local problem and skip the
         routing kernel. ``engine_state`` / ``lamport_out``: see
         ``decode_moe.select`` and ``decode_moe.LamportFc2Buffer``; an
-        un-finalized call with ``lamport_out`` always leaves its FC2 rows
-        there. ``candidates``: ``PreroutedRouting.candidates``; the call must
-        take ``ENGINE``, which fills ``prerouted`` from them."""
+        un-finalized call that takes ``ENGINE`` or ``CUTE_FC2`` leaves its FC2
+        rows in ``lamport_out`` (and returns that view), a ``CUBIN`` call
+        returns its own rows and leaves ``lamport_out`` untouched.
+        ``candidates``: ``PreroutedRouting.candidates``; the call must take
+        ``ENGINE``, which fills ``prerouted`` from them."""
         assert isinstance(tactic, list)
 
         args = FP4BlockScaleMoEInputs(*inputs)
         kernel_runner = self.get_runner()
+        if prerouted is not None:
+            tables, topk_ids, topk_weights = prerouted
+            layout = (None, None, args.hidden_states, args.hidden_states_scale,
+                      args.gemm1_weights, args.gemm1_weights_scale,
+                      args.gemm1_bias, args.gemm1_alpha, args.gemm1_beta,
+                      args.gemm1_clamp_limit, args.gemm2_weights,
+                      args.gemm2_weights_scale, args.gemm2_bias,
+                      args.output1_scale_scalar, args.output1_scale_gate_scalar,
+                      args.output2_scale_scalar, self.local_num_experts,
+                      self.top_k, self.n_group, self.topk_group,
+                      self.intermediate_size, 0, self.local_num_experts,
+                      self.routed_scaling_factor, self.routing_method_type,
+                      self.do_finalize, tactic, topk_weights, topk_ids, output,
+                      *tables, tactic[0])
+            run = kernel_runner.run_moe_prerouted
+        else:
+            layout = (args.routing_logits, args.routing_bias,
+                      args.hidden_states, args.hidden_states_scale,
+                      args.gemm1_weights, args.gemm1_weights_scale,
+                      args.gemm1_bias, args.gemm1_alpha, args.gemm1_beta,
+                      args.gemm1_clamp_limit, args.gemm2_weights,
+                      args.gemm2_weights_scale, args.gemm2_bias,
+                      args.output1_scale_scalar, args.output1_scale_gate_scalar,
+                      args.output2_scale_scalar, self.num_experts, self.top_k,
+                      self.n_group, self.topk_group, self.intermediate_size,
+                      self.local_expert_offset, self.local_num_experts,
+                      self.routed_scaling_factor, self.routing_method_type,
+                      self.do_finalize, tactic, args.topk_weights,
+                      args.topk_ids, output)
+            run = kernel_runner.run_moe
+        if not self.decode_tuning and candidates is None:
+            # Every model's call (no decode kernels declared): the runner's
+            # own kernels; a Lamport buffer only goes to ENGINE / CUTE_FC2.
+            return run(*layout)
+        return self._forward_decode(args, kernel_runner, run, layout, tactic,
+                                    output, prerouted, engine_state,
+                                    lamport_out, candidates)
 
+    def _forward_decode(
+        self,
+        args: FP4BlockScaleMoEInputs,
+        kernel_runner: torch.ScriptObject,
+        run: Callable[..., List[torch.Tensor]],
+        layout: tuple,
+        tactic: List[int],
+        output: Optional[torch.Tensor],
+        prerouted: Optional[Tuple[List[torch.Tensor], torch.Tensor,
+                                  torch.Tensor]],
+        engine_state: Optional[torch.Tensor],
+        lamport_out: Optional[torch.Tensor],
+        candidates: Optional[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """``forward`` of a call that may take the decode kernels
+        (``decode_moe.select``); ``run`` / ``layout``: the runner entry point
+        and its arguments for the CUBIN call."""
         from ..moe.fused_moe.trtllm_gen import decode_moe
         kernel = decode_moe.DecodeKernel.CUBIN
         if self.decode_tuning:
-            kernel = decode_moe.select(kernel_runner,
-                                       self.act_type,
-                                       tactic,
-                                       args,
-                                       top_k=self.top_k,
-                                       do_finalize=self.do_finalize,
-                                       output=output,
-                                       intermediate_size=self.intermediate_size,
-                                       prerouted=prerouted is not None,
-                                       engine_state=engine_state,
-                                       fine_grained_sync=self.fine_grained_sync)
+            kernel = decode_moe.select(
+                kernel_runner,
+                self.act_type,
+                tactic,
+                args,
+                top_k=self.top_k,
+                do_finalize=self.do_finalize,
+                output=output,
+                intermediate_size=self.intermediate_size,
+                prerouted=prerouted is not None,
+                engine_state=engine_state,
+                # The C++ runner prefers its fine-grained-sync FC1 / FC2 pair
+                # (llm_args.use_fine_grained_sync); read per call, as there.
+                fine_grained_sync=os.environ.get("TLLM_USE_FINE_GRAINED_SYNC")
+                == "1")
         if candidates is not None and kernel != decode_moe.DecodeKernel.ENGINE:
             raise ValueError(
                 "pre-routed candidates need the decode MoE engine, which this "
                 f"call does not take ({kernel})")
-        cute_fc2 = kernel == decode_moe.DecodeKernel.CUTE_FC2
-
-        def fc2(outputs):
-            return decode_moe.run_cute_fc2(outputs, args, lamport_out)
-
-        if prerouted is not None:
+        if kernel == decode_moe.DecodeKernel.ENGINE:
             tables, topk_ids, topk_weights = prerouted
-            pre = (None, None, args.hidden_states, args.hidden_states_scale,
-                   args.gemm1_weights, args.gemm1_weights_scale,
-                   args.gemm1_bias, args.gemm1_alpha, args.gemm1_beta,
-                   args.gemm1_clamp_limit, args.gemm2_weights,
-                   args.gemm2_weights_scale, args.gemm2_bias,
-                   args.output1_scale_scalar, args.output1_scale_gate_scalar,
-                   args.output2_scale_scalar, self.local_num_experts,
-                   self.top_k, self.n_group, self.topk_group,
-                   self.intermediate_size, 0, self.local_num_experts,
-                   self.routed_scaling_factor, self.routing_method_type,
-                   self.do_finalize, tactic, topk_weights, topk_ids, output,
-                   *tables, tactic[0])
-            if kernel == decode_moe.DecodeKernel.ENGINE:
-                m = args.hidden_states.shape[0]
-                return decode_moe.run_engine(
-                    args,
-                    tables,
-                    tactic[0],
-                    self.top_k,
-                    self.local_num_experts,
-                    engine_state,
-                    lamport_out,
-                    release_after_wait=0 < self.decode_early_release_rows <= m,
-                    beside_shared_expert=0 < self.decode_shared_expert_rows <=
-                    m,
-                    candidates=candidates,
-                    topk_ids=topk_ids,
-                    topk_weights=topk_weights,
-                    local_start=self.local_expert_offset)
-            if cute_fc2:
-                return fc2(
-                    kernel_runner.run_moe_prerouted_fc1(
-                        *decode_moe.fc1_only_args(pre)))
-            result = kernel_runner.run_moe_prerouted(*pre)
-            if lamport_out is not None and not self.do_finalize:
-                result = decode_moe.copy_to_lamport(result, tables[0],
-                                                    lamport_out)
-            return result
-
-        layout = (args.routing_logits, args.routing_bias, args.hidden_states,
-                  args.hidden_states_scale, args.gemm1_weights,
-                  args.gemm1_weights_scale, args.gemm1_bias, args.gemm1_alpha,
-                  args.gemm1_beta, args.gemm1_clamp_limit, args.gemm2_weights,
-                  args.gemm2_weights_scale, args.gemm2_bias,
-                  args.output1_scale_scalar, args.output1_scale_gate_scalar,
-                  args.output2_scale_scalar, self.num_experts, self.top_k,
-                  self.n_group, self.topk_group, self.intermediate_size,
-                  self.local_expert_offset, self.local_num_experts,
-                  self.routed_scaling_factor, self.routing_method_type,
-                  self.do_finalize, tactic, args.topk_weights, args.topk_ids,
-                  output)
-        if cute_fc2:
-            return fc2(
-                kernel_runner.run_moe_fc1(*decode_moe.fc1_only_args(layout)))
-        result = kernel_runner.run_moe(*layout)
-        if lamport_out is not None and not self.do_finalize:
-            result = decode_moe.copy_to_lamport(result, result[2], lamport_out)
-        return result
+            m = args.hidden_states.shape[0]
+            return decode_moe.run_engine(
+                args,
+                tables,
+                tactic[0],
+                self.top_k,
+                self.local_num_experts,
+                engine_state,
+                lamport_out,
+                release_after_wait=0 < self.decode_early_release_rows <= m,
+                beside_shared_expert=0 < self.decode_shared_expert_rows <= m,
+                candidates=candidates,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                local_start=self.local_expert_offset)
+        if kernel == decode_moe.DecodeKernel.CUTE_FC2:
+            fc1 = (kernel_runner.run_moe_prerouted_fc1
+                   if prerouted is not None else kernel_runner.run_moe_fc1)
+            return decode_moe.run_cute_fc2(
+                fc1(*decode_moe.fc1_only_args(layout)), args, lamport_out)
+        return run(*layout)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -837,8 +851,9 @@ def _run_fp4_block_scale_moe(
     (``moe_persistent_engine.new_state``), which pre-routed calls need to take
     the engine; ``decode_early_release_rows`` /
     ``decode_shared_expert_rows``: see ``FP4BlockScaleMoERunner``. ``lamport_fc2_out``: a ``decode_moe.LamportFc2Buffer`` tensor; with
-    ``do_finalize=False`` the FC2 rows go there and the op returns an empty
-    tensor in their place (an output may not alias an input).
+    ``do_finalize=False`` a call that takes ``ENGINE`` or ``CUTE_FC2`` writes
+    its FC2 rows there and returns an empty tensor in their place (an output
+    may not alias an input); a ``CUBIN`` call returns its own rows.
 
     ``prerouted_tables`` (flat int32 routing tables), ``prerouted_ids`` /
     ``prerouted_weights`` (top-k ids, BF16 top-k weights), built for
@@ -945,8 +960,10 @@ def _run_fp4_block_scale_moe(
             tactic=[-1, -1] if best_tactic == -1 else best_tactic,
             output=output,
             lamport_out=lamport_fc2_out)
-    # The FC2 rows are in lamport_fc2_out (an output may not alias an input).
-    if lamport_fc2_out is not None and not do_finalize:
+    # A call that took the Lamport buffer (ENGINE / CUTE_FC2) left its FC2 rows
+    # there (an output may not alias an input); a CUBIN call returns its own.
+    if (lamport_fc2_out is not None and not do_finalize
+            and result[0].data_ptr() == lamport_fc2_out.data_ptr()):
         return [result[0].new_empty(0), *result[1:]]
     # When output is provided and do_finalize=True, the result is written in-place to output.
     # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+

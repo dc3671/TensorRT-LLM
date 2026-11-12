@@ -531,10 +531,12 @@ def test_lamport_out_takes_the_decode_kernels_rows(monkeypatch):
         picked.clear()
         out = op_runner.forward(_op_inputs(ex, xq, xsf), lamport_out=lamport, **kw)[0]
         torch.cuda.synchronize()
-        assert (
-            picked == ([] if expect is None else [expect]) and out.data_ptr() == lamport.data_ptr()
-        )
+        assert picked == ([] if expect is None else [expect])
         assert torch.equal(out[rows].view(torch.int16), plain[rows].view(torch.int16))
+        if expect is None:  # the cubins: their own rows, the buffer untouched
+            assert out.data_ptr() != lamport.data_ptr() and (words == -1).all()
+            continue
+        assert out.data_ptr() == lamport.data_ptr()
         assert not (words[rows].view(torch.int32) == -1).any()
         assert (words[rest] == -1).all()
         words[rows] = -1  # the fold's write-back
@@ -585,9 +587,8 @@ def test_lamport_out_takes_the_decode_kernels_rows(monkeypatch):
     words[rows] = -1
     out = run(lamport, decode_tuning=False)
     torch.cuda.synchronize()
-    assert out[0] is lamport
+    assert out[0] is not lamport and (words == -1).all()
     assert torch.equal(out[0][rows].view(torch.int16), plain[0][rows].view(torch.int16))
-    assert (words[rest] == -1).all()
 
 
 def test_lamport_buffer_holds_every_tile_the_runner_can_tune():

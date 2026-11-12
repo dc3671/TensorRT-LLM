@@ -1021,11 +1021,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         shared_expert_output, shared_expert_gate_logits = shared_expert_outputs
         if not do_finalize:
+            # Calls on the runner's own FC2 (CUBIN) hand back their rows
+            # instead of writing the Lamport buffer.
             return _DeferredSharedExpertFinalize(
                 tuple(final_hidden_states),
                 shared_expert_output,
                 shared_expert_gate_logits,
-                fc2_lamport=lamport_out is not None,
+                fc2_lamport=(lamport_out is not None
+                             and final_hidden_states[0].data_ptr()
+                             == lamport_out.data_ptr()),
             )
         if fold_shared_expert:
             return _DeferredSharedExpertFinalize(
