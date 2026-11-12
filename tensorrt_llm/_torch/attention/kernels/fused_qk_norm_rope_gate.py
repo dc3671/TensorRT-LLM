@@ -24,7 +24,7 @@ LoRA, or attention-backend fallback behavior.
 """
 
 import functools
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import triton
@@ -34,6 +34,11 @@ import triton.language.extra.libdevice as tldevice
 from ...distributed.ll_exchange import ll_pos_gather
 from ...flashinfer_utils import get_env_enable_pdl
 from ...modules.fla.op import gdc_wait_with_memory_clobber
+
+if TYPE_CHECKING:
+    from triton.compiler import CompiledKernel
+
+    from ..backends.fmha.gqa_decode import KvAppendPlan
 
 _MIN_TILED_HEAD_ROWS = 3072  # 384 eight-token CTAs.
 
@@ -67,7 +72,7 @@ def _fused_qkv_gemma_rmsnorm_rope_gate_kernel(
     mrope_section1: tl.constexpr,
     mrope_section2: tl.constexpr,
     block_tokens: tl.constexpr,
-):
+) -> None:
     """Normalize and rotate independent rows in a token/head tile.
 
     Normalized Q/K round through the output dtype before RoPE, as in the
@@ -452,7 +457,7 @@ def fused_qkv_gemma_rmsnorm_rope_gate(
 
 
 @triton.jit
-def _fp8_like_cxx(x_bf16_as_f32, scale_bf16_as_f32):
+def _fp8_like_cxx(x_bf16_as_f32: tl.tensor, scale_bf16_as_f32: tl.tensor) -> tl.tensor:
     # mmha::store_8bits_vec for T=bf16: bf16 * bf16 (one rounding), then cvt.rn.satfinite to e4m3.
     return (x_bf16_as_f32 * scale_bf16_as_f32).to(tl.bfloat16).to(tl.float32).to(tl.float8e4nv)
 
@@ -510,7 +515,7 @@ def _qkv_rope_gate_fp8_append_kernel(
     GA_G: tl.constexpr = 1,
     GA_SLOT_WORDS: tl.constexpr = 1,
     PDL: tl.constexpr = False,
-):
+) -> None:
     # Same arithmetic as _fused_qkv_gemma_rmsnorm_rope_gate_kernel; the FP8 outputs come from its bf16-rounded values.
     # GATHER: every q program also all-gathers its FP8 head over the KV group into ga_out (ll_pos_gather).
     # PDL: operands no predecessor writes load before griddepcontrol.wait; dependents are released right after it.
@@ -712,7 +717,7 @@ GATHER_MAX_PROGRAMS_PER_SM = 8
 
 
 @functools.lru_cache(maxsize=None)
-def _resident_programs_per_sm(kernel) -> int:
+def _resident_programs_per_sm(kernel: "CompiledKernel") -> int:
     """Programs of a compiled Triton kernel the driver keeps resident per SM (its registers, shared memory, warps)."""
     from cuda.bindings import driver
 
@@ -877,7 +882,7 @@ def _rope_fp8_append_launch(
     mrope_section1: int,
     mrope_section2: int,
     ga: Optional[tuple] = None,
-):
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Body of both custom ops. ``ga``: as in _rope_fp8_append_kernel_call; the fifth output is then the gathered q,
     else None."""
     num_tokens = qkv.shape[0]
@@ -1117,7 +1122,7 @@ def fused_qkv_rope_gate_fp8_append(
     head_dim: int,
     rotary_dim: int,
     mrope_section: Optional[Tuple[int, int, int]],
-    plan,
+    plan: "KvAppendPlan",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``fused_qkv_gemma_rmsnorm_rope_gate`` plus the FP8 query, the paged FP8 K / V append and the FMHA scales.
 
@@ -1162,7 +1167,7 @@ def rope_gather_max_tokens(
     head_dim: int,
     rotary_dim: int,
     mrope_section: Optional[Tuple[int, int, int]],
-    plan,
+    plan: "KvAppendPlan",
     gather: tuple,
 ) -> int:
     """The most tokens fused_qkv_rope_gate_fp8_append_gather takes with these arguments: its grid polls the peers,
@@ -1213,7 +1218,7 @@ def fused_qkv_rope_gate_fp8_append_gather(
     head_dim: int,
     rotary_dim: int,
     mrope_section: Optional[Tuple[int, int, int]],
-    plan,
+    plan: "KvAppendPlan",
     gather: tuple,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """``fused_qkv_rope_gate_fp8_append`` that also all-gathers the FP8 query over the KV-replica group in the same
@@ -1276,7 +1281,7 @@ def _fused_sigmoid_mul_kernel(
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr = False,
-):
+) -> None:
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_launch_dependents()
     token = tl.program_id(0).to(tl.int64)
@@ -1319,7 +1324,7 @@ def _fused_sigmoid_mul_fp8_kernel(
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr = False,
-):
+) -> None:
     """_fused_sigmoid_mul_kernel with the E4M3 output that static_quantize_e4m3_per_tensor makes of its result: the
     product rounded to the attention dtype, times the correctly rounded reciprocal of the scale, RN-satfinite."""
     if LAUNCH_WITH_PDL:
@@ -1352,7 +1357,9 @@ def _fused_sigmoid_mul_fp8_kernel(
     )
 
 
-def _sigmoid_mul_launch_args(attention_output: torch.Tensor, gate: torch.Tensor):
+def _sigmoid_mul_launch_args(
+    attention_output: torch.Tensor, gate: torch.Tensor
+) -> Tuple[int, int, int, int, int]:
     """(num_tokens, hidden_size, head_dim, gate token stride, gate head stride) of an output-gate call."""
     assert attention_output.dim() == 2 and attention_output.stride(-1) == 1
     num_tokens, hidden_size = attention_output.shape

@@ -42,8 +42,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import ModuleType
+from typing import Any, NoReturn
 
 REPO = Path(__file__).resolve().parents[2]
 FMHA_DIR = REPO / "cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha"
@@ -216,23 +219,23 @@ TRTLLM_NAMESPACE_END
 """
 
 
-def log(*args):
+def log(*args: object) -> None:
     print("[gen_stage_kv]", *args, flush=True)
 
 
-def kernel_params_sha256():
+def kernel_params_sha256() -> str:
     h = hashlib.sha256()
     for path in KERNEL_PARAMS_HEADERS:
         h.update(path.read_bytes())
     return h.hexdigest()
 
 
-def fail(msg):
+def fail(msg: str) -> NoReturn:
     sys.exit(f"gen_stage_kv: {msg}")
 
 
 @contextmanager
-def redirect_fds(path):
+def redirect_fds(path: Path) -> Iterator[None]:
     """Send the process's stdout / stderr (C++ logging included) to a file."""
     sys.stdout.flush()
     sys.stderr.flush()
@@ -251,14 +254,14 @@ def redirect_fds(path):
                 os.close(fd)
 
 
-def trtllm_package_dir():
+def trtllm_package_dir() -> Path:
     spec = importlib.util.find_spec("tensorrt_llm")
     if spec is None or not spec.submodule_search_locations:
         fail("tensorrt_llm is not installed")
     return Path(list(spec.submodule_search_locations)[0])
 
 
-def build_extension(build_dir, fmha_build_dir):
+def build_extension(build_dir: Path, fmha_build_dir: Path) -> ModuleType:
     import torch.utils.cpp_extension as ce
 
     pkg = trtllm_package_dir()
@@ -343,7 +346,15 @@ IDENTITY_KEYS = [
 ]
 
 
-def enumerate_kernels(ext, sm, num_sms, heads, head_dim, page, stage):
+def enumerate_kernels(
+    ext: ModuleType,
+    sm: int,
+    num_sms: int,
+    heads: list[tuple[int, int]],
+    head_dim: int,
+    page: int,
+    stage: int,
+) -> dict[str, tuple[dict[str, object], list[tuple[int, ...]]]]:
     """Kernel name -> (identity, [shape args...]) over the grid; every shape of a name must give the same identity."""
     kernels = {}
     for (hq, hkv), b, q, kv in itertools.product(heads, BATCH_SIZES, SEQ_LENS_Q, SEQ_LENS_KV):
@@ -366,7 +377,7 @@ def enumerate_kernels(ext, sm, num_sms, heads, head_dim, page, stage):
     return kernels
 
 
-def make_exec_dir(exec_dir, fmha_build_dir):
+def make_exec_dir(exec_dir: Path, fmha_build_dir: Path) -> Path:
     """Create a stand-in for the runner's exec path.
 
     It links to the kernel headers of the installed build, so the generator reads the same headers but writes its
@@ -382,7 +393,9 @@ def make_exec_dir(exec_dir, fmha_build_dir):
     return exec_dir
 
 
-def generate(ext, args, exec_dir, out_dir):
+def generate(
+    ext: ModuleType, args: tuple[int, ...], exec_dir: Path, out_dir: Path
+) -> tuple[dict[str, object], Path, Path, str]:
     """Generator source, cubin and NVRTC options of the kernel selected for args, moved into out_dir."""
     out_dir.mkdir(parents=True, exist_ok=True)
     with redirect_fds(out_dir / "generator.log"):
@@ -400,7 +413,7 @@ def generate(ext, args, exec_dir, out_dir):
     return d, src, cub, m[-1].strip()
 
 
-def split_options(line):
+def split_options(line: str) -> list[str]:
     """The generator logs its NVRTC options space-separated."""
     return [o for o in line.split(" ") if o]
 
@@ -410,7 +423,7 @@ JITIFY_MAP = "_ZZN7jitify26detailL23get_jitsafe_headers_mapEvE19jitsafe_headers_
 JITIFY_MAP_GUARD = "_ZGVZN7jitify26detailL23get_jitsafe_headers_mapEvE19jitsafe_headers_map"
 
 
-def jitify_headers(ext):
+def jitify_headers(ext: ModuleType) -> dict[bytes, bytes]:
     """The built-in headers the generator's NVRTC front end (jitify2) supplies for <type_traits> etc.
 
     They are part of the generator's compile: the offline compile reproduces its cubin only with the same set. Read
@@ -453,7 +466,9 @@ def jitify_headers(ext):
 JITIFY_OPTIONS = ["-include=jitify_preinclude.h", "-default-device"]
 
 
-def nvrtc_compile(source, name, options, headers, log_path):
+def nvrtc_compile(
+    source: str, name: str, options: list[str], headers: dict[bytes, bytes], log_path: Path
+) -> bytes:
     """NVRTC compile as the generator does it: program name = kernel name, jitify2's headers in memory."""
     from cuda.bindings import nvrtc
 
@@ -478,7 +493,7 @@ def nvrtc_compile(source, name, options, headers, log_path):
     return cubin
 
 
-def apply_e4(source):
+def apply_e4(source: str) -> str:
     lines = source.split("\n")
     code = [i for i, ln in enumerate(lines) if not ln.lstrip().startswith("//")]
     # The loop counter's generated name (loopOffset<id>) differs between kernels; it must be one name in the block.
@@ -505,12 +520,12 @@ def apply_e4(source):
     return "\n".join(edited)
 
 
-def smem_bytes(cubin, func_name):
+def smem_bytes(cubin: bytes, func_name: str) -> int:
     """Dynamic shared memory of the kernel, from the <name>GetSmemSize helper the generator emits."""
     import torch
     from cuda.bindings import driver as cu
 
-    def check(res):
+    def check(res: tuple[Any, ...]) -> Any:
         if res[0] != cu.CUresult.CUDA_SUCCESS:
             fail(f"CUDA driver call failed reading the shared memory of {func_name}: {res[0]}")
         return res[1] if len(res) > 1 else None
@@ -527,7 +542,7 @@ def smem_bytes(cubin, func_name):
     return int(out.item())
 
 
-def write_archive(stem, cubin):
+def write_archive(stem: str, cubin: bytes) -> None:
     with tempfile.TemporaryDirectory(dir=CUBIN_DIR.parent) as tmp:
         (Path(tmp) / f"{stem}.cubin").write_bytes(cubin)
         subprocess.run(
@@ -547,7 +562,7 @@ def write_archive(stem, cubin):
         )
 
 
-def meta_entry(sm, stem, func, ident, smem, sha):
+def meta_entry(sm: int, stem: str, func: str, ident: dict[str, object], smem: int, sha: str) -> str:
     b = lambda v: "true" if v else "false"  # noqa: E731
     i = ident
     return (
@@ -591,7 +606,7 @@ def meta_entry(sm, stem, func, ident, smem, sha):
     )
 
 
-def write_header(sm, decls, entries):
+def write_header(sm: int, decls: str, entries: str) -> None:
     """Replace this SM's blocks in the header, keeping the other SMs' blocks."""
     blocks = {"decls": {}, "entries": {}}
     text = META_HEADER.read_text() if META_HEADER.exists() else ""
@@ -617,7 +632,7 @@ def write_header(sm, decls, entries):
     )
 
 
-def parse_heads(text):
+def parse_heads(text: str) -> list[tuple[int, int]]:
     """'32:2,16:1' -> [(32, 2), (16, 1)]: (Q heads, KV heads) per rank of every layout the cubins serve."""
     heads = []
     for item in text.split(","):
@@ -630,7 +645,7 @@ def parse_heads(text):
     return heads
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )

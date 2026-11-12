@@ -909,7 +909,7 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                  max_requests_per_server: int = 1,
                  max_queue_wait_s: Optional[float] = None,
                  kv_transfer_timeout_ms: Optional[float] = None,
-                 **kwargs):
+                 **kwargs: Any) -> None:
         if server_role != ServerRole.GENERATION:
             raise ValueError(
                 "max_requests_per_server is a generation router option")
@@ -998,7 +998,8 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
             key["orig_elapsed_s"] = orig_elapsed_s
         return key
 
-    def _on_servers_updated(self, old_servers, new_servers):
+    def _on_servers_updated(self, old_servers: list[str],
+                            new_servers: list[str]) -> None:
         # A leaving server keeps its state while requests hold its seats; it
         # gets that state back if it rejoins, so their releases stay counted.
         for server in old_servers:
@@ -1069,9 +1070,9 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
 
     async def _acquire(self,
                        rid: int,
-                       priority,
+                       priority: Optional[float],
                        exclude_server: Optional[str],
-                       orig_elapsed_s=None) -> str:
+                       orig_elapsed_s: Optional[float] = None) -> str:
         """Wait for a seat and return its server.
 
         A repeated call for a request that holds a seat returns that seat; one for a
@@ -1148,15 +1149,16 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None,
                              success: bool = True,
-                             req_id: Optional[int] = None):
+                             req_id: Optional[int] = None) -> None:
         del session, success, req_id
         async with self._lock:
             await self._release_locked(id(request))
 
-    async def get_next_server_by_key(self,
-                                     routing_key,
-                                     exclude_server=None,
-                                     req_id=None):
+    async def get_next_server_by_key(
+            self,
+            routing_key: Optional[dict],
+            exclude_server: Optional[str] = None,
+            req_id: Optional[int] = None) -> tuple[str, dict, int]:
         if req_id is None:
             raise ValueError(
                 "Pooled generation routing through the coordinator requires a "
@@ -1170,7 +1172,9 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
             "server_info": self._server_info.get(server, {})
         }, req_id
 
-    async def finish_request_by_id(self, req_id, success=True):
+    async def finish_request_by_id(self,
+                                   req_id: Optional[int],
+                                   success: bool = True) -> None:
         del success
         if req_id is None:
             return

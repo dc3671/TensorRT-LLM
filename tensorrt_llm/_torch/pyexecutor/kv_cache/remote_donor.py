@@ -50,14 +50,27 @@ import threading
 import time
 import uuid
 import weakref
-from typing import TYPE_CHECKING, Optional
+from collections.abc import Callable, Iterator
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Optional
 
 from tensorrt_llm._torch.mmap_utils import madvise_range
 from tensorrt_llm.llmapi.llm_args import REMOTE_CACHE_CHUNK_BYTES, REMOTE_CACHE_DONOR_RESERVE_BYTES
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
+    from cuda.bindings.driver import (
+        CUdevice,
+        CUmemAllocationProp,
+        CUmemGenericAllocationHandle,
+        CUstreamCaptureMode,
+    )
+
     from tensorrt_llm.llmapi.llm_args import RemoteCacheConfig
+    from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
+        BaseTransferAgent,
+        NixlTransferAgent,
+    )
 
 
 def _nvml_gpu_index(device: int) -> int:
@@ -215,7 +228,7 @@ def _bind_to_numa_node(address: int, nbytes: int, node: int) -> bool:
     return True
 
 
-def _cuda_check(result):
+def _cuda_check(result: object) -> Any:
     """Unwrap a cuda.bindings driver call's (CUresult, value...) tuple, raising on an error."""
     from cuda.bindings import driver as drv
 
@@ -301,7 +314,7 @@ def _contiguous_free_gib(
     return total / _GIB
 
 
-def _host_numa_node_of(drv, device) -> int:
+def _host_numa_node_of(drv: ModuleType, device: "CUdevice") -> int:
     """The host NUMA node closest to CUDA device `device`; the first node with memory if the driver reports none."""
     err, node = drv.cuDeviceGetAttribute(
         drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, device
@@ -334,7 +347,7 @@ def _compact_node(node: int, gib: float) -> None:
 
 
 @contextlib.contextmanager
-def _node_compaction_lock(directory: str, host: str, node: int):
+def _node_compaction_lock(directory: str, host: str, node: int) -> Iterator[bool]:
     """Hold the exclusive flock of NUMA node `node` of `host` in `directory`; yields False, holding nothing, when the
     file system refuses it (no pass may then run on the node)."""
     path = os.path.join(directory, f"compact.{host}.node{node}.lock")
@@ -359,17 +372,17 @@ def _node_compaction_lock(directory: str, host: str, node: int):
 def _place_chunks(
     n_chunks: int,
     nodes: list,
-    create,
+    create: Callable[[int], Optional[object]],
     *,
     chunk_gib: float,
     reserve_gib: float,
-    node_lock,
-    meminfo=None,
-    compact=None,
-    contiguous=None,
-    sleep=time.sleep,
-    clock=time.monotonic,
-):
+    node_lock: Callable[[int], contextlib.AbstractContextManager[bool]],
+    meminfo: Optional[Callable[[int], dict]] = None,
+    compact: Optional[Callable[[int, float], None]] = None,
+    contiguous: Optional[Callable[[int], float]] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> tuple[list, dict[int, int]]:
     """Place up to `n_chunks` chunks over `nodes`, the preferred node first; `create(node)` returns a handle, or None
     when the driver refuses. A node takes chunks while it keeps `reserve_gib`; a refused chunk is retried, then
     compacted for under `node_lock(node)` (see the constants), which donors sharing the node take in turn; a node
@@ -384,11 +397,11 @@ def _place_chunks(
     min_pass_gib = margin_gib = reserve_gib * _PASS_RESERVE_SHARE
     max_pass_gib = _MAX_PASS_CHUNKS * chunk_gib
 
-    def room(node):
+    def room(node: int) -> float:
         info = meminfo(node)
         return info.get("MemFree", 0.0) + _reclaimable_gib(info) if info else float("inf")
 
-    def recover(node):
+    def recover(node: int) -> Optional[object]:
         delay, deadline = 0.05, clock() + _FABRIC_RETRY_S
         while clock() < deadline:
             sleep(delay)
@@ -479,7 +492,7 @@ def _meta_fields(path: str) -> dict:
     return fields
 
 
-def scan_donors(directory: str):
+def scan_donors(directory: str) -> tuple[list[dict], list[dict]]:
     """The donors of a rendezvous directory that have reported: (published, failed). A published donor offers the
     whole chunks of its segments; a failed one left donor.<name>.failed (RemoteMemDonor.publish_failure)."""
     published, failed = [], []
@@ -531,7 +544,7 @@ def check_remote_capacity(
     timeout_s: float,
     transport: Optional[str] = None,
     poll_s: float = 2.0,
-    log=None,
+    log: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Wait until `num_donors` donors have published or failed (at most `timeout_s`), or until they offer
     `need_bytes`, then raise if the offer falls short, naming the failed and short donors. A job whose donors cannot
@@ -668,7 +681,7 @@ class RemoteMemDonor:
         name: Optional[str] = None,
         numa_node: Optional[int] = None,
         device: Optional[int] = None,
-    ):
+    ) -> None:
         if nbytes < chunk_bytes:
             raise ValueError(f"donation size {nbytes} is below one chunk ({chunk_bytes})")
         self.transport = transport
@@ -690,7 +703,9 @@ class RemoteMemDonor:
     def _path(self, suffix: str) -> str:
         return os.path.join(self.directory, f"donor.{self.name}.{suffix}")
 
-    def _publish(self, extra_files, meta_lines, timing: str) -> None:
+    def _publish(
+        self, extra_files: list[tuple[str, bytes]], meta_lines: list[str], timing: str
+    ) -> None:
         meta = "\n".join(
             [
                 "version 1",
@@ -794,7 +809,7 @@ class RemoteMemDonor:
         self.transport.release(self)
 
 
-def _make_nixl_agent(name: str, backend_params: dict):
+def _make_nixl_agent(name: str, backend_params: dict) -> "NixlTransferAgent":
     """A NIXL transfer agent (the C++ binding's ``NixlTransferAgent``, a ``BaseTransferAgent``) named `name`."""
     from tensorrt_llm.tensorrt_llm_transfer_agent_binding import BaseAgentConfig, NixlTransferAgent
 
@@ -823,7 +838,12 @@ class AgentDonorTransport(DonorTransport):
     _agent = None
     _registered: bool = False
 
-    def __init__(self, *, ucx_devices: Optional[str] = None, make_agent=_make_nixl_agent):
+    def __init__(
+        self,
+        *,
+        ucx_devices: Optional[str] = None,
+        make_agent: Callable[[str, dict], "BaseTransferAgent"] = _make_nixl_agent,
+    ) -> None:
         self.ucx_devices = ucx_devices
         self._make_agent = make_agent
         self._map = None
@@ -927,7 +947,7 @@ class FabricDonorTransport(DonorTransport):
     # The device whose primary context _fabric_ctx retains; close() releases it.
     _fabric_device = None
 
-    def __init__(self, *, reserve_bytes: int = REMOTE_CACHE_DONOR_RESERVE_BYTES):
+    def __init__(self, *, reserve_bytes: int = REMOTE_CACHE_DONOR_RESERVE_BYTES) -> None:
         self.reserve_bytes = reserve_bytes
         self._fabric = []
         self._fabric_ctx = None
@@ -948,7 +968,7 @@ class FabricDonorTransport(DonorTransport):
         self._fabric = []
 
     @staticmethod
-    def _fabric_prop(drv, node: int):
+    def _fabric_prop(drv: ModuleType, node: int) -> "CUmemAllocationProp":
         prop = drv.CUmemAllocationProp()
         prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
         prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
@@ -956,7 +976,9 @@ class FabricDonorTransport(DonorTransport):
         prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
         return prop
 
-    def _try_create(self, drv, prop):
+    def _try_create(
+        self, drv: ModuleType, prop: "CUmemAllocationProp"
+    ) -> Optional["CUmemGenericAllocationHandle"]:
         """One chunk, or None when the node is out of memory (any other error raises)."""
         try:
             return _cuda_check(drv.cuMemCreate(self.chunk_bytes, prop, 0))
@@ -1068,7 +1090,14 @@ class FabricDonorTransport(DonorTransport):
             f"{t1 - t0:.1f} s",
         )
 
-    def _leave_fabric_context(self, drv, capture_mode, *, pop: bool, raise_errors: bool) -> None:
+    def _leave_fabric_context(
+        self,
+        drv: ModuleType,
+        capture_mode: "CUstreamCaptureMode",
+        *,
+        pop: bool,
+        raise_errors: bool,
+    ) -> None:
         """Pop the fabric context (if `pop`) and restore the thread's capture mode. A failure raises only after a
         successful start, so it never replaces the start error."""
         steps = [lambda: drv.cuThreadExchangeStreamCaptureMode(capture_mode)]
@@ -1118,7 +1147,7 @@ def make_donor(
     name: Optional[str] = None,
     numa_node: Optional[int] = None,
     device: Optional[int] = None,
-    **transport_options,
+    **transport_options: object,
 ) -> RemoteMemDonor:
     """A donation of `nbytes` in `directory`, made reachable by `transport` (one of ``TRANSPORTS``) built with
     `transport_options` (``ucx_devices`` for NIXL, ``reserve_bytes`` for fabric)."""

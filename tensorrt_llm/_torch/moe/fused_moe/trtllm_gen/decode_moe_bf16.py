@@ -6,6 +6,8 @@ instead of ``trtllm_bf16_moe``'s routing + two GEMMs and returns its ``do_finali
 and BF16 top-k weight per (token, k) bit for bit, through the engine's own expanded -> permuted index (rows packed).
 """
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from tensorrt_llm._torch.kernels.blackwell.moe_bf16_engine import (
@@ -18,8 +20,12 @@ from tensorrt_llm._torch.utils import ActivationType
 from ..quantization import TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K
 from ..routing import RoutingMethodType
 
+if TYPE_CHECKING:
+    from .flashinfer_bf16 import FlashinferTrtllmGenBf16Impl
+    from .kernel_inputs import KernelInputs
 
-def applies(impl, k) -> bool:
+
+def applies(impl: "FlashinferTrtllmGenBf16Impl", k: "KernelInputs") -> bool:
     """Whether this run fits the engine (host-side checks only)."""
     if k.do_finalize or k.router_logits is None or k.routing_bias is not None:
         return False
@@ -63,7 +69,9 @@ def applies(impl, k) -> bool:
     return hidden % 128 == 0 and inter % 128 == 0
 
 
-def run(impl, k, state: torch.Tensor):
+def run(
+    impl: "FlashinferTrtllmGenBf16Impl", k: "KernelInputs", state: torch.Tensor
+) -> list[torch.Tensor]:
     from tensorrt_llm._torch.kernels.blackwell.moe_bf16_engine import moe_bf16_engine
 
     x = k.x

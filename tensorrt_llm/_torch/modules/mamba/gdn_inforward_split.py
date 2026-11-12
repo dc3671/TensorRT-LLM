@@ -10,9 +10,14 @@ Index tensors are ``InforwardSnapshotSplit`` fields (int64 views of one persiste
 depend only on host-known counts, so the kernels capture into CUDA graphs.
 """
 
+from typing import TYPE_CHECKING
+
 import torch
 import triton
 import triton.language as tl
+
+if TYPE_CHECKING:
+    from .mamba2_metadata import InforwardSnapshotSplit
 
 # Elements per program along a row.
 _BLOCK = 4096
@@ -36,7 +41,7 @@ def _split_conv_state_kernel(
     stride_x_tok,
     W: tl.constexpr,
     BLOCK_C: tl.constexpr,
-):
+) -> None:
     """Split request j: stage its live conv state (the window that ends at the prompt end), then load the window that
     ends at P, i.e. the W raw inputs before P (rows conv_win[j * W : (j + 1) * W] of x, oldest first)."""
     j = tl.program_id(0)
@@ -65,7 +70,7 @@ def _split_state_rows_kernel(
     stride_ssm,
     ROW: tl.constexpr,
     BLOCK: tl.constexpr,
-):
+) -> None:
     """Rows r < n_live: ssm[live[r]] = final[main_rows[r]]; rows n_live + j: tail_init[j] = final[split_rows[j]]."""
     r = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -102,7 +107,7 @@ def _tail_token_gather_kernel(
     V_ROW: tl.constexpr,
     G_ROW: tl.constexpr,
     BLOCK: tl.constexpr,
-):
+) -> None:
     """Tail token t: q / k / v / g / beta rows of token tail_tok[t] into row t of the compact tail tensors."""
     t = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -134,7 +139,7 @@ def _tail_scatter_kernel(
     STATE_ROW: tl.constexpr,
     OUT_ROW: tl.constexpr,
     BLOCK: tl.constexpr,
-):
+) -> None:
     """Rows r < k: stage[stage_rows[r]] = tail_final[r]; rows k + t: out[tail_tok[t]] = tail_out[t]."""
     r = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -179,7 +184,10 @@ def split_conv_states_ok(
 
 
 def split_conv_states(
-    conv_states: torch.Tensor, mixed_qkv: torch.Tensor, split, stage_conv: torch.Tensor
+    conv_states: torch.Tensor,
+    mixed_qkv: torch.Tensor,
+    split: "InforwardSnapshotSplit",
+    stage_conv: torch.Tensor,
 ) -> None:
     """``_inforward_split_conv_states`` with the window read from ``mixed_qkv`` itself: stage the split requests'
     conv states, then load the raw ``d_conv - 1`` inputs before P. ``mixed_qkv`` must still hold the raw inputs
@@ -210,7 +218,17 @@ def split_conv_states(
     )
 
 
-def split_core_ok(query, key, value, g, beta, final, ssm_states, stage_ssm, core_out) -> bool:
+def split_core_ok(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    final: torch.Tensor,
+    ssm_states: torch.Tensor,
+    stage_ssm: torch.Tensor,
+    core_out: torch.Tensor,
+) -> bool:
     """Layout / dtype conditions of the three core-side copies (else keep the index ops)."""
     qkv_ok = all(
         x.dim() == 4 and x.shape[0] == 1 and _rows_contiguous(x, 2) for x in (query, key, value)
@@ -239,7 +257,9 @@ def split_core_ok(query, key, value, g, beta, final, ssm_states, stage_ssm, core
     )
 
 
-def split_state_rows(final: torch.Tensor, ssm_states: torch.Tensor, split) -> torch.Tensor:
+def split_state_rows(
+    final: torch.Tensor, ssm_states: torch.Tensor, split: "InforwardSnapshotSplit"
+) -> torch.Tensor:
     """``ssm_states.index_copy_(0, live, final.index_select(0, main_rows))`` and
     ``final.index_select(0, split_rows)`` (returned: the tails' initial states) in one launch."""
     row = final[0].numel()
@@ -264,7 +284,14 @@ def split_state_rows(final: torch.Tensor, ssm_states: torch.Tensor, split) -> to
     return tail_init
 
 
-def gather_tail_tokens(query, key, value, g, beta, split):
+def gather_tail_tokens(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    split: "InforwardSnapshotSplit",
+) -> list[torch.Tensor]:
     """``x.index_select(1, tail_tok)`` for query, key, value, g and beta in one launch (contiguous outputs)."""
     nt = split.tail_tok.shape[0]
     outs = [
@@ -302,7 +329,7 @@ def scatter_tail(
     stage_ssm: torch.Tensor,
     tail_out: torch.Tensor,
     core_out: torch.Tensor,
-    split,
+    split: "InforwardSnapshotSplit",
 ) -> bool:
     """``stage_ssm.index_copy_(0, stage_rows, tail_final)`` and ``core_out[0].index_copy_(0, tail_tok,
     tail_out[0])`` in one launch. Returns False (nothing written) when the tensors do not match its conditions."""
