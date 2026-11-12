@@ -26,6 +26,8 @@ from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, graph_safe_cute_tensor
 from ..flashinfer_utils import get_env_enable_pdl
 
 _NUM_SMS_DEFAULT = 148
+# SM100/SM103 opt-in shared memory per block; stands in for the device without CUDA (CPU-only test collection).
+_MAX_SMEM_BYTES_DEFAULT = 232448
 
 # Most rows of one launch.
 MAX_M = 32
@@ -48,7 +50,7 @@ def _num_sms() -> int:
 def _max_smem_bytes() -> int:
     """A block's opt-in shared memory on the current device (no tactic fits without one)."""
     if not torch.cuda.is_available():
-        return 0
+        return _MAX_SMEM_BYTES_DEFAULT
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     return props.shared_memory_per_block_optin
 
