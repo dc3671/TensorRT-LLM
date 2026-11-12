@@ -310,7 +310,7 @@ def _seg_merge_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-def load_segment_attention_module() -> None:
+def load_trtllm_gen_decode_module() -> None:
     """Load FlashInfer's trtllm-gen decode module, which segment_attention and the trtllm-gen decode call; FlashInfer
     JIT-builds it on first use."""
     flashinfer.decode.get_trtllm_gen_fmha_module()

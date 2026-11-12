@@ -60,7 +60,7 @@ from .gqa_kv_replica_fused import kv_replica_fused_state, kv_replica_fused_suppo
 from .gqa_segmented_decode import (
     MAX_FOLDED_ROWS,
     MAX_Q_LEN,
-    load_segment_attention_module,
+    load_trtllm_gen_decode_module,
     segment_attention_softmax_bytes,
     segmented_decode,
     segmented_decode_supported,
@@ -481,7 +481,7 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
         if not self._decode_module_loaded and metadata.num_generations > 0:
             # On the first generation call (warmup's), which a dedicated kernel may serve: the segmented and
             # trtllm-gen decodes that need the module may come only with mixed or larger batches.
-            load_segment_attention_module()
+            load_trtllm_gen_decode_module()
             self._decode_module_loaded = True
 
     def _reserve_segment_stats(
