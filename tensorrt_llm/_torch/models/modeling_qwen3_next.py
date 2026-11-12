@@ -794,11 +794,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             x: torch.Tensor) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """(shared expert output, gate logits [M, 1]) from two warp-MMA launches: up to
         ``_shared_expert_raced_rows`` rows on their own races, else where the low-M race picked the warp-MMA
-        GEMM for gate_up_proj and down_proj; else None (also under torch.compile: AutoTuner and CuTe DSL host
-        code)."""
+        GEMM for gate_up_proj and down_proj; else None (also for 0 rows, which the warp-MMA GEMM refuses, and
+        under torch.compile: AutoTuner and CuTe DSL host code)."""
         weights = self._shared_expert_low_m
         if (weights is None or x.dim() != 2 or x.dtype != torch.bfloat16
-                or torch.compiler.is_compiling()):
+                or x.shape[0] == 0 or torch.compiler.is_compiling()):
             return None
         mlp = self.shared_expert
         gate_up, down = mlp.gate_up_proj, mlp.down_proj

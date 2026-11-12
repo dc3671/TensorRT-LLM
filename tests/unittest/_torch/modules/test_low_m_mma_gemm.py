@@ -254,6 +254,10 @@ def test_shared_expert_module_path(inter, monkeypatch, m=7):
     _assert_close(out, ref_out)
     _assert_close(logits, ref_gate)
     assert looked_up == plain_fp8_input
+    # 0 rows (the warp-MMA GEMM refuses M = 0) stay on the stock shared expert, raced rows or not.
+    for raced_rows in (0, 8):
+        blk._shared_expert_raced_rows = raced_rows
+        assert blk._shared_expert_low_m_forward(x[:0]) is None
 
 
 @pytest.mark.parametrize("inter", [512, 64])  # TP2 / TP16 shards of a 1024-wide shared expert

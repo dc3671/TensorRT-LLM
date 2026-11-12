@@ -543,7 +543,7 @@ def test_slot_kernel_takes_every_supported_hidden_size() -> None:
         for m in range(1, SLOT_MAX_ROWS + 1):
             ts = _ctas_per_token(m, hidden, sms) if m >= TWO_SHOT_ROWS else 0
             try:
-                MnnvlSlotAllReduceNormKernel(
+                kernel = MnnvlSlotAllReduceNormKernel(
                     hidden=hidden,
                     norm_eps=EPS,
                     nranks=8,
@@ -557,6 +557,12 @@ def test_slot_kernel_takes_every_supported_hidden_size() -> None:
                 )
             except ValueError:
                 built = False
+                continue
+            # The launch reserves the kernel's shared memory: warp sums, the cluster sums (one per warp of the
+            # token with the two-shot arithmetic), flags and mbarrier; 512 bytes up to hidden 16384.
+            nsum = kernel.ctas * kernel.num_warps if ts else kernel.ctas
+            assert kernel.smem_bytes() >= 4 * (kernel.num_warps + nsum) + 32 + 8, (hidden, m)
+            assert hidden > 16384 or kernel.smem_bytes() == 512, (hidden, m)
         warps = hidden // 2048
         assert supported == (warps & (warps - 1) == 0), hidden
         assert not supported or built, hidden

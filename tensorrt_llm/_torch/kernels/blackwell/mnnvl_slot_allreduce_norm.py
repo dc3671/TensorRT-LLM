@@ -332,10 +332,22 @@ class MnnvlSlotAllReduceNormKernel:
             grid=[m * self.ctas, 1, 1],
             block=[self.threads, 1, 1],
             cluster=[self.ctas, 1, 1],
-            smem=512,
+            smem=self.smem_bytes(),
             stream=stream,
             use_pdl=self.use_pdl,
         )
+
+    def smem_bytes(self) -> int:
+        """Dynamic shared memory of a launch: ``kernel``'s allocations (warp sums, cluster sums, flags, mbarrier,
+        each 16-byte aligned), at least the 512 bytes every launch reserved before the cluster sums grew with the
+        hidden size."""
+
+        def up16(n: int) -> int:
+            return (n + 15) // 16 * 16
+
+        nsum = self.ctas * self.num_warps if self.ts_ctas else self.ctas
+        need = up16(4 * self.num_warps) + up16(4 * nsum) + 32 + (8 if self.ctas > 1 else 0)
+        return max(512, up16(need))
 
     @cute.kernel
     def kernel(
