@@ -360,6 +360,11 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._strip_gen_subagent_affinity(gen_req)
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
+                if ctx_response is not None:
+                    # A pooled generation router ages the request from its arrival and
+                    # bounds its wait by the context servers' KV transfer timeout, which
+                    # runs from here. Stamped again below to include this wait.
+                    self._stamp_orig_elapsed(gen_req, arrival_time)
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server, req_id=disagg_request_id
                 )

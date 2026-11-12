@@ -38,7 +38,7 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
     KV_CACHE_HASH_ALGO_V2_SHA256_64, KV_CACHE_HASH_ALGOS, BlockHash,
     BlockHashMixin, OpenAIRequest, block_key_hasher, get_request_num_tokens,
     hash_v1_block_key, responses_request_text, truncate_sha256_hash_to_int64)
-from tensorrt_llm.serve.seat_pool import SeatPool, priority_or_default
+from tensorrt_llm.serve.seat_pool import SeatPool, Waiter, priority_or_default
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
 # Retries ride out a burst that fills the coordinator's accept queue; select is
@@ -863,6 +863,11 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
     request priority first, ties in arrival order, and with ``max_queue_wait_s`` the
     requests that waited that long first. In disaggregated serving the coordinator owns
     the queue; its ``select`` waits for the seat outside the reservation lock.
+
+    A request whose context phase has finished (``disaggregated_params.orig_elapsed_s``
+    set) waits from its arrival at the orchestrator and, with ``kv_transfer_timeout_ms``
+    (the context servers' value, filled in by ``extract_disagg_cfg``), fails once it has
+    waited that long for a seat: its context server has dropped the KV transfer by then.
     """
 
     pooled = True
@@ -875,6 +880,7 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                  use_tokens: bool = False,
                  max_requests_per_server: int = 1,
                  max_queue_wait_s: Optional[float] = None,
+                 kv_transfer_timeout_ms: Optional[float] = None,
                  **kwargs):
         if server_role != ServerRole.GENERATION:
             raise ValueError(
@@ -889,15 +895,34 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                          metadata_server,
                          use_tokens=False,
                          **kwargs)
-        self._pool = SeatPool(max_requests_per_server, max_queue_wait_s)
+        self._pool = SeatPool(
+            max_requests_per_server,
+            max_queue_wait_s,
+            kv_transfer_timeout_s=(None if kv_transfer_timeout_ms is None else
+                                   kv_transfer_timeout_ms / 1000.0))
         logger.info(f"PooledLoadBalancingRouter: "
                     f"{self._pool.describe(len(self._servers))}")
+        if (max_queue_wait_s is not None and kv_transfer_timeout_ms is not None
+                and max_queue_wait_s * 1000.0 > kv_transfer_timeout_ms):
+            logger.warning(
+                f"max_queue_wait_s ({max_queue_wait_s} s) exceeds the context "
+                f"servers' kv_transfer_timeout_ms ({kv_transfer_timeout_ms} "
+                f"ms): a request fails at that timeout before the cap can "
+                f"move it ahead")
+
+    @staticmethod
+    def _orig_elapsed_s(request: OpenAIRequest) -> Optional[float]:
+        params = getattr(request, "disaggregated_params", None)
+        return getattr(params, "orig_elapsed_s", None)
 
     def routing_key(self, request: OpenAIRequest) -> dict:
-        """The parent's key plus the request priority, the queue's order."""
+        """The parent's key plus the priority and, past the context phase, ``orig_elapsed_s``."""
         key = super().routing_key(request)
         key["priority"] = priority_or_default(getattr(request, "priority",
                                                       None))
+        orig_elapsed_s = self._orig_elapsed_s(request)
+        if orig_elapsed_s is not None:
+            key["orig_elapsed_s"] = orig_elapsed_s
         return key
 
     def _on_servers_updated(self, old_servers, new_servers):
@@ -916,8 +941,16 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
     def _active_servers(self) -> List[str]:
         return [s for s in self._servers if s in self._server_state]
 
+    def _expire_locked(self, waiter: Optional[Waiter] = None) -> None:
+        """Fail the waiters past their KV transfer deadline, and ``waiter``."""
+        for expired in self._pool.expire(waiter):
+            if not expired.future.done():
+                expired.future.set_exception(
+                    ValueError(self._pool.expiry_message(expired)))
+
     async def _dispatch_locked(self) -> None:
         """Give free seats to waiters, best first. Called with ``self._lock`` held."""
+        self._expire_locked()
         while len(self._pool):
             free = [
                 s for s in self._active_servers()
@@ -942,12 +975,16 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
             sum(self._get_server_load(s) for s in servers),
             self._pool.seats * len(servers))
 
-    async def _acquire(self, rid: int, priority,
-                       exclude_server: Optional[str]) -> str:
+    async def _acquire(self,
+                       rid: int,
+                       priority,
+                       exclude_server: Optional[str],
+                       orig_elapsed_s=None) -> str:
         """Wait for a seat and return its server.
 
         A repeated call for a request that holds a seat returns that seat; one for a
-        waiting request shares its place in the queue.
+        waiting request shares its place in the queue. Raises ``ValueError`` once a
+        request past its context phase has waited the KV transfer timeout.
         """
         async with self._lock:
             server = self._req_routing_table.get(rid)
@@ -957,12 +994,19 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
             if waiter is None:
                 waiter = self._pool.add(
                     rid, priority, exclude_server,
-                    asyncio.get_running_loop().create_future())
+                    asyncio.get_running_loop().create_future(), orig_elapsed_s)
             waiter.holders += 1
             await self._dispatch_locked()
             waiter.arriving = False
         try:
-            return await asyncio.shield(waiter.future)
+            try:
+                return await asyncio.wait_for(asyncio.shield(waiter.future),
+                                              self._pool.remaining_s(waiter))
+            except asyncio.TimeoutError:
+                async with self._lock:
+                    if not waiter.future.done():
+                        self._expire_locked(waiter)
+                return await asyncio.shield(waiter.future)
         except asyncio.CancelledError:
             async with self._lock:
                 waiter.holders -= 1
@@ -997,7 +1041,8 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
         self._validate_servers_available()
         server = await self._acquire(id(request),
                                      getattr(request, "priority", None),
-                                     exclude_server)
+                                     exclude_server,
+                                     self._orig_elapsed_s(request))
         return server, {"server_info": self._server_info.get(server, {})}
 
     async def finish_request(self,
@@ -1018,9 +1063,10 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                 "Pooled generation routing through the coordinator requires a "
                 "request ID")
         self._validate_servers_available()
-        server = await self._acquire(req_id, (routing_key
-                                              or {}).get("priority"),
-                                     exclude_server)
+        routing_key = routing_key or {}
+        server = await self._acquire(req_id, routing_key.get("priority"),
+                                     exclude_server,
+                                     routing_key.get("orig_elapsed_s"))
         return server, {
             "server_info": self._server_info.get(server, {})
         }, req_id

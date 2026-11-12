@@ -403,6 +403,11 @@ def extract_disagg_cfg(
     gen_router_config = extract_router_config(generation_servers)
     ctx_router_config.server_role = ServerRole.CONTEXT
     gen_router_config.server_role = ServerRole.GENERATION
+    if gen_router_config.args.get("max_requests_per_server") is not None:
+        # The pooled generation router fails a request that waits for a seat past
+        # the context servers' KV transfer timeout.
+        gen_router_config.args["kv_transfer_timeout_ms"] = (
+            _ctx_kv_transfer_timeout_ms(context_servers))
     if disagg_cluster:
         disagg_cluster_config = extract_disagg_cluster_config(disagg_cluster)
     else:
@@ -501,6 +506,15 @@ def _warn_if_subagent_affinity_inactive(config: DisaggServerConfig) -> None:
             "the 'conversation' router on the "
             f"{', '.join(non_conversation)} fleet(s), but they use a different "
             "router type; sub-agent instance affinity will be inactive there.")
+
+
+def _ctx_kv_transfer_timeout_ms(context_servers: dict) -> Optional[int]:
+    """The context servers' cache_transceiver_config.kv_transfer_timeout_ms, else its default."""
+    cfg = context_servers.get("cache_transceiver_config") or {}
+    if "kv_transfer_timeout_ms" in cfg:
+        return cfg["kv_transfer_timeout_ms"]
+    from .llm_args import CacheTransceiverConfig
+    return CacheTransceiverConfig.model_fields["kv_transfer_timeout_ms"].default
 
 
 def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],

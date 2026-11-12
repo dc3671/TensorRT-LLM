@@ -25,9 +25,10 @@ from tensorrt_llm.llmapi.disagg_utils import (
     DisaggServerConfig,
     RouterConfig,
     ServerRole,
+    extract_disagg_cfg,
 )
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
-from tensorrt_llm.serve.openai_protocol import CompletionRequest
+from tensorrt_llm.serve.openai_protocol import CompletionRequest, DisaggregatedParams
 from tensorrt_llm.serve.router import (
     POOLED_SELECT_TIMEOUT_S,
     CoordinatorDelegatingRouter,
@@ -94,6 +95,37 @@ def test_pool_cap_puts_aged_waiters_first_oldest_first():
     assert pool.pick(["s"])[0].rid == 2
 
 
+def test_pool_ages_from_the_orchestrator_arrival():
+    """A request past its context phase has waited since it reached the orchestrator."""
+    clock = _Clock()
+    pool = SeatPool(1, max_wait_s=60.0, clock=clock)
+    pool.add(1, 0.9, None, None)
+    pool.add(2, 0.1, None, None, orig_elapsed_s=55.0)
+    assert pool.pick(["s"])[0].rid == 1
+    clock.now = 5.0
+    assert pool.pick(["s"])[0].rid == 2  # 60 s since its arrival, 5 s in the pool
+
+
+def test_pool_expires_at_the_kv_transfer_timeout():
+    """Only a request past its context phase gets the deadline, counted from its entry here."""
+    clock = _Clock()
+    pool = SeatPool(1, clock=clock, kv_transfer_timeout_s=60.0)
+    pool.add(1, 0.5, None, None, orig_elapsed_s=10.0)
+    pool.add(2, 0.5, None, None)
+    clock.now = 59.9
+    assert pool.expire() == [] and pool.remaining_s(pool.waiter(1)) == pytest.approx(0.1)
+    clock.now = 60.0
+    expired = pool.expire()
+    assert [w.rid for w in expired] == [1] and pool.expired == 1
+    assert "KV transfer timeout (60 s" in pool.expiry_message(expired[0])
+    assert len(pool) == 1 and pool.remaining_s(pool.waiter(2)) is None
+    # Without the timeout nothing expires on its own.
+    plain = SeatPool(1, clock=clock)
+    plain.add(3, 0.5, None, None, orig_elapsed_s=10.0)
+    clock.now = 1e6
+    assert plain.expire() == []
+
+
 def test_pool_skips_excluded_server():
     pool = SeatPool(1, clock=_Clock())
     pool.add(1, 0.9, "s0", None)
@@ -107,12 +139,11 @@ def test_pool_skips_excluded_server():
 # ---------------------------------------------------------------------------------- router
 
 
-def _router(servers=("s0", "s1"), seats=1, cap=None) -> PooledLoadBalancingRouter:
-    config = RouterConfig(
-        type="load_balancing",
-        server_role=ServerRole.GENERATION,
-        args={"max_requests_per_server": seats, "max_queue_wait_s": cap},
-    )
+def _router(servers=("s0", "s1"), seats=1, cap=None, kv_ms=None) -> PooledLoadBalancingRouter:
+    args = {"max_requests_per_server": seats, "max_queue_wait_s": cap}
+    if kv_ms is not None:
+        args["kv_transfer_timeout_ms"] = kv_ms
+    config = RouterConfig(type="load_balancing", server_role=ServerRole.GENERATION, args=args)
     router = create_router(config, list(servers))
     assert isinstance(router, PooledLoadBalancingRouter)
     return router
@@ -159,6 +190,29 @@ def test_routing_key_carries_priority():
         "priority": 0.25,
     }
     assert router.routing_key(CompletionRequest(model="m", prompt="x"))["priority"] == 0.5
+    after_ctx = CompletionRequest(
+        model="m",
+        prompt="x",
+        disaggregated_params=DisaggregatedParams(
+            request_type="generation_only", orig_elapsed_s=2.5
+        ),
+    )
+    assert router.routing_key(after_ctx)["orig_elapsed_s"] == 2.5
+
+
+def test_extract_disagg_cfg_gives_the_pooled_router_the_ctx_kv_timeout():
+    pooled = {"router": {"type": "load_balancing", "max_requests_per_server": 1}}
+    default = extract_disagg_cfg(generation_servers=dict(pooled, router=dict(pooled["router"])))
+    assert default.gen_router_config.args["kv_transfer_timeout_ms"] == 60000
+    config = extract_disagg_cfg(
+        context_servers={"cache_transceiver_config": {"kv_transfer_timeout_ms": 30000}},
+        generation_servers=dict(pooled, router=dict(pooled["router"])),
+    )
+    assert config.gen_router_config.args["kv_transfer_timeout_ms"] == 30000
+    router = create_router(config.gen_router_config, ["s"])
+    assert router._pool.kv_transfer_timeout_s == 30.0
+    plain = extract_disagg_cfg(generation_servers={"router": {"type": "load_balancing"}})
+    assert "kv_transfer_timeout_ms" not in plain.gen_router_config.args
 
 
 async def _settle():
@@ -243,6 +297,33 @@ async def test_cancellation_releases_queue_place_and_seat():
     with pytest.raises(asyncio.CancelledError):
         await late
     assert router._get_server_load("s0") == 0 and router._req_routing_table == {}
+
+
+@pytest.mark.asyncio
+async def test_waiter_fails_at_the_kv_transfer_timeout():
+    """A request past its context phase that finds no seat within the timeout fails; others wait."""
+    router = _router(servers=("s0",), seats=1, kv_ms=50)
+    await router.get_next_server_by_key({}, req_id=0)
+    doomed = asyncio.create_task(
+        router.get_next_server_by_key({"priority": 0.9, "orig_elapsed_s": 3.0}, req_id=1)
+    )
+    patient = asyncio.create_task(router.get_next_server_by_key({"priority": 0.1}, req_id=2))
+    with pytest.raises(ValueError, match="KV transfer timeout"):
+        await asyncio.wait_for(doomed, timeout=5)
+    assert len(router._pool) == 1 and router._pool.expired == 1 and not patient.done()
+    await router.finish_request_by_id(0)
+    assert (await asyncio.wait_for(patient, timeout=5))[0] == "s0"
+    # The in-process path reads the elapsed time from the request.
+    request = CompletionRequest(
+        model="m",
+        prompt="x",
+        disaggregated_params=DisaggregatedParams(
+            request_type="generation_only", orig_elapsed_s=1.0
+        ),
+    )
+    with pytest.raises(ValueError, match="KV transfer timeout"):
+        await asyncio.wait_for(router.get_next_server(request), timeout=5)
+    assert router._get_server_load("s0") == 1 and len(router._pool) == 0
 
 
 @pytest.mark.asyncio
