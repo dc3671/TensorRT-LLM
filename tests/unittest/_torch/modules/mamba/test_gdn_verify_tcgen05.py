@@ -84,6 +84,24 @@ def _rel(a, b):
     return ((a - b).norm() / b.norm().clamp_min(1e-30)).item()
 
 
+def _check_matches_reference(y, m, y_ref, m_ref, mut, state_indices):
+    """y up to FP8 rounding flips; the state and histories of the requests' slots up to bf16 rounding (errors
+    relative to those slots only), and every other slot left untouched by both ops."""
+    assert y.dtype == torch.float8_e4m3fn and y.shape == y_ref.shape
+    assert _rel(y, y_ref) < 5e-2
+    assert (y.view(torch.uint8) != y_ref.view(torch.uint8)).float().mean().item() < 0.2
+    slots = state_indices[state_indices >= 0].long()
+    other = torch.ones(_SLOTS, dtype=torch.bool, device=slots.device)
+    other[slots] = False
+    for k in mut:
+        assert torch.equal(m[k][other], mut[k][other]), k
+        assert torch.equal(m_ref[k][other], mut[k][other]), k
+    assert _rel(m["old_u"][slots], m_ref["old_u"][slots]) < 1e-3
+    assert _rel(m["old_k"][slots], m_ref["old_k"][slots]) < 1e-2
+    assert torch.allclose(m["old_g"][slots], m_ref["old_g"][slots], rtol=1e-5, atol=1e-6)
+    assert _rel(m["ssm"][slots], m_ref["ssm"][slots]) < 1e-3
+
+
 @pytest.mark.parametrize(
     "T,HV,HK,fp8_out,expected",
     [
@@ -112,6 +130,13 @@ def test_gdn_verify_tcgen05_supported(T, HV, HK, fp8_out, expected):
         ((2, 8), 128),
         ((16, 64), 8),
         ((16, 64), 52),
+        # GQA groups HV / HK of 1, 2 and 3 (the cases above are group 4).
+        ((4, 4), 1),
+        ((4, 4), 52),
+        ((4, 8), 1),
+        ((4, 8), 52),
+        ((4, 12), 1),
+        ((4, 12), 52),
     ],
 )
 @pytest.mark.parametrize("pnat", [0, 12])
@@ -120,14 +145,7 @@ def test_gdn_verify_tcgen05_matches_gdn_verify(heads, n, pnat):
     y_ref, m_ref = _verify_op(torch.ops.trtllm.gdn_verify, HV, cd, n, _T, proj, ba, st, mut)
     y, m = _verify_op(gdn_verify_tcgen05, HV, cd, n, _T, proj, ba, st, mut)
     torch.cuda.synchronize()
-    assert y.dtype == torch.float8_e4m3fn and y.shape == y_ref.shape
-    # identical up to FP8 rounding flips of near-tie values
-    assert _rel(y, y_ref) < 5e-2
-    assert (y.view(torch.uint8) != y_ref.view(torch.uint8)).float().mean().item() < 0.2
-    assert _rel(m["old_u"], m_ref["old_u"]) < 1e-3
-    assert _rel(m["old_k"], m_ref["old_k"]) < 1e-2
-    assert torch.allclose(m["old_g"], m_ref["old_g"], rtol=1e-5, atol=1e-6)
-    assert _rel(m["ssm"], m_ref["ssm"]) < 1e-3
+    _check_matches_reference(y, m, y_ref, m_ref, mut, st["state_indices"])
     if pnat + _T > _HIST:
         assert not torch.equal(m["ssm"], mut["ssm"]), "commit expected (history full)"
 
@@ -166,13 +184,7 @@ def test_gdn_verify_tcgen05_matches_gdn_verify_across_draft_lengths(t, pnat, n):
     y_ref, m_ref = _verify_op(torch.ops.trtllm.gdn_verify, HV, cd, n, t, proj, ba, st, mut)
     y, m = _verify_op(gdn_verify_tcgen05, HV, cd, n, t, proj, ba, st, mut)
     torch.cuda.synchronize()
-    assert y.dtype == torch.float8_e4m3fn and y.shape == y_ref.shape
-    assert _rel(y, y_ref) < 5e-2
-    assert (y.view(torch.uint8) != y_ref.view(torch.uint8)).float().mean().item() < 0.2
-    assert _rel(m["old_u"], m_ref["old_u"]) < 1e-3
-    assert _rel(m["old_k"], m_ref["old_k"]) < 1e-2
-    assert torch.allclose(m["old_g"], m_ref["old_g"], rtol=1e-5, atol=1e-6)
-    assert _rel(m["ssm"], m_ref["ssm"]) < 1e-3
+    _check_matches_reference(y, m, y_ref, m_ref, mut, st["state_indices"])
 
 
 @skip_no_sm100f
@@ -303,4 +315,8 @@ def test_gdn_verify_tcgen05_addresses_the_history_by_replay_slot(heads, n):
     assert _rel(y_p[out], y_r[out]) < 5e-2
     assert _rel(v_p["old_u"][rows], v_r["old_u"][rows]) < 1e-3
     assert torch.allclose(v_p["old_g"][rows], v_r["old_g"][rows], rtol=1e-5, atol=1e-6)
-    assert _rel(ssm_p, ssm_r) < 1e-3
+    assert _rel(ssm_p[slots], ssm_r[slots]) < 1e-3
+    other = torch.ones(_SLOTS, dtype=torch.bool, device="cuda")
+    other[slots] = False
+    assert torch.equal(ssm_p[other], mut["ssm"][other])
+    assert torch.equal(ssm_r[other], mut["ssm"][other])
