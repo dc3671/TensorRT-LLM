@@ -3710,9 +3710,14 @@ class PyExecutor:
         self._pending_num_completed_requests = 0
 
         # Snapshot per-loop profiler timings plus the batch-matched GPU
-        # forward time. The FPM GPU value is read from CUDA events without
-        # synchronizing here; the normal sampler/update path has already
-        # established the required completion point for processed batches.
+        # forward time. Events on the current stream are only queried (not
+        # complete -> no value); every caller runs after _update_requests,
+        # whose sampler synchronize (TorchSampler) follows this forward on that
+        # stream. With the timing side stream (perf_metrics_timing_side_stream)
+        # try_compute_gpu_elapsed_time_ms synchronizes on the end event, which
+        # that stream records once this batch's forward has finished: the host
+        # can wait for that point (already passed after a sampler synchronize),
+        # never for later work.
         host_step_time_ms = self._latest_host_step_time_ms
         prev_device_step_time_ms = self._latest_prev_device_step_time_ms
         gpu_forward_time_ms = self.perf_manager.try_compute_gpu_elapsed_time_ms(
