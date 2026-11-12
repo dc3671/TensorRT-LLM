@@ -16,9 +16,14 @@
 
 import ctypes
 import errno
+import gc
 import mmap
+import os
+import shutil
 import sys
+import tempfile
 import unittest
+import weakref
 from unittest import mock
 
 from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
@@ -65,6 +70,60 @@ class TestPopulate(unittest.TestCase):
         ):
             remote_donor._populate(region, address, _SIZE)
         self.assertEqual(_resident_bytes(address, _SIZE), _SIZE)
+
+
+class _RecordingTransport(remote_donor.DonorTransport):
+    """Publishes without memory and counts releases."""
+
+    kind = "test"
+
+    def __init__(self):
+        self.releases = 0
+
+    def start(self, donor):
+        donor._publish([], ["segment 0 0"], "test")
+
+    def release_unowned(self):
+        self.releases += 1
+
+
+class TestUnclosedDonor(unittest.TestCase):
+    """A donor nobody closed frees its transport's memory too, not just its files: the process may live on."""
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp(prefix="kvcm2_unclosed_")
+        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+
+    def _started(self, transport):
+        donor = remote_donor.RemoteMemDonor(self.directory, 1 << 20, transport, chunk_bytes=1 << 20)
+        donor.start()
+        self.assertTrue(os.path.exists(donor._path("ready")))
+        return donor
+
+    def test_a_collected_donor_releases_its_transport(self):
+        transport = _RecordingTransport()
+        donor = self._started(transport)
+        ready, failed = donor._path("ready"), donor._path("failed")
+        del donor
+        gc.collect()
+        self.assertEqual(transport.releases, 1)
+        self.assertFalse(os.path.exists(ready))
+        self.assertTrue(os.path.exists(failed))
+
+    def test_a_closed_donor_releases_once(self):
+        transport = _RecordingTransport()
+        donor = self._started(transport)
+        donor.close()
+        del donor
+        gc.collect()
+        self.assertEqual(transport.releases, 1)
+
+    def test_the_finalizer_does_not_keep_the_donor_alive(self):
+        donor = self._started(_RecordingTransport())
+        ref = weakref.ref(donor)
+        del donor
+        gc.collect()
+        self.assertIsNone(ref())
 
 
 if __name__ == "__main__":

@@ -32,7 +32,8 @@ allocates and registers the memory:
 
 A donor that cannot start, or whose owner fails, leaves ``donor.<name>.failed``, which clients ignore and capacity
 checks count. In a serving process ``start_donation`` starts the donation (``remote_cache_config.donate_size``)
-before the KV cache estimation, and the final ``KVCacheManagerV2`` owns it.
+before the KV cache estimation, or, where no estimation runs (``TRTLLM_SKIP_KV_CACHE_ESTIMATION``, helix CP on KV
+cache manager v2, encoder-decoder models), when the target ``KVCacheManagerV2`` is built; that manager owns it.
 
 Trust model: the directory is private to the job's user (``ensure_rendezvous_directory``) and every file in it is
 0600, since donor files hold NIXL memory registration keys and fabric handles; use one directory per job.
@@ -155,14 +156,21 @@ def _write_atomically(path: str, data: bytes) -> None:
     os.replace(tmp, path)
 
 
-def _withdraw_unowned(published: list, failed_path: str, marker: bytes) -> None:
-    """Finalizer of a donor nobody closed: withdraw its files and leave the failure marker."""
+def _withdraw_unowned(
+    published: list, failed_path: str, marker: bytes, transport: "DonorTransport"
+) -> None:
+    """Finalizer of a donor nobody closed: withdraw its files, leave the failure marker and free its memory.
+
+    It holds the transport, not the donor: e.g. a fabric donation's pinned chunks and retained primary context
+    otherwise stay until the process exits, though the donor is gone (a failed startup in a process that lives on).
+    """
     for path in reversed(published):
         with contextlib.suppress(OSError):
             os.unlink(path)
     published.clear()
     with contextlib.suppress(OSError):
         _write_atomically(failed_path, marker)
+    transport.release_unowned()
 
 
 # Linux values (asm-generic, so x86_64 and aarch64 alike); Python's mmap module lacks some of them before 3.13.
@@ -574,6 +582,44 @@ class DonorTransport:
 
     def release(self, donor: "RemoteMemDonor") -> None:
         """Free what ``start`` made; teardown keeps going past errors."""
+        self.release_unowned()
+
+    def release_unowned(self) -> None:
+        """``release`` without the donor, for the finalizer of a donor nobody closed."""
+
+
+@contextlib.contextmanager
+def _donor_thread_cuda(device: Optional[int]):
+    """CUDA state of the thread that starts a donation, for the duration of the start.
+
+    Relaxed stream-capture mode: the start may run in the background while the serving thread captures a CUDA graph
+    in global mode, and a capture-unsafe CUDA call here (e.g. host-memory registration) would invalidate that capture.
+    `device`'s primary context current: CUDA calls the transport makes land on the donor's GPU, not on device 0.
+    """
+    from cuda.bindings import driver as drv
+
+    _cuda_check(drv.cuInit(0))
+    capture_mode = _cuda_check(
+        drv.cuThreadExchangeStreamCaptureMode(
+            drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
+        )
+    )
+    cu_device = context = None
+    try:
+        if device is not None:
+            cu_device = _cuda_check(drv.cuDeviceGet(device))
+            context = _cuda_check(drv.cuDevicePrimaryCtxRetain(cu_device))
+            _cuda_check(drv.cuCtxPushCurrent(context))
+        yield
+    finally:
+        steps = [lambda: drv.cuThreadExchangeStreamCaptureMode(capture_mode)]
+        if context is not None:
+            steps = [drv.cuCtxPopCurrent, lambda: drv.cuDevicePrimaryCtxRelease(cu_device), *steps]
+        for step in steps:
+            try:
+                _cuda_check(step())
+            except RuntimeError as error:
+                _log(f"leaving the donor thread's CUDA state failed: {error}")
 
 
 class RemoteMemDonor:
@@ -687,6 +733,7 @@ class RemoteMemDonor:
                 self._published,
                 self._path("failed"),
                 self._failure_text(RuntimeError("the donor's owner exited without closing it")),
+                self.transport,
             )
         self.transport.start(self)
 
@@ -759,6 +806,8 @@ class AgentDonorTransport(DonorTransport):
     ucx_devices: Optional[str] = None
     _map: Optional[mmap.mmap] = None
     _address: int = 0
+    _nbytes: int = 0  # the registered donation
+    _name: str = ""  # the donor's, for logs
     _agent = None
     _registered: bool = False
 
@@ -767,6 +816,8 @@ class AgentDonorTransport(DonorTransport):
         self._make_agent = make_agent
         self._map = None
         self._address = 0
+        self._nbytes = 0
+        self._name = ""
         self._agent = None
         self._registered = False
 
@@ -789,6 +840,8 @@ class AgentDonorTransport(DonorTransport):
         backend_params = nixl_ucx_backend_params(
             resolve_ucx_devices(self.ucx_devices, donor.device)
         )
+        self._name = donor.name
+        self._nbytes = donor.nbytes
         t0 = time.monotonic()
         flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_NORESERVE
         self._map = mmap.mmap(-1, donor.nbytes, flags=flags)
@@ -806,11 +859,13 @@ class AgentDonorTransport(DonorTransport):
         _populate(self._map, self._address, donor.nbytes)
         t1 = time.monotonic()
 
-        self._agent = self._make_agent(donor.name, backend_params)
-        self._agent.register_memory(
-            MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, donor.nbytes, 0)])
-        )
-        self._registered = True
+        # NIXL/UCX may make CUDA calls while creating the agent and registering host memory.
+        with _donor_thread_cuda(donor.device):
+            self._agent = self._make_agent(donor.name, backend_params)
+            self._agent.register_memory(
+                MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, donor.nbytes, 0)])
+            )
+            self._registered = True
         t2 = time.monotonic()
         desc = self._agent.get_local_agent_desc().serialize()
         donor._publish(
@@ -819,7 +874,7 @@ class AgentDonorTransport(DonorTransport):
             f"map + populate {t1 - t0:.1f} s, register {t2 - t1:.1f} s",
         )
 
-    def release(self, donor: "RemoteMemDonor") -> None:
+    def release_unowned(self) -> None:
         # Clients still holding chunks fail their next transfer at the NIC.
         if self._agent is not None and self._registered:
             from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
@@ -830,10 +885,10 @@ class AgentDonorTransport(DonorTransport):
 
             try:
                 self._agent.deregister_memory(
-                    MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, donor.nbytes, 0)])
+                    MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, self._nbytes, 0)])
                 )
             except Exception as error:  # noqa: BLE001 - teardown keeps going
-                _log(f"{donor.name}: deregistering failed: {error}")
+                _log(f"{self._name}: deregistering failed: {error}")
             self._registered = False
         self._agent = None
         if self._map is not None:
@@ -1015,7 +1070,7 @@ class FabricDonorTransport(DonorTransport):
                     raise
                 _log(f"{self.name}: leaving the fabric context failed: {error}")
 
-    def release(self, donor: "RemoteMemDonor") -> None:
+    def release_unowned(self) -> None:
         if self._fabric_ctx is not None:
             from cuda.bindings import driver as drv
 
