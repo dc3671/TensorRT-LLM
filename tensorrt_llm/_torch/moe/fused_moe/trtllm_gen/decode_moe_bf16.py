@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Decode MoE engine on FlashInfer's BF16 trtllm-gen path (declared by ``MoEDecodeOptions.bf16_draft_engine``): an
+"""Decode MoE engine on FlashInfer's BF16 trtllm-gen path (declared by ``MoEDecodeOptions.bf16_logits_routing``): an
 un-finalized logits-routed SwiGLU run of up to ``M_MAX`` rows takes one launch (``moe_bf16_engine.py``)
 instead of ``trtllm_bf16_moe``'s routing + two GEMMs and returns its ``do_finalize=False`` outputs: the same gemm2 row
 and BF16 top-k weight per (token, k) bit for bit, through the engine's own expanded -> permuted index (rows packed).

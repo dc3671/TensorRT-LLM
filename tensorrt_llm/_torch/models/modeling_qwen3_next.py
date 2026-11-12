@@ -2034,8 +2034,7 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
                 shared_expert_rows=_large_step_rows(model_config),
                 fc2_weights_evict_first_rows=_decode_step_rows(model_config) *
                 model_config.mapping.dp_size,
-                bf16_logits_routing=no_adp,
-                bf16_draft_engine=no_adp)
+                bf16_logits_routing=no_adp)
             if no_adp:
                 # Its temperature verify steps sample and accept in one launch where that launch takes the step.
                 model_config.extra_attrs["spec_fused_sample_accept"] = True

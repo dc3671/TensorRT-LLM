@@ -81,7 +81,7 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
     #: plain Renormalize routes inside the op from the router logits (TopK -> Softmax), without the host-side top-k
     #: and pack launches.
     routes_from_logits: bool = False
-    #: Declared by the model (``MoEDecodeOptions.bf16_draft_engine``), for every such layer: un-finalized
+    #: With ``routes_from_logits`` (``MoEDecodeOptions.bf16_logits_routing``), for every such layer: un-finalized
     #: logits-routed SwiGLU runs of up to 32 rows take the one-launch BF16 decode MoE engine (decode_moe_bf16.py).
     use_draft_engine: bool = False
     #: The engine's call state, created with the weights (``cache_derived_state``).
@@ -98,7 +98,7 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         super().__init__(model_config=model_config, **kwargs)
         decode = MoEDecodeOptions.of(model_config.extra_attrs)
         self.routes_from_logits = decode.bf16_logits_routing
-        self.use_draft_engine = self.routes_from_logits and decode.bf16_draft_engine
+        self.use_draft_engine = self.routes_from_logits
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
