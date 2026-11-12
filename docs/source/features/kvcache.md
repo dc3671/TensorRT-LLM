@@ -358,6 +358,96 @@ configured separately from `KvCacheConfig`; see
 [KV Cache Compression](kv-cache-compression.md) for the available methods and
 their activation points.
 
+### Remote Cache Level in Donated Host Memory (Prototype)
+
+KV cache manager V2 can add a cache level below the host tier whose pages live in
+host memory that other ranks of the same job donate. In disaggregated serving,
+generation ranks typically donate host memory they do not use, and context ranks
+use it to keep more reusable prefixes. `kv_cache_config.remote_cache_config`
+configures it; it requires `use_kv_cache_manager_v2: true`.
+
+Each rank takes one or both of two roles:
+
+- **Donor** (`donate_size > 0`): at startup, before the KV cache estimation, the
+  rank allocates and registers `donate_size` bytes of host memory in whole 1 GiB
+  chunks and publishes it in the rendezvous directory. The memory stays donated
+  for the lifetime of the process. The donor does no work after publishing; the
+  claiming ranks move pages themselves.
+- **Claimant** (`cache_size > 0`): the rank gets a remote cache level of
+  `cache_size` bytes, and claims whole chunks of the donors' memory for it.
+
+For example, with eight generation ranks that donate 100 GiB each:
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  remote_cache_config:
+    directory: /shared/kv_rendezvous/${SLURM_JOB_ID}
+    donate_size: 107374182400
+```
+
+and four context ranks with a 96 GiB remote level each below their host tier:
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  host_cache_size: 137438953472
+  remote_cache_config:
+    directory: /shared/kv_rendezvous/${SLURM_JOB_ID}
+    cache_size: 103079215104
+    expected_num_donors: 8                # donating ranks the job starts
+    expected_claim_size: 412316860416     # cache_size summed over all claimants
+```
+
+The Slurm launcher in `examples/disaggregated/slurm/benchmark` fills in `directory`
+(when unset) and the two expected-donor fields from the job's layout.
+
+**Rendezvous directory.** `directory` must be on a file system that every rank of
+the job sees; environment variables in it are expanded. Use a new directory for
+each job. Donor files hold NIXL memory registration keys or fabric handles, so the
+directory is created with mode 0700, every file in it is 0600, and a rank refuses
+a directory that another user owns or that group or others can write.
+
+**Transport.** `transport: nixl` (the default) moves pages with one-sided NIXL
+RDMA; `ucx_devices` selects the UCX devices of its agents. `transport: fabric`
+donates CUDA fabric memory, which claimants in the same multi-node NVLink domain
+copy over NVLink. A fabric donation fills the GPU's host NUMA node first, then the
+other nodes, keeping `donor_reserve_size` bytes free on each node, and is
+published short when it does not fit. Every rank that shares a directory must use
+the same transport.
+
+**Sizing.** The donors' published memory must cover the claims. A claimant splits
+`cache_size` across layer groups (by the hot tier's split, or `pool_ratio`) and
+rounds each up to whole chunks, so it can claim slightly more than `cache_size`.
+Donated memory is host memory in addition to `host_cache_size`; include it in the
+host-memory budget of every donating node. Donors publish while their own servers
+start, so a claimant waits for them: up to `donor_wait_timeout_s` (default 900
+seconds) for each chunk claim. With `expected_num_donors` and
+`expected_claim_size` (set together), it first waits, within the same bound, until
+those donors have reported, and fails at once when they cannot cover the job's
+claims instead of after a claim wait.
+
+**Disk tier and pool rebalance.** The remote level takes the disk level's place:
+`cache_size` cannot be combined with `disk_cache_size`. It cannot be combined with
+`enable_kv_pool_rebalance` either.
+
+**Failure behavior.**
+
+- At startup, a donor that cannot start publishes a failure marker that claimants
+  count as reported. A claimant that cannot claim its chunks fails KV cache
+  manager construction, so its server does not start; with the expected-donor
+  fields, the error names the failed and short donors.
+- At runtime, a NIXL transfer that fails or exceeds `transfer_timeout_s` (default
+  30 seconds), for example because its donor died, retires the remote level for
+  the rest of the process. Its pages leave the reuse tree, nothing more is written
+  to it, and the tiers above it keep serving.
+- A request whose KV cache pages were on a retired level does not fail if its
+  pages can be recomputed. If it has not computed anything yet, it is matched
+  against the cache again. If it has started, it computes its context again when
+  the executor supports recompute pause; otherwise it fails with an error.
+- A transfer that never completes keeps its staging buffers and chunk claims
+  until the process exits.
+
 ### Partial Reuse
 
 Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default. Set `enable_partial_reuse=False` to stop matching part of a cached block.

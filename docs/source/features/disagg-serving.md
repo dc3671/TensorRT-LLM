@@ -300,7 +300,7 @@ A single disaggregated server process is itself a single-threaded orchestrator a
 
 The two roles split as follows:
 
-- **Coordinator** — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (`/select`, `/finish`, `/cluster_info`, `/health`).
+- **Coordinator** — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (`/select`, `/finish`, `/renew`, `/cluster_info`, `/health`, `/version`, and `/output_length` for [output-length prediction](#generation-admission-by-predicted-output-length)). The API has no authentication: any client that reaches the coordinator's port can reserve and release servers, and through `/output_length` record arbitrary reply lengths for any conversation ID, which changes the generation priority of that conversation's later requests. Keep the port reachable only from the fleet workers.
 - **Fleet workers** — `num_workers` stateless disaggregated servers that share the public port via `SO_REUSEPORT` (each worker is its own process binding the same port, so the kernel load-balances incoming connections across them by 4-tuple hash). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection. Each worker also gets a distinct `process_id` for the [global request ID](#unique-global-request-id).
 
 This is controlled by two fields in the disaggregated config:
@@ -323,6 +323,8 @@ The fleet delegates `load_balancing`, `kv_cache_aware`, and `conversation` routi
 #### Generation admission by predicted output length
 
 With `output_length_prediction: {predictor: ridge_gbm}` (or `ridge`, which needs no scikit-learn) at the top level of the disaggregated config, the coordinator learns each conversation's reply lengths online and the orchestrator sets every generation request's `priority` from the predicted length (shorter first; `max_tokens` is never read). Generation servers order their waiting queue by it with `scheduler_config: {waiting_queue_policy: priority, waiting_queue_max_wait_s: 60}`; the cap lets a request that waited that long go first. `generation_servers.router: {type: load_balancing, max_requests_per_server: 1, max_queue_wait_s: 60}` additionally holds generation requests in the orchestrator until a server has a free seat, in the same order, with the cap also counted from the arrival at the orchestrator. A request held there longer than the context servers' `cache_transceiver_config.kv_transfer_timeout_ms` (read from `context_servers`, default 60000) fails, since its context server has dropped the KV cache transfer by then; keep `max_queue_wait_s` at or below it.
+
+With prediction on, the client's conversation ID sets the generation priority. The orchestrator replaces any `priority` the client sent with the predicted one. The prediction comes from the earlier replies of the conversation named by the request's `conversation_params.conversation_id`, either sent in the body or taken from the session header (see [request headers](subagent-routing.md#request-headers)). A request without a conversation ID, or the first request of a conversation, is predicted from its prompt length and the replies of all conversations. A client that reuses another conversation's ID therefore takes that conversation's predicted priority, and its replies change that conversation's later predictions. Treat the conversation ID as untrusted input: when untrusted clients reach the server, a gateway in front of it should set or validate the ID.
 
 #### Example: implicit coordinator + 4-worker fleet
 
@@ -453,6 +455,35 @@ Reduce concurrency or increase the KV budget when both slots and pages are full.
 Pool headroom belongs to each executor. Configuring preemption on a context
 worker also reserves headroom. `target_output_tps` has simulation coverage only;
 GPU validation is limited to `tpot_budget`.
+
+### Deferred KV cache release on generation servers (prototype)
+
+On a generation server, releasing a finished request's KV cache is host work on
+the executor's critical path. With
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  defer_generation_only_release: true
+```
+
+the overlap executor releases the KV cache of finished generation-only requests
+after the next forward is enqueued, so that the release overlaps GPU work. The
+request itself finishes as before; its pages return one iteration later:
+
+- The next iteration's scheduler cannot place new requests in those pages. Leave
+  the option off on generation servers whose admission is bound by KV cache
+  capacity.
+- KV cache events for the released pages are published one iteration later, or
+  in the same iteration when the server goes idle.
+- An idle server, an iteration that skips its forward, and a KV pool rebalance
+  release the pending caches before they continue.
+
+The option requires KV cache manager V2 and the overlap scheduler
+(`disable_overlap_scheduler: false`) without pipeline parallelism; other
+configurations are rejected at startup. It affects only generation-only
+requests, so it has no effect on context servers or aggregated serving (startup
+logs a warning when the server has no cache transceiver).
 
 ### Bounding the graceful stop of a server
 
