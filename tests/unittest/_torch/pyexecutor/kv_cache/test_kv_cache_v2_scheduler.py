@@ -40,6 +40,7 @@ from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
     ContextSchedulingPolicy,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import RemoteMemError
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1333,6 +1334,118 @@ class TestKVCacheFailuresGen:
         # → gen1 self-evicts, victim is not in paused list from eviction
         assert ids(out.generation_requests) == [0]
         assert 99 not in ids(out.paused_requests)
+
+
+def _remote_level_failed():
+    return RemoteMemError(
+        "KVCM2 remote level: a READ of 4 page(s) x 1048576 B timed out after 30000 ms"
+    )
+
+
+class TestKVPagesLostToAFailedRemoteLevel:
+    """A resume that raises RemoteMemError lost pages on a failed remote cache level: only that request is affected."""
+
+    @staticmethod
+    def _lose_pages_of(lost_id):
+        def alloc_fn(req):
+            if req.py_request_id == lost_id:
+                raise _remote_level_failed()
+            return True
+
+        return alloc_fn
+
+    def test_a_generation_request_recomputes(self):
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=self._lose_pages_of(1))
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        lost = make_gen_request(1)
+
+        out = sched.schedule_request([make_gen_request(0), lost, make_gen_request(2)], set())
+
+        assert ids(out.generation_requests) == [0, 2]
+        assert ids(out.recompute_paused_requests) == [1]
+        assert out.paused_requests == []
+        mgr.free_resources.assert_called_once_with(lost)
+        assert sched.take_lost_kv_requests() == []
+
+    def test_a_request_that_cannot_recompute_is_failed_by_the_executor(self):
+        """A disaggregated server cannot replay a prefill."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=self._lose_pages_of(1))
+        sched = make_scheduler(mgr, max_num_tokens=100, enable_recompute_pause=False)
+        lost = make_gen_request(1)
+
+        out = sched.schedule_request([make_gen_request(0), lost, make_gen_request(2)], set())
+
+        assert ids(out.generation_requests) == [0, 2]
+        assert out.recompute_paused_requests == []
+        [(failed, message)] = sched.take_lost_kv_requests()
+        assert failed is lost and "failed remote cache level" in message
+        assert sched.take_lost_kv_requests() == []
+
+    def test_no_further_victim_is_taken_once_the_pages_are_known_lost(self):
+        """The first resume found no room; the one after a victim made room read the dead level."""
+        calls = []
+
+        def alloc_fn(req):
+            calls.append(req.py_request_id)
+            if req.py_request_id == 1:
+                if calls.count(1) == 1:
+                    return False
+                raise _remote_level_failed()
+            return True
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_gen_request(i) for i in (0, 1, 98, 99)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.paused_requests) == [99]
+        assert ids(out.recompute_paused_requests) == [1]
+        assert ids(out.generation_requests) == [0, 98]
+
+    def test_a_first_context_chunk_matches_again(self):
+        """It computed nothing: its caches go, and the next pass matches without the failed level's pages."""
+        calls = [0]
+
+        def prepare_fn(req):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise _remote_level_failed()
+            return True
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        lost = make_ctx_request(0, context_remaining_length=100)
+        mgr.kv_cache_map[0] = Mock()
+
+        out = sched.schedule_request(
+            [lost, make_ctx_request(1, context_remaining_length=100)], set()
+        )
+
+        assert ids(out.context_requests) == [1]
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_called_once_with(lost)
+        assert lost.context_current_position == 0
+        out = sched.schedule_request([lost], set())
+        assert ids(out.context_requests) == [0]
+
+    def test_a_started_context_request_recomputes(self):
+        def prepare_fn(req):
+            if req.py_request_id == 0:
+                raise _remote_level_failed()
+            return True
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        lost = make_ctx_request(0, context_remaining_length=100, is_first_context_chunk=False)
+
+        out = sched.schedule_request(
+            [lost, make_ctx_request(1, context_remaining_length=100)], set()
+        )
+
+        assert ids(out.context_requests) == [1]
+        assert ids(out.recompute_paused_requests) == [0]
+        mgr.free_resources.assert_called_once_with(lost)
 
 
 class TestUnpairedDraftAdmission:

@@ -24,6 +24,7 @@ from tensorrt_llm.llmapi.llm_args import (
     ContextSchedulingPolicy,
 )
 from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime.kv_cache_manager_v2 import RemoteMemError
 
 from ...disaggregation import diagnostics as disagg_diagnostics
 from ..llm_request import (
@@ -170,6 +171,11 @@ class KVCacheV2Scheduler(RequestScheduler):
     Merges capacity checking (KV cache allocation via resize()) and token budget
     assignment into one unified loop.
     """
+
+    # Set by _try_allocate_generation when the request's KV pages were on a remote cache level that failed.
+    _lost_kv_error: Optional[RemoteMemError] = None
+    # (request, error message) of requests that lost KV pages and cannot recompute them; take_lost_kv_requests.
+    _lost_kv_requests: tuple = ()
 
     def __init__(
         self,
@@ -900,9 +906,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                     scheduled_encoder.append(req)
                     budget.commit(req, tokens, peft_pages)
                 else:
-                    action, tokens, chunking_flag = self._try_schedule_context(
-                        req, budget, preempt_for_pages, token_cap
-                    )
+                    try:
+                        action, tokens, chunking_flag = self._try_schedule_context(
+                            req, budget, preempt_for_pages, token_cap
+                        )
+                    except RemoteMemError as error:
+                        # Raised by its cache's resume, before anything was taken for it.
+                        self._lost_kv_error = error
+                        action = self._on_lost_kv_cache(req, inflight_request_ids, recompute_paused)
                     if action is ScheduleAction.STOP:
                         ctx_stopped = True
                         break
@@ -2071,7 +2082,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         elif scheduled_beam_width != beam_width:
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
+        self._lost_kv_error = None
         success = self._try_allocate_generation(req)
+        if self._lost_kv_error is not None:
+            lost = self._on_lost_kv_cache(req, inflight_request_ids, recompute_paused)
+            return lost, 0, scheduled_beam_width, req_it_end
 
         if not success and self.has_cp_helix and not self.enable_recompute_pause:
             # Without recompute pause (e.g. a disaggregated generation server,
@@ -2082,6 +2097,9 @@ class KVCacheV2Scheduler(RequestScheduler):
             # instead of stalling.
             if self.kv_cache_manager.flush_deferred_closes():
                 success = self._try_allocate_generation(req)
+            if self._lost_kv_error is not None:
+                lost = self._on_lost_kv_cache(req, inflight_request_ids, recompute_paused)
+                return lost, 0, scheduled_beam_width, req_it_end
             if not success:
                 raise RuntimeError(
                     f"[V2Scheduler] KV allocation failed for helix request "
@@ -2103,7 +2121,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
                 )
 
-        if not success:
+        if not success and self._lost_kv_error is None:
             req_it_end, success = self._try_recompute_pause_for_gen(
                 req,
                 requests_list,
@@ -2114,6 +2132,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                 recompute_paused,
                 inflight_request_ids,
             )
+
+        if self._lost_kv_error is not None:
+            # Lost only once a victim made room for its resume; the ladders stopped there.
+            lost = self._on_lost_kv_cache(req, inflight_request_ids, recompute_paused)
+            return lost, 0, scheduled_beam_width, req_it_end
 
         if success:
             return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
@@ -2155,7 +2178,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         here, but its mirror still has to be admitted under this rollback: see
         ``_admit_unpaired_draft``.
         """
-        if not self.kv_cache_manager.try_allocate_generation(req):
+        try:
+            if not self.kv_cache_manager.try_allocate_generation(req):
+                return False
+        except RemoteMemError as error:
+            # Its resume read pages a failed remote cache level took with it: no room brings them back.
+            self._lost_kv_error = error
             return False
 
         draft_manager = self._joint_draft_manager
@@ -2167,6 +2195,47 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         self.kv_cache_manager.revert_allocate_generation(req)
         return False
+
+    def _on_lost_kv_cache(
+        self, req: LlmRequest, inflight_request_ids: set[int], recompute_paused: RequestList
+    ) -> ScheduleAction:
+        """Handle *req* after its cache's resume raised ``_lost_kv_error``: pages it needs were on a remote cache
+        level that failed, which the manager retires and unlinks from the reuse tree.
+
+        A request that computed nothing yet matches its prompt again next pass. A started one re-prefills through
+        recompute pause where this executor can, and is failed (``take_lost_kv_requests``) where it cannot.
+        """
+        error, self._lost_kv_error = self._lost_kv_error, None
+        if not self._is_started_request(req):
+            logger.warning(
+                f"[V2Scheduler] Request {req.py_request_id} matched KV pages on a failed remote cache level; "
+                f"matching it again: {error}"
+            )
+            self.release_context_admission(req)
+        elif self.enable_recompute_pause and self._is_recompute_pause_candidate(
+            req, inflight_request_ids
+        ):
+            logger.warning(
+                f"[V2Scheduler] Request {req.py_request_id} lost KV pages to a failed remote cache level; "
+                f"recomputing it: {error}"
+            )
+            self._preempt_or_defer(req, recompute_paused)
+        else:
+            logger.error(
+                f"[V2Scheduler] Request {req.py_request_id} lost KV pages to a failed remote cache level and "
+                f"cannot recompute them here; failing it: {error}"
+            )
+            self._clear_request_runtime_state(req)
+            if all(lost is not req for lost, _ in self._lost_kv_requests):
+                message = f"KV cache pages lost with a failed remote cache level: {error}"
+                self._lost_kv_requests = (*self._lost_kv_requests, (req, message))
+        return ScheduleAction.SKIP
+
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        """Requests the last passes could neither schedule nor recompute after a remote cache level failed, with their
+        error messages; the executor fails them."""
+        lost, self._lost_kv_requests = self._lost_kv_requests, ()
+        return list(lost)
 
     # ---- Eviction ----
 
@@ -2597,6 +2666,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             if self._try_allocate_generation(req):
                 return req_it_end, True
+            if self._lost_kv_error is not None:
+                break  # no victim brings its pages back
 
         return req_it_end, False
 
@@ -2676,6 +2747,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             # secondary-tier capacity just released to ordinary-suspend another
             # active victim.
             success = self._try_allocate_generation(req)
+            if self._lost_kv_error is not None:
+                return req_it_end, False
             if not success and self.kv_cache_manager.can_evict:
                 req_it_end, success = self._try_evict_for_gen(
                     req, requests_list, req_it, req_it_end, evicted, inflight_request_ids

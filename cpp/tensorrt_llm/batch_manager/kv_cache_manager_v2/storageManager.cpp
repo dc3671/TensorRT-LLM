@@ -1453,7 +1453,49 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
 {
     refreshRetention();
     dropPagesOfFailedRemoteLevels();
-    _prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
+    auto const numFailedClients = [this]()
+    {
+        return std::count_if(
+            mRemoteClients.begin(), mRemoteClients.end(), [](auto const& client) { return client->failed(); });
+    };
+    for (auto failedBefore = numFailedClients();; failedBefore = numFailedClients())
+    {
+        try
+        {
+            _prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
+            return;
+        }
+        catch (RemoteMemError const&)
+        {
+            // An eviction WRITE failed the level before pointing any page at it, and the rollback put the evicted
+            // pages back: retire the level and evict past it, instead of failing whoever needed the room.
+            if (numFailedClients() == failedBefore)
+            {
+                throw;
+            }
+            dropPagesOfFailedRemoteLevels();
+        }
+    }
+}
+
+std::vector<CacheLevel> StorageManager::takeNewlyFailedRemoteLevels()
+{
+    std::vector<CacheLevel> levels;
+    if (std::none_of(mRemoteClients.begin(), mRemoteClients.end(), [](auto const& client) { return client->failed(); }))
+    {
+        return levels;
+    }
+    dropPagesOfFailedRemoteLevels();
+    for (CacheLevel level{1}; level < numCacheLevels(); ++level)
+    {
+        if (remoteLevelFailed(level)
+            && std::find(mRetiredRemoteLevels.begin(), mRetiredRemoteLevels.end(), level) == mRetiredRemoteLevels.end())
+        {
+            mRetiredRemoteLevels.push_back(level);
+            levels.push_back(level);
+        }
+    }
+    return levels;
 }
 
 void StorageManager::_prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,

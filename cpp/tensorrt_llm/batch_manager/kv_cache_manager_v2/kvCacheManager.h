@@ -562,6 +562,10 @@ public:
     friend class Batch;
 
 private:
+    //! Unlink the committed pages of newly failed remote levels from the radix tree, so that no new match reads them;
+    //! a request still holding such a page fails its next resume (RemoteMemError). Caller holds the exclusive lock.
+    void _unlinkPagesOfFailedRemoteLevels();
+
     //! Units a step selects per buffer of this life cycle. The cache must hold a whole
     //! selection on top of everything in flight, so this is what the in-flight headroom is
     //! measured against.

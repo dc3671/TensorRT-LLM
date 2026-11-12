@@ -179,9 +179,14 @@ public:
     // Check if a page is evictable (optionally at a target level).
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
 
-    // Ensure the requested free slots exist at this level (evicting pages as needed).
+    // Ensure the requested free slots exist at this level (evicting pages as needed). A remote level that fails an
+    // eviction WRITE is retired and the eviction retried past it.
     void prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
+
+    //! Remote levels that failed since the last call, each returned once, after their evictable pages are dropped.
+    //! The caller unlinks the pages still held there from the radix tree, so that reuse no longer finds them.
+    [[nodiscard]] std::vector<CacheLevel> takeNewlyFailedRemoteLevels();
 
     // Force-evict pages from a level to free space.
     void forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages,
@@ -544,6 +549,8 @@ private:
     bool mHasRemoteLevel = false;
     // The deepest level that still takes pages: the last level, until trailing remote levels fail.
     CacheLevel mLastLiveLevel{0};
+    // Failed remote levels takeNewlyFailedRemoteLevels() has returned.
+    std::vector<CacheLevel> mRetiredRemoteLevels;
 
     // Get buffer attributes for a (LayerId, DataRole) pair. Throws std::out_of_range if not found.
     // Mirrors Python's get_buffer_attr().

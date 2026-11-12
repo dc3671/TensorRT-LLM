@@ -553,6 +553,81 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             base.take_poison()
             shutil.rmtree(directory, ignore_errors=True)
 
+    def _with_dying_donor(self, prefix: str, body) -> None:
+        """Run body(stream, donor) against a remote level whose donor the body stops; the manager must stay usable."""
+        if self.transport == "fabric":
+            self.skipTest(_NIXL_DEATH_ONLY)
+        directory = tempfile.mkdtemp(prefix=prefix)
+        donor = _Donor(directory, 1 << 30, self.transport)
+        try:
+            self.cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=10_000)
+            self.manager = KVCacheManager(self.cfg)
+            self.engine = FakeEngine(self.cfg)
+            stream_holder = base.CachedCudaStream()
+            body(cast(CudaStream, stream_holder.handle), donor)
+            self.assertIsNone(base.poison_reason())
+        finally:
+            donor.stop()
+            if hasattr(self, "manager"):
+                with contextlib.suppress(Exception):
+                    self.manager.shutdown()
+                del self.manager
+            gc.collect()
+            base.take_poison()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_a_failed_eviction_write_retires_the_level_instead_of_failing_the_request(self) -> None:
+        """A WRITE to a gone donor while making room retires the level instead of failing the request.
+
+        The eviction goes past the level (here: drops, as it is the last level), so the request still gets its room.
+        """
+
+        def body(stream, donor) -> None:
+            prompt = self._prompt(4 * self.tokens_per_block)
+            self._prefill(prompt, stream)
+            self._push_to_last_level(prompt, stream)
+            donor.stop()
+            # The host tier is full: every prefill evicts toward the remote level.
+            for _ in range(8):
+                self._prefill(self._prompt(256), stream)
+            self.assertEqual(self._residency(prompt)[-1], 0, "the failed level still offers pages")
+            fresh = self._prompt(2 * self.tokens_per_block)
+            self._prefill(fresh, stream)
+            self._reuse_and_check(fresh, stream)
+
+        self._with_dying_donor("kvcm2_write_", body)
+
+    def test_pages_a_request_holds_on_a_failed_level_leave_the_reuse_tree(self) -> None:
+        """Pages a suspended request holds on a failed remote level are matched by no new request.
+
+        Only the holder's resume fails; the prompt is computed again for everyone else.
+        """
+
+        def body(stream, donor) -> None:
+            prompt = self._prompt(4 * self.tokens_per_block)
+            holder = self.manager.create_kv_cache()
+            self.assertTrue(holder.resume(stream))
+            holder.capacity = len(prompt)
+            holder.history_length = len(prompt)
+            self.engine.execute([Step(holder, prompt, [])], stream)
+            holder.commit(prompt)
+            holder.suspend()
+            self._push_to_last_level(prompt, stream)
+            donor.stop()
+            for _ in range(2):
+                with self.assertRaisesRegex(RemoteMemError, "remote level"):
+                    holder.resume(stream)
+            self.assertEqual(
+                self._residency(prompt)[-1], 0, "a new request matched the failed level's pages"
+            )
+            self._prefill(prompt, stream)
+            self._reuse_and_check(prompt, stream)
+            holder.close()
+            del holder
+            self._reuse_and_check(prompt, stream)
+
+        self._with_dying_donor("kvcm2_held_", body)
+
     def test_a_transfer_past_its_deadline_keeps_its_staging_until_it_quiesces(self) -> None:
         """A READ past its deadline keeps its staging lease out of use until it concludes, then is reaped.
 
