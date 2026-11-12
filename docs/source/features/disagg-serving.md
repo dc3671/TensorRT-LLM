@@ -473,9 +473,9 @@ the overlap executor releases the KV cache of finished generation-only requests
 after the next forward is enqueued, so that the release overlaps GPU work. The
 request itself finishes as before; its pages return one iteration later:
 
-- The next iteration's scheduler cannot place new requests in those pages. Leave
-  the option off on generation servers whose admission is bound by KV cache
-  capacity.
+- When the next iteration's scheduler runs out of KV cache pages, it releases
+  the pending caches before it suspends or recompute-pauses a running request.
+  Until then, new requests are admitted as if those pages were still in use.
 - KV cache events for the released pages are published one iteration later, or
   in the same iteration when the server goes idle.
 - An idle server, an iteration that skips its forward, and a KV pool rebalance

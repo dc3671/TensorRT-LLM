@@ -5715,9 +5715,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description="Release the KV cache of a finished generation-only request "
         "(disaggregated generation server) after the next forward is enqueued, "
         "so that the host-side release overlaps GPU work. The pages return one "
-        "iteration later: the next iteration's scheduler cannot admit requests "
-        "into them, so leave this off on generation servers bound by KV cache "
-        "capacity. Their KV cache events are published one iteration later too, "
+        "iteration later, or as soon as the scheduler runs out of pages, before "
+        "it suspends or recompute-pauses a running request. Their KV cache events "
+        "are published one iteration later too, "
         "or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler "
         "without pipeline parallelism.")
 

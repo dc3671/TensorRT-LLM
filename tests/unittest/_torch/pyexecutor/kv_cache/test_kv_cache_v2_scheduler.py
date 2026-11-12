@@ -572,6 +572,8 @@ def make_kv_cache_manager(
     mgr.preempt_request.side_effect = preempt_request
     # A bare Mock would answer truthily and suppress every stall check.
     mgr.has_pending_preemption.return_value = False
+    # No deferred close is pending unless a test queues one.
+    mgr.flush_deferred_closes.return_value = False
     return mgr
 
 
@@ -1454,7 +1456,6 @@ class TestKVPagesLostToAFailedRemoteLevel:
         assert ids(out.recompute_paused_requests) == [0]
         mgr.free_resources.assert_called_once_with(lost)
 
-
     def test_a_disagg_generation_init_request_matches_again(self):
         """A generation-init admission whose prefix match resumed pages of a failed level costs only that request."""
         calls = [0]
@@ -1572,6 +1573,50 @@ class TestKVPagesLostToAFailedRemoteLevel:
         (message,), kwargs = executor._handle_errors.call_args
         assert kwargs == {"requests": [lost], "charge_budget": False}
         assert "failed remote cache level" in message
+
+
+class TestDeferredClosesBeforeEviction:
+    """Deferred closes (defer_generation_only_release) are flushed before any running request pays for room."""
+
+    @pytest.mark.parametrize("enable_recompute_pause", [True, False])
+    def test_a_flush_that_makes_room_pauses_nobody(self, enable_recompute_pause):
+        pending = [True]
+        room = [False]
+
+        def flush():
+            had, pending[0] = pending[0], False
+            room[0] = room[0] or had
+            return had
+
+        def alloc_fn(req):
+            return req.py_request_id != 0 or room[0]
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        mgr.flush_deferred_closes.side_effect = flush
+        sched = make_scheduler(
+            mgr, max_num_tokens=100, enable_recompute_pause=enable_recompute_pause
+        )
+        reqs = [make_gen_request(i) for i in (0, 1, 2)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.generation_requests) == [0, 1, 2]
+        assert out.paused_requests == []
+        assert out.recompute_paused_requests == []
+        mgr.flush_deferred_closes.assert_called_once_with()
+
+    def test_without_pending_closes_the_ladder_runs_as_before(self):
+        def alloc_fn(req):
+            return req.py_request_id != 0 or mgr.kv_cache_map[2].is_active is False
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_gen_request(i) for i in (0, 1, 2)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.paused_requests) == [2]
+        assert ids(out.generation_requests) == [0, 1]
 
 
 class TestUnpairedDraftAdmission:

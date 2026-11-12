@@ -2114,29 +2114,32 @@ class KVCacheV2Scheduler(RequestScheduler):
             lost = self._on_lost_kv_cache(req, inflight_request_ids, recompute_paused)
             return lost, 0, scheduled_beam_width, req_it_end
 
-        if not success and self.has_cp_helix and not self.enable_recompute_pause:
-            # Without recompute pause (e.g. a disaggregated generation server,
-            # which cannot replay a prefill) the only pages left to free are
-            # those of finished requests whose close is deferred
-            # (kv_cache_config.defer_generation_only_release). Suspending to a
-            # lower tier is validated only under aggregated helix, so fail
-            # instead of stalling.
-            if self.kv_cache_manager.flush_deferred_closes():
-                success = self._try_allocate_generation(req)
+        if not success and self.kv_cache_manager.flush_deferred_closes():
+            # Finished requests whose close is deferred
+            # (kv_cache_config.defer_generation_only_release) still hold pages.
+            # Closing them now is never earlier than the immediate close they
+            # replace, and costs no running request a suspend or a recompute.
+            success = self._try_allocate_generation(req)
             if self._lost_kv_error is not None:
                 lost = self._on_lost_kv_cache(req, inflight_request_ids, recompute_paused)
                 return lost, 0, scheduled_beam_width, req_it_end
-            if not success:
-                raise RuntimeError(
-                    f"[V2Scheduler] KV allocation failed for helix request "
-                    f"{req.py_request_id}; recompute pause is disabled "
-                    f"(e.g. on a disaggregated generation server, which "
-                    f"cannot replay the prefill), so the scheduler cannot "
-                    f"preempt a request. Increase "
-                    f"kv_cache_config.max_gpu_total_bytes (rank-local bytes) "
-                    f"or max_tokens (GLOBAL tokens across CP ranks, not "
-                    f"per-rank), or reduce concurrency."
-                )
+
+        if not success and self.has_cp_helix and not self.enable_recompute_pause:
+            # Without recompute pause (e.g. a disaggregated generation server,
+            # which cannot replay a prefill) and with the deferred closes above
+            # flushed, no page is left to free. Suspending to a lower tier is
+            # validated only under aggregated helix, so fail instead of
+            # stalling.
+            raise RuntimeError(
+                f"[V2Scheduler] KV allocation failed for helix request "
+                f"{req.py_request_id}; recompute pause is disabled "
+                f"(e.g. on a disaggregated generation server, which "
+                f"cannot replay the prefill), so the scheduler cannot "
+                f"preempt a request. Increase "
+                f"kv_cache_config.max_gpu_total_bytes (rank-local bytes) "
+                f"or max_tokens (GLOBAL tokens across CP ranks, not "
+                f"per-rank), or reduce concurrency."
+            )
 
         if not success:
             # Under helix without a tier below GPU, a suspended request's pages
