@@ -1601,6 +1601,17 @@ def gdn_verify_tcgen05(
     if replay_indices is None:
         replay_indices = slots
     assert replay_indices.numel() == n
+    # gdnVerifyOp.cpp's operand checks: int32 indices and bookkeeping, the history's replay slots, the gate / norm
+    # parameters.
+    assert slots.dtype == torch.int32 and slots.is_contiguous()
+    assert replay_indices.dtype == torch.int32 and replay_indices.is_contiguous()
+    assert cache_buf_idx.dtype == torch.int32 and cache_buf_idx.dim() == 1
+    assert prev_acc.dtype == torch.int32 and prev_acc.dim() == 1
+    assert old_g.dtype == torch.float32 and tuple(old_g.shape) == (old_u.shape[0], 2, HV, HIST)
+    assert old_k.shape[0] == old_u.shape[0] == cache_buf_idx.shape[0] == prev_acc.shape[0]
+    assert A_log.dtype == torch.float32 and A_log.is_contiguous() and A_log.numel() == HV
+    assert dt_bias.dtype == torch.float32 and dt_bias.is_contiguous() and dt_bias.numel() == HV
+    assert norm_w.dtype == torch.bfloat16 and norm_w.is_contiguous() and norm_w.numel() == D
     u_stride, k_stride, g_stride = old_u.stride(), old_k.stride(), old_g.stride()
     # packed slot rows (the per-slot strides a pool page gives are free); the TMA needs 16-byte slot strides and bases
     assert u_stride[1:] == (HIST * HV * D, HV * D, D, 1) or _packed_slot_rows(old_u), u_stride
