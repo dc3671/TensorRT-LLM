@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, PriorityWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ADPRouter,
     ConversationAwareADPRouter,
@@ -39,7 +39,7 @@ def _dist(tp_size, tp_rank=0):
     return dist
 
 
-def _item(req_id, conv, num_tokens=100, target=None, relax=True, children=0):
+def _item(req_id, conv, num_tokens=100, target=None, relax=True, children=0, priority=0.5):
     item = MagicMock()
     item.id = req_id
     item.child_req_ids = (
@@ -53,6 +53,7 @@ def _item(req_id, conv, num_tokens=100, target=None, relax=True, children=0):
     item.request.py_scheduling_params = sp
     item.request.py_conversation_params = ConversationParams(conversation_id=conv) if conv else None
     item.request.input_token_ids = list(range(num_tokens))
+    item.request.priority = priority
     return item
 
 
@@ -181,16 +182,15 @@ def test_no_aging_when_no_rank_has_room():
 def test_a_request_the_round_does_not_reach_keeps_its_age():
     """The bound on waiting holds even across rounds that stop before the held request."""
     router = _router(rounds=10)
-    _bind(router, {"A": 0, "B": 1})
+    _bind(router, {"A": 0})
     queue = FCFSWaitingQueue()
     queue.add_request(_item(1, "A"))
     assert _round(router, queue, [1, 0, 0, 0], 1) == {}  # A held while other ranks had room
     assert router._home_wait_age[1] == 1
-    # B's request, of an earlier admission group, is held at the front, so this round stops before A.
-    queue.prepend_requests([_item(2, "B")])
-    queue.admission_groups = lambda reqs: [0, 1][: len(reqs)]
-    assert _round(router, queue, [1, 1, 0, 0], 1) == {}
-    assert router._home_wait_age == {1: 1, 2: 1}
+    # A new conversation ahead of A takes the round's whole budget, so the round stops before A (still in the window).
+    queue.prepend_requests([_item(2, "C")])
+    assert list(_round(router, queue, [1, 0, 0, 0], 1, max_new=1)) == [2]
+    assert router._home_wait_age == {1: 1}
 
 
 def test_window_extends_past_held_requests():
@@ -263,15 +263,60 @@ def test_new_conversation_bound_in_the_same_round():
 
 
 def test_admission_groups_are_respected():
-    """A later admission group may not pass a held request of an earlier group."""
+    """A later admission group passes a held request of an earlier group, but not into its home rank."""
     router = _router(rounds=10)
+    _bind(router, {"A": 0, "B": 1, "E": 0})
+    queue = FCFSWaitingQueue()
+    # A needs 2 slots and its home rank 0 has 1. Its own group's F may still take that slot; group 1's E may not.
+    queue.add_requests([_item(1, "A", children=1), _item(4, "F"), _item(2, "B"), _item(3, "E")])
+    queue.admission_groups = lambda reqs: [0, 0, 1, 1][: len(reqs)]
+    pos = _round(router, queue, [1, 0, 0, 0], 2)
+    assert 1 not in pos and 4 in pos and pos[2] == 1 and 3 not in pos
+    assert [x.id for x in queue] == [1, 3]
+    assert router._home_wait_age == {1: 1, 3: 1}
+
+
+def test_continuous_priorities_do_not_block_other_ranks():
+    """Priority queue with one group per request (output-length predictor): a request held for a full home rank does
+    not stop lower-priority requests bound to other ranks, and a lower-priority request does not pass it at home."""
+    router = _router(rounds=10)
+    _bind(router, {"A": 0, "B": 1, "C": 2, "D": 0})
+    queue = PriorityWaitingQueue()
+    queue.add_requests(
+        [
+            _item(1, "A", priority=0.9),
+            _item(2, "B", priority=0.8),
+            _item(3, "C", priority=0.7),
+            _item(4, "D", priority=0.6),
+        ]
+    )
+    assert queue.admission_groups(queue.peek_requests(4)) == [0, 1, 2, 3]
+    pos = _round(router, queue, [1, 0, 0, 0], 1)
+    assert pos == {2: 1, 3: 2}
+    assert [x.id for x in queue] == [1, 4]
+    assert router._home_wait_age == {1: 1, 4: 1}
+    # Rank 0 frees a slot: the higher-priority A takes it, D keeps waiting.
+    assert _round(router, queue, [0, 1, 1, 0], 1) == {1: 0}
+    assert [x.id for x in queue] == [4]
+
+
+def test_round_passes_over_a_bounded_number_of_requests():
+    """A deep queue of held requests costs a round at most HOME_WAIT_MAX_PASSED requests, not the whole queue."""
+    router = _router(rounds=10_000)
+    router.HOME_WAIT_WINDOW = 4
+    router.HOME_WAIT_MAX_PASSED = 8
     _bind(router, {"A": 0})
     queue = FCFSWaitingQueue()
-    queue.add_requests([_item(1, "A"), _item(2, "C"), _item(3, "D")])
-    queue.admission_groups = lambda reqs: [0, 0, 1][: len(reqs)]
-    pos = _round(router, queue, [1, 0, 0, 0], 1)
-    assert 1 not in pos and 2 in pos and 3 not in pos
-    assert [x.id for x in queue] == [1, 3]
+    queue.add_requests([_item(i, "A") for i in range(1, 1001)])
+    queue.add_request(_item(2000, "C"))
+    peeked = []
+    peek = queue.peek_requests
+    queue.peek_requests = lambda k: peeked.append(k) or peek(k)
+    for _ in range(3):
+        assert _round(router, queue, [1, 0, 0, 0], 1) == {}
+    assert max(peeked) <= 2 * router.HOME_WAIT_MAX_PASSED
+    assert router._home_wait_age == {i: 3 for i in range(1, 9)}
+    assert len(queue) == 1001
 
 
 def test_children_need_their_slots_on_one_rank():

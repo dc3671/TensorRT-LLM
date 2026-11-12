@@ -1085,6 +1085,9 @@ class ConversationAwareADPRouter(ADPRouter):
     _home_wait_age: Dict[int, int] | Mapping[int, int] = MappingProxyType({})
     # The first window one home-wait round peeks; it doubles while no request in it stopped the round.
     HOME_WAIT_WINDOW = 256
+    # Requests one home-wait round may pass over (held, or unbound without room) before it stops: bounds the round's
+    # work by this plus its admission budget, however deep the queue of held requests.
+    HOME_WAIT_MAX_PASSED = 256
 
     def __init__(
         self,
@@ -1201,7 +1204,8 @@ class ConversationAwareADPRouter(ADPRouter):
         Home-wait admits a returning conversation only to its home rank until it was held ``home_wait_rounds``
         rounds while another rank had room; then it is admitted unplanned and overflows in ``route_requests``.
         Other requests are admitted as without home-wait. Later requests of a held request's admission group
-        may pass it; held requests stay in order.
+        may pass it; a later group may too, except into its home rank, so that each rank still admits in group
+        (priority) order. Held requests stay in order. A round passes over at most ``HOME_WAIT_MAX_PASSED`` requests.
         """
         if self._home_wait_rounds is None or max_new_requests <= 0 or len(all_rank_states) <= 1:
             return super().pop_requests(
@@ -1219,7 +1223,10 @@ class ConversationAwareADPRouter(ADPRouter):
         budget = max_new_requests
         chosen_idx: List[int] = []
         placement: Dict[int, int] = {}
-        held_group = None
+        # Admission group of the request last examined, and the home ranks of the requests held in it.
+        group = None
+        held_homes: set = set()
+        passed = 0
         window: List["RequestQueueItem"] = []
         size = self.HOME_WAIT_WINDOW
         idx = 0
@@ -1230,11 +1237,19 @@ class ConversationAwareADPRouter(ADPRouter):
             stopped = False
             while idx < len(window):
                 item = window[idx]
-                if held_group is not None and groups[idx] != held_group:
-                    stopped = True  # a group must finish before the next one (WaitingQueue.admission_groups)
-                    break
+                if groups[idx] != group:
+                    # A group finishes before the next one on each rank (WaitingQueue.admission_groups): a rank a
+                    # held request waits for takes no planned request of a later group.
+                    group = groups[idx]
+                    if held_homes:
+                        for rank in held_homes:
+                            num_active[rank] = max(num_active[rank], max_num_active_requests)
+                        held_homes.clear()
+                        if all(n >= max_num_active_requests for n in num_active):
+                            stopped = True
+                            break
                 need = 1 + (len(item.child_req_ids) if item.child_req_ids else 0)
-                if need > budget:
+                if need > budget or passed >= self.HOME_WAIT_MAX_PASSED:
                     stopped = True
                     break
                 conv_id = self._conversation_id(item)
@@ -1244,6 +1259,8 @@ class ConversationAwareADPRouter(ADPRouter):
                     if can_process_attention_dp_request(item, num_active, max_num_active_requests):
                         budget -= need
                         chosen_idx.append(idx)
+                    else:
+                        passed += 1
                 elif num_active[home] + need <= max_num_active_requests:
                     num_active[home] += need
                     budget -= need
@@ -1261,7 +1278,8 @@ class ConversationAwareADPRouter(ADPRouter):
                     else:
                         if other_room:
                             ages[item.id] = ages.get(item.id, 0) + 1
-                        held_group = groups[idx]
+                        held_homes.add(home)
+                        passed += 1
                 idx += 1
             if stopped or len(window) < size or budget <= 0:
                 break
