@@ -29,6 +29,8 @@ _TOKENS_PER_PAGE = 64
 _HEAD_DIM = 256
 # The V descale (scale_out / bmm2_scale) of the calls, not 1 so that its application is checked.
 _SCALE_OUT = 0.75
+# The FP8 kernel's error against the FP32 reference relative to the output norm (P is rounded to E4M3 for P @ V).
+_MAX_REL_ERR = 6e-2
 
 
 def _make_case(q_lens, kv_lens, num_heads_q, num_heads_kv, seed=0):
@@ -108,16 +110,27 @@ def test_fmha_paged_context_fp8(head_dim_per_stage_kv, q_lens, kv_lens):
         True,
     )
     ref = _reference(q, pool, block_tables, q_lens, kv_lens, softmax_scale) * _SCALE_OUT
-    torch.testing.assert_close(
-        out.view(-1, num_heads_q, _HEAD_DIM).float(), ref, atol=3e-2, rtol=5e-2
-    )
+    got = out.view(-1, num_heads_q, _HEAD_DIM).float()
+    torch.testing.assert_close(got, ref, atol=3e-2, rtol=5e-2)
+    # Relative to the output's norm, which a zero output does not meet at long KV (where atol alone would pass it).
+    rel = ((got - ref).norm() / ref.norm()).item()
+    assert rel < _MAX_REL_ERR, rel
 
 
-def test_fmha_paged_context_fp8_matches_flashinfer():
+# Every shape of the FP32-reference test, and one with a 5000-token KV.
+@pytest.mark.parametrize(
+    "q_lens,kv_lens",
+    [
+        ([700, 129, 64], [2048, 129, 5000]),
+        ([300, 77], [428, 77]),
+        ([1], [130]),
+        ([1024, 64, 513], [1024, 4160, 600]),
+    ],
+)
+def test_fmha_paged_context_fp8_matches_flashinfer(q_lens, kv_lens):
     """The K / V stage size does not change the output bits, and the output matches FlashInfer's prebuilt
     trtllm-gen context kernel up to one BF16 ulp in a few elements (the JIT and prebuilt kernels differ there)."""
     flashinfer = pytest.importorskip("flashinfer")
-    q_lens, kv_lens = [700, 129, 64], [2048, 129, 5000]
     num_heads_q, num_heads_kv = 16, 1
     q, pool, block_tables, seq_lens, cu_q, cu_kv, scale_bmm1, softmax_scale = _make_case(
         q_lens, kv_lens, num_heads_q, num_heads_kv, seed=1
