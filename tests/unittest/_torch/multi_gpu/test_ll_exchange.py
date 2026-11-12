@@ -454,8 +454,9 @@ def _group_allgather(tp):
         # Refused before any launch: an integer payload (its all-ones words would arrive rewritten), a pushed
         # merge of two partials per row (its producer pushes one), and an in-kernel gather on an exchange created
         # without its head dim.
-        with pytest.raises(ValueError, match="floating-point"):
-            ex.allgather(torch.zeros(4, 256, dtype=torch.int32, device="cuda"))
+        for dtype in (torch.int32, torch.float64):
+            with pytest.raises(ValueError, match="floating-point"):
+                ex.allgather(torch.zeros(4, 256, dtype=dtype, device="cuda"))
         o = torch.zeros(group_size, 2, 4, 4, 256, dtype=torch.bfloat16, device="cuda")
         lse = torch.zeros(group_size, 2, 4, 4, device="cuda")
         out = torch.empty(4, 4, 256, dtype=torch.bfloat16, device="cuda")
@@ -851,14 +852,17 @@ def test_ll_exchange(case, mpi_pool_executor):
 
 
 def test_group_exchange_is_cached_per_gather_head_dim(monkeypatch):
-    """get_tp_group_exchange returns the exchange created for the same group and in-kernel gather head dim."""
+    """get_tp_group_exchange returns the exchange created for the same group, channel count and in-kernel gather
+    head dim (a PDL-off engine's exchange has no RoPE-gather channel for a later PDL-on one)."""
     from tensorrt_llm._torch.distributed import ll_exchange
 
     created = []
 
     def create(cls, mapping, group_size, max_bytes, max_merge_rows, num_channels, gather_head_dim):
         created.append(gather_head_dim)
-        return SimpleNamespace(transport="ipc", gather_head_dim=gather_head_dim)
+        return SimpleNamespace(
+            transport="ipc", gather_head_dim=gather_head_dim, num_channels=num_channels
+        )
 
     monkeypatch.setattr(ll_exchange.TPGroupExchange, "create", classmethod(create))
     monkeypatch.setattr(ll_exchange, "_GROUP_EXCHANGES", {})

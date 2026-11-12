@@ -1558,10 +1558,14 @@ class TPGroupExchange:
         self, x: torch.Tensor, out: Optional[torch.Tensor] = None, channel: int = 0, trigger=False
     ) -> torch.Tensor:
         """``[rows, *rest]`` per member -> ``[rows, G * prod(rest)]`` (member-major along the last dim);
-        e.g. q ``[T, 4, 256]`` -> ``[T, 16 * 256]`` (view it as ``[T, 16, 256]``). Floating-point payloads only:
-        a word equal to the empty-slot sentinel (all bits set, NaNs in every float format) arrives as another NaN."""
-        if not x.dtype.is_floating_point:
-            raise ValueError(f"allgather moves floating-point payloads, got {x.dtype}")
+        e.g. q ``[T, 4, 256]`` -> ``[T, 16 * 256]`` (view it as ``[T, 16, 256]``). FP32 / FP16 / BF16 / E4M3 /
+        E5M2 payloads only: a word equal to the empty-slot sentinel (all bits set: NaNs in each of these formats)
+        arrives as another NaN; in other dtypes (integers, float64, the fnuz / E8M0 / FP4 formats) the rewrite
+        would change a value."""
+        if x.dtype not in _ALLGATHER_DTYPES:
+            raise ValueError(
+                f"allgather moves floating-point payloads whose all-ones words are NaN, got {x.dtype}"
+            )
         assert x.is_contiguous()
         rows = x.shape[0]
         row_bytes = x[0].numel() * x.element_size() if rows else 0
@@ -1813,6 +1817,15 @@ class TPGroupExchange:
 
 _GROUP_EXCHANGES: Dict[tuple, Optional[TPGroupExchange]] = {}
 
+# Payload dtypes of TPGroupExchange.allgather: those whose all-ones words are NaN.
+_ALLGATHER_DTYPES = (
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.float8_e4m3fn,
+    torch.float8_e5m2,
+)
+
 
 def get_tp_group_exchange(
     mapping,
@@ -1823,12 +1836,13 @@ def get_tp_group_exchange(
     gather_head_dim: int = 0,
 ) -> Optional[TPGroupExchange]:
     """The TP subgroup exchange, created by the first call (collective over the TP group, not during graph capture)
-    with these sizes and channels; later calls with the same group and in-kernel gather head dim return it as
-    created."""
+    with these sizes and channels; later calls with the same group, channel count and in-kernel gather head dim
+    return it as created (each call checks its payload against the sizes it was created with)."""
     key = (
         tuple(mapping.tp_group),
         mapping.tp_rank,
         group_size,
+        num_channels,
         gather_head_dim,
         torch.cuda.current_device(),
     )
