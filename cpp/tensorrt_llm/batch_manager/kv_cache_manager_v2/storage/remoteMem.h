@@ -104,6 +104,10 @@ public:
     //! Record the first transfer failure and throw it as RemoteMemError; the client has failed() from then on.
     [[noreturn]] void fail(std::string const& message);
 
+    //! Throws RemoteMemError when an earlier transfer failed. Call it before leasing page staging for a transfer: a
+    //! failed level's unquiesced transfers may still hold all of it.
+    void checkUsable() const;
+
     //! Whether a transfer failed. A failed client throws RemoteMemError on every transfer and claim.
     [[nodiscard]] bool failed() const noexcept
     {

@@ -443,6 +443,12 @@ RemoteChunk RemoteMemClient::acquireChunk(size_t minBytes)
     }
 }
 
+void RemoteMemClient::checkUsable() const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    throwIfFailed();
+}
+
 void RemoteMemClient::releaseChunk(RemoteChunk chunk) noexcept
 {
     std::lock_guard<std::mutex> lock(mMutex);

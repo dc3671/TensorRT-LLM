@@ -264,6 +264,12 @@ public:
         return lvl == numCacheLevels() - 1;
     }
 
+    //! Whether evicted pages stop at `lvl`: the last level, or the last one above trailing failed remote levels.
+    bool isLastLiveLevel(CacheLevel lvl) const noexcept
+    {
+        return lvl >= mLastLiveLevel;
+    }
+
     //! Whether a cold level keeps its slots in remote memory (RemoteCacheTierConfig).
     [[nodiscard]] bool hasRemoteLevel() const noexcept
     {

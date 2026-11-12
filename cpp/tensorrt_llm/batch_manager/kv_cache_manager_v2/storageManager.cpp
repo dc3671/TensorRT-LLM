@@ -1134,6 +1134,9 @@ void StorageManager::submitRemoteHotMigration(CacheLevel dstLevel, CacheLevel sr
     // points any page at its new slot).
     RemoteRange& range = remoteLevel(coldLevel)->remoteRange(coldPgIdx, PoolIndex{0});
     RemoteMemClient& client = range.client();
+    // Before any staging lease: a failed level's unquiesced transfer may hold all of it, and the lease would then fail
+    // with a plain exception instead of the RemoteMemError that costs only this request.
+    client.checkUsable();
     bool const streamOrdered = client.streamOrdered();
     std::vector<RemoteIo> ios;
     while (remaining > 0)
@@ -1236,6 +1239,14 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
         // another on the stream.
         bool const streamOrdered = (srcRange == nullptr || srcRange->client().streamOrdered())
             && (dstRange == nullptr || dstRange->client().streamOrdered());
+        // Before any staging lease, as in submitRemoteHotMigration.
+        for (RemoteRange const* remoteRange : {srcRange, dstRange})
+        {
+            if (remoteRange != nullptr)
+            {
+                remoteRange->client().checkUsable();
+            }
+        }
         std::vector<RemoteIo> ios;
         std::vector<Task<MemAddress, MemAddress>> tasks;
         size_t remaining = numPages;
@@ -1553,7 +1564,7 @@ void StorageManager::forceEvict(
     auto evicted = mLevels.at(level).controller.evict(minNumPages);
     auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
 
-    if (isLastLevel(level))
+    if (isLastLiveLevel(level))
     {
         // Last level: all evicted pages must be DROPPABLE (they get dropped, not migrated).
         for (auto const& pages : evicted)
@@ -1664,7 +1675,9 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     auto& lvl = mLevels.at(lvlId);
     auto& storage = *lvl.storage;
     auto& ctrl = lvl.controller;
-    bool const isLast = isLastLevel(lvlId);
+    // Pages stop at the last live level: below it are only failed remote levels, which take none. The held pages
+    // falling to it are reserved there, as at the last level; nothing recurses into the failed levels.
+    bool const isLast = isLastLiveLevel(lvlId);
     // A failed remote level counts as full with nothing to evict: pages fall past it, or drop after the last level.
     bool const isFailed = remoteLevelFailed(lvlId);
     auto const& grouping = poolGroupMapping(lvlId);
@@ -1805,7 +1818,22 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 accepted.insert(
                     accepted.end(), std::make_move_iterator(held.begin()), std::make_move_iterator(held.end()));
                 held.clear();
-                fallenPages.at(lifeCycle).clear();
+                auto& rejected = fallenPages.at(lifeCycle);
+                if (dropRecorder && !rejected.empty() && !isLastLevel(lvlId))
+                {
+                    // Above failed trailing levels these droppable pages would have been migrated down: count them
+                    // as dropped from the level they leave. (At the last level the behaviour is unchanged.)
+                    std::map<CacheLevel, std::vector<SharedPtr<Page>>> byLevel;
+                    for (auto const& page : rejected)
+                    {
+                        byLevel[page->cacheLevel].push_back(page);
+                    }
+                    for (auto const& [fromLevel, pages] : byLevel)
+                    {
+                        dropRecorder(pages, fromLevel);
+                    }
+                }
+                rejected.clear();
             }
         }
         else

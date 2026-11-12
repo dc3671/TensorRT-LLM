@@ -291,6 +291,7 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
         remote_quota: int = 512 << 20,
         wait_timeout_ms: int = 60_000,
         expected_donors: int = 0,
+        gpu_quota: int = 32 << 20,
     ):
         layers = []
         for lid in range(2):
@@ -310,7 +311,7 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
                     buffers=[BufferConfig(role=DataRole("ssm_state"), size=self.buf_size)],
                 )
             )
-        tiers = [GpuCacheTierConfig(quota=32 << 20)]
+        tiers = [GpuCacheTierConfig(quota=gpu_quota)]
         if with_host:
             tiers.append(HostCacheTierConfig(quota=16 << 20))
         tiers.append(
@@ -687,6 +688,142 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             gc.collect()
             base.take_poison()
             shutil.rmtree(directory, ignore_errors=True)
+
+    def test_a_stalled_transfer_holding_all_staging_fails_later_resumes_with_remote_mem_error(self) -> None:
+        """A READ past its deadline that holds the whole page-staging ring fails later remote resumes as RemoteMemError.
+
+        The level is checked before staging is leased: otherwise the next resume of a request holding pages on it fails
+        to lease staging with a plain error, which the scheduler does not take for a lost remote level.
+        """
+        if self.transport == "fabric":
+            self.skipTest(
+                "fabric copies are stream-ordered: their staging is retired on the stream"
+            )
+        # 16 MiB attention pages: the 64 MiB ring is 4 of them, and the 8-block READ below asks for all of it.
+        self.buf_size = 4 << 20
+        directory = tempfile.mkdtemp(prefix="kvcm2_ring_")
+        tcp = {"UCX_TLS": "tcp,cuda_copy"}
+        # Room for both prompts and the pushes on the remote level, so that neither is evicted from it; chunks hold
+        # whole 16 MiB pages.
+        donor = _Donor(directory, 2 << 30, self.transport, chunk_bytes=64 << 20, env=tcp)
+        stopped = False
+        kvs = []
+        try:
+            self.cfg = self._config(
+                with_host=False,
+                directory=directory,
+                transfer_timeout_ms=2_000,
+                remote_quota=1 << 30,
+                gpu_quota=256 << 20,
+            )
+            with mock.patch.dict(os.environ, tcp):
+                self.manager = KVCacheManager(self.cfg)
+            self.engine = FakeEngine(self.cfg)
+            stream_holder = base.CachedCudaStream()
+            stream = cast(CudaStream, stream_holder.handle)
+            first = self._prompt(8 * self.tokens_per_block)
+            second = self._prompt(4 * self.tokens_per_block)
+            self._prefill(first, stream)
+            self._prefill(second, stream)
+            self._push_to_last_level(first, stream)
+            self._push_to_last_level(second, stream)
+            self.assertEqual(self._residency(first)[-1], len(first))
+            # Room on the GPU, so that the first transfer to stall is the 8-page READ, which leases the whole ring,
+            # rather than an eviction WRITE of a few pages.
+            self.assertTrue(self.manager.resize(cast(CacheLevel, CacheLevel(0)), 1 << 30))
+            # Both match the level's pages before it fails.
+            kvs = [self.manager.create_kv_cache(input_tokens=p) for p in (first, second)]
+            os.kill(donor.proc.pid, signal.SIGSTOP)
+            stopped = True
+            with self.assertRaises(RemoteMemError):
+                kvs[0].resume(stream)
+            self.assertGreaterEqual(_introspection.remote_unquiesced_transfers(self.manager), 1)
+            # Not a staging-lease failure: the scheduler re-matches or recomputes on RemoteMemError only.
+            with self.assertRaisesRegex(RemoteMemError, "remote level"):
+                kvs[1].resume(stream)
+        finally:
+            if stopped:
+                os.kill(donor.proc.pid, signal.SIGCONT)
+            if hasattr(self, "manager"):
+                deadline = time.monotonic() + 60
+                while (
+                    _introspection.remote_unquiesced_transfers(self.manager)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.1)
+            for kv in kvs:
+                with contextlib.suppress(Exception):
+                    kv.close()
+            kvs.clear()
+            donor.stop()
+            if hasattr(self, "manager"):
+                with contextlib.suppress(Exception):
+                    self.manager.shutdown()
+                del self.manager
+            gc.collect()
+            base.take_poison()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_held_pages_stop_at_the_host_level_above_a_failed_remote_level(self) -> None:
+        """Once the trailing remote level failed, the host level is the last one: held pages falling to it are kept,
+        and the droppable pages it evicts are counted as dropped.
+
+        Treated as a middle level, the host let pages fall to the failed level: held ones, which nothing there can
+        hold (every later allocation then failed with OutOfPagesError), and droppable ones, cleared there uncounted.
+        """
+
+        def body(stream, donor) -> None:
+            lost = self._prompt(4 * self.tokens_per_block)
+            self._prefill(lost, stream)
+            self._push_to_last_level(lost, stream)
+            donor.stop()
+            kv = self.manager.create_kv_cache(input_tokens=lost)
+            with self.assertRaisesRegex(RemoteMemError, "remote level"):
+                kv.resume(stream)
+            kv.close()
+            del kv
+            # Held pages fill the host level's attention pool but one slot, so when the last of them fall the host
+            # has room for them and not for the droppable pages falling with them.
+            groups = _introspection.level_pool_groups(self.manager, 1)
+            attention_slots = max(groups, key=lambda group: group[1])[0]
+            ssm_slots = min(groups, key=lambda group: group[1])[0]
+            num_holders = max(1, min(4, ssm_slots - 1))
+            held_blocks = (attention_slots - 1) // num_holders
+            self.assertGreater(held_blocks, 0, groups)
+            holders = []
+            for _ in range(num_holders):
+                prompt = self._prompt(held_blocks * self.tokens_per_block)
+                holder = self.manager.create_kv_cache()
+                self.assertTrue(holder.resume(stream))
+                holder.capacity = len(prompt)
+                holder.history_length = len(prompt)
+                self.engine.execute([Step(holder, prompt, [])], stream)
+                holder.commit(prompt)
+                holder.suspend()
+                holders.append((holder, prompt))
+            # The GPU fills with droppable pages: the held ones go down to the host, the droppable ones drop.
+            self.manager.get_and_reset_iteration_stats()
+            for _ in range(8):
+                self._prefill(self._prompt(256), stream)
+            stats = self.manager.get_and_reset_iteration_stats()
+            self.assertGreater(
+                sum(delta.iter_host_dropped_blocks for delta in stats.values()),
+                0,
+                "pages the host level evicted were dropped uncounted",
+            )
+            for holder, prompt in holders:
+                self.assertTrue(holder.resume(stream), "a held page fell past the host level")
+                history = list(prompt)
+                holder.capacity = len(history) + 1
+                token = TokenId(next(self._token_ids))
+                # Reads every page of the holder's history and compares it with what its prefill wrote.
+                self.engine.execute([Step(holder, [token], history)], stream)
+                holder.suspend()
+            for holder, _ in holders:
+                holder.close()
+            holders.clear()
+
+        self._with_dying_donor("kvcm2_held_host_", body)
 
     def test_withdrawn_donor_takes_no_new_claims(self) -> None:
         """Growing the level after its donor withdrew claims nothing from it, though the client knew its chunks."""
