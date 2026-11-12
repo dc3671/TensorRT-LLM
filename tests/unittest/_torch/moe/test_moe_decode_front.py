@@ -412,26 +412,35 @@ def test_fused_front_parity(m, nl, ls, tile, dup):
 
 # M = 40 (odd split over the 8 routing CTAs), 112 / 224 (MTP-6 verify at batch 16 / 32), 256 (clusters of 8);
 # 257..1024 run on clusters of 16, above 512 with two-word token masks.
+_ROUTE_FRONT_CASES = [
+    (21, 64, 448, 8, False, False),
+    (40, 128, 0, 8, False, False),
+    (56, 512, 0, 16, False, False),
+    (224, 128, 384, 32, False, False),
+    (256, 256, 256, 8, False, False),
+    (112, 128, 128, 8, True, False),
+    (224, 128, 0, 8, False, True),
+    (280, 128, 128, 16, False, False),
+    (448, 64, 448, 16, False, False),
+    (448, 128, 0, 16, True, False),
+    (448, 128, 0, 16, False, True),
+    (513, 128, 0, 16, False, False),
+    (896, 256, 256, 32, True, False),
+    (1024, 128, 0, 16, False, True),
+]
+# The lean table build runs on clusters of 8 only; above 256 rows the route front takes the default kernel.
+_LEAN_MAX_M = 256
+
+
 @pytest.mark.parametrize(
-    "m,nl,ls,tile,dup,crowd",
+    "m,nl,ls,tile,dup,crowd,lean",
     [
-        (21, 64, 448, 8, False, False),
-        (40, 128, 0, 8, False, False),
-        (56, 512, 0, 16, False, False),
-        (224, 128, 384, 32, False, False),
-        (256, 256, 256, 8, False, False),
-        (112, 128, 128, 8, True, False),
-        (224, 128, 0, 8, False, True),
-        (280, 128, 128, 16, False, False),
-        (448, 64, 448, 16, False, False),
-        (448, 128, 0, 16, True, False),
-        (448, 128, 0, 16, False, True),
-        (513, 128, 0, 16, False, False),
-        (896, 256, 256, 32, True, False),
-        (1024, 128, 0, 16, False, True),
+        pytest.param(*c, lean, id="-".join(map(str, ("lean" if lean else "default", *c))))
+        for lean in (False, True)
+        for c in _ROUTE_FRONT_CASES
+        if not lean or c[0] <= _LEAN_MAX_M
     ],
 )
-@pytest.mark.parametrize("lean", [False, True], ids=["default", "lean"])
 def test_route_front_parity(m, nl, ls, tile, dup, crowd, lean):
     """The route front after the stock router GEMM equals the Triton route kernel and fp4_quantize bitwise,
     tables in token order; a repeated launch gives the same result. ``lean`` (the decode kernels' table build, up
