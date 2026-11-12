@@ -172,6 +172,7 @@ def _strict_accept_kernel(
         "num_gens",
         "accepted_stride",
         "frac",
+        "split",
     ]
 )
 def _sample_accept_kernel(
@@ -199,7 +200,7 @@ def _sample_accept_kernel(
     num_gens,
     accepted_stride,
     frac,
-    SPLIT: tl.constexpr,
+    split,
     BLOCK_V: tl.constexpr,
     NRANKS: tl.constexpr,
     WORDS: tl.constexpr,
@@ -217,12 +218,14 @@ def _sample_accept_kernel(
 ):
     """The four-draws Gumbel sample of the TP key exchange (``argmax_logits``) drawn from seed + 1; the
     program that takes the last ticket stores seed + 1 after the exchange and runs the strict acceptance on
-    the tokens it wrote. Every program reads the seed before it takes its ticket."""
+    the tokens it wrote. Every program reads the seed before it takes its ticket. ``split`` (programs per row,
+    ``ll_exchange._fast_gumbel_split``) follows the row count, so it is a runtime argument: one compiled kernel serves
+    every split."""
     pv = tl.load(peers_ptr + tl.arange(0, NRANKS))  # host-written table: ahead of the wait
     if WAIT:
         gdc_wait_with_memory_clobber()
     pid = tl.program_id(0)
-    row = pid // SPLIT
+    row = pid // split
     key = fast_gumbel_key(
         logits_ptr,
         stride_m,
@@ -230,11 +233,11 @@ def _sample_accept_kernel(
         temp_ptr,
         seed_ptr,
         row,
-        pid % SPLIT,
+        pid % split,
         vocab_offset,
         vocab_full,
         greedy_threshold,
-        SPLIT,
+        split,
         BLOCK_V,
         1,
     )
@@ -249,7 +252,7 @@ def _sample_accept_kernel(
         state_ptr,
         pv,
         rank,
-        SPLIT,
+        split,
         NRANKS,
         WORDS,
         BLOCK_M,
@@ -365,7 +368,7 @@ def sample_and_strict_accept(
         num_gens,
         accepted.stride(0),
         float(frac),
-        SPLIT=split,
+        split=split,
         BLOCK_V=block_v,
         NRANKS=nranks,
         WORDS=words,

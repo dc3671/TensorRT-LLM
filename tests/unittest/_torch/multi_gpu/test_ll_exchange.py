@@ -409,6 +409,26 @@ def _sample_accept(tp):
                 check(ref, got, 0, (force_kind, "replay", replay))
                 assert torch.equal(seeds[0], seeds[1]) and torch.equal(counters[0], counters[1])
             del graph
+
+        # The split (programs per row) follows the row count: launches at other splits reuse the compiled kernel
+        # and draw the same tokens.
+        from tensorrt_llm._torch.distributed import ll_exchange
+        from tensorrt_llm._torch.speculative import fused_accept
+
+        real_split = ll_exchange._fast_gumbel_split
+        seeds = [torch.full((1,), 11, dtype=torch.int64, device="cuda") for _ in range(2)]
+        compiled = triton_num_compiled(fused_accept._sample_accept_kernel)
+        try:
+            for step, split in enumerate((4, 6, 8, 2)):
+                ll_exchange._fast_gumbel_split = lambda m, v_shard, num_sms, s=split: s
+                logits, temps, draft = inputs(0, 5, 40 + step)
+                ref = stock(logits, temps, draft, 0, 5, seeds[0], None)
+                got = fused(logits, temps, draft, 0, 5, seeds[1], None)
+                torch.cuda.synchronize()
+                check(ref, got, 0, ("split", split))
+        finally:
+            ll_exchange._fast_gumbel_split = real_split
+        assert triton_num_compiled(fused_accept._sample_accept_kernel) == compiled
     finally:
         MPI.COMM_WORLD.barrier()
         ex.close()

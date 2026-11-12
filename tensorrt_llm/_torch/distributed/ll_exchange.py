@@ -241,12 +241,13 @@ def fast_gumbel_key(
     vocab_offset,
     vocab_full,
     greedy_threshold,
-    SPLIT: tl.constexpr,
+    SPLIT,
     BLOCK_V: tl.constexpr,
     SEED_OFFSET: tl.constexpr,
 ):
     """The exchange key of chunk ``part`` of ``row`` under the four-draws Gumbel noise of seed
-    ``seed_ptr[0] + SEED_OFFSET`` (``_argmax_exchange_kernel``'s FAST_GUMBEL)."""
+    ``seed_ptr[0] + SEED_OFFSET`` (``_argmax_exchange_kernel``'s FAST_GUMBEL). ``SPLIT`` (programs per row) may be a
+    runtime value: a caller that launches at many row counts keeps one compiled kernel."""
     chunk = tl.cdiv(tl.cdiv(v_shard, SPLIT), BLOCK_V) * BLOCK_V  # whole tiles
     start = part * chunk
     end = tl.minimum(start + chunk, v_shard)
@@ -297,7 +298,7 @@ def argmax_exchange_finish(
     state_ptr,
     pv,
     rank,
-    SPLIT: tl.constexpr,
+    SPLIT,
     NRANKS: tl.constexpr,
     WORDS: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -306,7 +307,7 @@ def argmax_exchange_finish(
 ):
     """Fold ``key`` into ``row``'s scratch key; the program that takes the last ticket swaps the keys
     out (resetting the scratch and the ticket) and runs the exchange. Returns whether this program
-    took the last ticket."""
+    took the last ticket. ``SPLIT`` (programs per row) may be a runtime value."""
     tl.atomic_max(scratch_ptr + row, key, sem="relaxed", scope="gpu")
     ticket = tl.atomic_add(ticket_ptr, 1, sem="acq_rel", scope="gpu")
     last = ticket == m * SPLIT - 1
