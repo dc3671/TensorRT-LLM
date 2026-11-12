@@ -120,10 +120,12 @@ class FCFSWaitingQueue(deque, WaitingQueue):
     @staticmethod
     def _warn_if_priority_set(request: RequestQueueItem) -> None:
         if request.request is not None and request.request.priority != DEFAULT_REQUEST_PRIORITY:
-            logger.warning(
+            # Once per process: with output_length_prediction every request has one.
+            logger.warning_once(
                 "A request has a non-default priority but the FCFS waiting "
                 "queue is in use; the priority value will be ignored. "
-                "Use WaitingQueuePolicy.PRIORITY to enable priority scheduling."
+                "Use WaitingQueuePolicy.PRIORITY to enable priority scheduling.",
+                key="fcfs_waiting_queue_ignores_priority",
             )
 
     def add_request(self, request: RequestQueueItem) -> None:
