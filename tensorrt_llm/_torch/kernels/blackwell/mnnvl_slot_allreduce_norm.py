@@ -32,7 +32,14 @@ two-shot outputs bit for bit: the rank-order FP32 sum is packed to BF16 and sani
 owner's broadcast word), the norm's sum of squares is the two-shot CTA butterfly over that CTA's warps, then summed in
 CTA order (the cluster exchange carries every warp's sum, not one per CTA), and the norm output is ``(w * x) * rstd``.
 
-Before ``griddepcontrol.wait`` only the norm weight and shared memory / cluster state are touched.
+Before ``griddepcontrol.wait`` only the norm weight and shared memory / cluster state are touched, except in the
+no-wait Lamport mode (``fc2_lamport``): there the fold reads the residual, the routing tables (relaxed loads), the
+shared expert's output and gate, and polls FC2's rows, all before the wait, which comes only before the stores. That
+is safe because none of these is written by a kernel still running when this launch starts: FC2 (the PDL primary)
+releases it only after its own dependency wait and, for an engine that routes, after it wrote the routing tables, so
+the residual's producer has completed; the shared expert runs on the aux stream, which the caller fences and joins
+before this launch (a full stream dependency, not PDL); FC2's own rows are polled per 16-byte vector against
+0xFFFFFFFF. The stores wait because the outputs may alias allocator blocks FC2 still reads.
 """
 
 from __future__ import annotations
@@ -409,7 +416,8 @@ class MnnvlSlotAllReduceNormKernel:
             if tidx == 0:
                 _mbar_expect_tx(mbar_addr, Int32(4 * nsum))
 
-        # ---- before the dependency wait: only the norm weight ----
+        # ---- before the dependency wait: only the norm weight (with fc2_lamport also the fold's inputs below: there
+        # the wait comes before the stores; see the module docstring) ----
         w0, w1, w2, w3 = _ld_v4(Int64(gW.iterator.toint()) + Int64(vi) * Int64(16))
         topk: cutlass.Constexpr = self.moe_topk
         pk = cute.make_rmem_tensor((max(topk, 1),), Int32)
