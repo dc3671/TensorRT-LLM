@@ -176,6 +176,45 @@ def test_routes_from_logits_declaration():
     assert not impl(True, ds)._requires_separated_routing()
 
 
+def test_routes_from_logits_yields_to_host_top_k_readers(monkeypatch):
+    """A declared layer still routes on the host while Router Replay, expert statistics or the layer-wise
+    calibrator reads the separated top-k (the fused branch hands them nothing)."""
+    from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
+    from tensorrt_llm._torch.moe.fused_moe.routing import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.flashinfer_bf16 import (
+        FlashinferTrtllmGenBf16Impl,
+    )
+    from tensorrt_llm._torch.route_capture import ROUTE_CAPTURE_ATTR
+    from tensorrt_llm._torch.utils import model_extra_attrs
+    from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
+    from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Mode
+
+    leaf = SimpleNamespace(
+        routes_from_logits=True,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=TOPK),
+        num_slots=E,
+    )
+    leaf._routes_renormalize_from_logits = functools.partial(
+        FlashinferTrtllmGenBf16Impl._routes_renormalize_from_logits, leaf
+    )
+
+    def separated():
+        return FlashinferTrtllmGenBf16Impl._requires_separated_routing(leaf)
+
+    assert not separated()
+    with model_extra_attrs({ROUTE_CAPTURE_ATTR: object()}):
+        assert separated()
+    with model_extra_attrs({}):
+        assert not separated()
+    with monkeypatch.context() as m:
+        m.setattr(ExpertStatistic, "expert_statistic_obj", object())
+        assert separated()
+    with monkeypatch.context() as m:
+        m.setattr(get_calibrator(), "mode", Mode.COLLECT)
+        assert separated()
+    assert not separated()
+
+
 def _leaf_and_inputs(m, e_local, local_start, seed, **overrides):
     """A FlashInfer BF16 leaf's attributes that ``decode_moe_bf16`` reads, and its kernel inputs."""
     from tensorrt_llm._torch.moe.fused_moe.quantization import (

@@ -17,7 +17,11 @@
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
+from tensorrt_llm._torch.route_capture import get_active_route_capture
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
+from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Mode as CalibratorMode
 
 from ..impl_contract import (
     MoEDecodeOptions,
@@ -45,6 +49,16 @@ from .kernel_inputs import prepare_kernel_inputs, to_trtllm_gen_act_type
 # Largest expert count and top-k the in-op Renormalize routing was checked for (FlashInfer tier <512, 16>).
 _LOGITS_ROUTING_MAX_EXPERTS = 512
 _LOGITS_ROUTING_MAX_TOP_K = 16
+
+
+def _host_top_k_observed() -> bool:
+    """Whether a reader of the host-side top-k is active: the running engine's Router Replay capturer, expert
+    statistics, or the layer-wise calibrator (``moe_scheduler`` hands them the separated routing's ids only)."""
+    return (
+        get_active_route_capture() is not None
+        or ExpertStatistic.get() is not None
+        or get_calibrator().mode != CalibratorMode.NONE
+    )
 
 
 @register_moe_impl
@@ -105,9 +119,14 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         variant has accuracy issues, so its fused form is used instead.
 
         With ``routes_from_logits`` plain Renormalize (no routing bias, up to
-        512 experts and top-16) also routes in the op, from the router logits.
+        512 experts and top-16) also routes in the op, from the router logits,
+        unless something reads the host-side top-k (``_host_top_k_observed``).
         """
-        if self.routes_from_logits and self._routes_renormalize_from_logits():
+        if (
+            self.routes_from_logits
+            and self._routes_renormalize_from_logits()
+            and not _host_top_k_observed()
+        ):
             return False
         return not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
 
