@@ -772,6 +772,31 @@ def _group_merge(tp):
         ex.close()
 
 
+def _peer_fill_failure(tp):
+    """A sentinel fill that fails on one rank declines the peer buffers on every rank (no rank is left waiting in
+    the barrier the fill is agreed in)."""
+    from cuda.bindings import runtime as cudart
+
+    from tensorrt_llm._torch.distributed.ll_exchange import _PeerBuffers
+
+    mapping, rank = _mapping(tp)
+    real = cudart.cudaMemset
+
+    def memset(ptr, value, nbytes):
+        # Only the sentinel fill: IpcMemory's own zero fill (before its handle exchange) stays real.
+        if rank == 1 and value == 0xFF:
+            return (cudart.cudaError_t.cudaErrorInvalidValue,)
+        return real(ptr, value, nbytes)
+
+    cudart.cudaMemset = memset
+    try:
+        buffers = _PeerBuffers.create(mapping, 1 << 20, fill=0xFF)
+    finally:
+        cudart.cudaMemset = real
+    MPI.COMM_WORLD.barrier()
+    assert buffers is None, "a rank kept peer buffers whose fill failed on another rank"
+
+
 def _worker(fn, tp):
     try:
         with torch.inference_mode():
@@ -791,6 +816,7 @@ CASES = {
     "group_allgather": _group_allgather,
     "rope_gather": _rope_gather,
     "group_merge": _group_merge,
+    "peer_fill_failure": _peer_fill_failure,
 }
 
 
@@ -821,3 +847,5 @@ def test_group_exchange_is_cached_per_gather_head_dim(monkeypatch):
     b = ll_exchange.get_tp_group_exchange(mapping, 2, 1 << 20, 64, 3, gather_head_dim=128)
     assert ll_exchange.get_tp_group_exchange(mapping, 2, 1 << 20, 64, 3, gather_head_dim=256) is a
     assert b.gather_head_dim == 128 and created == [256, 128]
+    c = ll_exchange.get_tp_group_exchange(mapping, 2, 1 << 20, 64, 2, gather_head_dim=256)
+    assert c is not a and c.num_channels == 2 and a.num_channels == 3

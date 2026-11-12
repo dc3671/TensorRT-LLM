@@ -565,14 +565,21 @@ class _PeerBuffers:
             if not all(comm.allgather(ok)):
                 del ipc
                 return None
-            if fill:
-                from cuda.bindings import runtime as cudart
+            error = None
+            try:
+                if fill:
+                    from cuda.bindings import runtime as cudart
 
-                (err,) = cudart.cudaMemset(ipc.local_ptr, fill, nbytes)
-                if err != cudart.cudaError_t.cudaSuccess:
-                    raise RuntimeError(f"[ll_exchange] peer buffer fill failed: {err}")
-            torch.cuda.synchronize()
-            comm.barrier()  # every rank's buffer is filled before any rank writes into it
+                    (err,) = cudart.cudaMemset(ipc.local_ptr, fill, nbytes)
+                    if err != cudart.cudaError_t.cudaSuccess:
+                        raise RuntimeError(f"cudaMemset: {err}")
+                torch.cuda.synchronize()
+            except RuntimeError as e:
+                error = e
+            # Agreed before the barrier: every rank's buffer is filled before any rank writes into it.
+            if not cls._all_filled(comm, "IPC", error):
+                del ipc
+                return None
             return cls(ipc.local_ptr, ipc.peer_ptrs, nbytes, "IPC", ipc)
         try:
             mem = TpMnnvlMemory(mapping, nbytes)
@@ -580,10 +587,28 @@ class _PeerBuffers:
             logger.warning(f"[ll_exchange] MNNVL peer buffers failed: {e}")
             return None
         peers = [mem.ptr + r * mem.rank_stride for r in range(mapping.tp_size)]
-        mem.as_torch_strided_tensor(torch.uint8)[mapping.tp_rank].fill_(fill)
-        torch.cuda.synchronize()
-        comm.barrier()  # every rank's buffer is filled before any rank writes into it
+        error = None
+        try:
+            mem.as_torch_strided_tensor(torch.uint8)[mapping.tp_rank].fill_(fill)
+            torch.cuda.synchronize()
+        except RuntimeError as e:
+            error = e
+        if not cls._all_filled(comm, "MNNVL", error):
+            del mem
+            return None
         return cls(peers[mapping.tp_rank], peers, nbytes, "MNNVL", mem)
+
+    @staticmethod
+    def _all_filled(comm, transport: str, error: Optional[BaseException]) -> bool:
+        """Every rank's fill outcome, agreed over the TP group (the barrier the writes wait for); on any failure
+        every rank logs each failed rank's cause and declines the buffers."""
+        errors = comm.allgather(None if error is None else str(error))
+        failed = [f"rank {r}: {e}" for r, e in enumerate(errors) if e is not None]
+        if failed:
+            logger.warning(
+                f"[ll_exchange] {transport} peer buffer fill failed ({'; '.join(failed)})"
+            )
+        return not failed
 
 
 class TPKeyExchange:

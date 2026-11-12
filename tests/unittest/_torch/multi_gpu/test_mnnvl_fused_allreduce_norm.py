@@ -684,3 +684,48 @@ def test_mnnvl_fused_allreduce_norm(case, mpi_pool_executor):
         pytest.skip(f"needs {tp} GPUs")
     results = mpi_pool_executor.map(_worker, [CASES[case]] * tp, [tp] * tp)
     assert all(results)
+
+
+def _tp2_setup_failure(tp):
+    """A failure past the multicast buffer's collective handle exchange on one rank (its pointer-table init is not
+    collective) fails Tp2AllReduceNorm's construction on every rank, naming the failed rank's cause. Returns this
+    rank's outcome as text (exceptions stay in the worker)."""
+    import importlib
+
+    from tensorrt_llm._torch.distributed.tp2_allreduce import Tp2AllReduceNorm
+
+    # By name: a bare ``ops`` in this function would make cloudpickle ship the torch.ops module with it.
+    allreduce_ops = importlib.import_module("tensorrt_llm._torch.distributed.ops")
+
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
+    real = allreduce_ops._make_mnnvl_mcast_buffer
+
+    def make(*args, **kwargs):
+        handle = real(*args, **kwargs)
+        if rank == 1:
+            raise RuntimeError("injected pointer-table failure")
+        return handle
+
+    allreduce_ops._make_mnnvl_mcast_buffer = make
+    try:
+        Tp2AllReduceNorm(mapping, H, 4096)
+        outcome = "constructed"
+    except RuntimeError as e:
+        outcome = str(e)
+    except BaseException as e:  # noqa: BLE001 - reported to the parent as text
+        outcome = f"unexpected {type(e).__name__}: {e}"
+    finally:
+        allreduce_ops._make_mnnvl_mcast_buffer = real
+    MPI.COMM_WORLD.barrier()
+    return outcome
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_tp2_setup_failure_on_one_rank(mpi_pool_executor):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs 2 GPUs")
+    outcomes = list(mpi_pool_executor.map(_tp2_setup_failure, [2] * 2))
+    assert all("rank 1: injected pointer-table failure" in o for o in outcomes), outcomes
