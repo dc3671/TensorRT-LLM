@@ -117,19 +117,25 @@ GBM_PARAMS = {
 }
 
 NAN = float("nan")
+# Prompt and reply lengths are valid up to this many tokens, far beyond any model's context window. It bounds the
+# log1p features and targets the models learn (<= 16.7), and a model's log prediction is clamped to it.
+MAX_TOKENS = float(2**24)
+_LOG1P_MAX_TOKENS = math.log1p(MAX_TOKENS)
 
 # A conversation's history as passed to features(): (count, last out, EMA out, sum out, max out, last prompt).
 Snapshot = Tuple[float, float, float, float, float, float]
 
 
-def is_finite_nonneg(value: Any) -> bool:
-    """Whether ``value`` is a finite number >= 0 (not a bool)."""
+def is_token_count(value: Any) -> bool:
+    """Whether ``value`` is a number in [0, ``MAX_TOKENS``] (not a bool or NaN)."""
     return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        and value >= 0
+        isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= MAX_TOKENS
     )
+
+
+def _tokens_of(log1p_tokens: float) -> float:
+    """A model's log1p prediction as tokens, clamped to [0, ``MAX_TOKENS``] (NaN stays NaN)."""
+    return math.expm1(min(max(log1p_tokens, 0.0), _LOG1P_MAX_TOKENS))
 
 
 def priority_of(tokens: float) -> float:
@@ -644,18 +650,20 @@ class OnlineLengthPredictor:
     def predict(self, conv_id: Optional[str], isl: float, t: float) -> Tuple[float, int]:
         """(predicted output tokens, key): the key goes back with the reply, so its features can be learned.
 
-        Raises ValueError unless ``isl`` is a finite number >= 0.
+        Raises ValueError unless ``isl`` is a finite number in [0, ``MAX_TOKENS``].
         """
-        if not is_finite_nonneg(isl):
-            raise ValueError(f"prompt tokens must be a finite number >= 0, got {isl!r}")
+        if not is_token_count(isl):
+            raise ValueError(
+                f"prompt tokens must be a finite number in [0, {MAX_TOKENS:.0f}], got {isl!r}"
+            )
         self._tick(t)
         snapshot = self.table.snapshot_for(conv_id, isl)
         x = features(snapshot, isl)
         tokens, source = NAN, "prior"
         if self.gbm is not None:
-            tokens, source = max(math.expm1(self.gbm.raw(x)), 0.0), "gbm"
+            tokens, source = _tokens_of(self.gbm.raw(x)), "gbm"
         elif self.ridge.coef is not None:
-            tokens, source = max(math.expm1(self.ridge.raw(ridge_row(x))), 0.0), "ridge"
+            tokens, source = _tokens_of(self.ridge.raw(ridge_row(x))), "ridge"
         elif snapshot is not None:
             tokens, source = snapshot[2], "ema"
         elif self.median.n:
@@ -676,14 +684,14 @@ class OnlineLengthPredictor:
     ) -> bool:
         """Learn a finished reply of ``out`` tokens; returns whether it was learned.
 
-        Not learned: a non-finite or negative ``isl`` / ``out``, and a reply of at most
+        Not learned: an ``isl`` / ``out`` outside [0, ``MAX_TOKENS``] (or NaN), and a reply of at most
         ``SKIP_MAX_OUT`` tokens (a cache primer). A reply without a conversation id trains the
         global models only.
         """
         self._tick(t)
         self.reported += 1
         x = self._pending.pop(key, None) if key is not None else None
-        if not (is_finite_nonneg(isl) and is_finite_nonneg(out)):
+        if not (is_token_count(isl) and is_token_count(out)):
             self.invalid += 1
             return self._learned(False)
         if out <= SKIP_MAX_OUT:

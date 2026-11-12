@@ -64,8 +64,9 @@ from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.output_length_predictor import (
     OUTPUT_LENGTH_KEY,
+    PRIOR_TOKENS,
     OnlineLengthPredictor,
-    is_finite_nonneg,
+    is_token_count,
     priority_of,
 )
 from tensorrt_llm.serve.render.fingerprint import fingerprint_summary
@@ -222,6 +223,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._disagg_cluster_manager: Optional[DisaggClusterManager] = None
         # One predictor for every frontend, so that it learns from all replies.
         self._output_length_predictor: Optional[OnlineLengthPredictor] = None
+        self._output_length_errors = 0
         if config.output_length_prediction is not None:
             self._output_length_predictor = OnlineLengthPredictor(
                 config.output_length_prediction.predictor
@@ -292,7 +294,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
     def _predict_in_select(self, role: str, routing_key: Any) -> Optional[dict]:
         """Predict a generation request's output length from its routing key's ``OUTPUT_LENGTH_KEY``.
 
-        The prediction's priority replaces the key's ``priority``, so a pooled router orders by it.
+        The prediction's priority replaces the key's ``priority``, so a pooled router orders by it. A predictor
+        error gives the key the prior's priority and returns None (the frontend then uses the prior too).
         """
         if not isinstance(routing_key, dict):
             return None
@@ -305,9 +308,19 @@ class DisaggCoordinatorService(DisaggCoordinator):
         ):
             return None
         conv, isl = inputs.get("conv"), inputs.get("isl")
-        if (conv is not None and not isinstance(conv, str)) or not is_finite_nonneg(isl):
+        if (conv is not None and not isinstance(conv, str)) or not is_token_count(isl):
             return None
-        tokens, key = self._output_length_predictor.predict(conv, float(isl), time.monotonic())
+        try:
+            tokens, key = self._output_length_predictor.predict(conv, float(isl), time.monotonic())
+        except Exception as e:  # noqa: BLE001  (an admission hint is never worth failing a placement)
+            self._output_length_errors += 1
+            if self._output_length_errors <= 10 or self._output_length_errors % 1000 == 0:
+                logger.warning(
+                    f"[output_length] prediction #{self._output_length_errors} in /select failed, "
+                    f"prior used: {type(e).__name__}: {e}"
+                )
+            routing_key["priority"] = priority_of(PRIOR_TOKENS)
+            return None
         priority = priority_of(tokens)
         routing_key["priority"] = priority
         return {"tokens": tokens, "key": key, "priority": priority}

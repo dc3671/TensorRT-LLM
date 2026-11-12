@@ -48,7 +48,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._telemetry import create_uvicorn_server
 from tensorrt_llm.serve.cluster_storage import HttpClusterStorageServer
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
-from tensorrt_llm.serve.output_length_predictor import RECORD_BATCH_MAX, is_finite_nonneg
+from tensorrt_llm.serve.output_length_predictor import MAX_TOKENS, RECORD_BATCH_MAX, is_token_count
 from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -165,10 +165,10 @@ class CoordinatorServer:
         """Why a prediction's or reply's fields are invalid, or None."""
         if conv is not None and not isinstance(conv, str):
             return "conv must be a string or null"
-        if not is_finite_nonneg(isl):
-            return "isl must be a finite number >= 0"
-        if not is_finite_nonneg(out):
-            return "out must be a finite number >= 0"
+        if not is_token_count(isl):
+            return f"isl must be a finite number in [0, {MAX_TOKENS:.0f}]"
+        if not is_token_count(out):
+            return f"out must be a finite number in [0, {MAX_TOKENS:.0f}]"
         if key is not None and (not isinstance(key, int) or isinstance(key, bool)):
             return "key must be an integer or null"
         return None

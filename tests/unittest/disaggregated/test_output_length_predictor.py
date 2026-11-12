@@ -469,6 +469,35 @@ def test_non_finite_values_never_reach_the_models():
     assert olp.priority_of(float("inf")) == 0.0
 
 
+def test_out_of_range_lengths_never_reach_the_models():
+    """Finite lengths past MAX_TOKENS are invalid, and a model's log prediction is clamped before expm1."""
+    predictor = olp.OnlineLengthPredictor("ridge")
+    for i in range(300):
+        _, key = predictor.predict(f"c{i}", 1000 + i, 0.0)
+        assert predictor.record(f"c{i}", 1000 + i, 200.0 + i, key, 0.0)
+    for _ in range(2000):
+        assert not predictor.record(None, 1000, 1e308, None, 0.0)
+    assert not predictor.record(None, olp.MAX_TOKENS + 1, 100.0, None, 0.0)
+    assert not predictor.record(None, 10**400, 100.0, None, 0.0)
+    assert predictor.invalid == 2002 and predictor.learned == 300
+    with pytest.raises(ValueError, match="finite"):
+        predictor.predict(None, 1e308, 0.0)
+    for isl in (1000, 8192, 131072, olp.MAX_TOKENS):
+        tokens, _ = predictor.predict(None, isl, olp.RIDGE_REFIT_S)
+        assert 0.0 <= tokens <= olp.MAX_TOKENS * (1 + 1e-12)
+    assert predictor.ridge_fits == 1
+    # A model that extrapolates past expm1's range (log1p > 709.78) predicts MAX_TOKENS.
+    predictor.ridge.intercept = 1e4
+    tokens, _ = predictor.predict(None, 8192, olp.RIDGE_REFIT_S)
+    assert tokens == pytest.approx(olp.MAX_TOKENS)
+    predictor.ridge.intercept = -1e4
+    assert predictor.predict(None, 8192, olp.RIDGE_REFIT_S)[0] == 0.0
+    predictor.ridge.intercept = float("nan")
+    assert predictor.predict(None, 8192, olp.RIDGE_REFIT_S)[0] == olp.PRIOR_TOKENS
+    assert olp.is_token_count(olp.MAX_TOKENS) and olp.is_token_count(0)
+    assert not olp.is_token_count(olp.MAX_TOKENS + 1) and not olp.is_token_count(float("nan"))
+
+
 def test_conversationless_replies_train_the_global_models():
     predictor = olp.OnlineLengthPredictor("ridge")
     for i in range(olp.RIDGE_MIN_ROWS):

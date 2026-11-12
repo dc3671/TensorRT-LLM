@@ -111,6 +111,9 @@ def test_coordinator_server_route():
         {"op": "record", "records": [["c", 1, nan, None]]},
         {"op": "record", "records": [["c", inf, 5, None]]},
         {"op": "record", "records": [["c", 1, -5, None]]},
+        {"op": "record", "records": [[None, 1000, 1e308, None]]},
+        {"op": "record", "records": [["c", olp.MAX_TOKENS + 1, 5, None]]},
+        {"op": "predict", "conv": "c", "isl": 1e308},
         {"op": "record", "records": [["c", 1, 5]]},
         {"op": "record", "records": [["c", 1, 5, None]] * (olp.RECORD_BATCH_MAX + 1)},
     ):
@@ -295,6 +298,19 @@ async def test_select_predicts_the_output_length():
         "generation", {olp.OUTPUT_LENGTH_KEY: {"conv": None, "isl": float("nan")}}, 4, None
     )
     assert olp.OUTPUT_LENGTH_KEY not in info
+    await coordinator.finish("generation", 4)
+
+    # A predictor error never fails the placement: the request gets the prior's priority.
+    def overflow(*_args):
+        raise OverflowError("math range error")
+
+    coordinator._output_length_predictor.predict = overflow
+    routing_key = {olp.OUTPUT_LENGTH_KEY: {"conv": "c", "isl": 9000.0}}
+    server, info, _ = await coordinator.select("generation", routing_key, 5, None)
+    assert server == "g:1" and olp.OUTPUT_LENGTH_KEY not in info
+    assert routing_key["priority"] == pytest.approx(olp.priority_of(olp.PRIOR_TOKENS))
+    assert coordinator._output_length_errors == 1
+    await coordinator.finish("generation", 5)
     await coordinator.stop()
 
 
