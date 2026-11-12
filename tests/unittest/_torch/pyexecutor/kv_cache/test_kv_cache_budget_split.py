@@ -262,6 +262,7 @@ class TestSplitGpuBudgetForDraft:
         draft_model_config.mapping = creator._mapping
         creator._kv_cache_manager_cls = DraftCostKVCacheManager
         creator._is_disagg = False
+        creator._disable_overlap_scheduler = False
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
         creator._get_num_draft_layers = Mock(return_value=1)
@@ -384,6 +385,7 @@ class TestSplitGpuBudgetForDraft:
         draft_model_config.mapping = creator._mapping
         creator._kv_cache_manager_cls = RecordingKVCacheManager
         creator._is_disagg = False
+        creator._disable_overlap_scheduler = False
         creator._cache_transceiver_config = None
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
@@ -478,6 +480,7 @@ class TestSplitGpuBudgetForDraft:
         creator._max_num_tokens = 128
         creator._speculative_config = None
         creator._is_disagg = False
+        creator._disable_overlap_scheduler = False
         # The second of two pipeline ranks: it holds global layers 2 and 3.
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [2, 3]
@@ -508,6 +511,7 @@ class TestSplitGpuBudgetForDraft:
         c._is_encoder_decoder = Mock(return_value=False)
         c._kv_connector_manager = None
         c._is_disagg = False
+        c._disable_overlap_scheduler = False
         c._max_num_tokens = 8192
         c._max_beam_width = 1
         c._execution_stream = None
@@ -729,6 +733,7 @@ def test_helix_attention_dp_draft_cost_uses_the_drafter_shard(mocker):
     c._draft_config = draft_model_config
     c._kv_cache_manager_cls = ProbeKVCacheManager
     c._is_disagg = True
+    c._disable_overlap_scheduler = False
     c._is_encoder_decoder = Mock(return_value=False)
     c._should_create_separate_draft_kv_cache = Mock(return_value=True)
     c._get_num_draft_layers = Mock(return_value=5)
@@ -1562,6 +1567,7 @@ class TestExternalDrafterKvDtype:
         draft_model_config.mapping = c._mapping
         c._kv_cache_manager_cls = ProbeKVCacheManager
         c._is_disagg = True
+        c._disable_overlap_scheduler = False
         c._cache_transceiver_config = None
         c._is_encoder_decoder = Mock(return_value=False)
         c._should_create_separate_draft_kv_cache = Mock(return_value=True)
