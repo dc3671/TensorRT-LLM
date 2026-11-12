@@ -49,7 +49,7 @@ import heapq
 import json
 import math
 import os
-import subprocess
+import subprocess  # nosec B404 - runs sys.executable -I with a fixed argv, no shell
 import sys
 import threading
 import time
