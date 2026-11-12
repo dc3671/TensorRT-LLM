@@ -6602,6 +6602,20 @@ class KVCacheManagerV2(BaseResourceManager):
         """True when a suspended page has somewhere to be evicted to."""
         return len(self.impl.cache_tier_list) > 1
 
+    @property
+    def remote_donor(self) -> Optional["RemoteMemDonor"]:
+        """This rank's donation (remote_cache_config.donate_size) while this manager owns it, else None."""
+        return self._remote_donor
+
+    @property
+    def has_remote_cache_level(self) -> bool:
+        """True when this manager has a remote cache level (remote_cache_config.cache_size)."""
+        return CacheTier.REMOTE in self.impl.cache_tier_list
+
+    def remote_level_failed(self) -> bool:
+        """Whether a remote cache level of this manager failed on this rank (a transfer or its donor did)."""
+        return self.impl.remote_level_failed
+
     def has_pending_preemption(self) -> bool:
         """True while a deferred preemption is still waiting on a connector."""
         return bool(self._pending_preemption)

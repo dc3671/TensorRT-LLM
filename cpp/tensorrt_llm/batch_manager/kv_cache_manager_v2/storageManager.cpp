@@ -652,6 +652,12 @@ RemoteCacheLevelStorage* StorageManager::remoteLevel(CacheLevel level) const
     return lvl.cacheTier == CacheTier::REMOTE ? static_cast<RemoteCacheLevelStorage*>(lvl.storage.get()) : nullptr;
 }
 
+bool StorageManager::anyRemoteLevelFailed() const noexcept
+{
+    return std::any_of(
+        mRemoteClients.begin(), mRemoteClients.end(), [](auto const& client) { return client->failed(); });
+}
+
 bool StorageManager::remoteLevelFailed(CacheLevel level) const
 {
     // One flag per client while none has failed: this runs whenever a page is scheduled for eviction.

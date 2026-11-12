@@ -616,6 +616,7 @@ def make_scheduler(
     enable_recompute_pause: bool = True,
     context_scheduling_policy: ContextSchedulingPolicy = ContextSchedulingPolicy.FCFS,
     context_starvation_iterations: int | None = None,
+    recover_lost_kv_per_rank: bool = True,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -645,6 +646,7 @@ def make_scheduler(
             enable_recompute_pause=enable_recompute_pause,
             context_scheduling_policy=context_scheduling_policy,
             context_starvation_iterations=context_starvation_iterations,
+            recover_lost_kv_per_rank=recover_lost_kv_per_rank,
             **kwargs,
         )
 
@@ -1417,6 +1419,9 @@ class TestKVPagesLostToAFailedRemoteLevel:
         sched = make_scheduler(mgr, max_num_tokens=1000)
         lost = make_ctx_request(0, context_remaining_length=100)
         mgr.kv_cache_map[0] = Mock()
+        # Where the failed match left it: past the reused prefix.
+        lost.context_current_position = 64
+        lost.estimated_reusable_tokens = 64
 
         out = sched.schedule_request(
             [lost, make_ctx_request(1, context_remaining_length=100)], set()
@@ -1426,6 +1431,8 @@ class TestKVPagesLostToAFailedRemoteLevel:
         assert out.recompute_paused_requests == []
         mgr.free_resources.assert_called_once_with(lost)
         assert lost.context_current_position == 0
+        assert lost.estimated_reusable_tokens == 0
+        lost.set_prepopulated_prompt_len.assert_called_once_with(0, mgr.tokens_per_block)
         out = sched.schedule_request([lost], set())
         assert ids(out.context_requests) == [0]
 
@@ -1446,6 +1453,125 @@ class TestKVPagesLostToAFailedRemoteLevel:
         assert ids(out.context_requests) == [1]
         assert ids(out.recompute_paused_requests) == [0]
         mgr.free_resources.assert_called_once_with(lost)
+
+
+    def test_a_disagg_generation_init_request_matches_again(self):
+        """A generation-init admission whose prefix match resumed pages of a failed level costs only that request."""
+        calls = [0]
+
+        def prepare_fn(req):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise _remote_level_failed()
+            return True
+
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=1000, enable_recompute_pause=False)
+        lost = make_disagg_request(0)
+        mgr.kv_cache_map[0] = Mock()
+
+        out = sched.schedule_request([lost, make_gen_request(1)], set())
+
+        assert ids(out.generation_requests) == [1]
+        assert out.fitting_disagg_gen_init_requests == []
+        mgr.free_resources.assert_called_once_with(lost)
+        assert sched.take_lost_kv_requests() == []
+        out = sched.schedule_request([lost], set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0]
+
+    @pytest.mark.parametrize("path", ["generation", "context", "disagg_generation_init"])
+    def test_a_lockstep_rank_stops_instead_of_recovering_alone(self, path):
+        """TP/CP/PP peers did not see this rank's failure: recovering here alone would desynchronize them."""
+
+        def lose(req):
+            raise _remote_level_failed()
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lose if path == "generation" else None,
+            prepare_context_fn=lose if path == "context" else None,
+            prepare_disagg_gen_init_fn=lose if path == "disagg_generation_init" else None,
+        )
+        mgr.has_remote_cache_level = True
+        mgr.remote_level_failed.return_value = False
+        sched = make_scheduler(mgr, max_num_tokens=1000, recover_lost_kv_per_rank=False)
+        request = {
+            "generation": lambda: make_gen_request(0),
+            "context": lambda: make_ctx_request(0, context_remaining_length=100),
+            "disagg_generation_init": lambda: make_disagg_request(0),
+        }[path]()
+
+        with pytest.raises(RemoteMemError, match="lock step"):
+            sched.schedule_request([request], set())
+        mgr.free_resources.assert_not_called()
+        assert sched.take_lost_kv_requests() == []
+
+    @pytest.mark.parametrize("fails_during_pass", [False, True])
+    def test_a_lockstep_rank_stops_once_its_level_failed(self, fails_during_pass):
+        """A level that failed in an eviction WRITE, which the manager retried past, still diverged the reuse tree."""
+        mgr = make_kv_cache_manager()
+        mgr.has_remote_cache_level = True
+        failed = [not fails_during_pass]
+
+        def alloc_fn(req):
+            failed[0] = True
+            return True
+
+        mgr.try_allocate_generation.side_effect = alloc_fn
+        mgr.remote_level_failed.side_effect = lambda: failed[0]
+        sched = make_scheduler(mgr, max_num_tokens=1000, recover_lost_kv_per_rank=False)
+
+        with pytest.raises(RemoteMemError, match="lock step"):
+            sched.schedule_request([make_gen_request(0)], set())
+        assert mgr.try_allocate_generation.called == fails_during_pass
+
+    def test_a_per_rank_scheduler_never_polls_the_level(self):
+        """TP1 and attention DP recover per request: no per-pass query."""
+        mgr = make_kv_cache_manager()
+        mgr.has_remote_cache_level = True
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+
+        sched.schedule_request([make_gen_request(0)], set())
+
+        mgr.remote_level_failed.assert_not_called()
+
+    def test_the_executor_fails_lost_requests_under_the_multimodal_scheduler(self):
+        """MultimodalScheduler forwards the wrapped scheduler's lost requests to PyExecutor._schedule."""
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import MultimodalScheduler
+
+        class StopAfterLost(RuntimeError):
+            pass
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=self._lose_pages_of(1))
+        inner = make_scheduler(mgr, max_num_tokens=100, enable_recompute_pause=False)
+        lost = make_gen_request(1)
+        requests = [make_gen_request(0), lost]
+        for request in requests:
+            request.py_mm_encoder_state = None
+        executor = object.__new__(PyExecutor)
+        executor.active_requests = requests
+        executor.inflight_req_ids = set()
+        executor.kv_cache_manager = mgr
+        executor._maybe_record_hang_diagnostic_phase = Mock()
+        executor._cancelled_disagg_model_request_ids = Mock(return_value=set())
+        executor.scheduler = MultimodalScheduler(
+            inner,
+            max_batch_size=8,
+            max_num_tokens=100,
+            encoder_cache=Mock(),
+            get_item_cache_keys=lambda request: None,
+            bytes_per_encoder_embedding=2,
+            retain_cache_entries=False,
+        )
+        executor._handle_errors = Mock(side_effect=StopAfterLost)
+
+        with pytest.raises(StopAfterLost):
+            PyExecutor._schedule(executor)
+
+        executor._handle_errors.assert_called_once()
+        (message,), kwargs = executor._handle_errors.call_args
+        assert kwargs == {"requests": [lost], "charge_budget": False}
+        assert "failed remote cache level" in message
 
 
 class TestUnpairedDraftAdmission:

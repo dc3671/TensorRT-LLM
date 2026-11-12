@@ -9047,12 +9047,12 @@ class PyExecutor:
             ]
         scheduler_output = self.scheduler.schedule_request(
             scheduling_requests, self.inflight_req_ids)
-        if isinstance(self.scheduler, KVCacheV2Scheduler):
-            # Requests whose KV pages a failed remote cache level took with it, unable to recompute them here.
-            for request, error_msg in self.scheduler.take_lost_kv_requests():
-                self._handle_errors(error_msg,
-                                    requests=[request],
-                                    charge_budget=False)
+        # Requests whose KV pages a failed remote cache level took with it, unable to recompute them here; a
+        # wrapping scheduler (e.g. MultimodalScheduler) forwards them from the scheduler it wraps.
+        for request, error_msg in self.scheduler.take_lost_kv_requests():
+            self._handle_errors(error_msg,
+                                requests=[request],
+                                charge_budget=False)
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder

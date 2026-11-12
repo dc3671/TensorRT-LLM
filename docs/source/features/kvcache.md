@@ -442,9 +442,16 @@ claims instead of after a claim wait.
   the rest of the process. Its pages leave the reuse tree, nothing more is written
   to it, and the tiers above it keep serving.
 - A request whose KV cache pages were on a retired level does not fail if its
-  pages can be recomputed. If it has not computed anything yet, it is matched
-  against the cache again. If it has started, it computes its context again when
-  the executor supports recompute pause; otherwise it fails with an error.
+  pages can be recomputed. If it has not computed anything yet (including a
+  disaggregated generation request being admitted), it is matched against the
+  cache again. If it has started, it computes its context again when the
+  executor supports recompute pause; otherwise it fails with an error.
+- This per-request recovery applies where each rank schedules its own requests:
+  a single rank, or attention data parallelism. Ranks that schedule the same
+  requests in lock step (tensor parallelism without attention data parallelism,
+  context parallelism, pipeline parallelism) cannot recover a failure only some
+  of them saw: a rank whose remote level retires stops its executor with
+  `RemoteMemError`, and the server fails.
 - A transfer that never completes keeps its staging buffers and chunk claims
   until the process exits.
 

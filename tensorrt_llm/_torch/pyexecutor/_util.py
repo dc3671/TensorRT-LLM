@@ -4947,6 +4947,11 @@ def create_py_executor_resources(
             context_starvation_iterations=scheduler_config.
             context_starvation_iterations
             if scheduler_config is not None else None,
+            # Ranks that schedule the same requests in lock step cannot recover
+            # a remote cache level failure that only some of them saw.
+            recover_lost_kv_per_rank=not (
+                mapping.has_pp() or mapping.has_cp() or
+                (mapping.has_tp() and mapping.tp_group_shares_requests)),
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
