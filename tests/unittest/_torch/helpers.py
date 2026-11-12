@@ -409,3 +409,38 @@ def triton_num_compiled(kernel) -> int:
     if caches is None:
         pytest.skip("this Triton has no JITFunction.device_caches")
     return sum(len(cache[0]) for cache in caches.values())
+
+
+@triton.jit
+def _late_copy_kernel(src_ptr, dst_ptr, n, delay_ns, BLOCK: tl.constexpr):
+    # Releases its PDL dependents at entry, then copies after ~delay_ns.
+    tl.extra.cuda.gdc_launch_dependents()
+    t0 = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;",
+                                   "=l", [],
+                                   dtype=tl.int64,
+                                   is_pure=False,
+                                   pack=1)
+    t = t0
+    while t - t0 < delay_ns:
+        t = tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;",
+                                      "=l", [],
+                                      dtype=tl.int64,
+                                      is_pure=False,
+                                      pack=1)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(dst_ptr + offs, tl.load(src_ptr + offs, mask=mask), mask=mask)
+
+
+def late_copy(src: torch.Tensor, dst: torch.Tensor, delay_ns: int) -> None:
+    """``dst.copy_(src)`` by a one-program kernel that releases a PDL-launched
+    successor at entry and stores ``dst`` only ~``delay_ns`` later: a
+    successor that reads ``dst`` before its griddepcontrol.wait sees the old
+    values."""
+    assert src.is_contiguous() and dst.is_contiguous()
+    assert src.dtype == dst.dtype and src.numel() == dst.numel()
+    _late_copy_kernel[(1, )](src,
+                             dst,
+                             src.numel(),
+                             delay_ns,
+                             BLOCK=triton.next_power_of_2(src.numel()))

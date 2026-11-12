@@ -27,7 +27,12 @@ from types import SimpleNamespace
 import cloudpickle
 import pytest
 import torch
-from _torch.helpers import fast_gumbel_max_reference, gumbel_max_reference
+from _torch.helpers import (
+    fast_gumbel_max_reference,
+    gumbel_max_reference,
+    late_copy,
+    triton_num_compiled,
+)
 from mpi4py import MPI
 
 import tensorrt_llm
@@ -552,6 +557,22 @@ def _rope_gather(tp):
                 replay,
             )
         del graph
+
+        # PDL: the positions come from the immediate predecessor, which releases this launch at entry and stores
+        # them ~2 ms later; the kernel reads them (and the cos / sin rows they select) only after its wait.
+        q_len, b = 7, 3
+        qkv, positions, seq, tables = call_inputs(q_len, b, 300)
+        pool_g, pool_p = pools(b)
+        ref = run(False, q_len, b, qkv, positions, seq, tables, pool_p)
+        late = torch.zeros_like(positions)
+        late_copy(positions, late, 1000)  # compile outside the timed launch
+        torch.cuda.synchronize()
+        late.zero_()
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.barrier()
+        late_copy(positions, late, 2_000_000)
+        got = run(True, q_len, b, qkv, late, seq, tables, pool_g)
+        check(got, ref, pool_g, pool_p, ("pdl predecessor writes the positions",))
     finally:
         MPI.COMM_WORLD.barrier()
         ex.close()

@@ -564,6 +564,14 @@ def _qkv_rope_gate_fp8_append_kernel(
         weight_second = tl.load(
             weight_ptr + half_rotary + rotary_offsets, mask=rotary_mask, other=0.0
         ).to(tl.float32)
+        if GATHER:
+            ar_g = tl.arange(0, GA_G)
+            pv = tl.load(ga_peers_ptr + ar_g)
+        if PDL:
+            gdc_wait_with_memory_clobber()
+            tl.extra.cuda.gdc_launch_dependents()
+
+        # After the wait: the positions are a copy the immediate predecessor may still be writing.
         if use_mrope:
             section = tl.where(
                 (rotary_offsets % 3 == 1) & (rotary_offsets < mrope_section1 * 3),
@@ -591,12 +599,6 @@ def _qkv_rope_gate_fp8_append_kernel(
         )
         cos = tl.where(position_is_valid, cos, float("nan"))
         sin = tl.where(position_is_valid, sin, float("nan"))
-        if GATHER:
-            ar_g = tl.arange(0, GA_G)
-            pv = tl.load(ga_peers_ptr + ar_g)
-        if PDL:
-            gdc_wait_with_memory_clobber()
-            tl.extra.cuda.gdc_launch_dependents()
 
         x = tl.load(input_base + head_offsets, mask=head_mask, other=0.0).to(tl.float32)
         inverse_rms = tl.rsqrt(tl.sum(x * x, axis=0) / head_dim + eps)
