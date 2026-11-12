@@ -2023,15 +2023,25 @@ class _BasePageTableMaterializer:
 
 
 def _withdraws_remote_donation_on_error(init):
-    """Wrap ``__init__`` so a construction that raises withdraws the donation the manager took over."""
+    """Wrap ``__init__`` so a construction that raises undoes what it set up (``_abandon_construction``).
+
+    A subclass wraps its ``__init__`` too, so that its own finalization after ``super().__init__()`` is guarded; the
+    outermost wrapper does the cleanup, and ``shutdown()`` inside it leaves the donation to that cleanup.
+    """
 
     @functools.wraps(init)
     def wrapper(self, *args, **kwargs):
+        if self.__dict__.get("_guarding_construction", False):
+            init(self, *args, **kwargs)
+            return
+        self._guarding_construction = True
         try:
             init(self, *args, **kwargs)
         except BaseException as error:
-            self._close_remote_donor(error)
+            self._abandon_construction(error)
             raise
+        finally:
+            self._guarding_construction = False
 
     return wrapper
 
@@ -2042,6 +2052,8 @@ class KVCacheManagerV2(BaseResourceManager):
     _remote_donor: Optional["RemoteMemDonor"] = None
     # The remote config of a donation this manager owns, started or not; a failure leaves its marker.
     _planned_donation: Optional[RemoteCacheConfig] = None
+    # True while a __init__ wrapped by _withdraws_remote_donation_on_error runs.
+    _guarding_construction: bool = False
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -8673,6 +8685,20 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{remote_config.cache_size / (1 << 30):.2f}GiB via {remote_dir} ({remote_config.transport})"
             )
 
+    def _abandon_construction(self, error: BaseException) -> None:
+        """Undo a construction that raised `error`: withdraw the donation with it, whose failure marker tells the
+        peers counting on this donor to stop waiting, and shut the runtime down, which returns this rank's remote
+        chunk claims now rather than at garbage collection."""
+        self._close_remote_donor(error)
+        impl = self.__dict__.get("impl")
+        if impl is not None:
+            try:
+                impl.shutdown()  # a no-op when it is shut down already
+            except Exception as shutdown_error:  # noqa: BLE001 - `error` is the one to report
+                logger.warning(
+                    f"KV cache manager v2: shutting down after a failed construction failed: {shutdown_error!r}"
+                )
+
     def _close_remote_donor(self, error: Optional[BaseException] = None) -> None:
         """Withdraw this rank's donation: clients still holding its chunks fail their next transfer. With `error`, leave
         the donation's failure marker too, also for a donation that never started, so that peers stop waiting for it."""
@@ -9095,7 +9121,10 @@ class KVCacheManagerV2(BaseResourceManager):
         try:
             self._shutdown_caches()
         finally:
-            self._close_remote_donor()
+            # A construction that shuts down on an error withdraws the donation with that error itself
+            # (_abandon_construction), so that its failure marker tells peers to stop waiting.
+            if not self._guarding_construction:
+                self._close_remote_donor()
         # Shut the streaming event manager down last so removals emitted during
         # cache / impl teardown (via the radix tree's own event-manager
         # reference) are still flushed before the publisher stops. Do not null

@@ -46,6 +46,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _swa_endpoint_priority,
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
+    _withdraws_remote_donation_on_error,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
@@ -420,6 +421,7 @@ def _make_manager_for_cache_tier_test(
     dtype: DataType = DataType.HALF,
     layer_specs: list[KVCacheLayerSpec] | None = None,
     remote_donor: object | None = None,
+    manager_cls: type = KVCacheManagerV2,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -470,7 +472,7 @@ def _make_manager_for_cache_tier_test(
         patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
         patch(f"{module}.get_pp_layers", return_value=([0], 1)),
     ):
-        manager = KVCacheManagerV2(
+        manager = manager_cls(
             kv_cache_config,
             CacheType.SELFKONLY,
             num_layers=1,
@@ -1996,6 +1998,46 @@ class TestRemoteTierInitStatus:
         ):
             _make_manager_for_cache_tier_test(self._config(tmp_path, donate_size=1 << 30), [Mock()])
         assert str(donor.close.call_args.args[0]) == "late failure"
+
+    @pytest.mark.cpu_only
+    def test_a_subclass_that_fails_after_the_base_init_withdraws_the_donation_with_its_error(
+        self, tmp_path
+    ) -> None:
+        """E.g. MambaHybridCacheManagerV2 whose state pool comes out too small: it shuts down and raises after
+        KVCacheManagerV2.__init__. The donation is withdrawn with that error, whose marker tells peers to stop
+        waiting for this donor, not closed quietly by the shutdown."""
+        donor, add_remote_level = self._starting_donor()
+
+        class FinalizesAfterTheBaseInit(KVCacheManagerV2):
+            @_withdraws_remote_donation_on_error
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                KVCacheManagerV2.shutdown(self)
+                raise ValueError("state pool too small")
+
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ),
+            pytest.raises(ValueError, match="state pool too small"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, donate_size=1 << 30),
+                [Mock()],
+                manager_cls=FinalizesAfterTheBaseInit,
+            )
+        donor.close.assert_called_once()
+        assert str(donor.close.call_args.args[0]) == "state pool too small"
+
+    @pytest.mark.cpu_only
+    def test_the_mamba_hybrid_manager_guards_its_own_finalization(self) -> None:
+        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
+            MambaHybridCacheManagerV2,
+        )
+
+        assert hasattr(MambaHybridCacheManagerV2.__init__, "__wrapped__")
 
     @pytest.mark.cpu_only
     def test_shutdown_withdraws_the_donation_when_a_deferred_close_raises(self, tmp_path) -> None:
