@@ -23,8 +23,9 @@ block and the request-order table.
 TMEM (128 columns): 0-15 state x [k|q], 16-31 Gram ([k|q|kh] x [k|q]), 32-47 history products, 64-127 fold chunk 0
 (kd 0-63); fold chunk 1 (kd 64-127) reuses 0-63 once the output path has read 0-47.
 
-PDL: barrier init, TMEM alloc, the order table and the first pair's scalar loads and TMA run before
-griddepcontrol.wait; dependents are released when each CTA starts its last pair.
+PDL (``TRTLLM_ENABLE_PDL``, default on): barrier init, TMEM alloc, the order table and the first pair's scalar loads
+and TMA run before griddepcontrol.wait; dependents are released when each CTA starts its last pair. With PDL off the
+kernel is launched without the programmatic attribute, which makes both instructions no-ops.
 
 Precision: every stage has the arithmetic and roundings of ``trtllm::gdn_verify``; results differ from it only
 through the MMA accumulation order (tcgen05 instead of mma.sync) and the gated norm's 128-column sum order.
@@ -43,6 +44,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as MT
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
+
+from ...flashinfer_utils import get_env_enable_pdl
 
 D = 128
 HIST = 16
@@ -1365,6 +1368,7 @@ def _launch(
     T_: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
     HK: cutlass.Constexpr[int],
+    PDL: cutlass.Constexpr[bool],
 ):
     BF = cutlass.BFloat16
     sw = cuda_exp.TensorMapSwizzle.s128b
@@ -1434,14 +1438,14 @@ def _launch(
         grid=(n_ctas, 1, 1),
         block=(NTHR, 1, 1),
         stream=stream,
-        use_pdl=True,
+        use_pdl=PDL,
         min_blocks_per_mp=CTAS_PER_SM,
         max_number_threads=[NTHR, 1, 1],
     )
 
 
 @functools.lru_cache(maxsize=None)
-def _compiled(T_: int, HV: int, HK: int):
+def _compiled(T_: int, HV: int, HK: int, use_pdl: bool):
     mk = cute.runtime.make_fake_compact_tensor
     bf, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
     return cute.compile(
@@ -1474,6 +1478,7 @@ def _compiled(T_: int, HV: int, HK: int):
         T_=T_,
         HV=HV,
         HK=HK,
+        PDL=use_pdl,
         options="--enable-tvm-ffi",
     )
 
@@ -1497,8 +1502,8 @@ def gdn_verify_tcgen05_supported(T: int, HV: int, HK: int, fp8_out: bool) -> boo
 
 
 def compile_gdn_verify_tcgen05(T: int, HV: int, HK: int, device=None) -> None:
-    """Compile (and cache) the kernel for (T, HV, HK) ahead of any call, e.g. at model construction, so that no
-    compilation runs inside a warm-up or a CUDA-graph capture."""
+    """Compile (and cache) the kernel for (T, HV, HK) and the current ``TRTLLM_ENABLE_PDL`` ahead of any call, e.g. at
+    model construction, so that no compilation runs inside a warm-up or a CUDA-graph capture."""
     assert gdn_verify_tcgen05_supported(T, HV, HK, True), (T, HV, HK)
     dev = (
         torch.device("cuda", torch.cuda.current_device())
@@ -1507,7 +1512,7 @@ def compile_gdn_verify_tcgen05(T: int, HV: int, HK: int, device=None) -> None:
     )
     index = dev.index if dev.index is not None else torch.cuda.current_device()
     with torch.cuda.device(index):
-        _compiled(T, HV, HK)
+        _compiled(T, HV, HK, get_env_enable_pdl())
     _num_sms(index)
 
 
@@ -1560,7 +1565,7 @@ def gdn_verify_tcgen05(
     dev = x.device.index if x.device.index is not None else torch.cuda.current_device()
     n_pairs = n * HV
     n_ctas = min(n_pairs, CTAS_PER_SM * _num_sms(dev))
-    fn = _compiled(T_, HV, HK)
+    fn = _compiled(T_, HV, HK, get_env_enable_pdl())
     fn(
         _one(x),
         _one(z),

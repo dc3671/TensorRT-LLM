@@ -9,6 +9,7 @@ the committed state and the histories to bf16 rounding. A replay from the same i
 import pytest
 import torch
 
+from tensorrt_llm._torch.kernels.blackwell import gdn_verify_tcgen05 as gdn_verify_module
 from tensorrt_llm._torch.kernels.blackwell.gdn_verify_tcgen05 import (
     compile_gdn_verify_tcgen05,
     gdn_verify_tcgen05,
@@ -172,3 +173,35 @@ def test_gdn_verify_tcgen05_matches_gdn_verify_across_draft_lengths(t, pnat, n):
     assert _rel(m["old_k"], m_ref["old_k"]) < 1e-2
     assert torch.allclose(m["old_g"], m_ref["old_g"], rtol=1e-5, atol=1e-6)
     assert _rel(m["ssm"], m_ref["ssm"]) < 1e-3
+
+
+@skip_no_sm100f
+def test_gdn_verify_tcgen05_honours_enable_pdl(monkeypatch):
+    """TRTLLM_ENABLE_PDL=0 compiles and launches the kernel without PDL; the results are bitwise those with PDL."""
+    H, HV = 2, 8
+    n = 52
+    compile_pdl = []
+    real_compile = gdn_verify_module.cute.compile
+
+    def recording_compile(*args, **kwargs):
+        compile_pdl.append(kwargs.get("PDL"))
+        return real_compile(*args, **kwargs)
+
+    monkeypatch.setattr(gdn_verify_module.cute, "compile", recording_compile)
+    gdn_verify_module._compiled.cache_clear()
+    HV, cd, proj, ba, st, mut = _verify_case((H, HV), n, _T, 0)
+    st["pnat"][st["state_indices"][::3].long()] = 12
+    results = {}
+    try:
+        for env in ("1", "0"):
+            monkeypatch.setenv("TRTLLM_ENABLE_PDL", env)
+            compile_gdn_verify_tcgen05(_T, HV, H)
+            results[env] = _verify_op(gdn_verify_tcgen05, HV, cd, n, _T, proj, ba, st, mut)
+        torch.cuda.synchronize()
+    finally:
+        gdn_verify_module._compiled.cache_clear()
+    assert compile_pdl == [True, False]
+    (y_on, m_on), (y_off, m_off) = results["1"], results["0"]
+    assert torch.equal(y_on.view(torch.uint8), y_off.view(torch.uint8))
+    for k in m_on:
+        assert torch.equal(m_on[k], m_off[k]), k
