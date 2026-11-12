@@ -1195,6 +1195,96 @@ class TestBuildManagersBudgetGates:
         targets[-1].shutdown.assert_called_once_with()
         assert resources == {}
 
+    @staticmethod
+    def _published_donor(directory: str):
+        """A real donation published in `directory` by a transport that allocates nothing."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
+
+        class PublishingTransport(remote_donor.DonorTransport):
+            kind = "test"
+
+            def start(self, donor):
+                donor._publish([], ["segment 0 1"], "test")
+
+        donor = remote_donor.RemoteMemDonor(
+            directory, 1 << 30, PublishingTransport(), chunk_bytes=1 << 30
+        )
+        donor.start()
+        return donor
+
+    @staticmethod
+    def _target_owning(donor):
+        """A final target manager that owns `donor`, with the real shutdown()."""
+        target = KVCacheManagerV2.__new__(KVCacheManagerV2)
+        target._remote_donor = donor
+        target._shutdown_caches = Mock()
+        target.event_manager = None
+        return target
+
+    @pytest.mark.parametrize("estimation", [True, False], ids=["estimation", "no_estimation"])
+    def test_a_failed_draft_build_marks_the_targets_donation(
+        self, estimation, tmp_path, monkeypatch
+    ):
+        """Peers waiting for expected_num_donors stop at the failure marker; an unmarked withdrawal makes them wait the
+        full donor_wait_timeout_s. Without the estimation the target starts the donation itself."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
+
+        directory = str(tmp_path / "rendezvous")
+        remote_donor.ensure_rendezvous_directory(directory)
+        early = self._published_donor(directory) if estimation else None
+        monkeypatch.setattr(remote_donor, "start_donation", lambda config, device: early)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._skip_est = not estimation
+        c.configure_kv_cache_capacity = Mock()
+        c._kv_cache_config = KvCacheConfig(
+            max_gpu_total_bytes=10 * GB,
+            host_cache_size=0,
+            remote_cache_config={"directory": directory, "donate_size": 1 << 30},
+        )
+        c._create_kv_cache_manager.side_effect = lambda estimating, **kwargs: (
+            Mock()
+            if estimating
+            else self._target_owning(kwargs["remote_donor"] or self._published_donor(directory))
+        )
+        resources = {}
+        if estimation:
+            c.build_managers(resources, estimating_kv_cache=True)
+            resources.clear()  # the probe's teardown
+        c._create_one_model_draft_kv_cache_manager.side_effect = RuntimeError("draft OOM")
+
+        with pytest.raises(RuntimeError, match="draft OOM"):
+            c.build_managers(resources, estimating_kv_cache=False)
+
+        published, failed = remote_donor.scan_donors(directory)
+        assert published == []
+        assert len(failed) == 1 and "draft OOM" in failed[0]["error"]
+        c.close_remote_donor(
+            RuntimeError("creator cleanup")
+        )  # the creator's failure path marks nothing twice
+        assert len(remote_donor.scan_donors(directory)[1]) == 1
+        assert "draft OOM" in remote_donor.scan_donors(directory)[1][0]["error"]
+
+    def test_without_estimation_the_draft_waits_for_the_targets_own_donation(
+        self, tmp_path, monkeypatch
+    ):
+        """Skipping the estimation (TRTLLM_SKIP_KV_CACHE_ESTIMATION, sparse-offload decode workers), the target starts
+        the donation itself; a separate draft that does not get it charges the donation a second time."""
+        c, _, _ = self._gen_style_donation(tmp_path, monkeypatch)
+        c._skip_est = True
+        c.configure_kv_cache_capacity = Mock()
+        own = Mock()
+        c._create_kv_cache_manager.side_effect = lambda *args, **kwargs: SimpleNamespace(
+            _remote_donor=own
+        )
+
+        c.build_managers({}, estimating_kv_cache=False)
+
+        assert c._create_one_model_draft_kv_cache_manager.call_args.kwargs["remote_donor"] is own
+        error = RuntimeError("rebind failed")
+        c.close_remote_donor(error)  # a later startup failure still marks it
+        own.close.assert_called_once_with(error)
+
     def test_cross_manager_neither_claims_nor_donates(self, tmp_path):
         """The self-attention manager owns the rank's remote level and donation; a cross manager with the config would
         donate and claim a second time."""

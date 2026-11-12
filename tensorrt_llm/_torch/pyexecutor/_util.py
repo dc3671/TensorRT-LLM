@@ -3651,8 +3651,11 @@ class KvCacheCreator:
             remote_donor=early_donor,
         )
         if not estimating_kv_cache:
-            # The manager owns it now; kept only to mark it should startup fail after this.
-            self._handed_remote_donor, self._remote_donor = self._remote_donor, None
+            # The manager owns it now, or the donation it started itself when the estimation was skipped; kept only
+            # to mark it should startup fail after this. The draft waits for either and does not charge it again.
+            if early_donor is None:
+                early_donor = getattr(kv_cache_manager, "_remote_donor", None)
+            self._handed_remote_donor, self._remote_donor = early_donor, None
         try:
             draft_kv_cache_manager, cross_kv_cache_manager = (
                 self._build_secondary_managers(
@@ -3660,8 +3663,10 @@ class KvCacheCreator:
                     estimating_kv_cache, self_kv_cache_config,
                     draft_kv_cache_config, cross_kv_cache_config,
                     cold_page_codec_provider, early_donor))
-        except BaseException:
-            # Nothing holds the target manager yet; shutting it down withdraws its donation.
+        except BaseException as error:
+            # Nothing holds the target manager yet: withdraw its donation with the failure marker, then shut it down.
+            if not estimating_kv_cache:
+                self.close_remote_donor(error)
             if kv_cache_manager is not None:
                 kv_cache_manager.shutdown()
             raise
