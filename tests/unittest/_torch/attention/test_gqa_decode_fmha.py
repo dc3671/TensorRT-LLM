@@ -722,6 +722,7 @@ def _generation_call(
         max_context_length=1,
         num_ctx_tokens=0,
         num_contexts=0,
+        num_generations=num_requests,
         is_cuda_graph=False,
     )
     workspace = torch.empty(0, dtype=torch.int8, device=dev)
