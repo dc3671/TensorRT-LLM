@@ -72,6 +72,25 @@ std::optional<std::string> readDonorFile(std::filesystem::path const& path)
     return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
 }
 
+//! The transport a donor's .failed file names, or nullopt when it names none.
+std::optional<std::string> failedDonorTransport(std::string const& text)
+{
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line))
+    {
+        std::istringstream fields(line);
+        std::string key;
+        std::string value;
+        fields >> key >> value;
+        if (key == "transport")
+        {
+            return value;
+        }
+    }
+    return std::nullopt;
+}
+
 //! Bounds on what a donor's .meta may declare, so a malformed file cannot make a client allocate without limit.
 constexpr uint64_t kMinChunkBytes = 1ULL << 20;
 constexpr uint64_t kMaxChunksPerDonor = 1ULL << 20;
@@ -141,14 +160,16 @@ void RemoteMemClient::refreshDonors()
         else if (file.size() > kDonorPrefix.size() + kFailedSuffix.size() && file.starts_with(kDonorPrefix)
             && file.ends_with(kFailedSuffix))
         {
-            ++failed;
+            // A failed donor of another transport is not one of the donors this client counts on.
+            auto const text = readDonorFile(entry.path());
+            auto const transport = text ? failedDonorTransport(*text) : std::nullopt;
+            failed += !transport || *transport == mBackend->kind() ? 1 : 0;
         }
     }
     if (ec)
     {
         throw RemoteMemError("KVCM2 remote level: cannot list " + mOptions.directory + ": " + ec.message());
     }
-    mReportedDonors = ready.size() + failed;
     std::sort(ready.begin(), ready.end());
     for (auto& donor : mDonors)
     {
@@ -159,7 +180,7 @@ void RemoteMemClient::refreshDonors()
     }
     for (auto const& name : ready)
     {
-        if (mDonorIndex.count(name) != 0)
+        if (mDonorIndex.count(name) != 0 || mForeignDonors.count(name) != 0)
         {
             continue;
         }
@@ -221,7 +242,8 @@ void RemoteMemClient::refreshDonors()
                 donor.segments.emplace_back(base, bytes);
             }
         }
-        if (version != 1 || agentName != name || donor.chunkBytes == 0 || donor.segments.empty())
+        // Donors publish one segment (remote_donor.py): more could overlap or sum past the chunk bound.
+        if (version != 1 || agentName != name || donor.chunkBytes == 0 || donor.segments.size() != 1)
         {
             TLLM_LOG_WARNING("KVCM2 remote level: ignoring donor %s: malformed meta (version %d, name '%s')",
                 name.c_str(), version, agentName.c_str());
@@ -229,17 +251,16 @@ void RemoteMemClient::refreshDonors()
         }
         if (transport != mBackend->kind())
         {
-            TLLM_LOG_WARNING("KVCM2 remote level: ignoring donor %s: it donates over %s, this client uses %s",
+            TLLM_LOG_WARNING(
+                "KVCM2 remote level: ignoring donor %s: it donates over %s, this client uses %s; it is not counted as "
+                "one of the expected donors",
                 name.c_str(), transport.c_str(), mBackend->kind());
+            mForeignDonors.insert(name);
             continue;
         }
-        uint64_t numChunks = 0;
-        bool segmentsValid = donor.chunkBytes >= kMinChunkBytes;
-        for (auto const& [base, bytes] : donor.segments)
-        {
-            segmentsValid = segmentsValid && base <= UINT64_MAX - bytes;
-            numChunks += segmentsValid ? bytes / donor.chunkBytes : 0;
-        }
+        auto const [segmentBase, segmentBytes] = donor.segments.front();
+        bool const segmentsValid = donor.chunkBytes >= kMinChunkBytes && segmentBase <= UINT64_MAX - segmentBytes;
+        uint64_t const numChunks = segmentsValid ? segmentBytes / donor.chunkBytes : 0;
         if (!segmentsValid || numChunks > kMaxChunksPerDonor)
         {
             TLLM_LOG_WARNING("KVCM2 remote level: ignoring donor %s: chunk size %llu B or its segments out of bounds",
@@ -270,6 +291,10 @@ void RemoteMemClient::refreshDonors()
         mDonorIndex.emplace(name, mDonors.size());
         mDonors.push_back(std::move(donor));
     }
+    // Counted once the new ready donors are parsed: a donor of another transport is not reported to this client.
+    mReportedDonors = failed
+        + static_cast<size_t>(std::count_if(
+            ready.begin(), ready.end(), [this](std::string const& name) { return mForeignDonors.count(name) == 0; }));
 }
 
 bool RemoteMemClient::stillPublished(RemoteDonor& donor)

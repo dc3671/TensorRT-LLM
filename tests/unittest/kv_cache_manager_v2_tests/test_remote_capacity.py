@@ -55,14 +55,17 @@ finally:
 _GIB = 1 << 30
 
 
-def _publish(directory, name, gib, chunk_gib=1, short_gib=0, host="hostA", extra=()):
+def _publish(
+    directory, name, gib, chunk_gib=1, short_gib=0, host="hostA", extra=(), transport="fabric"
+):
     lines = [
         "version 1",
         f"name {name}",
         f"host {host}",
         "pid 1",
         f"chunk_bytes {chunk_gib * _GIB}",
-        "transport fabric",
+        # A NIXL donor's .meta names no transport.
+        *([f"transport {transport}"] if transport != "nixl" else []),
         "numa 0",
         f"segment 0 {gib * _GIB}",
         *extra,
@@ -94,6 +97,24 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertEqual([f["name"] for f in failed], ["c"])
         self.assertEqual(failed[0]["planned_bytes"], 160 * _GIB)
         self.assertIn("OUT_OF_MEMORY", failed[0]["error"])
+
+    def test_only_donors_of_the_clients_transport_count(self):
+        """Clients skip donors of another transport, so their capacity does not cover the need."""
+        _publish(self.dir, "fabric", 160)
+        _publish(self.dir, "nixl", 40, transport="nixl")
+        check_remote_capacity(self.dir, 2, 100 * _GIB, timeout_s=10, log=lambda _: None)
+        with self.assertRaises(RuntimeError) as ctx:
+            check_remote_capacity(
+                self.dir,
+                2,
+                100 * _GIB,
+                transport="nixl",
+                timeout_s=0.2,
+                poll_s=0.05,
+                log=lambda _: None,
+            )
+        self.assertIn("1 of 2 planned donors published 40 GiB", str(ctx.exception))
+        self.assertIn("donate_size", str(ctx.exception))
 
     def test_passes_when_offer_covers_need(self):
         for i in range(8):

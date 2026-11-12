@@ -37,6 +37,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -158,10 +159,11 @@ private:
     std::vector<RemoteChunk> mFreeChunks;
     std::vector<std::string> mClaims;
     uint64_t mClaimedBytes = 0;
-    size_t mReportedDonors = 0;  // donors with a .ready or .failed file at the last refresh
-    std::string mLastClaimError; // why the last donor was withdrawn at claim time
+    size_t mReportedDonors = 0; // donors of this transport with a .ready or .failed file at the last refresh
+    std::unordered_set<std::string> mForeignDonors; // ready donors of another transport, passed over
+    std::string mLastClaimError;                    // why the last donor was withdrawn at claim time
     bool mAbandoned = false;
-    std::string mFailure;        // the first transfer failure
+    std::string mFailure;                           // the first transfer failure
     std::atomic<bool> mFailed{false};
 };
 

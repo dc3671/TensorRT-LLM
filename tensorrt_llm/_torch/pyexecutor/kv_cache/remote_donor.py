@@ -500,6 +500,8 @@ def scan_donors(directory: str):
                     {
                         "name": name,
                         "host": fields.get("host", "?"),
+                        # The NIXL transport's .meta predates the field.
+                        "transport": fields.get("transport", "nixl"),
                         "offered_bytes": offered,
                         "short_bytes": int(fields.get("short_bytes", 0)),
                         "numa_chunks": fields.get("numa_chunks", ""),
@@ -511,6 +513,7 @@ def scan_donors(directory: str):
                     {
                         "name": name,
                         "host": fields.get("host", "?"),
+                        "transport": fields.get("transport"),
                         "planned_bytes": int(fields.get("planned_bytes", 0)),
                         "error": fields.get("error", "?"),
                     }
@@ -526,18 +529,25 @@ def check_remote_capacity(
     need_bytes: int,
     *,
     timeout_s: float,
+    transport: Optional[str] = None,
     poll_s: float = 2.0,
     log=None,
 ) -> dict:
     """Wait until `num_donors` donors have published or failed (at most `timeout_s`), or until they offer
     `need_bytes`, then raise if the offer falls short, naming the failed and short donors. A job whose donors cannot
-    cover its clients thus stops when the last donor reports instead of after the clients' claim wait."""
+    cover its clients thus stops when the last donor reports instead of after the clients' claim wait.
+
+    With `transport`, only donors of that transport count, as the clients skip the others; a failure marker that
+    names no transport counts."""
     log = log or _log
     need = need_bytes
     expected = num_donors
     deadline = time.monotonic() + timeout_s
     while True:
         published, failed = scan_donors(directory)
+        if transport is not None:
+            published = [p for p in published if p["transport"] == transport]
+            failed = [f for f in failed if f["transport"] in (None, transport)]
         offered = sum(p["offered_bytes"] for p in published)
         reported = len(published) + len(failed)
         if offered >= need or reported >= expected or time.monotonic() >= deadline:
@@ -558,6 +568,8 @@ def check_remote_capacity(
         raise RuntimeError(
             f"KVCM2 remote level capacity check failed in {directory}: {summary}"
             + (f". {'; '.join(notes)}" if notes else "")
+            + ". Raise remote_cache_config.donate_size or the number of donating ranks (expected_num_donors), "
+            "lower cache_size (expected_claim_size), or for the fabric transport lower donor_reserve_size."
         )
     log(f"KVCM2 remote level capacity check passed in {directory}: {summary}")
     return {"published": published, "failed": failed, "offered_bytes": offered, "need_bytes": need}

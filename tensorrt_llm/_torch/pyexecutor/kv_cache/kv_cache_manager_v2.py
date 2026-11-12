@@ -8661,6 +8661,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     remote_dir,
                     remote_config.expected_num_donors,
                     remote_config.expected_claim_size,
+                    transport=remote_config.transport,
                     timeout_s=remote_config.donor_wait_timeout_s,
                     log=logger.info,
                 )
@@ -10017,7 +10018,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return self.impl.probe_first_new_block_key(scope, tokens)
 
     def prefetch_for_context_tokens(self, requests: list) -> bool:
-        """Prefetch radix-tree blocks from disk→host for upcoming context requests.
+        """Prefetch radix-tree blocks from a cold level (disk or remote) to the host for upcoming context requests.
 
         Returns True if all prefetches succeeded, False if any failed.
         """
@@ -10039,7 +10040,8 @@ class KVCacheManagerV2(BaseResourceManager):
             except RemoteMemError as error:
                 # A failed remote level has retired; its pages drop from the tree, so the request recomputes them.
                 logger.warning(f"prefetch for request {req.py_request_id} failed: {error}")
-                prefetched = False
+                success = False
+                continue
             if not prefetched:
                 logger.warning("prefetch failed for request %s", req.py_request_id)
                 success = False
