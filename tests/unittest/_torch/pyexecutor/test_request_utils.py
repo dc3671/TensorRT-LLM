@@ -1687,7 +1687,7 @@ def test_executor_request_to_llm_request_adopts_return_routed_experts() -> None:
 
 class TestBroadcasterClock:
     """RequestBroadcaster(sync_clock=True): rank 0's clock and aux ride along
-    with the request count."""
+    with the request count, or in the single-round envelope."""
 
     def _dist(self, rank, world_size=2):
         dist = Mock()
@@ -1712,17 +1712,34 @@ class TestBroadcasterClock:
         assert list(values) == [0]
         assert b.rank0_now is None
 
-    def test_sync_clock_keeps_the_count_probe(self):
-        """The single-round broadcast has no room for the clock."""
-        for sync_clock, probes in ((False, 0), (True, 1)):
+    def test_sync_clock_rides_the_single_round(self):
+        """With the single-round transport, the clock and aux travel in the envelope: one call, no count probe."""
+        items = [_make_broadcast_item(3)]
+        for received, want in (((1_000_000, 170_000, None), []), ((2_000_000, -1, items), items)):
             dist = self._dist(rank=1)
             dist.supports_single_round_broadcast = True
-            dist.broadcast_or_none = Mock(return_value=None)
-            dist.broadcast_int64 = Mock(return_value=[0, 1_000_000, -1])
-            b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=sync_clock)
-            assert b.broadcast([]) == []
-            assert dist.broadcast_int64.call_count == probes
-            assert dist.broadcast_or_none.call_count == 1 - probes
+            dist.broadcast_or_none = Mock(return_value=received)
+            dist.broadcast_int64 = Mock()
+            b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=True)
+            b.aux = 9.0  # ignored off rank 0
+            assert b.broadcast([]) == want
+            dist.broadcast_int64.assert_not_called()
+            assert dist.broadcast_or_none.call_count == 1
+            assert dist.broadcast_or_none.call_args.args[0] is None
+            assert b.rank0_now == pytest.approx(received[0] / 1e6)
+            assert b.rank0_aux == (None if received[1] < 0 else pytest.approx(0.17))
+
+    def test_sync_clock_single_round_root_sends_clock_every_iteration(self):
+        items = [_make_broadcast_item(1)]
+        for new_requests, payload in (([], None), (items, items)):
+            dist = _SingleRoundDist(rank=0)
+            b = RequestBroadcaster(dist, MagicMock(), sync_clock=True)
+            b.aux = 0.25
+            assert b.broadcast(new_requests) == new_requests
+            assert len(dist.calls) == 1
+            kind, (now_us, aux_us, sent) = dist.calls[0]
+            assert kind == "broadcast_or_none" and aux_us == 250_000 and sent == payload
+            assert b.rank0_now == pytest.approx(now_us / 1e6) and b.rank0_aux == pytest.approx(0.25)
 
     def test_default_probe_pp_forwards_count(self):
         dist = self._dist(rank=4, world_size=8)
