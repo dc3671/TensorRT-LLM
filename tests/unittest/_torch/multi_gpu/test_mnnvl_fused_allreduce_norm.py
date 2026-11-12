@@ -71,13 +71,13 @@ def _check(got, ref, tag, rtol=2e-2):
     )
 
 
-def _mnnvl(tp, hidden=H):
+def _mnnvl(tp, hidden=H, max_num_tokens=max(ROWS)):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     os.environ["TLLM_TEST_MNNVL"] = "1"
     MPI.COMM_WORLD.barrier()
     mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
-    ar = MNNVLAllReduce(mapping, torch.bfloat16, max_num_tokens=max(ROWS), hidden_size=hidden)
+    ar = MNNVLAllReduce(mapping, torch.bfloat16, max_num_tokens=max_num_tokens, hidden_size=hidden)
     assert MnnvlAllReduceNorm.is_supported(mapping, torch.bfloat16, hidden)
     assert ar.fused_norm is not None, "CuTe DSL kernels not built"
     return ar, rank
@@ -400,18 +400,21 @@ def _gemm_norm_cases(tp, k=1024):
             _check(res, ref_res, ("gemm residual", m, fp8_payload))
 
 
-def _gemm_twoshot_cases(tp, k=1024):
+def _gemm_twoshot_cases(
+    tp, k=1024, max_num_tokens=max(ROWS), rows=(9, 17, 33, 56, 64, 65, 96, 128), required=False
+):
     """The tcgen05 FP8 GEMM + two-shot all-reduce + norm launch (GemmTwoShotAllReduceNorm) over its rows, with and
     without the FP8 output, and an E4M3 or BF16 input."""
-    ar, rank = _mnnvl(tp)
+    ar, rank = _mnnvl(tp, max_num_tokens=max_num_tokens)
     assert ar.gemm_twoshot is not None, "GEMM + two-shot all-reduce + norm kernel not built"
     norm_weight = _rand((H,), 5, 0.1) + 1
     weight_scale = torch.tensor([0.02], dtype=torch.float32, device="cuda")
     input_scale = torch.tensor([4.0 / 448], dtype=torch.float32, device="cuda")
     scale = torch.tensor([0.05], dtype=torch.float32, device="cuda")
     probe = torch.empty((H, k), dtype=torch.float8_e4m3fn, device="cuda")
-    for m in (9, 17, 33, 56, 64, 65, 96, 128):
+    for m in rows:
         if not ar.gemm_twoshot.takes(m, probe):
+            assert not required, ("GEMM + two-shot refused", m)
             continue
         outs, args = [], None
         for r in range(tp):
@@ -455,6 +458,21 @@ def _gemm_twoshot_cases(tp, k=1024):
         norm, fp8, res = ar.gemm_twoshot_allreduce_norm(xq, w, weight_scale, input_scale, params)
         _check(norm, ref_norm, ("gemm two-shot norm with fp8", m))
         _check(fp8.float() * scale, ref_norm.clamp(-448 * 0.05, 448 * 0.05), ("fp8", m), rtol=7e-2)
+
+
+def _gemm_twoshot_large_workspace_cases(tp, k=1024):
+    """The GEMM + two-shot launch on a Lamport buffer of 2 GiB (max_num_tokens 131072 at H 4096), whose size and
+    offsets the kernel must read as unsigned, over consecutive calls that cycle through all three buffers."""
+    from tensorrt_llm._torch.distributed.ops import _MNNVL_ONE_SHOT_THRESHOLD_BYTES as one_shot
+    from tensorrt_llm._torch.kernels.blackwell import gemm_twoshot_allreduce_norm as kern
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    min_rows = one_shot // (H * tp * 2) + 1
+    fits = [m for m in range(1, kern.MAX_ROWS + 1) if kern.supports_rows(m, H, tp, sms, min_rows)]
+    if not fits:  # TP2: no row takes the kernel
+        return
+    rows = (fits[0], fits[len(fits) // 2], fits[-1])
+    _gemm_twoshot_cases(tp, k, max_num_tokens=131072, rows=rows, required=True)
 
 
 def test_gemm_twoshot_rows() -> None:
@@ -651,6 +669,7 @@ CASES = {
     "large_moe_fold": _large_moe_fold_cases,
     "gemm_norm": _gemm_norm_cases,
     "gemm_twoshot": _gemm_twoshot_cases,
+    "gemm_twoshot_large_workspace": _gemm_twoshot_large_workspace_cases,
     "tp2": _tp2_cases,
     "meta_init": _meta_init_cases,
     "opt_in": _opt_in_cases,

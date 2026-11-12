@@ -194,6 +194,13 @@ def _shfl_idx(x: Float32, src: Int32, *, loc=None, ip=None) -> Float32:
 
 
 @cute.jit
+def _flag_u32(word: Int32) -> Int64:
+    """A ``buffer_flags`` word (uint32 on the host, held as Int32 here) zero-extended: the buffer and clear sizes
+    reach 4 GiB."""
+    return Int64(word) & Int64(0xFFFFFFFF)
+
+
+@cute.jit
 def _clear_dirty(
     own: Int64,
     fl,
@@ -209,8 +216,8 @@ def _clear_dirty(
         if Int32(s_i) < dirty_stages:
             stage_bytes = buf_bytes // Int64(dirty_stages)
             stage = own + (Int64(dirty) * Int64(dirty_stages) + Int64(s_i)) * stage_bytes
-            sb = fl.subview(4 + s_i).load()
-            clear_vecs = (Int64(sb) + Int64(15)) // Int64(16)
+            sb = _flag_u32(fl.subview(4 + s_i).load())
+            clear_vecs = (sb + Int64(15)) // Int64(16)
             c = gtid
             while c < clear_vecs:
                 _st_v4(stage + c * Int64(16), neg0, neg0, neg0, neg0)
@@ -459,7 +466,7 @@ def _kernel(
 
     cur = fl.subview(0).load()
     dirty = fl.subview(1).load()
-    buf_bytes = Int64(fl.subview(2).load())
+    buf_bytes = _flag_u32(fl.subview(2).load())
     dirty_stages = fl.subview(3).load()
     data_off = Int64(cur) * buf_bytes
     half = buf_bytes // Int64(2)
