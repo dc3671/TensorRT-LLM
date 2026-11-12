@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Gated DeltaNet MTP target-verify step on tcgen05: ``trtllm::gdn_verify`` (same 16 arguments) with FP8 output.
+"""Gated DeltaNet MTP target-verify step on tcgen05: ``trtllm::gdn_verify`` (same arguments) with FP8 output.
 
 Per (request, value head) pair: the cached-replay delta rule over the request's T draft rows against its pn history
 rows (keys, U rows, cumulative gates) and its checkpoint state h; this step's rows appended to the history, or, when
@@ -397,6 +397,7 @@ def _gdn_verify_tcgen05_kernel(
     gNw: cute.Tensor,
     gScale: cute.Tensor,
     gSlots: cute.Tensor,
+    gRepl: cute.Tensor,
     gOldU: cute.Tensor,
     gOldK: cute.Tensor,
     gOldG: cute.Tensor,
@@ -408,6 +409,11 @@ def _gdn_verify_tcgen05_kernel(
     xs: Int32,
     zs: Int32,
     abst: Int32,
+    uss: Int64,
+    kss: Int64,
+    gss: Int64,
+    cbs: Int64,
+    pas: Int64,
     eps: Float32,
     T_: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
@@ -442,6 +448,9 @@ def _gdn_verify_tcgen05_kernel(
     s_order = _saddr(ordt)
     sOrdF = _saddr(ordf)
     pSl = Int64(gSlots.iterator.toint())
+    # replay slots: the rows of the history (old_u / old_k / old_g, slot strides uss / kss / gss) and of its
+    # bookkeeping (cache_buf_idx / prev_acc, strides cbs / pas); a padded request (state slot < 0) reads replay slot 0
+    pRs = Int64(gRepl.iterator.toint())
     pPa = Int64(gPacc.iterator.toint())
     pCb = Int64(gCbi.iterator.toint())
     pOg = Int64(gOldG.iterator.toint())
@@ -472,7 +481,11 @@ def _gdn_verify_tcgen05_kernel(
                 )
             pa_l = []
             for ci in cutlass.range_constexpr(NCH):
-                pa_l.append(_ld_s32(pPa + Int64(cutlass.max(s_l[ci], Int32(0))) * Int64(4)))
+                r_l = _ld_s32(
+                    pRs + Int64(cutlass.min(Int32(32 * ci) + lane, nreq - Int32(1))) * Int64(4)
+                )
+                r_l = _si(s_l[ci] >= Int32(0), r_l, 0)
+                pa_l.append(_ld_s32(pPa + Int64(r_l) * pas * Int64(4)))
             lt_q = _lanemask_lt()
             fpos = Int32(0)
             opos = Int32(0)
@@ -524,6 +537,7 @@ def _gdn_verify_tcgen05_kernel(
         pnx // Int32(HV),
     )
     slot_n = _ld_s32(pSl + Int64(rq_n) * Int64(4))
+    rs_n = _ld_s32(pRs + Int64(rq_n) * Int64(4))
     # slot 1's position, request and slot (slot 0's when the CTA has one pair)
     isf1 = (rem + c_b) >= k_b
     pq_nn = _si(npc > Int32(1), bidx + _si(isf1, icnt, c_b + Int32(1) - icnt) * n_ctas, pnx)
@@ -535,13 +549,14 @@ def _gdn_verify_tcgen05_kernel(
         pq_nn // Int32(HV),
     )
     slot_nn = _ld_s32(pSl + Int64(rq_nn) * Int64(4))
-    sln = cutlass.max(slot_n, Int32(0))
+    rs_nn = _ld_s32(pRs + Int64(rq_nn) * Int64(4))
+    rs_n = _si(slot_n >= Int32(0), rs_n, 0)
     hvn = pnx - (pnx // Int32(HV)) * Int32(HV)
-    pn_n = _ld_s32(pPa + Int64(sln) * Int64(4))
-    buf_n = _ld_s32(pCb + Int64(sln) * Int64(4))
+    pn_n = _ld_s32(pPa + Int64(rs_n) * pas * Int64(4))
+    buf_n = _ld_s32(pCb + Int64(rs_n) * cbs * Int64(4))
     g0n = (
         pOg
-        + (Int64(sln) * Int64(2 * HV) + Int64(hvn)) * Int64(HIST * 4)
+        + (Int64(rs_n) * gss + Int64(hvn * Int32(HIST))) * Int64(4)
         + Int64(lane & Int32(15)) * Int64(4)
     )
     gh0_n = _ld_f32(g0n)
@@ -571,13 +586,13 @@ def _gdn_verify_tcgen05_kernel(
                             prims.cp_async_bulk_tensor_shared_cta_global(
                                 uhs.subview(x * HIST * 64 + jb * 8 * 64),
                                 tm_u.get_ptr(),
-                                (Int32(64 * x), hvx0, Int32(8 * jb), buf_n, slot_n),
+                                (Int32(64 * x), hvx0, Int32(8 * jb), buf_n, rs_n),
                                 bars.subview(0),
                             )
                             prims.cp_async_bulk_tensor_shared_cta_global(
                                 reg.subview(x * REG_E + (KH_ROW + 8 * jb) * 64),
                                 tm_k.get_ptr(),
-                                (Int32(64 * x), hkx0, Int32(8 * jb), buf_n, slot_n),
+                                (Int32(64 * x), hkx0, Int32(8 * jb), buf_n, rs_n),
                                 bars.subview(0),
                             )
     cute.arch.griddepcontrol_wait()
@@ -592,6 +607,7 @@ def _gdn_verify_tcgen05_kernel(
         pid = pq  # this pair's position in the order; its request was located with it
         rq = rq_n
         slot = slot_n
+        rslot = rs_n
         pn = pn_n
         buf = buf_n
         gh0 = gh0_n
@@ -603,6 +619,7 @@ def _gdn_verify_tcgen05_kernel(
         pnx = pq_nn
         rq_n = rq_nn
         slot_n = slot_nn
+        rs_n = rs_nn
         isfn = (rem + c_b) >= k_b
         pnxx = _si(
             (kk + Int32(2)) < npc, bidx + _si(isfn, icnt, c_b + kk + Int32(2) - icnt) * n_ctas, pnx
@@ -616,16 +633,17 @@ def _gdn_verify_tcgen05_kernel(
             pnxx // Int32(HV),
         )
         slot_nn = _ld_s32(pSl + Int64(rq_nn) * Int64(4))
+        rs_nn = _ld_s32(pRs + Int64(rq_nn) * Int64(4))
         pq = pnx
-        sln = cutlass.max(slot_n, Int32(0))
+        rs_n = _si(slot_n >= Int32(0), rs_n, 0)
         hvn = pnx - (pnx // Int32(HV)) * Int32(HV)
-        pn_n = _ld_s32(pPa + Int64(sln) * Int64(4))
+        pn_n = _ld_s32(pPa + Int64(rs_n) * pas * Int64(4))
         # lane & (n_ctas >> 31) is 0 at run time but lane-dependent to the compiler, so buf_n stays a vector
         # value and its uniform copies are made at the TMA issues, not here
-        buf_n = _ld_s32(pCb + Int64(sln + (lane & (n_ctas >> Int32(31)))) * Int64(4))
+        buf_n = _ld_s32(pCb + (Int64(rs_n) * cbs + Int64(lane & (n_ctas >> Int32(31)))) * Int64(4))
         g0n = (
             pOg
-            + (Int64(sln) * Int64(2 * HV) + Int64(hvn)) * Int64(HIST * 4)
+            + (Int64(rs_n) * gss + Int64(hvn * Int32(HIST))) * Int64(4)
             + Int64(lane & Int32(15)) * Int64(4)
         )
         gh0_n = _ld_f32(g0n)
@@ -665,13 +683,13 @@ def _gdn_verify_tcgen05_kernel(
                                     prims.cp_async_bulk_tensor_shared_cta_global(
                                         uhs.subview(x * HIST * 64 + jb * 8 * 64),
                                         tm_u.get_ptr(),
-                                        (Int32(64 * x), hvx1, Int32(8 * jb), buf_n, slot_n),
+                                        (Int32(64 * x), hvx1, Int32(8 * jb), buf_n, rs_n),
                                         bars.subview(0),
                                     )
                                     prims.cp_async_bulk_tensor_shared_cta_global(
                                         reg.subview(x * REG_E + (KH_ROW + 8 * jb) * 64),
                                         tm_k.get_ptr(),
-                                        (Int32(64 * x), hkx1, Int32(8 * jb), buf_n, slot_n),
+                                        (Int32(64 * x), hkx1, Int32(8 * jb), buf_n, rs_n),
                                         bars.subview(0),
                                     )
         else:
@@ -858,7 +876,7 @@ def _gdn_verify_tcgen05_kernel(
                                     prims.cp_async_bulk_tensor_shared_cta_global(
                                         reg.subview(x * REG_E + (KH_ROW + 8 * jb) * 64),
                                         tm_k.get_ptr(),
-                                        (Int32(64 * x), hkx5, Int32(8 * jb), buf_n, slot_n),
+                                        (Int32(64 * x), hkx5, Int32(8 * jb), buf_n, rs_n),
                                         bars.subview(0),
                                     )
                 gacc = cutlass.Array(Float32, 16, alignment=32)
@@ -899,8 +917,8 @@ def _gdn_verify_tcgen05_kernel(
                     _sts_f32(sF + (Int32(FS_EGQ) + lane) * Int32(4), _sf(lt, _mul(eg, iql), 0.0))
                 if lt:
                     gw = Int64(gOldG.iterator.toint()) + (
-                        ((Int64(slot) * Int64(2) + Int64(wbuf)) * Int64(HV) + Int64(hv))
-                        * Int64(HIST)
+                        Int64(rslot) * gss
+                        + (Int64(wbuf) * Int64(HV) + Int64(hv)) * Int64(HIST)
                         + Int64(woff + lane)
                     ) * Int64(4)
                     _st_f32(gw, _sf(is_write, gl, gv))
@@ -1062,7 +1080,7 @@ def _gdn_verify_tcgen05_kernel(
                                         prims.cp_async_bulk_tensor_shared_cta_global(
                                             uhs.subview(x * HIST * 64 + jb * 8 * 64),
                                             tm_u.get_ptr(),
-                                            (Int32(64 * x), hvx2, Int32(8 * jb), buf_n, slot_n),
+                                            (Int32(64 * x), hvx2, Int32(8 * jb), buf_n, rs_n),
                                             bars.subview(0),
                                         )
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -1162,11 +1180,8 @@ def _gdn_verify_tcgen05_kernel(
                 xb.append(_bf16r(ov))
             # history U rows
             ub = Int64(gOldU.iterator.toint()) + (
-                (
-                    ((Int64(slot) * Int64(2) + Int64(wbuf)) * Int64(HIST) + Int64(woff)) * Int64(HV)
-                    + Int64(hv)
-                )
-                * Int64(D)
+                Int64(rslot) * uss
+                + ((Int64(wbuf) * Int64(HIST) + Int64(woff)) * Int64(HV) + Int64(hv)) * Int64(D)
                 + Int64(tid)
             ) * Int64(2)
             for t in cutlass.range_constexpr(T_):
@@ -1210,12 +1225,8 @@ def _gdn_verify_tcgen05_kernel(
             # history keys of this step (one value head per key head): bf16(k_raw / |k_t|)
             if (hv % Int32(GROUP)) == Int32(0):
                 kb = Int64(gOldK.iterator.toint()) + (
-                    (
-                        ((Int64(slot) * Int64(2) + Int64(wbuf)) * Int64(HIST) + Int64(woff))
-                        * Int64(HK)
-                        + Int64(hk)
-                    )
-                    * Int64(D)
+                    Int64(rslot) * kss
+                    + ((Int64(wbuf) * Int64(HIST) + Int64(woff)) * Int64(HK) + Int64(hk)) * Int64(D)
                     + Int64(tid)
                 ) * Int64(2)
                 kx = tid >> Int32(6)
@@ -1295,13 +1306,13 @@ def _gdn_verify_tcgen05_kernel(
                                         prims.cp_async_bulk_tensor_shared_cta_global(
                                             uhs.subview(x * HIST * 64 + jb * 8 * 64),
                                             tm_u.get_ptr(),
-                                            (Int32(64 * x), hvx8, Int32(8 * jb), buf_n, slot_n),
+                                            (Int32(64 * x), hvx8, Int32(8 * jb), buf_n, rs_n),
                                             bars.subview(0),
                                         )
                                         prims.cp_async_bulk_tensor_shared_cta_global(
                                             reg.subview(x * REG_E + (KH_ROW + 8 * jb) * 64),
                                             tm_k.get_ptr(),
-                                            (Int32(64 * x), hkx8, Int32(8 * jb), buf_n, slot_n),
+                                            (Int32(64 * x), hkx8, Int32(8 * jb), buf_n, rs_n),
                                             bars.subview(0),
                                         )
                         cute.arch.cp_async_bulk_wait_group(1, read=True)
@@ -1350,6 +1361,7 @@ def _launch(
     scale: cute.Tensor,
     state: cute.Tensor,
     slots: cute.Tensor,
+    repl: cute.Tensor,
     oldu: cute.Tensor,
     oldk: cute.Tensor,
     oldg: cute.Tensor,
@@ -1364,6 +1376,12 @@ def _launch(
     abst: Int32,
     s_slots: Int32,
     sss16: Int64,
+    r_slots: Int32,
+    uss: Int64,
+    kss: Int64,
+    gss: Int64,
+    cbs: Int64,
+    pas: Int64,
     eps: Float32,
     T_: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
@@ -1383,12 +1401,12 @@ def _launch(
     tm_u = cuda_exp.create_tensor_map_tiled(
         global_address=oldu.iterator.toint(),
         dtype=BF,
-        global_dims=[D, HV, HIST, 2, s_slots],
+        global_dims=[D, HV, HIST, 2, r_slots],
         global_strides=[
             D * 2 // 16,
             HV * D * 2 // 16,
             HIST * HV * D * 2 // 16,
-            2 * HIST * HV * D * 2 // 16,
+            uss * 2 // 16,
         ],
         box_dims=[64, 1, 8, 1, 1],
         swizzle=sw,
@@ -1396,12 +1414,12 @@ def _launch(
     tm_k = cuda_exp.create_tensor_map_tiled(
         global_address=oldk.iterator.toint(),
         dtype=BF,
-        global_dims=[D, HK, HIST, 2, s_slots],
+        global_dims=[D, HK, HIST, 2, r_slots],
         global_strides=[
             D * 2 // 16,
             HK * D * 2 // 16,
             HIST * HK * D * 2 // 16,
-            2 * HIST * HK * D * 2 // 16,
+            kss * 2 // 16,
         ],
         box_dims=[64, 1, 8, 1, 1],
         swizzle=sw,
@@ -1419,6 +1437,7 @@ def _launch(
         nw,
         scale,
         slots,
+        repl,
         oldu,
         oldk,
         oldg,
@@ -1430,6 +1449,11 @@ def _launch(
         xs,
         zs,
         abst,
+        uss,
+        kss,
+        gss,
+        cbs,
+        pas,
         eps,
         T_,
         HV,
@@ -1460,6 +1484,7 @@ def _compiled(T_: int, HV: int, HK: int, use_pdl: bool):
         mk(f32, (1,), assumed_align=4),
         mk(bf, (1,), assumed_align=16),
         mk(i32, (1,), assumed_align=4),
+        mk(i32, (1,), assumed_align=4),
         mk(bf, (1,), assumed_align=16),
         mk(bf, (1,), assumed_align=16),
         mk(f32, (1,), assumed_align=4),
@@ -1473,6 +1498,12 @@ def _compiled(T_: int, HV: int, HK: int, use_pdl: bool):
         Int32(1),
         Int32(1),
         Int32(1),
+        Int64(1),
+        Int32(1),
+        Int64(1),
+        Int64(1),
+        Int64(1),
+        Int64(1),
         Int64(1),
         Float32(1e-6),
         T_=T_,
@@ -1490,6 +1521,16 @@ def _num_sms(device_index: int) -> int:
 
 def _one(t):
     return torch.as_strided(t, (1,), (1,))
+
+
+def _packed_slot_rows(t: torch.Tensor) -> bool:
+    """Whether the dimensions after t's leading (slot) dimension are packed."""
+    expected = 1
+    for d in range(t.dim() - 1, 0, -1):
+        if t.size(d) != 1 and t.stride(d) != expected:
+            return False
+        expected *= t.size(d)
+    return True
 
 
 def gdn_verify_tcgen05_supported(T: int, HV: int, HK: int, fp8_out: bool) -> bool:
@@ -1533,10 +1574,13 @@ def gdn_verify_tcgen05(
     old_g,
     cache_buf_idx,
     prev_acc,
+    replay_indices=None,
 ) -> torch.Tensor:
     """``trtllm::gdn_verify`` with FP8 output (same arguments); returns y [n T, HV 128] float8_e4m3fn.
 
-    state (the checkpoints), old_u, old_k and old_g are updated in place.
+    state (the checkpoints), old_u, old_k and old_g are updated in place. The history (old_u, old_k, old_g) and its
+    bookkeeping (cache_buf_idx, prev_acc) are rows of replay_indices, which default to the state slots; their slot
+    strides may be those of a pool page (the other dimensions packed).
     """
     n = slots.numel()
     HV = old_u.shape[3]
@@ -1554,7 +1598,16 @@ def gdn_verify_tcgen05(
         and state.stride(1) == D * D
         and state.stride(0) % 8 == 0
     )
-    assert old_u.is_contiguous() and old_k.is_contiguous() and old_g.is_contiguous()
+    if replay_indices is None:
+        replay_indices = slots
+    assert replay_indices.numel() == n
+    u_stride, k_stride, g_stride = old_u.stride(), old_k.stride(), old_g.stride()
+    # packed slot rows (the per-slot strides a pool page gives are free); the TMA needs 16-byte slot strides and bases
+    assert u_stride[1:] == (HIST * HV * D, HV * D, D, 1) or _packed_slot_rows(old_u), u_stride
+    assert k_stride[1:] == (HIST * HK * D, HK * D, D, 1) or _packed_slot_rows(old_k), k_stride
+    assert g_stride[1:] == (HV * HIST, HIST, 1) or _packed_slot_rows(old_g), g_stride
+    assert u_stride[0] % 8 == 0 and k_stride[0] % 8 == 0
+    assert old_u.data_ptr() % 16 == 0 and old_k.data_ptr() % 16 == 0
     assert (
         old_u.shape[2] == HIST
         and old_u.shape[4] == D
@@ -1577,6 +1630,7 @@ def gdn_verify_tcgen05(
         _one(fp8_scale),
         _one(state),
         _one(slots),
+        _one(replay_indices),
         _one(old_u),
         _one(old_k),
         _one(old_g),
@@ -1590,6 +1644,12 @@ def gdn_verify_tcgen05(
         a.stride(0),
         state.shape[0],
         state.stride(0) * 2 // 16,
+        old_u.shape[0],
+        u_stride[0],
+        k_stride[0],
+        g_stride[0],
+        cache_buf_idx.stride(0),
+        prev_acc.stride(0),
         float(eps),
     )
     return y

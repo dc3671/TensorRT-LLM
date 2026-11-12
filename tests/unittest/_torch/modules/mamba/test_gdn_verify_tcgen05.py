@@ -205,3 +205,102 @@ def test_gdn_verify_tcgen05_honours_enable_pdl(monkeypatch):
     assert torch.equal(y_on.view(torch.uint8), y_off.view(torch.uint8))
     for k in m_on:
         assert torch.equal(m_on[k], m_off[k]), k
+
+
+def _page_views(pages, HV, H):
+    """Views of replay pages laid out as the V2 hybrid manager binds them: per replay slot a [prev_num_accepted,
+    cache_buf_idx, ., .] int32 row, then the history planes (slot strides of a page)."""
+    planes = {
+        "old_u": (torch.bfloat16, (2, _HIST, HV, _DIM)),
+        "old_k": (torch.bfloat16, (2, _HIST, H, _DIM)),
+        "old_g": (torch.float32, (2, HV, _HIST)),
+    }
+    views, off = {}, 16
+    for name, (dtype, shape) in planes.items():
+        nbytes = dtype.itemsize * torch.Size(shape).numel()
+        views[name] = pages[:, off : off + nbytes].view(dtype).unflatten(1, shape)
+        off += nbytes
+    meta = pages[:, :16].view(torch.int32)
+    return views, meta[:, 0], meta[:, 1]
+
+
+def _page_bytes(HV, H):
+    nbytes = 16 + 2 * _HIST * (HV + H) * _DIM * 2 + 2 * HV * _HIST * 4
+    return (nbytes + 48 + 15) // 16 * 16
+
+
+@skip_no_sm100f
+@pytest.mark.parametrize("heads,n", [((2, 8), 52), ((16, 64), 8)])
+def test_gdn_verify_tcgen05_addresses_the_history_by_replay_slot(heads, n):
+    """History and bookkeeping in replay pages of their own (the KV-cache replay region: slot strides of a page,
+    replay slots other than the state slots): bitwise the result of the same step on per-state-slot contiguous
+    history, trtllm::gdn_verify's up to the kernels' rounding, and no write outside the requests' history rows."""
+    H, HV = heads
+    HV, cd, proj, ba, st, mut = _verify_case(heads, n, _T, 0)
+    st["pnat"][st["state_indices"][::3].long()] = 12  # every third request commits
+    st["state_indices"][1] = -1  # a padded request
+    num_replay_slots = _SLOTS + 40
+    g = torch.Generator(device="cuda").manual_seed(7)
+    replay = torch.randperm(num_replay_slots, generator=g, device="cuda")[:n].to(torch.int32)
+    valid = st["state_indices"] >= 0
+    rows, slots = replay[valid].long(), st["state_indices"][valid].long()
+
+    pages = torch.randint(
+        0,
+        256,
+        (num_replay_slots, _page_bytes(HV, H)),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+    views, pnat, buf = _page_views(pages, HV, H)
+    # every bookkeeping row valid (a padded request reads replay slot 0's)
+    pnat.zero_()
+    buf.zero_()
+    for name, view in views.items():
+        view[rows] = mut[name][slots]
+    pnat[rows] = st["pnat"][slots]
+    buf[rows] = st["buf"][slots]
+
+    def run(op):
+        p = pages.clone()
+        v, pn, cb = _page_views(p, HV, H)
+        ssm = mut["ssm"].clone()
+        y = op(
+            proj[:, :cd],
+            proj[:, cd:].view(n * _T, HV, _DIM),
+            ba[:, HV:],
+            ba[:, :HV],
+            st["a_log"],
+            st["dt_bias"],
+            st["norm_w"],
+            st["fp8_scale"],
+            1e-6,
+            ssm,
+            st["state_indices"],
+            v["old_u"],
+            v["old_k"],
+            v["old_g"],
+            cb,
+            pn,
+            replay,
+        )
+        return y, ssm, p, v
+
+    y_c, m_c = _verify_op(gdn_verify_tcgen05, HV, cd, n, _T, proj, ba, st, mut)
+    y_p, ssm_p, pages_p, v_p = run(gdn_verify_tcgen05)
+    y_r, ssm_r, _, v_r = run(torch.ops.trtllm.gdn_verify)
+    torch.cuda.synchronize()
+    out = torch.arange(n * _T, device="cuda").view(n, _T)[valid].flatten()
+    assert torch.equal(y_p.view(torch.uint8)[out], y_c.view(torch.uint8)[out])
+    assert torch.equal(ssm_p, m_c["ssm"])
+    for name in views:
+        assert torch.equal(v_p[name][rows], m_c[name][slots]), name
+    untouched = torch.ones(num_replay_slots, dtype=torch.bool, device="cuda")
+    untouched[rows] = False
+    assert torch.equal(pages_p[untouched], pages[untouched])
+    assert torch.equal(pages_p[:, :16], pages[:, :16])  # the bookkeeping is the caller's to advance
+    assert _rel(y_p[out], y_r[out]) < 5e-2
+    assert _rel(v_p["old_u"][rows], v_r["old_u"][rows]) < 1e-3
+    assert torch.allclose(v_p["old_g"][rows], v_r["old_g"][rows], rtol=1e-5, atol=1e-6)
+    assert _rel(ssm_p, ssm_r) < 1e-3
