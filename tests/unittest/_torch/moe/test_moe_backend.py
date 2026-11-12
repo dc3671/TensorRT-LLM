@@ -645,9 +645,11 @@ def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
 def test_fp4_block_scale_decode_tactic_key_matches_tuning(
     monkeypatch: pytest.MonkeyPatch, do_finalize: bool
 ) -> None:
-    """``decode_tactic`` looks the tactic up under the key the MoE op tunes a call of that ``do_finalize``
-    under; a mismatch leaves every decode front without a tactic, so it falls back to the stock MoE."""
-    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+    """``decode_tactic`` finds the entry the MoE op's own lookup finds for a call of that ``do_finalize``: the
+    entry is stored under the runner, tuning config and shapes that ``_run_fp4_block_scale_moe`` builds. A
+    mismatch leaves every decode front without a tactic, so it falls back to the stock MoE."""
+    from tensorrt_llm._torch.autotuner import AutoTunerProfilingCache
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _run_fp4_block_scale_moe
     from tensorrt_llm._torch.moe.fused_moe.routing import RenormalizeMoeRoutingMethod
     from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.fp4_block_scale import (
         TRTLLMGenFp4BlockScaleBase,
@@ -655,20 +657,37 @@ def test_fp4_block_scale_decode_tactic_key_matches_tuning(
     from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.kernel_inputs import to_trtllm_gen_act_type
     from tensorrt_llm._torch.utils import ActivationType
 
-    looked_up = []
-    monkeypatch.setattr(
-        FP4BlockScaleMoERunner,
-        "lookup_tactic",
-        lambda self, inputs: looked_up.append(self.unique_id()),
-    )
-    num_local, inter, hidden = 64, 512, 4096
+    tuned_tactic = [8, 3]
+    # Bypasses __init__, which queries the device.
+    cache = AutoTunerProfilingCache.__new__(AutoTunerProfilingCache)
+    cache.cache = {}
+
+    class _OpLookedUp(Exception):
+        pass
+
+    class _Tuner:
+        """Stores the op's tactic where the op's runtime lookup searches, then stops the op before its kernel."""
+
+        is_tuning_mode = False
+        profiling_cache = cache
+        _find_nearest_profile = AutoTuner._find_nearest_profile
+
+        def choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
+            shapes = tuple(AutoTuner._get_input_sizes(self, inputs))
+            key = cache.get_cache_key(custom_op, runners[0], shapes, tuning_config)
+            cache[key] = (0, tuned_tactic, 1.0)
+            raise _OpLookedUp
+
+    tuner = _Tuner()
+    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
+    num_slots, top_k, num_local, inter, hidden, m = 512, 10, 64, 512, 4096, 14
 
     def meta(*shape):
         return torch.empty(shape, dtype=torch.uint8, device="meta")
 
     backend = SimpleNamespace(
-        routing_method=RenormalizeMoeRoutingMethod(top_k=10),
-        num_slots=512,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=top_k),
+        num_slots=num_slots,
         slot_start=0,
         expert_size_per_partition=num_local,
         _intermediate_size_padded=lambda: inter,
@@ -685,23 +704,78 @@ def test_fp4_block_scale_decode_tactic_key_matches_tuning(
         w2_weight=meta(num_local, hidden, inter // 2),
         w2_weight_scale=meta(num_local, hidden, inter // 16),
     )
-    TRTLLMGenFp4BlockScaleBase.decode_tactic(backend, 14, do_finalize)
-    # The runner the op tunes with for a call of this do_finalize (_run_fp4_block_scale_moe).
-    tuned = FP4BlockScaleMoERunner(
-        512,
-        10,
-        None,
-        None,
-        inter,
-        0,
-        num_local,
-        None,
-        int(backend.routing_method.routing_method_type),
-        do_finalize,
-        to_trtllm_gen_act_type(ActivationType.Swiglu),
-        decode_tuning=True,
+    # Not tuned yet.
+    assert TRTLLMGenFp4BlockScaleBase.decode_tactic(backend, m, do_finalize) is None
+    # The op call TRTLLMGenFp4BlockScaleBase.run_moe makes for m router-logit rows.
+    with pytest.raises(_OpLookedUp):
+        _run_fp4_block_scale_moe(
+            meta(m, num_slots),
+            None,
+            meta(m, hidden // 2),
+            meta(m * hidden // 16),
+            backend.w3_w1_weight,
+            backend.w3_w1_weight_scale,
+            None,
+            None,
+            None,
+            None,
+            backend.w2_weight,
+            backend.w2_weight_scale,
+            None,
+            None,
+            None,
+            None,
+            num_slots,
+            top_k,
+            None,
+            None,
+            inter,
+            backend.slot_start,
+            num_local,
+            None,
+            int(backend.routing_method.routing_method_type),
+            do_finalize,
+            to_trtllm_gen_act_type(backend.activation_type),
+            tune_max_num_tokens=backend.max_num_tokens,
+            use_dp=backend.use_dp,
+            decode_tuning=backend.decode_tuning,
+        )
+    assert TRTLLMGenFp4BlockScaleBase.decode_tactic(backend, m, do_finalize) == tuned_tactic
+    # The other do_finalize runs other kernels and is tuned apart.
+    assert TRTLLMGenFp4BlockScaleBase.decode_tactic(backend, m, not do_finalize) is None
+
+
+@pytest.mark.cpu_only
+def test_decode_front_tactics_per_do_finalize() -> None:
+    """The decode front looks the MoE tactic and its front race up and caches them per (rows, do_finalize), the
+    key the MoE op tunes them under: an un-finalized call never takes a finalized call's tactic or its miss."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_front as df
+
+    num_experts, top_k = 512, 10
+    asked = []
+
+    def decode_tactic(m: int, do_finalize: bool):
+        asked.append((m, do_finalize))
+        return None if do_finalize else [8, 0]
+
+    backend = SimpleNamespace(decode_tactic=decode_tactic)
+    front = df.DecodeFront(frozenset())
+    assert front._moe_tactic(backend, 14, True) is None
+    assert front._moe_tactic(backend, 14, False) == [8, 0]
+    assert front._moe_tactic(backend, 14, False) == [8, 0]  # cached
+    assert asked == [(14, True), (14, False)]
+
+    moe = SimpleNamespace(
+        backend=SimpleNamespace(
+            decode_tactic=decode_tactic, expert_size_per_partition=num_experts, slot_start=0
+        ),
+        routing_method=SimpleNamespace(experts_per_token=top_k),
     )
-    assert looked_up == [tuned.unique_id()]
+    gate = SimpleNamespace(weight=torch.empty(num_experts, 16))
+    unfinalized = front._front_runner(gate, moe, False)
+    finalized = front._front_runner(gate, moe, True)
+    assert unfinalized.tile_of(7) == 8 and finalized.tile_of(7) is None
+    assert unfinalized.unique_id() != finalized.unique_id()
 
 
 @pytest.mark.cpu_only
