@@ -2329,8 +2329,8 @@ class AttentionDpConfig(StrictBaseModel):
         "rounds in which another rank had room, then overflows by "
         "kv_cache_routing_new_conv_placement (keeping its home rank). Later "
         "requests of the same admission group may pass a waiting one. None "
-        "overflows at once. Only used when "
-        "kv_cache_routing_conversation_affinity is True.",
+        "overflows at once. Requires "
+        "kv_cache_routing_conversation_affinity=True.",
         status="prototype")
 
     @model_validator(mode='after')

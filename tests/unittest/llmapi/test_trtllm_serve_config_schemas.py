@@ -744,6 +744,45 @@ _GIB = 1 << 30
             },
             False,
         ),
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {"directory": "d", "cache_size": 1},
+                "enable_kv_pool_rebalance": True,
+            },
+            False,
+        ),
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {"directory": "d", "donate_size": _GIB},
+                "enable_kv_pool_rebalance": True,
+            },
+            True,
+        ),
+        *(
+            (
+                "kv_cache_config",
+                {
+                    "remote_cache_config": {
+                        "directory": "d",
+                        "cache_size": 1,
+                        "ucx_devices": devices,
+                    }
+                },
+                valid,
+            )
+            for devices, valid in (
+                ("mlx5_0", True),
+                ("mlx5_0:1, mlx5_{GPU}", True),
+                ("mlx5_0:", True),
+                ("mlx5_0:2", False),
+                ("mlx5_0::1", False),
+                ("mlx5_0,,mlx5_1", False),
+                (":1", False),
+                ("", False),
+            )
+        ),
         ("kv_cache_config", {"defer_generation_only_release": True}, True),
         (
             "kv_cache_config",
@@ -802,6 +841,70 @@ def test_cross_field_rules_match_runtime(
         assert validator.is_valid({section: config}) == valid, filename
         if filename == generator.DISAGG_SCHEMA:
             assert validator.is_valid({"generation_servers": {section: config}}) == valid
+
+
+@pytest.mark.parametrize(
+    ("config", "valid"),
+    [
+        ({"kv_cache_config": {"defer_generation_only_release": True}}, True),
+        (
+            {
+                "kv_cache_config": {"defer_generation_only_release": True},
+                "disable_overlap_scheduler": False,
+                "pipeline_parallel_size": 1,
+            },
+            True,
+        ),
+        (
+            {
+                "kv_cache_config": {"defer_generation_only_release": True},
+                "disable_overlap_scheduler": True,
+            },
+            False,
+        ),
+        (
+            {
+                "kv_cache_config": {"defer_generation_only_release": True},
+                "pipeline_parallel_size": 2,
+            },
+            False,
+        ),
+        (
+            {
+                "kv_cache_config": {"defer_generation_only_release": False},
+                "disable_overlap_scheduler": True,
+            },
+            True,
+        ),
+        ({"disable_overlap_scheduler": True, "pipeline_parallel_size": 2}, True),
+    ],
+)
+def test_deferred_release_launch_rule_matches_runtime(
+    schemas: dict[str, dict], config: dict, valid: bool
+) -> None:
+    """Both schemas accept defer_generation_only_release with the overlap loop exactly when TorchLlmArgs does."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
+
+    kv_cache_config = config.get("kv_cache_config") or {}
+    args = SimpleNamespace(
+        kv_cache_config=KvCacheConfig(**kv_cache_config),
+        disable_overlap_scheduler=config.get("disable_overlap_scheduler", False),
+        pipeline_parallel_size=config.get("pipeline_parallel_size", 1),
+    )
+    if valid:
+        TorchLlmArgs.validate_defer_generation_only_release(args)
+    else:
+        with pytest.raises(ValueError, match="defer_generation_only_release"):
+            TorchLlmArgs.validate_defer_generation_only_release(args)
+
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == valid, filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == valid, section
 
 
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:

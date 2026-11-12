@@ -198,6 +198,31 @@ def _set(name: str, schema: dict) -> dict:
     return {"properties": {name: schema}, "required": [name]}
 
 
+def _launch_rules() -> list[dict]:
+    """Top-level ``if``/``then`` rules: DWDP and ``validate_defer_generation_only_release()``.
+
+    ``_dwdp_launch_rules()``, plus ``TorchLlmArgs.validate_defer_generation_only_release()`` (the overlap loop
+    without pipeline parallelism). As there, values the YAML does not set are left to runtime validation.
+    """
+    defer = {"type": "object", **_set("defer_generation_only_release", {"const": True})}
+    return _dwdp_launch_rules() + [
+        {
+            "if": _set("kv_cache_config", defer),
+            "then": {
+                "properties": {
+                    "disable_overlap_scheduler": {"not": {"const": True}},
+                    "pipeline_parallel_size": {"maximum": 1},
+                }
+            },
+        }
+    ]
+
+
+# One RemoteCacheConfig.ucx_devices entry, stripped: a name without ':' or ',', then optionally ':' or ':1'.
+_UCX_DEVICE_ENTRY = r"\s*[^\s,:][^,:]*(:1?)?\s*"
+_UCX_DEVICES_PATTERN = rf"^{_UCX_DEVICE_ENTRY}(,{_UCX_DEVICE_ENTRY})*$"
+
+
 def _cross_field_rules(definitions: dict) -> None:
     """Mirror the model validators of the KV cache, scheduler and attention-DP options.
 
@@ -269,6 +294,8 @@ def _cross_field_rules(definitions: dict) -> None:
                 _set("ucx_devices", {"type": "string"}),
                 {"properties": {"transport": {"const": "nixl"}}},
             ),
+            # Comma-separated '<device>' or '<device>:1' entries (NIXL's UCX backend uses port 1).
+            {"properties": {"ucx_devices": {"pattern": _UCX_DEVICES_PATTERN}}},
         ]
     )
     # KvCacheConfig.validate_remote_cache_config() and validate_defer_generation_only_release().
@@ -279,7 +306,12 @@ def _cross_field_rules(definitions: dict) -> None:
             when(_set("defer_generation_only_release", {"const": True}), kv_v2),
             when(
                 _set("remote_cache_config", _set("cache_size", {"minimum": 1})),
-                {"properties": {"disk_cache_size": {"enum": [0, None]}}},
+                {
+                    "properties": {
+                        "disk_cache_size": {"enum": [0, None]},
+                        "enable_kv_pool_rebalance": {"not": {"const": True}},
+                    }
+                },
             ),
         ]
     )
@@ -415,7 +447,7 @@ def _serve_schema() -> dict:
             "type": "null",
             "description": "Live objects require the Python LLM API.",
         }
-    schema["allOf"] = _dwdp_launch_rules()
+    schema["allOf"] = _launch_rules()
     schema["$defs"]["RayPlacementConfig"]["properties"]["placement_groups"] = {"type": "null"}
     user_draft = schema["$defs"]["UserProvidedDecodingConfig"]["properties"]
     user_draft["drafter"] = {"not": {}, "description": "A Drafter requires the Python LLM API."}
@@ -455,7 +487,7 @@ def generate_disagg_schema() -> dict:
         "additionalProperties": True,
     }
     worker["additionalProperties"] = False
-    worker["allOf"] = _dwdp_launch_rules()
+    worker["allOf"] = _launch_rules()
     schema["$defs"]["DisaggServerBlock"] = worker
 
     orchestrator = _schema_for(extract_disagg_cfg, schema)["properties"]

@@ -136,7 +136,7 @@
             }
           ],
           "default": null,
-          "description": "Conversation-affinity routing: a returning conversation whose home rank is full waits for a slot there for up to this many scheduling rounds in which another rank had room, then overflows by kv_cache_routing_new_conv_placement (keeping its home rank). Later requests of the same admission group may pass a waiting one. None overflows at once. Only used when kv_cache_routing_conversation_affinity is True.",
+          "description": "Conversation-affinity routing: a returning conversation whose home rank is full waits for a slot there for up to this many scheduling rounds in which another rank had room, then overflows by kv_cache_routing_new_conv_placement (keeping its home rank). Later requests of the same admission group may pass a waiting one. None overflows at once. Requires kv_cache_routing_conversation_affinity=True.",
           "status": "prototype",
           "title": "Kv Cache Routing Home Wait Rounds"
         },
@@ -1939,6 +1939,38 @@
               },
               "tensor_parallel_size": {
                 "minimum": 2
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kv_cache_config": {
+                "properties": {
+                  "defer_generation_only_release": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "defer_generation_only_release"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "kv_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disable_overlap_scheduler": {
+                "not": {
+                  "const": true
+                }
+              },
+              "pipeline_parallel_size": {
+                "maximum": 1
               }
             }
           }
@@ -5018,6 +5050,11 @@
                   0,
                   null
                 ]
+              },
+              "enable_kv_pool_rebalance": {
+                "not": {
+                  "const": true
+                }
               }
             }
           }
@@ -5085,7 +5122,7 @@
         },
         "defer_generation_only_release": {
           "default": false,
-          "description": "Release the KV cache of a finished generation-only request (disaggregated generation server) after the next forward is enqueued, so that the host-side release overlaps GPU work. The pages return one iteration later: the next iteration's scheduler cannot admit requests into them, so leave this off on generation servers bound by KV cache capacity. Their KV cache events are published one iteration later too, or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler without pipeline parallelism.",
+          "description": "Release the KV cache of a finished generation-only request (disaggregated generation server) after the next forward is enqueued, so that the host-side release overlaps GPU work. The pages return one iteration later, or as soon as the scheduler runs out of pages, before it suspends or recompute-pauses a running request. Their KV cache events are published one iteration later too, or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler without pipeline parallelism.",
           "status": "prototype",
           "title": "Defer Generation Only Release",
           "type": "boolean"
@@ -7822,6 +7859,13 @@
               }
             }
           }
+        },
+        {
+          "properties": {
+            "ucx_devices": {
+              "pattern": "^\\s*[^\\s,:][^,:]*(:1?)?\\s*(,\\s*[^\\s,:][^,:]*(:1?)?\\s*)*$"
+            }
+          }
         }
       ],
       "description": "KV cache manager v2 remote cache level in host memory that other ranks donate.\n\nA rank with ``cache_size`` gets a cache level below the host tier whose slots\nlive in memory that ranks with ``donate_size`` publish in ``directory``.",
@@ -7859,8 +7903,9 @@
         },
         "donor_wait_timeout_s": {
           "default": 900.0,
-          "description": "Seconds a rank with `cache_size` waits for donors, applied to each wait on its own: for the expected donors to report, and for each chunk claim. Donors publish while their own servers start, so this bounds the job's startup skew per wait, not in total.",
+          "description": "Seconds a rank with `cache_size` waits for donors, applied to each wait on its own: for the expected donors to report, and for each chunk claim. Donors publish while their own servers start, so this bounds the job's startup skew per wait, not in total. At most 1e6.",
           "exclusiveMinimum": 0,
+          "maximum": 1000000.0,
           "status": "prototype",
           "title": "Donor Wait Timeout S",
           "type": "number"
@@ -7916,8 +7961,9 @@
         },
         "transfer_timeout_s": {
           "default": 30.0,
-          "description": "NIXL transport only: seconds one batch of page transfers may take before the remote level fails, e.g. on a donor that died.",
+          "description": "NIXL transport only: seconds one batch of page transfers may take before the remote level fails, e.g. on a donor that died. At most 1e6. The fabric transport's copies run on the CUDA stream and are not timed.",
           "exclusiveMinimum": 0,
+          "maximum": 1000000.0,
           "status": "prototype",
           "title": "Transfer Timeout S",
           "type": "number"
@@ -9443,6 +9489,38 @@
           },
           "tensor_parallel_size": {
             "minimum": 2
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kv_cache_config": {
+            "properties": {
+              "defer_generation_only_release": {
+                "const": true
+              }
+            },
+            "required": [
+              "defer_generation_only_release"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "kv_cache_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "not": {
+              "const": true
+            }
+          },
+          "pipeline_parallel_size": {
+            "maximum": 1
           }
         }
       }
