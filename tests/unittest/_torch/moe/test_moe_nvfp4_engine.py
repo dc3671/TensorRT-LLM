@@ -6,6 +6,7 @@ runner's pre-routed un-finalized run on the same routing: every (token, k) gemm2
 One TEP8 rank's shapes: 128 local experts of 512, hidden 4096, intermediate 512 per rank, top-10. Random
 checkpoint-format NVFP4 experts through the loader's own shuffle; block scales over 2^-6..2^6 so FP32 sums round."""
 
+import functools
 from types import SimpleNamespace
 
 import pytest
@@ -490,11 +491,27 @@ def test_engine_leaves_sms_to_the_shared_expert_from_the_declared_rows(monkeypat
         assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), rows
 
 
+def test_shared_expert_rows_reach_the_engine_only_beside_the_shared_expert():
+    """The NVFP4 leaf declares its shared-expert rows to the op only while the model runs the shared expert on its
+    aux stream (multi-stream: CUDA-graph capture); an in-order (eager) step leaves the engine every SM."""
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.fp4_block_scale import (
+        TRTLLMGenFp4BlockScaleBase,
+    )
+
+    leaf = SimpleNamespace(decode_shared_expert_rows=64)
+    rows = functools.partial(TRTLLMGenFp4BlockScaleBase._shared_expert_rows_beside, leaf)
+    with with_multi_stream(False):
+        assert rows() == 0
+    with with_multi_stream(True):
+        assert rows() == 64
+
+
 def test_lamport_out_takes_the_decode_kernels_rows(monkeypatch):
-    """With a Lamport FC2 buffer the engine and the CuTe FC2 write their rows there, and a call of the cubins copies
-    its real rows there, bit for bit the plain call's, leaving the rest of the buffer sentinel. Through the custom op
-    the rows always come back as an empty placeholder (an op output may not alias an input) that the op backend
-    replaces with the buffer."""
+    """With a Lamport FC2 buffer the engine and the CuTe FC2 write their rows there, bit for bit the plain call's,
+    leaving the rest of the buffer sentinel; a call of the cubins returns its own rows and leaves the buffer untouched
+    (no copy). Through the custom op the Lamport rows come back as an empty placeholder (an op output may not alias
+    an input) that the op backend replaces with the buffer."""
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
     from tensorrt_llm._torch.moe.fused_moe.impl_contract import PreroutedRouting

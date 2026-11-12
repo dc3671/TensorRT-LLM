@@ -27,6 +27,7 @@ per-format, so they are settled here rather than branched on above.
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.utils import (
     ActivationType,
     ActType_TrtllmGen,
@@ -198,6 +199,11 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         self.act_alpha.data.copy_(params.alpha)
         self.act_beta.data.copy_(params.beta)
 
+    def _shared_expert_rows_beside(self) -> int:
+        """``decode_shared_expert_rows`` for this call: the shared expert runs beside the engine only on the model's
+        aux stream (multi-stream, i.e. CUDA-graph capture); in-order steps (0) leave the engine every SM."""
+        return self.decode_shared_expert_rows if do_multi_stream() else 0
+
     def run_moe(
         self,
         ctx: MoERunContext,
@@ -265,7 +271,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             decode_engine_state=self.decode_engine_state,
             lamport_fc2_out=ctx.lamport_fc2_out,
             decode_early_release_rows=self.decode_early_release_rows,
-            decode_shared_expert_rows=self.decode_shared_expert_rows,
+            decode_shared_expert_rows=self._shared_expert_rows_beside(),
         )
 
         if not k.do_finalize:
