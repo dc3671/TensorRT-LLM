@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MoE decode route front above 32 tokens (512 experts, top-10).
+"""MoE decode route front (512 experts, top-10) for DecodeFront's steps above the one-launch front
+(``decode_front.route_front_steps``: from 33 rows, or from 17 where the model declares the TP decode kernels).
 
-After the stock router GEMM, routing + trtllm-gen pre-routed tables + NVFP4 quantization of the MoE input run in
-one launch of thread-block clusters. :mod:`moe_decode_front` covers M <= 32 with a single routing CTA. Outputs are
+After the router GEMM (the stock one; with the decode kernels, the CuTe router GEMM for 33-128 rows), routing +
+trtllm-gen pre-routed tables + NVFP4 quantization of the MoE input run in one launch of thread-block clusters.
+:mod:`moe_decode_front` covers the smaller steps with a single routing CTA. Outputs are
 bitwise: ids / BF16 weights as :mod:`moe_decode_front`, xq / xsf as ``fp4_quantize`` (linear scale layout), tables
 (``prerouted_table_sizes`` order) as the Triton route kernel's up to the row order inside an expert's block. ``lean``
 builds the same tables with a cheaper count exchange and releases its dependent (FC1) at kernel start.

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Warp-MMA GEMM for decode-sized M (<= 64 rows) over per-tensor FP8 (W8A8) and BF16 weights.
+"""Warp-MMA GEMM for decode-sized M (<= 128 rows) over per-tensor FP8 (W8A8) and BF16 weights.
 
 ``C[M, :] = A[M, K] @ W.T`` with register-prefetched weights in two segments, each a whole number of CTAs:
 
@@ -291,7 +291,7 @@ def _g2r_atom(dtype, streaming: bool):
 
 
 class LowMMmaGemmKernel:
-    """``num_rows`` (<= 64) x K GEMM over an FP8 and a BF16 weight segment."""
+    """``num_rows`` (<= 128) x K GEMM over an FP8 and a BF16 weight segment."""
 
     def __init__(
         self,

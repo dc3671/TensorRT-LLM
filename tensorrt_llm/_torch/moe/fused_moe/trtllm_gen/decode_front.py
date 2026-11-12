@@ -58,8 +58,9 @@ KERNEL_TOP_K = 10
 ROUTER_MAX_TOKENS = 32
 # Largest step of the one-launch front.
 FUSED_FRONT_MAX_TOKENS = 16
-# Largest step of the route front (route-only launch after the stock router GEMM): clusters of 8 up to 256
-# tokens, clusters of 16 (moe_route_front.ROUTE_CLUSTER_WIDE) above.
+# Largest step of the route front (route-only launch after the router GEMM: the stock one, or the CuTe one below for
+# the decode kernels' steps of ROUTER_MAX_TOKENS + 1 to ROUTER_GEMM_MAX_TOKENS rows): clusters of 8 up to 256 tokens,
+# clusters of 16 (moe_route_front.ROUTE_CLUSTER_WIDE) above.
 ROUTE_FRONT_MAX_TOKENS = 1024
 # Router GEMM of the route front steps above ROUTER_MAX_TOKENS rows (DecodeFront's decode kernels): one tcgen05 launch
 # whose split-K partials are summed inside the cluster in a fixed order (kernels/blackwell/moe_router_gemm.py),
@@ -1145,7 +1146,7 @@ class FrontRunner(TunableRunner):
 class DecodeFront:
     """Per MoE layer decode front (module docstring).
 
-    ``route_steps``: token counts the route front takes after the stock router GEMM (``route_front_steps``);
+    ``route_steps``: token counts the route front takes after the router GEMM (``route_front_steps``);
     other counts up to ``ROUTER_MAX_TOKENS`` run the router GEMM in the front (power-of-two hidden sizes only,
     ``router_front_supports``), as one launch where the AutoTuner's race of the two (``FrontRunner``) picked it.
     ``decode_kernels`` (declared by the model): the route front steps run the CuTe router GEMM above
@@ -1175,11 +1176,12 @@ class DecodeFront:
         self.route_front_router = RouteFrontRouterGemm() if decode_kernels else None
         if engine_route:
             self.engine_router = RouteFrontRouterGemm(engine_route=True)
-        # Per token count: the MoE op's tactic, and per (token count, tile) the table buffer. A buffer first made
-        # during CUDA-graph capture comes from the graph's pool and stays with the layer.
+        # Per (token count, do_finalize): the MoE op's tactic; per (token count, tile): the table buffer. A buffer
+        # first made during CUDA-graph capture comes from the graph's pool and stays with the layer.
         self._tactics = {}
         self._tables = {}
-        # Per token count: the FrontRunner tactic (k_warps of the one-launch front, 0 for the two launches).
+        # Per (token count, do_finalize): the FrontRunner tactic (k_warps of the one-launch front, 0 for the two
+        # launches).
         self._front_tactics = {}
         # (ExpertL2Prefetch, layer index): un-finalized calls record their experts for the next step's prefetch.
         self._expert_prefetch = None
@@ -1375,7 +1377,7 @@ class DecodeFront:
             prerouted=PreroutedRouting(flat, tactic, ids, wts, candidates),
             **moe_kwargs,
         )
-        if self._expert_prefetch is not None and not moe_kwargs.get("do_finalize", True):
+        if self._expert_prefetch is not None and not do_finalize:
             prefetch, layer_idx = self._expert_prefetch
             _, _, batch, limit, nct, _ = prerouted_table_views(flat, m, top_k, num_local, tile)
             prefetch.record(layer_idx, batch, limit, nct, tile, num_local, flat, rows=m)

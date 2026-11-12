@@ -526,8 +526,8 @@ QK-norm / RoPE / KV-append prologue the attention module deferred
 (`AttentionForwardArgs.kv_append.fold`, query = raw QKV projection) reaches only
 libraries that declare `supports_deferred_prologue`.
 
-Three per-forward arguments let a library return less than a full BF16
-`output`; callers that pass them must read the result accordingly:
+Two per-forward arguments and one layer field let a library return less than
+a full BF16 `output`; callers that set them must read the result accordingly:
 
 - `output_gate`: a library that multiplies `sigmoid(gate)` into the output sets
   `output_gate_applied`; otherwise the caller applies the gate.
