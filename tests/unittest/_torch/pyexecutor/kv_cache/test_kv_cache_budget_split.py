@@ -1280,7 +1280,7 @@ class TestBuildManagersBudgetGates:
         c.configure_kv_cache_capacity = Mock()
         own = Mock()
         c._create_kv_cache_manager.side_effect = lambda *args, **kwargs: SimpleNamespace(
-            _remote_donor=own
+            remote_donor=own
         )
 
         c.build_managers({}, estimating_kv_cache=False)
@@ -1289,6 +1289,23 @@ class TestBuildManagersBudgetGates:
         error = RuntimeError("rebind failed")
         c.close_remote_donor(error)  # a later startup failure still marks it
         own.close.assert_called_once_with(error)
+
+    def test_the_cross_manager_waits_for_the_targets_donation(self, tmp_path):
+        """Without the estimation (always for encoder-decoder) the target starts its donation in the background. The
+        cross manager sizes its automatic host tier from free host memory, so it waits for the donation first."""
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        events = []
+        donor = Mock()
+        donor.wait_started.side_effect = lambda: events.append("donation placed")
+        c._create_cross_kv_cache_manager = Mock(
+            side_effect=lambda *args, **kwargs: events.append("cross manager") or Mock()
+        )
+        config = KvCacheConfig(max_gpu_total_bytes=10 * GB)
+
+        c._build_secondary_managers(False, 1024, False, config, None, config, None, donor)
+
+        assert events == ["donation placed", "cross manager"]
+        donor.close.assert_not_called()  # the target owns it
 
     def test_cross_manager_neither_claims_nor_donates(self, tmp_path):
         """The self-attention manager owns the rank's remote level and donation; a cross manager with the config would

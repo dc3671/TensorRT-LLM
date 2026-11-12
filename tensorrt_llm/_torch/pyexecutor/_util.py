@@ -3686,7 +3686,7 @@ class KvCacheCreator:
             # The manager owns it now, or the donation it started itself when the estimation was skipped; kept only
             # to mark it should startup fail after this. The draft waits for either and does not charge it again.
             if early_donor is None:
-                early_donor = getattr(kv_cache_manager, "_remote_donor", None)
+                early_donor = getattr(kv_cache_manager, "remote_donor", None)
             self._handed_remote_donor, self._remote_donor = early_donor, None
         try:
             draft_kv_cache_manager, cross_kv_cache_manager = (
@@ -3745,6 +3745,11 @@ class KvCacheCreator:
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None
         if cross_kv_cache_config is not None:
+            if early_donor is not None:
+                # Without the estimation, the target started its donation in the background. The cross manager
+                # does not own it (it gets no remote config) but sizes its automatic host tier from free host
+                # memory, so measure with the donation placed.
+                early_donor.wait_started()
             cross_kv_cache_manager = self._create_cross_kv_cache_manager(
                 cross_kv_cache_config, estimating_kv_cache,
                 original_max_seq_len)
