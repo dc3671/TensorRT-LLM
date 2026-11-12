@@ -195,6 +195,9 @@ def test_mnnvl_fused_allreduce_norm_compiled_shared_memory(
                 cutlass.Int64(0),
                 cutlass.Int64(0),
                 cutlass.Int32(0),
+                cutlass.Int64(0),  # no L2 prefetch
+                cutlass.Int64(0),
+                cutlass.Int64(0),
                 stream,
             )
         store_size(output, cutlass.Int64(get_kernel_smem_size(kernel.kernel_mt))).launch(
