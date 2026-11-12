@@ -308,7 +308,17 @@ async def test_fleet_worker_gets_the_prediction_from_select(monkeypatch):
         RouterConfig(type="load_balancing", server_role=ServerRole.GENERATION), ["g:1"]
     )
     router = CoordinatorDelegatingRouter("http://c:1", local, "generation", 5.0)
-    router.enable_output_length_prediction()
+    assert router.enable_output_length_prediction()
+    # A conversation router's key is the conversation id: it keeps the separate prediction call.
+    conversation = create_router(
+        RouterConfig(type="conversation", server_role=ServerRole.GENERATION), ["g:1"]
+    )
+    assert not CoordinatorDelegatingRouter(
+        "http://c:1", conversation, "generation", 5.0
+    ).enable_output_length_prediction()
+    assert not CoordinatorDelegatingRouter(
+        "http://c:1", local, "context", 5.0
+    ).enable_output_length_prediction()
     sent = []
 
     async def post_select(payload):

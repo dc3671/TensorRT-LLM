@@ -826,8 +826,7 @@ class CoordinatorClient(DisaggCoordinator):
         ``/output_length``).
         """
         if isinstance(self._gen_router, CoordinatorDelegatingRouter):
-            self._gen_router.enable_output_length_prediction()
-            return True
+            return self._gen_router.enable_output_length_prediction()
         return False
 
     async def is_ready(self) -> bool:

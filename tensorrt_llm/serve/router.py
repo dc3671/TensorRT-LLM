@@ -2315,14 +2315,19 @@ class CoordinatorDelegatingRouter(Router):
                 if server in servers
             }
 
-    def enable_output_length_prediction(self) -> None:
+    def enable_output_length_prediction(self) -> bool:
         """Have the coordinator predict a generation request's output length in ``/select``.
 
         The routing key then carries the request's conversation id and prompt tokens; the
         coordinator orders the placement by the predicted priority and returns the prediction
         in the route info under ``OUTPUT_LENGTH_KEY``, which also sets ``request.priority``.
+        Returns whether it is on: only for a generation router with a dict routing key (not
+        ``conversation``, whose key is the conversation id).
         """
-        self._predict_output_length = self._role == "generation"
+        self._predict_output_length = (
+            self._role == "generation"
+            and not isinstance(self._local, ConversationRouter))
+        return self._predict_output_length
 
     def _output_length_inputs(self, request: OpenAIRequest) -> Optional[dict]:
         if not self._predict_output_length or "priority" not in getattr(
@@ -2368,7 +2373,7 @@ class CoordinatorDelegatingRouter(Router):
         # event loop driving the concurrent streams.
         key = await asyncio.to_thread(self._local.routing_key, request)
         prediction_inputs = self._output_length_inputs(request)
-        if prediction_inputs is not None:
+        if prediction_inputs is not None and isinstance(key, dict):
             key[OUTPUT_LENGTH_KEY] = prediction_inputs
         # Send the request's existing disagg id as the cross-process key (the
         # coordinator keys pending state by it for /finish); placement must not
