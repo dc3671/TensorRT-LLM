@@ -16,7 +16,8 @@
  */
 
 // Causal FP8 context attention over TRT-LLM's paged HND KV pool through the trtllm-gen FMHA runner, with a caller-fixed
-// head dimension per K/V stage (a precompiled stage-KV kernel when one matches the selected config, else NVRTC).
+// head dimension per K/V stage: a precompiled stage-KV kernel when one matches the selected config; otherwise the op
+// declines (NVRTC only with the test-only allow_nvrtc).
 
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunner.h"

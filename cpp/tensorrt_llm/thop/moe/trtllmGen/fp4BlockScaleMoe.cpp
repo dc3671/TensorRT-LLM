@@ -65,7 +65,7 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     // fc1_only: routing (unless pre-routed) and FC1 only; the caller runs FC2 into the returned gemm2 output, which
     // keeps the do_finalize == false contract (gemm2 output, expert weights, expanded -> permuted index).
     TORCH_CHECK(!fc1_only || (!do_finalize && !out_tensor.has_value() && dtype == btg::Dtype::E2m1),
-        "fc1_only requires do_finalize == false and E2m1 activations.");
+        "fc1_only requires do_finalize == false, no output tensor and E2m1 activations.");
     TORCH_CHECK(dtype == btg::Dtype::E4m3 || dtype == btg::Dtype::E2m1, "dtype can only be e4m3 or e2m1.");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP4 block scale MOE");
     TORCH_CHECK(tile_tokens_dim == 8 || tile_tokens_dim == 16 || tile_tokens_dim == 32 || tile_tokens_dim == 64
