@@ -1522,10 +1522,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         inforward_split = kwargs.get("inforward_split")
 
         conv_states_to_use = conv_states
-        # Context-only batches may take the fused prefill conv, which leaves mixed_qkv untouched.
+        # Context-only batches may take the fused prefill conv, which leaves mixed_qkv untouched. Not under
+        # FORCE_DETERMINISTIC: its q / k L2 norms differ from the stock kernels that prefill next to decodes.
         fused_conv = (
             num_decode_tokens == 0
             and self.fused_prefill_conv
+            and os.getenv("FORCE_DETERMINISTIC", "0") != "1"
             and gdn_prefill_conv_eligible(
                 mixed_qkv,
                 self.conv1d.weight,
