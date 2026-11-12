@@ -1213,12 +1213,8 @@ def _fp4_block_scale_moe_fake(
         prerouted_ids: Optional[torch.Tensor] = None,
         prerouted_weights: Optional[torch.Tensor] = None,
         prerouted_tactic: Optional[List[int]] = None,
-        prerouted_candidates: Optional[torch.Tensor] = None,
-        decode_tuning: bool = False,
-        decode_engine_state: Optional[torch.Tensor] = None,
-        lamport_fc2_out: Optional[torch.Tensor] = None,
-        decode_early_release_rows: int = 0,
-        decode_shared_expert_rows: int = 0) -> List[torch.Tensor]:
+        lamport_fc2_out: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+    """The fake of both ops (the decode op's state arguments do not shape the outputs)."""
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2
