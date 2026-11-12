@@ -429,6 +429,9 @@ class AgingPriorityWaitingQueue(WaitingQueue):
     def pop_request(self) -> RequestQueueItem:
         if not self._items:
             raise IndexError("pop from an empty queue")
+        # Unreachable from the executor: requests enter the queue only in
+        # _fetch_and_enqueue_requests, after set_now(rank0_now) on every rank, and the
+        # broadcaster's sync_clock (on with this queue) sets rank0_now on each broadcast.
         if self._now is None:
             raise RuntimeError("AgingPriorityWaitingQueue needs set_now() before the first pop")
         if self._aged_heap:
