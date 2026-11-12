@@ -19,9 +19,8 @@
 #include "kv_cache_manager_v2/storage/remoteTransferAgent.h"
 #include "kv_cache_manager_v2/storage/remoteTransferFabric.h"
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/executor/transferAgent.h"
-
-#include <stdexcept>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -47,7 +46,7 @@ std::unique_ptr<RemoteTransferBackend> makeRemoteTransferBackend(
     }
     case RemoteTransport::FABRIC: return std::make_unique<FabricTransferBackend>();
     }
-    throw std::invalid_argument("KVCM2 remote level: unknown transport");
+    TLLM_THROW("KVCM2 remote level: unknown transport %d", static_cast<int>(config.transport));
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

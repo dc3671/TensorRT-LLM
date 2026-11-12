@@ -119,11 +119,15 @@ enum class RemoteTransport : int
 };
 
 //! How a remote tier's pages move, apart from what memory it declares (RemoteCacheTierConfig).
+//! Upper bound of the remote tier's timeouts: 1e6 s, as RemoteCacheConfig allows.
+inline constexpr int64_t kMaxRemoteTimeoutMs = 1'000'000'000;
+
 struct RemoteTransferConfig
 {
     RemoteTransport transport = RemoteTransport::NIXL;
-    //! Required for NIXL: how long one batch of transfers may take before the level fails (transfer_timeout_s).
-    int64_t timeoutMs = 0;
+    //! NIXL: how long one batch of transfers may take before the level fails (transfer_timeout_s), in (0,
+    //! kMaxRemoteTimeoutMs]. Unused by FABRIC, whose copies run on the stream.
+    int64_t timeoutMs = 30'000;
     //! NIXL only: the agent's backend parameters, passed as they are (e.g. UCX's {"device_list": "mlx5_0, mlx5_1"});
     //! empty uses the process's UCX environment.
     std::map<std::string, std::string> backendParams;
@@ -136,8 +140,9 @@ struct RemoteCacheTierConfig
 {
     size_t quota = 0; // bytes
     std::string path; // the rendezvous directory the donors publish into
-    //! Required: how long creating the level waits for donor capacity (RemoteCacheConfig.donor_wait_timeout_s).
-    int64_t waitTimeoutMs = 0;
+    //! How long creating the level waits for donor capacity (RemoteCacheConfig.donor_wait_timeout_s), in (0,
+    //! kMaxRemoteTimeoutMs].
+    int64_t waitTimeoutMs = 900'000;
     //! Donors the job starts; once all have reported, a claim stops waiting. 0 if unknown.
     uint32_t expectedDonors = 0;
     //! Positive weights, one per layer group, that split the quota across layer groups instead of the hot level's

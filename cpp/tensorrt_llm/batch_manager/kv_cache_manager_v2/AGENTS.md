@@ -64,7 +64,9 @@ them before changing `batch.*`, `sparseCache.*` or the index conversion.
   -- act on which class they caught; throw those directly:
   `OutOfMemoryError` and its `Host`/`Disk`/`Cu` forms, `LogicError`,
   `AssertionError`, `CuError`, `CorruptedError`, `ResourceBusyError`,
-  `OutOfPagesError`.
+  `OutOfPagesError`, and `RemoteMemError` (a failed remote cache level: the
+  V2 scheduler and the prefetch path catch it by class to re-match, recompute
+  or fail only the affected requests).
   Validation at the binding boundary that throws `std::invalid_argument` or
   `std::out_of_range` is legacy and should migrate to `TLLM_CHECK*` as it is
   touched, so that KVCM2 ends up on the same footing as the rest of the repo.

@@ -28,6 +28,8 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cuda.h>
@@ -39,6 +41,17 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+//! `timeoutMs` from now on the steady clock, clamped to the clock's range: a timeout meant as "never" (e.g.
+//! transfer_timeout_s 1e10) must not wrap the deadline into the past.
+[[nodiscard]] inline std::chrono::steady_clock::time_point remoteDeadlineAfter(int64_t timeoutMs) noexcept
+{
+    auto const now = std::chrono::steady_clock::now();
+    auto const maxMs
+        = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::time_point::max() - now)
+              .count();
+    return now + std::chrono::milliseconds(std::clamp<int64_t>(timeoutMs, 0, maxMs));
+}
 
 //! A donor of one rendezvous directory, as RemoteMemClient read it from the donor's files.
 struct RemoteDonor

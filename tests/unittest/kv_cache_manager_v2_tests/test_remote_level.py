@@ -689,7 +689,9 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             base.take_poison()
             shutil.rmtree(directory, ignore_errors=True)
 
-    def test_a_stalled_transfer_holding_all_staging_fails_later_resumes_with_remote_mem_error(self) -> None:
+    def test_a_stalled_transfer_holding_all_staging_fails_later_resumes_with_remote_mem_error(
+        self,
+    ) -> None:
         """A READ past its deadline that holds the whole page-staging ring fails later remote resumes as RemoteMemError.
 
         The level is checked before staging is leased: otherwise the next resume of a request holding pages on it fails
@@ -765,11 +767,11 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             shutil.rmtree(directory, ignore_errors=True)
 
     def test_held_pages_stop_at_the_host_level_above_a_failed_remote_level(self) -> None:
-        """Once the trailing remote level failed, the host level is the last one: held pages falling to it are kept,
-        and the droppable pages it evicts are counted as dropped.
+        """Once the trailing remote level failed, the host level is the last one.
 
-        Treated as a middle level, the host let pages fall to the failed level: held ones, which nothing there can
-        hold (every later allocation then failed with OutOfPagesError), and droppable ones, cleared there uncounted.
+        Held pages falling to it are kept, and the droppable pages it evicts are counted as dropped. Treated as a
+        middle level, the host let pages fall to the failed level: held ones, which nothing there can hold (every
+        later allocation then failed with OutOfPagesError), and droppable ones, cleared there uncounted.
         """
 
         def body(stream, donor) -> None:
@@ -1013,10 +1015,10 @@ class TestRemotePoolRatio(_Transport, unittest.TestCase):
             [float("inf"), 1.0],
             [1.0, 1.0, 1.0],
         ):
-            # A bad entry is a ValueError of the tier config; a wrong entry count a RuntimeError (TLLM_CHECK).
+            # TLLM_CHECK, from the tier config (a bad entry) or the storage manager (a wrong entry count).
             with (
                 self.subTest(value=value),
-                self.assertRaisesRegex((ValueError, RuntimeError), "pool ratio"),
+                self.assertRaisesRegex(RuntimeError, "pool ratio"),
             ):
                 self._levels(value)
         self.assertEqual(sorted(glob.glob(os.path.join(self.module_dir, "claim.*"))), claims)

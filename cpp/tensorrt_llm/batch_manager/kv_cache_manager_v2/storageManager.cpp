@@ -747,8 +747,7 @@ void StorageManager::destroy()
     bool leakStaging = false;
     for (auto& transfer : mUnquiescedRemoteTransfers)
     {
-        auto const deadline
-            = std::chrono::steady_clock::now() + std::chrono::milliseconds(transfer.client->transferConfig().timeoutMs);
+        auto const deadline = remoteDeadlineAfter(transfer.client->transferConfig().timeoutMs);
         while (!transfer.attempt->quiesced() && std::chrono::steady_clock::now() < deadline)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));

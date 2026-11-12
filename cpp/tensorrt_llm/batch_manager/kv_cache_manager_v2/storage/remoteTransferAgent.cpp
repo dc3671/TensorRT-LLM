@@ -91,8 +91,7 @@ public:
 
     std::optional<RemoteTransferOutcome> wait(int64_t timeoutMs) override
     {
-        auto const deadline
-            = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max<int64_t>(0, timeoutMs));
+        auto const deadline = remoteDeadlineAfter(timeoutMs);
         for (auto& request : mRequests)
         {
             if (!request.concluded)

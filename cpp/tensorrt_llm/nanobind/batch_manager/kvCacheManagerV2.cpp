@@ -1770,7 +1770,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     nb::class_<kv::RemoteTransferConfig>(m, "RemoteTransferConfig")
         .def(nb::init<kv::RemoteTransport, int64_t, std::map<std::string, std::string>>(),
-            nb::arg("transport") = kv::RemoteTransport::NIXL, nb::arg("timeout_ms") = 0,
+            nb::arg("transport") = kv::RemoteTransport::NIXL,
+            nb::arg("timeout_ms") = kv::RemoteTransferConfig{}.timeoutMs,
             nb::arg("backend_params") = std::map<std::string, std::string>{})
         .def_rw("transport", &kv::RemoteTransferConfig::transport)
         .def_rw("timeout_ms", &kv::RemoteTransferConfig::timeoutMs)
@@ -1778,8 +1779,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     nb::class_<kv::RemoteCacheTierConfig>(m, "RemoteCacheTierConfig")
         .def(nb::init<size_t, std::string, int64_t, uint32_t, std::vector<double>, kv::RemoteTransferConfig>(),
-            nb::arg("quota"), nb::arg("path"), nb::arg("wait_timeout_ms") = 0, nb::arg("expected_donors") = 0,
-            nb::arg("pool_ratio") = std::vector<double>{}, nb::arg("transfer") = kv::RemoteTransferConfig{})
+            nb::arg("quota"), nb::arg("path"), nb::arg("wait_timeout_ms") = kv::RemoteCacheTierConfig{}.waitTimeoutMs,
+            nb::arg("expected_donors") = 0, nb::arg("pool_ratio") = std::vector<double>{},
+            nb::arg("transfer") = kv::RemoteTransferConfig{})
         .def_rw("quota", &kv::RemoteCacheTierConfig::quota)
         .def_rw("path", &kv::RemoteCacheTierConfig::path)
         .def_rw("wait_timeout_ms", &kv::RemoteCacheTierConfig::waitTimeoutMs)

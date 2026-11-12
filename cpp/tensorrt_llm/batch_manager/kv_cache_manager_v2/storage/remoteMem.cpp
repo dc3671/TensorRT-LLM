@@ -431,7 +431,7 @@ RemoteChunk RemoteMemClient::acquireChunk(size_t minBytes)
             return chunk;
         }
     }
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(mOptions.waitTimeoutMs);
+    auto const deadline = remoteDeadlineAfter(mOptions.waitTimeoutMs);
     bool warned = false;
     while (true)
     {

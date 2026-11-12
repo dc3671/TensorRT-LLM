@@ -4648,6 +4648,12 @@ class DynamicBatchConfig(StrictBaseModel, PybindMirror):
 
 _PositiveFiniteFloat = Annotated[float,
                                  PydanticField(gt=0, allow_inf_nan=False)]
+# Remote cache timeouts become C++ millisecond deadlines; 1e6 s (11.6 days) is
+# far past any wait yet far inside their range.
+_RemoteTimeoutSeconds = Annotated[float,
+                                  PydanticField(gt=0,
+                                                le=1e6,
+                                                allow_inf_nan=False)]
 
 
 class GenPreemptionConfig(StrictBaseModel):
@@ -5394,21 +5400,23 @@ class RemoteCacheConfig(StrictBaseModel):
         "Bytes all ranks of the job claim from `directory` together. Used with "
         "`expected_num_donors`.")
 
-    donor_wait_timeout_s: _PositiveFiniteFloat = Field(
+    donor_wait_timeout_s: _RemoteTimeoutSeconds = Field(
         default=900.0,
         status="prototype",
         description=
         "Seconds a rank with `cache_size` waits for donors, applied to each "
         "wait on its own: for the expected donors to report, and for each "
         "chunk claim. Donors publish while their own servers start, so this "
-        "bounds the job's startup skew per wait, not in total.")
+        "bounds the job's startup skew per wait, not in total. At most 1e6.")
 
-    transfer_timeout_s: _PositiveFiniteFloat = Field(
+    transfer_timeout_s: _RemoteTimeoutSeconds = Field(
         default=30.0,
         status="prototype",
         description=
         "NIXL transport only: seconds one batch of page transfers may take "
-        "before the remote level fails, e.g. on a donor that died.")
+        "before the remote level fails, e.g. on a donor that died. At most "
+        "1e6. The fabric transport's copies run on the CUDA stream and are not "
+        "timed.")
 
     @model_validator(mode="after")
     def validate_remote_cache(self) -> 'RemoteCacheConfig':

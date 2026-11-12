@@ -156,23 +156,20 @@ void DiskCacheTierConfig::validate() const
 
 void RemoteCacheTierConfig::validate() const
 {
-    if (quota == 0)
-    {
-        throw std::invalid_argument("RemoteCacheTierConfig: quota must be > 0");
-    }
-    if (!std::filesystem::is_directory(path))
-    {
-        throw std::invalid_argument("RemoteCacheTierConfig: rendezvous directory '" + path + "' is not a directory");
-    }
-    if (waitTimeoutMs <= 0 || transfer.timeoutMs <= 0)
-    {
-        throw std::invalid_argument("RemoteCacheTierConfig: timeouts must be positive");
-    }
-    if (std::any_of(
-            poolRatio.begin(), poolRatio.end(), [](double weight) { return !std::isfinite(weight) || weight <= 0.0; }))
-    {
-        throw std::invalid_argument("RemoteCacheTierConfig: pool ratio entries must be positive and finite");
-    }
+    TLLM_CHECK_WITH_INFO(quota > 0, "RemoteCacheTierConfig: quota must be > 0");
+    TLLM_CHECK_WITH_INFO(std::filesystem::is_directory(path),
+        "RemoteCacheTierConfig: rendezvous directory '%s' is not a directory", path.c_str());
+    TLLM_CHECK_WITH_INFO(0 < waitTimeoutMs && waitTimeoutMs <= kMaxRemoteTimeoutMs,
+        "RemoteCacheTierConfig: wait_timeout_ms (donor_wait_timeout_s) must be in (0, %lld], got %lld",
+        static_cast<long long>(kMaxRemoteTimeoutMs), static_cast<long long>(waitTimeoutMs));
+    // The fabric transport's copies are stream-ordered and never timed.
+    TLLM_CHECK_WITH_INFO(transfer.transport != RemoteTransport::NIXL
+            || (0 < transfer.timeoutMs && transfer.timeoutMs <= kMaxRemoteTimeoutMs),
+        "RemoteCacheTierConfig: the NIXL transfer timeout_ms (transfer_timeout_s) must be in (0, %lld], got %lld",
+        static_cast<long long>(kMaxRemoteTimeoutMs), static_cast<long long>(transfer.timeoutMs));
+    TLLM_CHECK_WITH_INFO(std::all_of(poolRatio.begin(), poolRatio.end(),
+                             [](double weight) { return std::isfinite(weight) && weight > 0.0; }),
+        "RemoteCacheTierConfig: pool ratio entries must be positive and finite");
 }
 
 namespace
