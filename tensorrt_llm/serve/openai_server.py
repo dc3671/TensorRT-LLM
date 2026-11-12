@@ -3918,6 +3918,14 @@ class OpenAIServer(_VideoRoutesMixin):
         if args is not None:
             if args.max_batch_size is not None:
                 content["max_batch_size"] = args.max_batch_size
+            # A pooled generation router bounds the seat wait by it.
+            cache_transceiver_config = getattr(args, "cache_transceiver_config",
+                                               None)
+            if (cache_transceiver_config is not None
+                    and cache_transceiver_config.kv_transfer_timeout_ms
+                    is not None):
+                content[
+                    "kv_transfer_timeout_ms"] = cache_transceiver_config.kv_transfer_timeout_ms
             kv_cache_config = args.kv_cache_config
             if kv_cache_config is not None:
                 content[

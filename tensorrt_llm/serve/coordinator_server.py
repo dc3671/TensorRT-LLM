@@ -48,6 +48,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._telemetry import create_uvicorn_server
 from tensorrt_llm.serve.cluster_storage import HttpClusterStorageServer
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+from tensorrt_llm.serve.output_length_predictor import RECORD_BATCH_MAX, is_finite_nonneg
+from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
 from tensorrt_llm.version import __version__ as VERSION
 
 TIMEOUT_KEEP_ALIVE = 10  # seconds
@@ -127,6 +129,9 @@ class CoordinatorServer:
             server, info, req_id = await self._coordinator.select(
                 role, body["routing_key"], req_id, exclude_server
             )
+        except NoGenerationSeatError as e:
+            # Overload, not a fault: the frontend answers its client 503 too.
+            return self._response({"error": str(e), "no_generation_seat": True}, status_code=503)
         except ValueError as e:
             return self._response({"error": str(e)}, status_code=503)
         except Exception as e:  # noqa: BLE001
@@ -155,32 +160,56 @@ class CoordinatorServer:
         await self._coordinator.finish(role, req_id, success)
         return self._response({})
 
+    @staticmethod
+    def _output_length_error(conv, isl, out=0.0, key=None) -> Optional[str]:
+        """Why a prediction's or reply's fields are invalid, or None."""
+        if conv is not None and not isinstance(conv, str):
+            return "conv must be a string or null"
+        if not is_finite_nonneg(isl):
+            return "isl must be a finite number >= 0"
+        if not is_finite_nonneg(out):
+            return "out must be a finite number >= 0"
+        if key is not None and (not isinstance(key, int) or isinstance(key, bool)):
+            return "key must be an integer or null"
+        return None
+
     async def output_length(self, raw_req: Request) -> Response:
-        """POST {"op": "predict" | "record", "conv", "isl"[, "out", "key"]}: output-length prediction."""
+        """Output-length prediction (``output_length_prediction``) for frontends.
+
+        POST {"op": "predict", "conv", "isl"} -> {"tokens", "key"}, and
+        POST {"op": "record", "records": [[conv, isl, out, key], ...]} -> {"learned"}.
+        """
         try:
             body = msgpack.unpackb(await raw_req.body(), raw=False)
         except Exception as e:
             return self._response({"error": f"invalid MessagePack body: {e}"}, status_code=400)
         if not isinstance(body, dict) or body.get("op") not in ("predict", "record"):
             return self._response({"error": "op must be 'predict' or 'record'"}, status_code=400)
-
-        def is_number(value) -> bool:
-            return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-        conv, isl, out, key = body.get("conv"), body.get("isl"), body.get("out"), body.get("key")
-        if conv is not None and not isinstance(conv, str):
-            return self._response({"error": "conv must be a string or null"}, status_code=400)
-        if not is_number(isl):
-            return self._response({"error": "isl must be a number"}, status_code=400)
-        if body["op"] == "record" and not is_number(out):
-            return self._response({"error": "out must be a number"}, status_code=400)
-        if key is not None and (not isinstance(key, int) or isinstance(key, bool)):
-            return self._response({"error": "key must be an integer or null"}, status_code=400)
         try:
             if body["op"] == "predict":
+                conv, isl = body.get("conv"), body.get("isl")
+                error = self._output_length_error(conv, isl)
+                if error:
+                    return self._response({"error": error}, status_code=400)
                 tokens, key = await self._coordinator.predict_output_length(conv, isl)
                 return self._response({"tokens": tokens, "key": key})
-            learned = await self._coordinator.record_output_length(conv, isl, out, key)
+            records = body.get("records")
+            if not isinstance(records, list) or len(records) > RECORD_BATCH_MAX:
+                return self._response(
+                    {"error": f"records must be a list of at most {RECORD_BATCH_MAX} entries"},
+                    status_code=400,
+                )
+            for record in records:
+                if not isinstance(record, list) or len(record) != 4:
+                    return self._response(
+                        {"error": "a record is [conv, isl, out, key]"}, status_code=400
+                    )
+                error = self._output_length_error(*record)
+                if error:
+                    return self._response({"error": error}, status_code=400)
+            learned = await self._coordinator.record_output_lengths(
+                [(conv, float(isl), float(out), key) for conv, isl, out, key in records]
+            )
             return self._response({"learned": learned})
         except ValueError as e:
             return self._response({"error": str(e)}, status_code=503)

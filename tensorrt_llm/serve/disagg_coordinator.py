@@ -39,7 +39,7 @@ import asyncio
 import os
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import aiohttp
 import msgpack
@@ -62,7 +62,12 @@ from tensorrt_llm.serve.cluster_storage import (
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient
-from tensorrt_llm.serve.output_length_predictor import OnlineLengthPredictor
+from tensorrt_llm.serve.output_length_predictor import (
+    OUTPUT_LENGTH_KEY,
+    OnlineLengthPredictor,
+    is_finite_nonneg,
+    priority_of,
+)
 from tensorrt_llm.serve.render.fingerprint import fingerprint_summary
 from tensorrt_llm.serve.router import (
     ROUTING_CONTENT_REQUIRED,
@@ -82,6 +87,9 @@ __all__ = [
 
 COORDINATOR_RESERVATION_TIMEOUT_ENV = "TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT"
 COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S = 180.0
+# A pooled generation seat is released by its /finish; this expiry only reclaims the seat of a
+# request whose frontend died without one, so it must outlast the longest generation.
+POOLED_RESERVATION_TIMEOUT_S = 6 * 3600.0
 COORDINATOR_RESERVATION_LOCK_STRIPES = 256
 COORDINATOR_STATE_SYNC_INTERVAL_S = 3.0
 
@@ -133,10 +141,13 @@ class DisaggCoordinator(ABC):
         """
         raise NotImplementedError("output_length_prediction is not configured")
 
-    async def record_output_length(
-        self, conv_id: Optional[str], prompt_tokens: float, output_tokens: float, key: Optional[int]
-    ) -> bool:
-        """Learn a finished reply's output tokens; returns whether it was learned."""
+    async def record_output_lengths(
+        self, records: Sequence[Tuple[Optional[str], float, float, Optional[int]]]
+    ) -> int:
+        """Learn finished replies, each ``(conv_id, prompt_tokens, output_tokens, key)``.
+
+        Returns how many were learned.
+        """
         raise NotImplementedError("output_length_prediction is not configured")
 
 
@@ -255,8 +266,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
         normalized_role = self._normalize_role(role)
         router = self._router_for_role(normalized_role)
         reservation_key = (normalized_role, req_id)
-        if getattr(router, "pooled", False):
-            return await self._select_pooled(router, role, routing_key, req_id, exclude_server, _t0)
+        prediction = self._predict_in_select(normalized_role, routing_key)
+        if router.pooled:
+            server, info, request_id = await self._select_pooled(
+                router, role, routing_key, req_id, exclude_server, _t0
+            )
+            return server, self._with_prediction(info, prediction), request_id
         async with self._reservation_lock(reservation_key):
             previous = self._reservation_tasks.pop(reservation_key, None)
             if previous is not None:
@@ -272,7 +287,41 @@ class DisaggCoordinatorService(DisaggCoordinator):
                     self._expire_reservation(reservation_key, router)
                 )
         self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
-        return server, self._compact_route_info(info), request_id
+        return server, self._with_prediction(self._compact_route_info(info), prediction), request_id
+
+    def _predict_in_select(self, role: str, routing_key: Any) -> Optional[dict]:
+        """Predict a generation request's output length from its routing key's ``OUTPUT_LENGTH_KEY``.
+
+        The prediction's priority replaces the key's ``priority``, so a pooled router orders by it.
+        """
+        if not isinstance(routing_key, dict):
+            return None
+        inputs = routing_key.pop(OUTPUT_LENGTH_KEY, None)
+        if (
+            inputs is None
+            or role != "generation"
+            or self._output_length_predictor is None
+            or not isinstance(inputs, dict)
+        ):
+            return None
+        conv, isl = inputs.get("conv"), inputs.get("isl")
+        if (conv is not None and not isinstance(conv, str)) or not is_finite_nonneg(isl):
+            return None
+        tokens, key = self._output_length_predictor.predict(conv, float(isl), time.monotonic())
+        priority = priority_of(tokens)
+        routing_key["priority"] = priority
+        return {"tokens": tokens, "key": key, "priority": priority}
+
+    @staticmethod
+    def _with_prediction(info: dict, prediction: Optional[dict]) -> dict:
+        if prediction is not None:
+            info[OUTPUT_LENGTH_KEY] = prediction
+        return info
+
+    def _reservation_timeout_for(self, router: Router) -> float:
+        if router.pooled:
+            return max(self._reservation_timeout_secs, POOLED_RESERVATION_TIMEOUT_S)
+        return self._reservation_timeout_secs
 
     async def _select_pooled(
         self,
@@ -288,7 +337,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
         The wait happens before the striped reservation lock is taken: ``finish`` takes
         that lock to free seats, so a waiter holding it could block the finish its seat
         depends on. A repeated select for the same ``req_id`` gets the same seat from the
-        router and only renews the reservation's expiry.
+        router and only renews the reservation's expiry, which is ``POOLED_RESERVATION_TIMEOUT_S``:
+        the seat must not be handed on while its generation still streams.
         """
         reservation_key = (self._normalize_role(role), req_id)
         server, info, request_id = await router.get_next_server_by_key(
@@ -329,12 +379,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
     ) -> Tuple[float, int]:
         return self._length_predictor().predict(conv_id, float(prompt_tokens), time.monotonic())
 
-    async def record_output_length(
-        self, conv_id: Optional[str], prompt_tokens: float, output_tokens: float, key: Optional[int]
-    ) -> bool:
-        return self._length_predictor().record(
-            conv_id, float(prompt_tokens), float(output_tokens), key, time.monotonic()
-        )
+    async def record_output_lengths(
+        self, records: Sequence[Tuple[Optional[str], float, float, Optional[int]]]
+    ) -> int:
+        predictor = self._length_predictor()
+        now = time.monotonic()
+        return sum(predictor.record(conv, isl, out, key, now) for conv, isl, out, key in records)
 
     async def finish(self, role: str, req_id, success: bool = True) -> None:
         _t0 = time.monotonic()
@@ -363,8 +413,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
             )
 
     async def _expire_reservation(self, key: tuple[str, int], router: Router) -> None:
+        timeout_s = self._reservation_timeout_for(router)
         try:
-            await asyncio.sleep(self._reservation_timeout_secs)
+            await asyncio.sleep(timeout_s)
         except asyncio.CancelledError:
             raise
         async with self._reservation_lock(key):
@@ -373,7 +424,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
             self._reservation_tasks.pop(key, None)
             logger.warning(
                 f"Releasing stale coordinator reservation for role={key[0]}, "
-                f"req_id={key[1]} after {self._reservation_timeout_secs}s"
+                f"req_id={key[1]} after {timeout_s}s"
             )
             await router.finish_request_by_id(key[1], False)
 
@@ -426,6 +477,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
             await self._wait_for_all_servers_ready()
 
     async def stop(self) -> None:
+        # Requests waiting for a generation seat would otherwise hold their /select open.
+        for router in (self._ctx_router, self._gen_router):
+            if router.pooled:
+                failed = await router.fail_waiters("the disaggregated coordinator is stopping")
+                if failed:
+                    logger.info(f"Failed {failed} requests waiting for a seat at shutdown")
         reservations = list(self._reservation_tasks.values())
         self._reservation_tasks.clear()
         for reservation in reservations:
@@ -751,19 +808,27 @@ class CoordinatorClient(DisaggCoordinator):
         )
         return float(reply["tokens"]), int(reply["key"])
 
-    async def record_output_length(
-        self, conv_id: Optional[str], prompt_tokens: float, output_tokens: float, key: Optional[int]
-    ) -> bool:
+    async def record_output_lengths(
+        self, records: Sequence[Tuple[Optional[str], float, float, Optional[int]]]
+    ) -> int:
         reply = await self._output_length_call(
             {
                 "op": "record",
-                "conv": conv_id,
-                "isl": float(prompt_tokens),
-                "out": float(output_tokens),
-                "key": key,
+                "records": [[conv, float(isl), float(out), key] for conv, isl, out, key in records],
             }
         )
-        return bool(reply["learned"])
+        return int(reply["learned"])
+
+    def enable_output_length_prediction_in_select(self) -> bool:
+        """Have ``/select`` predict the output length of delegated generation placements.
+
+        Returns whether the generation router is delegated (else the frontend asks
+        ``/output_length``).
+        """
+        if isinstance(self._gen_router, CoordinatorDelegatingRouter):
+            self._gen_router.enable_output_length_prediction()
+            return True
+        return False
 
     async def is_ready(self) -> bool:
         return self._is_ready

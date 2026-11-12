@@ -78,7 +78,7 @@ async def test_coordinator_predicts_and_learns_in_process():
     coordinator = DisaggCoordinatorService(_config(), client_factory=_client_factory)
     tokens, key = await coordinator.predict_output_length("c", 1000)
     assert tokens == olp.PRIOR_TOKENS
-    assert await coordinator.record_output_length("c", 1000, 64.0, key)
+    assert await coordinator.record_output_lengths([("c", 1000, 64.0, key)]) == 1
     assert (await coordinator.predict_output_length("c", 1200))[0] == 64.0
     off = DisaggCoordinatorService(_config(None), client_factory=_client_factory)
     with pytest.raises(ValueError, match="not configured"):
@@ -96,17 +96,28 @@ def test_coordinator_server_route():
 
     status, reply = post({"op": "predict", "conv": "c", "isl": 1000})
     assert status == 200 and reply["tokens"] == olp.PRIOR_TOKENS
-    status, reply = post({"op": "record", "conv": "c", "isl": 1000, "out": 80, "key": reply["key"]})
-    assert status == 200 and reply == {"learned": True}
+    status, reply = post({"op": "record", "records": [["c", 1000, 80, reply["key"]]]})
+    assert status == 200 and reply == {"learned": 1}
     assert post({"op": "predict", "conv": "c", "isl": 1100})[1]["tokens"] == 80.0
+    nan, inf = float("nan"), float("inf")
     for bad in (
         {"op": "fit"},
         {"op": "predict", "conv": 3, "isl": 1},
         {"op": "predict", "conv": "c", "isl": True},
+        {"op": "predict", "conv": "c", "isl": nan},
+        {"op": "predict", "conv": "c", "isl": -inf},
         {"op": "record", "conv": "c", "isl": 1},
-        {"op": "record", "conv": "c", "isl": 1, "out": 5, "key": "k"},
+        {"op": "record", "records": [["c", 1, 5, "k"]]},
+        {"op": "record", "records": [["c", 1, nan, None]]},
+        {"op": "record", "records": [["c", inf, 5, None]]},
+        {"op": "record", "records": [["c", 1, -5, None]]},
+        {"op": "record", "records": [["c", 1, 5]]},
+        {"op": "record", "records": [["c", 1, 5, None]] * (olp.RECORD_BATCH_MAX + 1)},
     ):
         assert post(bad)[0] == 400, bad
+    # NaN never reached the models: predictions and priorities stay finite.
+    tokens = post({"op": "predict", "conv": None, "isl": 1100})[1]["tokens"]
+    assert tokens == tokens and 0.0 <= olp.priority_of(tokens) <= 1.0
 
 
 @pytest.mark.asyncio
@@ -126,8 +137,8 @@ async def test_coordinator_client_round_trip():
             reply = {"tokens": tokens, "key": key}
         else:
             reply = {
-                "learned": await coordinator.record_output_length(
-                    body["conv"], body["isl"], body["out"], body["key"]
+                "learned": await coordinator.record_output_lengths(
+                    [tuple(record) for record in body["records"]]
                 )
             }
         return web.Response(body=msgpack.packb(reply), content_type="application/msgpack")
@@ -139,7 +150,7 @@ async def test_coordinator_client_round_trip():
         try:
             tokens, key = await client.predict_output_length("c", 1000)
             assert tokens == olp.PRIOR_TOKENS
-            assert await client.record_output_length("c", 1000, 77.0, key)
+            assert await client.record_output_lengths([("c", 1000, 77.0, key)]) == 1
             assert (await client.predict_output_length("c", 1100))[0] == 77.0
         finally:
             await client.stop()
@@ -205,7 +216,10 @@ async def test_service_sets_priority_before_generation_placement(monkeypatch):
         return [chunk async for chunk in response]
 
     chunks = await send("conv-1")
-    assert chunks[-1] == final.encode()
+    # The client did not ask for usage: the generation leg did, and its usage chunk is dropped.
+    gen_req = service._gen_client.send_request.call_args.args[0]
+    assert gen_req.stream_options.include_usage
+    assert final.encode() not in b"".join(chunks)
     assert placed == [pytest.approx(olp.priority_of(olp.PRIOR_TOKENS))]
     await asyncio.sleep(0.01)  # the record task
     predictor = coordinator._output_length_predictor
@@ -234,3 +248,88 @@ async def test_service_without_prediction_leaves_priority_alone(monkeypatch):
     request = CompletionRequest(model="m", prompt="hi")
     assert await service._send_disagg_request_ctx_first(request) == "response"
     assert service._gen_client.send_request.call_args.args[0].priority is None
+
+
+@pytest.mark.asyncio
+async def test_select_predicts_the_output_length():
+    """The coordinator predicts inside /select: the pooled placement orders by it, no extra call."""
+    from tensorrt_llm.llmapi.disagg_utils import CtxGenServerConfig, RouterConfig, ServerRole
+
+    config = _config()
+    config.server_configs = [CtxGenServerConfig(type="gen", hostname="g", port=1)]
+    config.ctx_router_config = RouterConfig(type="round_robin", server_role=ServerRole.CONTEXT)
+    config.gen_router_config = RouterConfig(
+        type="load_balancing",
+        server_role=ServerRole.GENERATION,
+        args={"max_requests_per_server": 1},
+    )
+    coordinator = DisaggCoordinatorService(config, client_factory=_client_factory)
+    await coordinator.record_output_lengths(
+        [("short", 1000, 50.0, None), ("long", 1000, 5000.0, None)]
+    )
+    server, info, _ = await coordinator.select("generation", {}, 1, None)
+    assert server == "g:1" and olp.OUTPUT_LENGTH_KEY not in info
+    waits = {
+        rid: asyncio.create_task(
+            coordinator.select(
+                "generation", {olp.OUTPUT_LENGTH_KEY: {"conv": conv, "isl": 1500.0}}, rid, None
+            )
+        )
+        for rid, conv in ((2, "long"), (3, "short"))
+    }
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await coordinator.finish("generation", 1)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert waits[3].done() and not waits[2].done()  # the shorter predicted reply goes first
+    _, info, _ = await waits[3]
+    prediction = info[olp.OUTPUT_LENGTH_KEY]
+    assert prediction["tokens"] == 50.0 and isinstance(prediction["key"], int)
+    assert prediction["priority"] == pytest.approx(olp.priority_of(50.0))
+    await coordinator.finish("generation", 3)
+    assert (await waits[2])[1][olp.OUTPUT_LENGTH_KEY]["tokens"] == 5000.0
+    await coordinator.finish("generation", 2)
+    # Invalid inputs are ignored rather than predicted.
+    _, info, _ = await coordinator.select(
+        "generation", {olp.OUTPUT_LENGTH_KEY: {"conv": None, "isl": float("nan")}}, 4, None
+    )
+    assert olp.OUTPUT_LENGTH_KEY not in info
+    await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_fleet_worker_gets_the_prediction_from_select(monkeypatch):
+    """A delegating generation router sends the prediction inputs and applies the returned priority."""
+    from tensorrt_llm.llmapi.disagg_utils import RouterConfig, ServerRole
+    from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, create_router
+
+    local = create_router(
+        RouterConfig(type="load_balancing", server_role=ServerRole.GENERATION), ["g:1"]
+    )
+    router = CoordinatorDelegatingRouter("http://c:1", local, "generation", 5.0)
+    router.enable_output_length_prediction()
+    sent = []
+
+    async def post_select(payload):
+        sent.append(payload)
+        return {
+            "server": "g:1",
+            "info": {olp.OUTPUT_LENGTH_KEY: {"tokens": 1024.0, "key": 3, "priority": 0.5}},
+        }
+
+    monkeypatch.setattr(router, "_post_select", post_select)
+    request = CompletionRequest(
+        model="m",
+        prompt="x",
+        conversation_params=ConversationParams(conversation_id="c"),
+        disaggregated_params=DisaggregatedParams(
+            request_type="generation_only",
+            ctx_request_id=5,
+            ctx_usage=UsageInfo(prompt_tokens=777),
+        ),
+    )
+    server, info = await router.get_next_server(request)
+    assert server == "g:1" and request.priority == 0.5 and info[olp.OUTPUT_LENGTH_KEY]["key"] == 3
+    assert sent[0]["routing_key"][olp.OUTPUT_LENGTH_KEY] == {"conv": "c", "isl": 777.0}
+    await router.close()

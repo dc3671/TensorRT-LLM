@@ -27,7 +27,7 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicCountTokensRequest,
     AnthropicCountTokensResponse,
 )
-from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
+from tensorrt_llm.serve.disagg_coordinator import CoordinatorClient, DisaggCoordinator
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -45,7 +45,7 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 from tensorrt_llm.serve.openai_service import OpenAIService
-from tensorrt_llm.serve.output_length_predictor import OutputLengthPriority
+from tensorrt_llm.serve.output_length_predictor import RECORD_FLUSH_S, OutputLengthPriority
 from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
@@ -176,8 +176,14 @@ class OpenAIDisaggregatedService(OpenAIService):
         # Generation priority from the predicted output length (output_length_prediction).
         self._output_length_priority: Optional[OutputLengthPriority] = None
         if config.output_length_prediction is not None:
+            # A fleet worker whose generation placement goes through the coordinator gets the
+            # prediction from /select, and reports replies in batches.
+            remote = isinstance(coordinator, CoordinatorClient)
             self._output_length_priority = OutputLengthPriority(
-                coordinator, config.output_length_prediction.predictor
+                coordinator,
+                config.output_length_prediction.predictor,
+                via_select=remote and coordinator.enable_output_length_prediction_in_select(),
+                record_flush_s=RECORD_FLUSH_S if remote else 0.0,
             )
             logger.info(self._output_length_priority.startup_line())
 
@@ -343,8 +349,11 @@ class OpenAIDisaggregatedService(OpenAIService):
                         hooks.on_disagg_request_id(disagg_request_id)
                 gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
                 if self._output_length_priority is not None:
-                    # Before the generation placement, which orders by the priority it sets.
-                    length_ticket = await self._output_length_priority.assign(gen_req)
+                    # Before the generation placement, which orders by the priority it sets
+                    # (or, in a fleet, predicts it in the same /select).
+                    length_ticket = await self._output_length_priority.assign(
+                        gen_req, placed_later=not gen_server
+                    )
             except Exception:
                 if gen_server:
                     await self._gen_router.finish_request(
@@ -365,10 +374,12 @@ class OpenAIDisaggregatedService(OpenAIService):
                     # bounds its wait by the context servers' KV transfer timeout, which
                     # runs from here. Stamped again below to include this wait.
                     self._stamp_orig_elapsed(gen_req, arrival_time)
-                gen_server, _ = await self._gen_router.get_next_server(
+                gen_server, gen_route_info = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server, req_id=disagg_request_id
                 )
                 gen_reservation_id = disagg_request_id
+                if length_ticket is not None:
+                    self._output_length_priority.placed(length_ticket, gen_req, gen_route_info)
             self._stamp_orig_elapsed(gen_req, arrival_time)
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id

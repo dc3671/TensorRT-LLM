@@ -403,9 +403,18 @@ def extract_disagg_cfg(
     gen_router_config = extract_router_config(generation_servers)
     ctx_router_config.server_role = ServerRole.CONTEXT
     gen_router_config.server_role = ServerRole.GENERATION
+    for section, router_config in (("context_servers", ctx_router_config),
+                                   ("generation_servers", gen_router_config)):
+        if (router_config.args.get("max_queue_wait_s") is not None
+                and router_config.args.get("max_requests_per_server") is None):
+            raise ValueError(
+                f"{section}.router.max_queue_wait_s only applies to pooled "
+                "generation dispatch; set generation_servers.router."
+                "max_requests_per_server too")
     if gen_router_config.args.get("max_requests_per_server") is not None:
         # The pooled generation router fails a request that waits for a seat past
-        # the context servers' KV transfer timeout.
+        # the context servers' KV transfer timeout. This is the fallback until the
+        # context servers report their own value in /server_info.
         gen_router_config.args["kv_transfer_timeout_ms"] = (
             _ctx_kv_transfer_timeout_ms(context_servers))
     if disagg_cluster:
@@ -509,7 +518,11 @@ def _warn_if_subagent_affinity_inactive(config: DisaggServerConfig) -> None:
 
 
 def _ctx_kv_transfer_timeout_ms(context_servers: dict) -> Optional[int]:
-    """The context servers' cache_transceiver_config.kv_transfer_timeout_ms, else its default."""
+    """``context_servers.cache_transceiver_config.kv_transfer_timeout_ms``, else its default.
+
+    The pooled generation router prefers the value the context servers report in
+    ``/server_info`` (their own ``--config``); this one applies until they do.
+    """
     cfg = context_servers.get("cache_transceiver_config") or {}
     if "kv_transfer_timeout_ms" in cfg:
         return cfg["kv_transfer_timeout_ms"]

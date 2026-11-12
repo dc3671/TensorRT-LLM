@@ -15,9 +15,12 @@
 """Pooled generation dispatch: serve/seat_pool.py and router.PooledLoadBalancingRouter."""
 
 import asyncio
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
+import msgpack
 import pytest
+from fastapi import HTTPException
 
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.disagg_utils import (
@@ -27,16 +30,23 @@ from tensorrt_llm.llmapi.disagg_utils import (
     ServerRole,
     extract_disagg_cfg,
 )
-from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+from tensorrt_llm.serve.coordinator_server import CoordinatorServer
+from tensorrt_llm.serve.disagg_coordinator import (
+    POOLED_RESERVATION_TIMEOUT_S,
+    DisaggCoordinatorService,
+)
+from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import CompletionRequest, DisaggregatedParams
 from tensorrt_llm.serve.router import (
     POOLED_SELECT_TIMEOUT_S,
     CoordinatorDelegatingRouter,
     LoadBalancingRouter,
     PooledLoadBalancingRouter,
+    Router,
+    build_disagg_routers,
     create_router,
 )
-from tensorrt_llm.serve.seat_pool import SeatPool, priority_or_default
+from tensorrt_llm.serve.seat_pool import NoGenerationSeatError, SeatPool, priority_or_default
 
 pytestmark = pytest.mark.cpu_only
 
@@ -107,23 +117,65 @@ def test_pool_ages_from_the_orchestrator_arrival():
 
 
 def test_pool_expires_at_the_kv_transfer_timeout():
-    """Only a request past its context phase gets the deadline, counted from its entry here."""
+    """Every waiter gets the deadline, counted from its entry here (generation_first ones too)."""
     clock = _Clock()
     pool = SeatPool(1, clock=clock, kv_transfer_timeout_s=60.0)
     pool.add(1, 0.5, None, None, orig_elapsed_s=10.0)
-    pool.add(2, 0.5, None, None)
+    clock.now = 10.0
+    pool.add(2, 0.5, None, None)  # no context phase yet: generation_first
     clock.now = 59.9
     assert pool.expire() == [] and pool.remaining_s(pool.waiter(1)) == pytest.approx(0.1)
     clock.now = 60.0
     expired = pool.expire()
     assert [w.rid for w in expired] == [1] and pool.expired == 1
     assert "KV transfer timeout (60 s" in pool.expiry_message(expired[0])
-    assert len(pool) == 1 and pool.remaining_s(pool.waiter(2)) is None
+    assert len(pool) == 1 and pool.remaining_s(pool.waiter(2)) == pytest.approx(10.0)
+    clock.now = 70.0
+    assert [w.rid for w in pool.expire()] == [2] and len(pool) == 0
     # Without the timeout nothing expires on its own.
     plain = SeatPool(1, clock=clock)
     plain.add(3, 0.5, None, None, orig_elapsed_s=10.0)
     clock.now = 1e6
     assert plain.expire() == []
+
+
+def test_pool_ages_by_arrival_then_seq():
+    """Aged waiters go by arrival at the orchestrator, like AgingPriorityWaitingQueue."""
+    clock = _Clock()
+    pool = SeatPool(1, max_wait_s=60.0, clock=clock)
+    pool.add(1, 0.5, None, None)  # arrival 0
+    clock.now = 1.0
+    pool.add(2, 0.5, None, None, orig_elapsed_s=30.0)  # arrival -29, joined later
+    clock.now = 60.0
+    assert pool.pick(["s"])[0].rid == 2
+    assert pool.sort_key(pool.waiter(2), 60.0) < pool.sort_key(pool.waiter(1), 60.0)
+
+
+def test_pool_pick_does_not_scan_every_waiter(monkeypatch):
+    """A placement looks at one waiter per excluded server, not at the whole queue."""
+    clock = _Clock()
+    pool = SeatPool(1, max_wait_s=600.0, clock=clock, kv_transfer_timeout_s=60.0)
+    for rid in range(2000):
+        pool.add(rid, (rid % 97) / 97.0, "ctx0" if rid % 2 else None, None)
+    calls = []
+    real = pool.sort_key
+    monkeypatch.setattr(pool, "sort_key", lambda w, now: calls.append(w) or real(w, now))
+    order = []
+    while len(pool) > 1990:
+        waiter, _ = pool.pick(["s"])
+        pool.record_grant(waiter)
+        order.append(waiter.priority)
+    assert len(calls) <= 2 * 10
+    assert order == sorted(order, reverse=True) and order[0] == 96 / 97.0
+    # Removed and placed waiters are never picked again, and expiry pops only the expired.
+    for rid in range(0, 2000, 3):
+        pool.remove(rid)
+    live = len(pool)
+    assert 0 < live == len(pool.waiters()) < 1990
+    clock.now = 59.0
+    assert pool.expire() == []
+    clock.now = 60.0
+    assert len(pool.expire()) == live and len(pool) == 0 and pool.pick(["s"]) is None
 
 
 def test_pool_skips_excluded_server():
@@ -301,18 +353,18 @@ async def test_cancellation_releases_queue_place_and_seat():
 
 @pytest.mark.asyncio
 async def test_waiter_fails_at_the_kv_transfer_timeout():
-    """A request past its context phase that finds no seat within the timeout fails; others wait."""
+    """A request that finds no seat within the timeout fails, generation_first ones too."""
     router = _router(servers=("s0",), seats=1, kv_ms=50)
     await router.get_next_server_by_key({}, req_id=0)
     doomed = asyncio.create_task(
         router.get_next_server_by_key({"priority": 0.9, "orig_elapsed_s": 3.0}, req_id=1)
     )
-    patient = asyncio.create_task(router.get_next_server_by_key({"priority": 0.1}, req_id=2))
-    with pytest.raises(ValueError, match="KV transfer timeout"):
+    gen_first = asyncio.create_task(router.get_next_server_by_key({"priority": 0.1}, req_id=2))
+    with pytest.raises(NoGenerationSeatError, match="KV transfer timeout"):
         await asyncio.wait_for(doomed, timeout=5)
-    assert len(router._pool) == 1 and router._pool.expired == 1 and not patient.done()
-    await router.finish_request_by_id(0)
-    assert (await asyncio.wait_for(patient, timeout=5))[0] == "s0"
+    with pytest.raises(NoGenerationSeatError, match="KV transfer timeout"):
+        await asyncio.wait_for(gen_first, timeout=5)
+    assert len(router._pool) == 0 and router._pool.expired == 2
     # The in-process path reads the elapsed time from the request.
     request = CompletionRequest(
         model="m",
@@ -392,3 +444,229 @@ def test_delegating_router_waits_longer_for_a_pooled_select():
     )
     assert pooled._select_timeout_s == POOLED_SELECT_TIMEOUT_S
     assert plain._select_timeout_s == 5.0
+
+
+# ---------------------------------------------------------------------------------- review fixes
+
+
+async def _set_servers(router, servers):
+    """What add_server / remove_server / the cluster watch do to the server list."""
+    async with router._lock:
+        old = router._servers.copy()
+        router._servers = list(servers)
+        router._on_servers_updated(old, router._servers)
+
+
+@pytest.mark.asyncio
+async def test_seat_count_survives_a_server_leaving_and_rejoining():
+    """A re-registered server keeps the seats its running requests hold (no -k drift)."""
+    router = _router(servers=("s0",), seats=1)
+    await router.get_next_server_by_key({}, req_id=1)
+    await _set_servers(router, [])
+    await _set_servers(router, ["s0"])
+    assert router._get_server_load("s0") == 1  # request 1 still holds its seat
+    waiting = asyncio.create_task(router.get_next_server_by_key({}, req_id=2))
+    await _settle()
+    assert not waiting.done()
+    await router.finish_request_by_id(1)
+    assert (await asyncio.wait_for(waiting, 5))[0] == "s0"
+    await router.finish_request_by_id(2)
+    assert router._get_server_load("s0") == 0 and router._departed_state == {}
+    # A server that leaves for good drops its state once its last seat is released.
+    await router.get_next_server_by_key({}, req_id=3)
+    await _set_servers(router, [])
+    await router.finish_request_by_id(3)
+    assert router._departed_state == {} and router._seat_state == {}
+
+
+def _ctx_router_with(infos):
+    ctx = create_router(
+        RouterConfig(type="round_robin", server_role=ServerRole.CONTEXT), list(infos)
+    )
+    ctx._server_info.update(infos)
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_seat_wait_bound_comes_from_the_context_servers():
+    """The context servers' own kv_transfer_timeout_ms (/server_info) wins over the server YAML."""
+    gen_config = RouterConfig(
+        type="load_balancing",
+        server_role=ServerRole.GENERATION,
+        args={"max_requests_per_server": 1, "kv_transfer_timeout_ms": 60000},
+    )
+    ctx_config = RouterConfig(type="round_robin", server_role=ServerRole.CONTEXT)
+    ctx, gen = build_disagg_routers(ctx_config, gen_config, ["c0", "c1"], ["s0"])
+    assert gen._context_router is ctx
+    ctx._server_info.update(
+        {"c0": {"kv_transfer_timeout_ms": 600000}, "c1": {"kv_transfer_timeout_ms": 300000}}
+    )
+    await gen.get_next_server_by_key({}, req_id=1)
+    assert gen._pool.kv_transfer_timeout_s == 300.0
+    # Without a reported value the configured one applies.
+    gen.set_context_router(_ctx_router_with({"c0": {}}))
+    waiting = asyncio.create_task(gen.get_next_server_by_key({}, req_id=2))
+    await _settle()
+    assert gen._pool.kv_transfer_timeout_s == 60.0
+    assert gen._pool.waiter(2).deadline - gen._pool.waiter(2).entered == pytest.approx(60.0)
+    waiting.cancel()
+
+
+def test_max_queue_wait_without_pooling_is_rejected():
+    with pytest.raises(ValueError, match="max_requests_per_server"):
+        extract_disagg_cfg(
+            generation_servers={"router": {"type": "load_balancing", "max_queue_wait_s": 30}}
+        )
+    with pytest.raises(ValueError, match="max_requests_per_server"):
+        extract_disagg_cfg(context_servers={"router": {"max_queue_wait_s": 30}})
+
+
+def test_router_declares_pooled():
+    assert Router.pooled is False and PooledLoadBalancingRouter.pooled is True
+    assert not create_router(
+        RouterConfig(type="load_balancing", server_role=ServerRole.GENERATION), ["s"]
+    ).pooled
+    assert CoordinatorDelegatingRouter("http://c:1", _router(), "generation", 5.0).pooled
+
+
+@pytest.mark.asyncio
+async def test_coordinator_stop_fails_seat_waiters():
+    coordinator = _coordinator()
+    await coordinator.select("generation", {}, 1, None)
+    waiting = asyncio.create_task(coordinator.select("generation", {}, 2, None))
+    await _settle()
+    await asyncio.wait_for(coordinator.stop(), timeout=5)
+    with pytest.raises(NoGenerationSeatError, match="stopping"):
+        await asyncio.wait_for(waiting, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_pooled_seat_is_not_reclaimed_at_the_reservation_ttl():
+    """A granted seat outlives the coordinator's 180 s TTL: only /finish (or the 6 h net) frees it."""
+    coordinator = _coordinator()
+    coordinator._reservation_timeout_secs = 0.05
+    await coordinator.select("generation", {}, 1, None)
+    await asyncio.sleep(0.3)
+    assert coordinator.gen_router._get_server_load("g:1") == 1
+    assert coordinator._reservation_timeout_for(coordinator.gen_router) == (
+        POOLED_RESERVATION_TIMEOUT_S
+    )
+    assert coordinator._reservation_timeout_for(coordinator.ctx_router) == 0.05
+    await coordinator.finish("generation", 1)
+    assert coordinator.gen_router._get_server_load("g:1") == 0
+
+
+def test_seat_timeout_reaches_the_client_as_503(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    coordinator = _coordinator()
+
+    async def no_seat(*_args):
+        raise NoGenerationSeatError("no seat within 60 s")
+
+    monkeypatch.setattr(coordinator, "select", no_seat)
+    http = TestClient(CoordinatorServer(coordinator).app)
+    raw = http.post(
+        "/select",
+        content=msgpack.packb({"role": "generation", "routing_key": {}, "req_id": 1}),
+    )
+    assert raw.status_code == 503
+    assert msgpack.unpackb(raw.content, raw=False)["no_generation_seat"] is True
+    server = SimpleNamespace(_perf_metrics_collector=Mock())
+    with pytest.raises(HTTPException) as error:
+        OpenAIDisaggServer._handle_exception(server, NoGenerationSeatError("no seat"))
+    assert error.value.status_code == 503
+
+
+class _FakeCoordinatorHttp:
+    """A coordinator whose pooled /select waits until a /finish for its req_id arrives."""
+
+    def __init__(self, select_delay_s=None):
+        self.finished = []
+        self.select_delay_s = select_delay_s
+        self._finish_events = {}
+
+    async def select(self, request):
+        from aiohttp import web
+
+        body = msgpack.unpackb(await request.read(), raw=False)
+        if self.select_delay_s is not None:
+            await asyncio.sleep(self.select_delay_s)
+        else:
+            event = self._finish_events.setdefault(body["req_id"], asyncio.Event())
+            await event.wait()
+            return web.Response(
+                status=503,
+                body=msgpack.packb({"error": "finished while waiting"}),
+                content_type="application/msgpack",
+            )
+        return web.Response(
+            body=msgpack.packb({"server": "s0", "info": {}, "req_id": body["req_id"]}),
+            content_type="application/msgpack",
+        )
+
+    async def finish(self, request):
+        from aiohttp import web
+
+        body = msgpack.unpackb(await request.read(), raw=False)
+        self.finished.append(body["req_id"])
+        self._finish_events.setdefault(body["req_id"], asyncio.Event()).set()
+        return web.Response(body=msgpack.packb({}), content_type="application/msgpack")
+
+
+async def _with_fake_coordinator(fake, body):
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    app = web.Application()
+    app.router.add_post("/select", fake.select)
+    app.router.add_post("/finish", fake.finish)
+    async with TestServer(app) as server:
+        router = CoordinatorDelegatingRouter(
+            f"http://{server.host}:{server.port}", _router(), "generation", 5.0
+        )
+        try:
+            await body(router)
+        finally:
+            await router.close()
+
+
+def _gen_request(rid):
+    return CompletionRequest(
+        model="m",
+        prompt="x",
+        disaggregated_params=DisaggregatedParams(
+            request_type="generation_only", ctx_request_id=rid, disagg_request_id=rid
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_delegating_router_finishes_a_cancelled_pooled_select_at_once():
+    """A cancelled caller sends /finish at once; it does not wait for the seat first."""
+    fake = _FakeCoordinatorHttp()
+
+    async def body(router):
+        selecting = asyncio.create_task(router.get_next_server(_gen_request(7)))
+        await asyncio.sleep(0.2)
+        selecting.cancel()
+        done, _ = await asyncio.wait({selecting}, timeout=5)
+        assert selecting in done and selecting.cancelled()
+        await asyncio.wait_for(router._finish_queue.join(), timeout=5)
+        assert 7 in fake.finished
+
+    await _with_fake_coordinator(fake, body)
+
+
+@pytest.mark.asyncio
+async def test_delegating_router_finishes_a_timed_out_select():
+    fake = _FakeCoordinatorHttp(select_delay_s=2.0)
+
+    async def body(router):
+        router._select_timeout_s = 0.1
+        with pytest.raises(asyncio.TimeoutError):
+            await router.get_next_server(_gen_request(9))
+        await asyncio.wait_for(router._finish_queue.join(), timeout=5)
+        assert fake.finished == [9]
+
+    await _with_fake_coordinator(fake, body)

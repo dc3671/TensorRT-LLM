@@ -18,7 +18,7 @@ import time
 from abc import ABC, abstractmethod
 from array import array
 from collections import OrderedDict
-from typing import Awaitable, Callable, Dict, Iterable, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
 import msgpack
@@ -31,6 +31,8 @@ from tensorrt_llm.serve.conversation_id import get_request_routing_id
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ResponsesRequest)
+from tensorrt_llm.serve.output_length_predictor import (OUTPUT_LENGTH_KEY,
+                                                        request_inputs)
 # Shared tokenization / block-hashing utilities (single source of truth).
 # Re-exported here for backward compat.
 from tensorrt_llm.serve.router_utils import (  # noqa: F401
@@ -38,7 +40,8 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
     KV_CACHE_HASH_ALGO_V2_SHA256_64, KV_CACHE_HASH_ALGOS, BlockHash,
     BlockHashMixin, OpenAIRequest, block_key_hasher, get_request_num_tokens,
     hash_v1_block_key, responses_request_text, truncate_sha256_hash_to_int64)
-from tensorrt_llm.serve.seat_pool import SeatPool, Waiter, priority_or_default
+from tensorrt_llm.serve.seat_pool import (NoGenerationSeatError, SeatPool,
+                                          Waiter, priority_or_default)
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
 # Retries ride out a burst that fills the coordinator's accept queue; select is
@@ -53,6 +56,7 @@ COORDINATOR_FINISH_QUEUE_SIZE = 4096
 COORDINATOR_FINISH_DRAIN_TIMEOUT_S = 5.0
 # A fleet worker's bound on a pooled generation /select, which waits for a free seat.
 POOLED_SELECT_TIMEOUT_S = 3600.0
+_UNREAD = object()
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
@@ -324,11 +328,16 @@ class LoadBalancingMixin:
             await self._server_state[server].decrement_load(request)
         return server
 
-    def _select_least_loaded(self,
-                             exclude_server: Optional[str] = None
-                             ) -> Optional[str]:
-        """Pick the server with the lowest load. Round-robin breaks ties."""
-        candidates = [s for s in self._servers if s != exclude_server]
+    def _select_least_loaded(
+            self,
+            exclude_server: Optional[str] = None,
+            candidates: Optional[List[str]] = None) -> Optional[str]:
+        """Pick the server with the lowest load. Round-robin breaks ties.
+
+        ``candidates`` (default: every server but ``exclude_server``) are the servers to pick from.
+        """
+        if candidates is None:
+            candidates = [s for s in self._servers if s != exclude_server]
         if not candidates:
             return None
         loads = {s: self._get_server_load(s) for s in candidates}
@@ -342,6 +351,11 @@ class LoadBalancingMixin:
 
 
 class Router(ABC):
+
+    # True for a router whose placement may wait for capacity (a generation seat). The coordinator
+    # then runs its select outside the reservation lock that its finish takes, waits for it longer
+    # (POOLED_SELECT_TIMEOUT_S), and fails its waiters (fail_waiters) when it stops.
+    pooled: bool = False
 
     def __init__(
             self,
@@ -401,6 +415,10 @@ class Router(ABC):
     @property
     def server_role(self) -> ServerRole:
         return self._server_role
+
+    def server_infos(self) -> dict[str, dict]:
+        """The ``/server_info`` of every prepared server, by server."""
+        return self._server_info
 
     @staticmethod
     def _ensure_url(server: str) -> str:
@@ -504,6 +522,11 @@ class Router(ABC):
                              success: bool = True,
                              req_id: Optional[int] = None):
         pass
+
+    async def fail_waiters(self, reason: str) -> int:
+        """Fail every request waiting for capacity (``pooled`` routers); returns how many."""
+        del reason
+        return 0
 
     async def renew_request(self,
                             request: OpenAIRequest,
@@ -865,9 +888,14 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
     the queue; its ``select`` waits for the seat outside the reservation lock.
 
     A request whose context phase has finished (``disaggregated_params.orig_elapsed_s``
-    set) waits from its arrival at the orchestrator and, with ``kv_transfer_timeout_ms``
-    (the context servers' value, filled in by ``extract_disagg_cfg``), fails once it has
-    waited that long for a seat: its context server has dropped the KV transfer by then.
+    set) ages from its arrival at the orchestrator. With ``kv_transfer_timeout_ms`` every
+    request fails once it has waited that long for a seat: its context server has dropped
+    the KV transfer by then. The value is the smallest one the context servers report in
+    ``/server_info`` (:meth:`set_context_router`), else the configured one.
+
+    A seat is released on the server state it was taken from: a server that leaves while
+    requests hold its seats keeps that state, and gets it back if it rejoins, so its seat
+    count stays right across a re-registration.
     """
 
     pooled = True
@@ -895,13 +923,25 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                          metadata_server,
                          use_tokens=False,
                          **kwargs)
+        self._configured_kv_timeout_ms = kv_transfer_timeout_ms
         self._pool = SeatPool(
             max_requests_per_server,
             max_queue_wait_s,
             kv_transfer_timeout_s=(None if kv_transfer_timeout_ms is None else
                                    kv_transfer_timeout_ms / 1000.0))
+        # The server state each granted seat was taken from, by request id.
+        self._seat_state: dict[int, ServerState] = {}
+        # Removed servers that still have seated requests, by server.
+        self._departed_state: dict[str, ServerState] = {}
+        self._context_router: Optional[Router] = None
+        # The value last read from the context servers (_UNREAD: none yet).
+        self._reported_kv_timeout_ms: Any = _UNREAD
         logger.info(f"PooledLoadBalancingRouter: "
                     f"{self._pool.describe(len(self._servers))}")
+        self._warn_if_cap_exceeds_kv_timeout(kv_transfer_timeout_ms)
+
+    def _warn_if_cap_exceeds_kv_timeout(self, kv_transfer_timeout_ms) -> None:
+        max_queue_wait_s = self._pool.max_wait_s
         if (max_queue_wait_s is not None and kv_transfer_timeout_ms is not None
                 and max_queue_wait_s * 1000.0 > kv_transfer_timeout_ms):
             logger.warning(
@@ -909,6 +949,39 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                 f"servers' kv_transfer_timeout_ms ({kv_transfer_timeout_ms} "
                 f"ms): a request fails at that timeout before the cap can "
                 f"move it ahead")
+
+    def set_context_router(self, context_router: Router) -> None:
+        """Bound the seat wait by the KV transfer timeout the context servers report."""
+        self._context_router = context_router
+
+    def _refresh_kv_timeout(self) -> None:
+        """Use the smallest ``kv_transfer_timeout_ms`` in the context servers' ``/server_info``."""
+        if self._context_router is None:
+            return
+        reported = [
+            info["kv_transfer_timeout_ms"]
+            for info in self._context_router.server_infos().values()
+            if isinstance(info.get("kv_transfer_timeout_ms"), (int, float))
+            and not isinstance(info.get("kv_transfer_timeout_ms"), bool)
+            and info["kv_transfer_timeout_ms"] > 0
+        ]
+        value = min(reported) if reported else None
+        if value == self._reported_kv_timeout_ms:
+            return
+        self._reported_kv_timeout_ms = value
+        if value is None:
+            value = self._configured_kv_timeout_ms
+            logger.warning(
+                "PooledLoadBalancingRouter: no context server reports "
+                "kv_transfer_timeout_ms in /server_info; generation requests "
+                f"wait at most the configured {value} ms for a seat")
+        else:
+            logger.info(f"PooledLoadBalancingRouter: generation requests wait "
+                        f"at most {value} ms for a seat, the context servers' "
+                        f"smallest kv_transfer_timeout_ms")
+        self._pool.kv_transfer_timeout_s = (None if value is None else value /
+                                            1000.0)
+        self._warn_if_cap_exceeds_kv_timeout(value)
 
     @staticmethod
     def _orig_elapsed_s(request: OpenAIRequest) -> Optional[float]:
@@ -926,7 +999,18 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
         return key
 
     def _on_servers_updated(self, old_servers, new_servers):
+        # A leaving server keeps its state while requests hold its seats; it
+        # gets that state back if it rejoins, so their releases stay counted.
+        for server in old_servers:
+            state = self._server_state.get(server)
+            if (server not in new_servers and state is not None
+                    and state._num_active_requests > 0):
+                self._departed_state[server] = state
         super()._on_servers_updated(old_servers, new_servers)
+        for server in new_servers:
+            state = self._departed_state.pop(server, None)
+            if state is not None:
+                self._server_state[server] = state
         if len(self._pool):
             # New servers may seat waiters; called with the lock held.
             try:
@@ -946,7 +1030,17 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
         for expired in self._pool.expire(waiter):
             if not expired.future.done():
                 expired.future.set_exception(
-                    ValueError(self._pool.expiry_message(expired)))
+                    NoGenerationSeatError(self._pool.expiry_message(expired)))
+
+    async def fail_waiters(self, reason: str) -> int:
+        """Fail every request still waiting for a seat (the coordinator stops)."""
+        async with self._lock:
+            waiters = self._pool.waiters()
+            for waiter in waiters:
+                self._pool.remove(waiter.rid)
+                if not waiter.future.done():
+                    waiter.future.set_exception(NoGenerationSeatError(reason))
+        return len(waiters)
 
     async def _dispatch_locked(self) -> None:
         """Give free seats to waiters, best first. Called with ``self._lock`` held."""
@@ -960,13 +1054,11 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
             if picked is None:
                 break
             waiter, candidates = picked
-            loads = {s: self._get_server_load(s) for s in candidates}
-            min_load = min(loads.values())
-            tied = [s for s in candidates if loads[s] == min_load]
-            server = tied[self._rr_counter % len(tied)]
-            self._rr_counter += 1
-            await self._server_state[server].increment_load_by(0)
+            server = self._select_least_loaded(candidates=candidates)
+            state = self._server_state[server]
+            await state.increment_load_by(0)
             self._req_routing_table[waiter.rid] = server
+            self._seat_state[waiter.rid] = state
             self._pool.record_grant(waiter)
             if not waiter.future.done():
                 waiter.future.set_result(server)
@@ -992,6 +1084,7 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                 return server
             waiter = self._pool.waiter(rid)
             if waiter is None:
+                self._refresh_kv_timeout()
                 waiter = self._pool.add(
                     rid, priority, exclude_server,
                     asyncio.get_running_loop().create_future(), orig_elapsed_s)
@@ -1029,8 +1122,14 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                     ValueError(
                         "generation request finished while waiting for a seat"))
             return
-        if server in self._server_state:
-            await self._server_state[server].decrement_load_by(0)
+        # Release on the state the seat was taken from, even if its server has
+        # left (and maybe rejoined) since.
+        state = self._seat_state.pop(rid, None)
+        if state is not None:
+            await state.decrement_load_by(0)
+            if (state._num_active_requests <= 0
+                    and self._departed_state.get(server) is state):
+                del self._departed_state[server]
         await self._dispatch_locked()
 
     async def get_next_server(self,
@@ -2168,8 +2267,11 @@ class CoordinatorDelegatingRouter(Router):
         self._role = role  # "context" | "generation"
         self._request_timeout_s = request_timeout_s
         # A pooled router's /select waits in the coordinator for a free seat.
-        self._select_timeout_s = (POOLED_SELECT_TIMEOUT_S if getattr(
-            local_router, "pooled", False) else request_timeout_s)
+        self.pooled = local_router.pooled
+        self._select_timeout_s = (POOLED_SELECT_TIMEOUT_S
+                                  if self.pooled else request_timeout_s)
+        # Ask /select for the output-length prediction (output_length_prediction).
+        self._predict_output_length = False
         self._session: Optional[aiohttp.ClientSession] = None
         self._finish_queue: asyncio.Queue[tuple[int, bool]] = asyncio.Queue(
             maxsize=COORDINATOR_FINISH_QUEUE_SIZE)
@@ -2213,6 +2315,24 @@ class CoordinatorDelegatingRouter(Router):
                 if server in servers
             }
 
+    def enable_output_length_prediction(self) -> None:
+        """Have the coordinator predict a generation request's output length in ``/select``.
+
+        The routing key then carries the request's conversation id and prompt tokens; the
+        coordinator orders the placement by the predicted priority and returns the prediction
+        in the route info under ``OUTPUT_LENGTH_KEY``, which also sets ``request.priority``.
+        """
+        self._predict_output_length = self._role == "generation"
+
+    def _output_length_inputs(self, request: OpenAIRequest) -> Optional[dict]:
+        if not self._predict_output_length or "priority" not in getattr(
+                type(request), "model_fields", {}):
+            return None
+        conv_id, isl = request_inputs(request)
+        if isl is None:
+            return None
+        return {"conv": conv_id, "isl": isl}
+
     def _request_id(self,
                     request: OpenAIRequest,
                     req_id: Optional[int] = None) -> int:
@@ -2247,6 +2367,9 @@ class CoordinatorDelegatingRouter(Router):
         # kv_cache_aware); run it in a thread so it doesn't block the fleet worker
         # event loop driving the concurrent streams.
         key = await asyncio.to_thread(self._local.routing_key, request)
+        prediction_inputs = self._output_length_inputs(request)
+        if prediction_inputs is not None:
+            key[OUTPUT_LENGTH_KEY] = prediction_inputs
         # Send the request's existing disagg id as the cross-process key (the
         # coordinator keys pending state by it for /finish); placement must not
         # change it, since the ctx<->gen KV transfer is keyed by it.
@@ -2258,9 +2381,11 @@ class CoordinatorDelegatingRouter(Router):
         }
         _t0 = time.monotonic()
         selection = asyncio.create_task(self._post_select(payload))
+        prediction = None
         try:
             body = await asyncio.shield(selection)
             info = body.get("info") or {}
+            prediction = info.get(OUTPUT_LENGTH_KEY)
             if body["server"] is None and info.get(ROUTING_CONTENT_REQUIRED):
                 # The coordinator placed nothing; repeat with the content key.
                 payload["routing_key"] = await asyncio.to_thread(
@@ -2269,6 +2394,13 @@ class CoordinatorDelegatingRouter(Router):
                 body = await asyncio.shield(selection)
                 info = body.get("info") or {}
         except asyncio.CancelledError:
+            if self.pooled:
+                # A pooled select may wait long for a seat. This finish fails
+                # its coordinator-side wait at once; the one below releases a
+                # seat granted before this finish arrived.
+                await self.finish_request(request,
+                                          success=False,
+                                          req_id=payload["req_id"])
             # /finish must not overtake /select and leave a late reservation.
             # Keep its existing HTTP timeout/retry bounds, even if the caller
             # cancels again while we wait to release the original routing ID.
@@ -2282,10 +2414,22 @@ class CoordinatorDelegatingRouter(Router):
                                       success=False,
                                       req_id=payload["req_id"])
             raise
+        except asyncio.TimeoutError:
+            # The coordinator may hold a reservation (or grant one later).
+            await self.finish_request(request,
+                                      success=False,
+                                      req_id=payload["req_id"])
+            raise
         self._select_lat.record(time.monotonic() - _t0)
         if body["server"] is None:
             raise ValueError(f"coordinator /select placed no {self._role} "
                              f"server: {info}")
+        prediction = info.get(OUTPUT_LENGTH_KEY, prediction)
+        if prediction is not None:
+            info = {**info, OUTPUT_LENGTH_KEY: prediction}
+            priority = prediction.get("priority")
+            if isinstance(priority, float) and 0.0 <= priority <= 1.0:
+                request.priority = priority
         return body["server"], info
 
     async def _post_select(self, payload: dict) -> dict:
@@ -2310,9 +2454,11 @@ class CoordinatorDelegatingRouter(Router):
                         timeout=self._select_timeout_s) as resp:
                     body = msgpack.unpackb(await resp.read(), raw=False)
                     if resp.status != 200:
-                        raise ValueError(
-                            f"coordinator /select returned {resp.status}: "
-                            f"{body.get('error', body)}")
+                        message = (f"coordinator /select returned "
+                                   f"{resp.status}: {body.get('error', body)}")
+                        if body.get("no_generation_seat"):
+                            raise NoGenerationSeatError(message)
+                        raise ValueError(message)
                 return body
             except aiohttp.ClientConnectionError as e:
                 if attempt == COORDINATOR_SELECT_MAX_ATTEMPTS:
@@ -2511,4 +2657,6 @@ def build_disagg_routers(
     gen_router = create_router(gen_router_config, gen_servers,
                                metadata_server_cfg, metadata_server,
                                server_preparation_func, disagg_node_id)
+    if gen_router.pooled:
+        gen_router.set_context_router(ctx_router)
     return ctx_router, gen_router

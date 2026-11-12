@@ -265,9 +265,20 @@ def allocate_gpus(
     return allocations
 
 
+# Router options of pooled generation dispatch; a context router rejects them.
+GEN_ONLY_ROUTER_KEYS = ("max_requests_per_server", "max_queue_wait_s")
+
+
 def convert_allocations_to_server_config(allocations,
                                          server_port=8333,
-                                         router_config=None):
+                                         router_config=None,
+                                         ctx_kv_transfer_timeout_ms=None):
+    """Build the disaggregated server config.
+
+    ``router_config`` applies to both roles, without its generation-only keys for the context
+    servers; ``ctx_kv_transfer_timeout_ms`` is the context workers' value, which bounds the
+    pooled generation wait.
+    """
     generation_servers = {}
     context_servers = {}
     server_hostname = None
@@ -283,6 +294,13 @@ def convert_allocations_to_server_config(allocations,
         server_config_entry = {'num_instances': num_servers, 'urls': urls}
         if router_config:
             server_config_entry['router'] = router_config.copy()
+            if server_type == "CTX":
+                for key in GEN_ONLY_ROUTER_KEYS:
+                    server_config_entry['router'].pop(key, None)
+        if server_type == "CTX" and ctx_kv_transfer_timeout_ms is not None:
+            server_config_entry['cache_transceiver_config'] = {
+                'kv_transfer_timeout_ms': ctx_kv_transfer_timeout_ms
+            }
 
         if server_type == "GEN":
             generation_servers = server_config_entry
@@ -698,8 +716,12 @@ def submit_job(config, log_dir, dry_run):
 
     # Generate disagg server config
     router_config = config.get('router_config', None)
+    ctx_transceiver = worker_config['ctx'].get('cache_transceiver_config') or {}
     server_config = convert_allocations_to_server_config(
-        allocations, router_config=router_config)
+        allocations,
+        router_config=router_config,
+        ctx_kv_transfer_timeout_ms=ctx_transceiver.get(
+            'kv_transfer_timeout_ms'))
     # Merge server_config_extra into disagg server config
     if 'server_config_extra' in config:
         server_config.update(config['server_config_extra'])
