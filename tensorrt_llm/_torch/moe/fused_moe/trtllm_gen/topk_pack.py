@@ -15,11 +15,13 @@ import triton.language as tl
 from ....flashinfer_utils import get_env_enable_pdl
 from ....modules.fla.op import gdc_wait_with_memory_clobber
 
-# Words per program: one Triton specialization for every call (a decode step's top-k fits one program).
+# Words per program (a decode step's top-k fits one program).
 _BLOCK = 1024
 
 
-@triton.jit
+# ``n`` only bounds the mask: not specialized, so one compiled variant serves every word count (Triton would
+# otherwise compile n == 1, n % 16 == 0 and other n apart, the first in-step call of a new class compiling).
+@triton.jit(do_not_specialize=["n"])
 def _pack_topk_bf16_kernel(ids_ptr, w_ptr, out_ptr, n, BLOCK: tl.constexpr, USE_PDL: tl.constexpr):
     if USE_PDL:
         gdc_wait_with_memory_clobber()
