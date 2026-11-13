@@ -1046,3 +1046,31 @@ def test_decode_front_engine_route_gate(
     assert out == "front" and calls == path, calls
     engine = path[0] == "engine_router"
     assert (seen[0].candidates is cand) == engine and (seen[0].candidates is None) != engine
+
+
+def test_engine_route_decision_is_kept_per_token_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``DecodeFront._engine_routes`` evaluates ``decode_moe.engine_routes`` once per token count after the backend's
+    engine state exists (everything else it reads is fixed per layer), and every call before that."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe as dm
+
+    evaluated: list[int] = []
+    real = dm.engine_routes
+
+    def counted(backend, m, top_k, num_experts):
+        evaluated.append(m)
+        return real(backend, m, top_k, num_experts)
+
+    monkeypatch.setattr(dm, "engine_routes", counted)
+    front = df.DecodeFront(frozenset({35, 42}), decode_kernels=True, engine_route=True)
+    front.engine_router = object()
+    unfinalized = {"do_finalize": False}
+    backend = _engine_backend(engine_state=False)
+    assert not front._engine_routes(backend, 35, K, E, unfinalized)
+    assert not front._engine_routes(backend, 35, K, E, unfinalized)
+    assert evaluated == [35, 35]
+    backend.decode_engine_state = torch.zeros(1, dtype=torch.int32)
+    for _ in range(3):
+        assert front._engine_routes(backend, 35, K, E, unfinalized)
+        assert not front._engine_routes(backend, 65, K, E, unfinalized)
+    assert not front._engine_routes(backend, 35, K, E, {"do_finalize": True})
+    assert evaluated == [35, 35, 35, 65]

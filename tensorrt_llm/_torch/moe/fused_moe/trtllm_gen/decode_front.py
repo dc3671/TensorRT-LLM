@@ -1185,6 +1185,9 @@ class DecodeFront:
         self._front_tactics = {}
         # (ExpertL2Prefetch, layer index): un-finalized calls record their experts for the next step's prefetch.
         self._expert_prefetch = None
+        # Per token count: whether an un-finalized call routes in the decode MoE engine (decode_moe.engine_routes),
+        # once the backend's engine state exists (everything else it reads is fixed per layer).
+        self._engine_route_rows = {}
 
     def set_expert_prefetch(self, prefetch: "ExpertL2Prefetch", layer_idx: int) -> None:
         self._expert_prefetch = (prefetch, layer_idx)
@@ -1212,9 +1215,14 @@ class DecodeFront:
         ``m`` rows takes the routing engine (the router GEMM may still decline the rows, then the route front runs)."""
         if self.engine_router is None or moe_kwargs.get("do_finalize", True):
             return False
-        from .decode_moe import engine_routes
+        routes = self._engine_route_rows.get(m)
+        if routes is None:
+            from .decode_moe import engine_routes
 
-        return engine_routes(backend, m, top_k, num_experts)
+            routes = engine_routes(backend, m, top_k, num_experts)
+            if backend.decode_engine_state is not None:
+                self._engine_route_rows[m] = routes
+        return routes
 
     def _table_buffer(
         self, m: int, top_k: int, num_local: int, tile: int, device: torch.device
