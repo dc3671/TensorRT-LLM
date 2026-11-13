@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/storage/remoteTransferFabric.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/utils/cudaContextScope.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
@@ -141,15 +142,8 @@ CUresult FabricTransferBackend::synchronizeContext() const noexcept
     {
         return CUDA_SUCCESS;
     }
-    CUresult result = cuCtxPushCurrent(mContext);
-    if (result != CUDA_SUCCESS)
-    {
-        return result;
-    }
-    result = cuCtxSynchronize();
-    CUcontext popped = nullptr;
-    cuCtxPopCurrent(&popped);
-    return result;
+    CudaContextScope const scope(mContext);
+    return scope.usable() ? cuCtxSynchronize() : scope.error();
 }
 
 bool FabricTransferBackend::acceptPayload(RemoteDonor const& donor) const
