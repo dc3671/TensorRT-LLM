@@ -22,13 +22,8 @@ from tensorrt_llm.functional import AllReduceFusionOp
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from .ops import (
-    MNNVLAllReduce,
-    _get_mnnvl_workspace_comm,
-    _make_mnnvl_mcast_buffer,
-    _mnnvl_workspace_all_succeeded,
-    use_mnnvl_fabric_handle,
-)
+from . import ops
+from .ops import MNNVLAllReduce
 
 # Fusion op -> (quantized output, normalized output): the fusions of the CuTe DSL norm kernels.
 _OUTPUTS = MNNVLAllReduce._FUSED_NORM_OUTPUTS
@@ -39,7 +34,7 @@ def _setup_failures(comm: Any, rank: int, error: Optional[BaseException]) -> str
     the TP ProcessGroup under Ray): "" when every rank succeeded, else "rank r: <cause>"
     for each failed rank (this rank's own cause only where the communicator is a ProcessGroup)."""
     if mpi_disabled():
-        if _mnnvl_workspace_all_succeeded(comm, error is None):
+        if ops._mnnvl_workspace_all_succeeded(comm, error is None):
             return ""
         return f"rank {rank}: {error}" if error is not None else "on a peer rank"
     errors = comm.allgather(None if error is None else str(error))
@@ -73,7 +68,7 @@ class Tp2AllReduceNorm:
         self.warps = 8
         # The TP pair's communicator (a split of the session communicator; the buffer only borrows it). Not
         # get_or_scale_allreduce_mnnvl_workspace: that would also allocate an MNNVL workspace nothing here uses.
-        comm = self._comm = _get_mnnvl_workspace_comm(mapping)
+        comm = self._comm = ops._get_mnnvl_workspace_comm(mapping)
         half = (max_tokens + 1) // 2
         lbytes = half * hidden * 2
         flag_bytes = 2 * self.sms * self.warps * 4
@@ -81,8 +76,8 @@ class Tp2AllReduceNorm:
         error = None
         try:
             # Collective up to the handle exchange; its pointer-table tail is not, so it is agreed on below.
-            self.handle = _make_mnnvl_mcast_buffer(
-                comm, size, mapping, use_mnnvl_fabric_handle(mapping)
+            self.handle = ops._make_mnnvl_mcast_buffer(
+                comm, size, mapping, ops.use_mnnvl_fabric_handle(mapping)
             )
             r, p = mapping.tp_rank, 1 - mapping.tp_rank
             own = self.handle.get_uc_buffer(r, (size // 4,), torch.int32, 0)
