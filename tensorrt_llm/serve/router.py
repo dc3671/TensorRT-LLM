@@ -17,7 +17,7 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from array import array
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
@@ -54,6 +54,8 @@ COORDINATOR_FINISH_TIMEOUT_S = 5.0
 COORDINATOR_FINISH_WORKERS = 16
 COORDINATOR_FINISH_QUEUE_SIZE = 4096
 COORDINATOR_FINISH_DRAIN_TIMEOUT_S = 5.0
+# Backoff cap of a pooled /finish, which is retried until delivered (see _finish_async).
+COORDINATOR_POOLED_FINISH_MAX_RETRY_DELAY_S = 5.0
 # A fleet worker's bound on a pooled generation /select, which waits for a free seat.
 POOLED_SELECT_TIMEOUT_S = 3600.0
 _UNREAD = object()
@@ -2235,6 +2237,14 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     0, self._server_content_load[server] - 1)
 
 
+class _CoordinatorFinishError(RuntimeError):
+    """A non-200 ``/finish`` reply; a 4xx (malformed request) is not retried for pooled seats."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
 class CoordinatorDelegatingRouter(Router):
     """Worker-side Router that delegates placement to the disagg coordinator.
 
@@ -2281,6 +2291,17 @@ class CoordinatorDelegatingRouter(Router):
             maxsize=COORDINATOR_FINISH_QUEUE_SIZE)
         self._finish_workers: set[asyncio.Task] = set()
         self._dropped_finishes = 0
+        # A pooled seat is a hard admission cap released only by its /finish: a full
+        # queue parks pooled finishes here instead of dropping them, and each is retried
+        # until the coordinator would have expired the reservation itself.
+        self._finish_overflow: deque[tuple[int, bool]] = deque()
+        self._parked_finishes = 0
+        self._pooled_finish_window_s = None
+        if self.pooled:
+            from tensorrt_llm.serve.disagg_coordinator import (
+                POOLED_RESERVATION_TIMEOUT_S, coordinator_reservation_timeout)
+            self._pooled_finish_window_s = max(coordinator_reservation_timeout(),
+                                               POOLED_RESERVATION_TIMEOUT_S)
         # Coordinator HTTP-client API latency (includes network round-trip to the
         # coordinator + its in-process handler). Compare against the owner-side
         # [coord_api] to isolate the fleet /select|/finish HTTP overhead.
@@ -2492,6 +2513,16 @@ class CoordinatorDelegatingRouter(Router):
         try:
             self._finish_queue.put_nowait((req_id, success))
         except asyncio.QueueFull:
+            if self.pooled:
+                # Dropping it would hold the seat until the reservation expires.
+                self._finish_overflow.append((req_id, success))
+                self._parked_finishes += 1
+                if self._parked_finishes == 1 or self._parked_finishes % 1000 == 0:
+                    logger.warning(
+                        f"CoordinatorDelegatingRouter finish queue full; parked "
+                        f"pooled finishes until it drains "
+                        f"(parked={self._parked_finishes})")
+                return
             self._dropped_finishes += 1
             if self._dropped_finishes == 1 or self._dropped_finishes % 1000 == 0:
                 logger.warning(
@@ -2524,14 +2555,28 @@ class CoordinatorDelegatingRouter(Router):
     async def _finish_worker(self) -> None:
         while True:
             req_id, success = await self._finish_queue.get()
+            if self._finish_overflow:
+                # The get freed a slot; no await since, so this cannot be QueueFull.
+                self._finish_queue.put_nowait(self._finish_overflow.popleft())
             try:
                 await self._finish_async(req_id, success)
             finally:
                 self._finish_queue.task_done()
 
     async def _finish_async(self, req_id: int, success: bool):
+        """POST /finish with retries.
+
+        A non-pooled finish only corrects a soft load counter and gives up after
+        ``COORDINATOR_FINISH_MAX_ATTEMPTS``. A pooled one frees a seat, so it is retried
+        with capped backoff until delivered, rejected as malformed (4xx), or past the
+        coordinator's own expiry of the reservation.
+        """
         _t0 = time.monotonic()
-        for attempt in range(1, COORDINATOR_FINISH_MAX_ATTEMPTS + 1):
+        give_up_at = (None if self._pooled_finish_window_s is None else _t0 +
+                      self._pooled_finish_window_s)
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 async with self.session.post(
                         f"{self._coordinator_url}/finish",
@@ -2553,22 +2598,33 @@ class CoordinatorDelegatingRouter(Router):
                             body = raw_body.decode(errors="replace")
                         error = body.get("error", body) if isinstance(
                             body, dict) else body
-                        raise RuntimeError(
+                        raise _CoordinatorFinishError(
+                            resp.status,
                             f"coordinator /finish returned {resp.status}: {error}"
                         )
                 self._finish_lat.record(time.monotonic() - _t0)
                 return
             except Exception as e:  # noqa: BLE001
-                if attempt == COORDINATOR_FINISH_MAX_ATTEMPTS:
+                delay = COORDINATOR_FINISH_RETRY_DELAY_S * (2**min(
+                    attempt - 1, 16))
+                if give_up_at is None:
+                    give_up = attempt == COORDINATOR_FINISH_MAX_ATTEMPTS
+                else:
+                    delay = min(delay,
+                                COORDINATOR_POOLED_FINISH_MAX_RETRY_DELAY_S)
+                    give_up = (isinstance(e, _CoordinatorFinishError)
+                               and 400 <= e.status < 500) or (
+                                   time.monotonic() + delay >= give_up_at)
+                if give_up:
                     logger.warning(
                         f"CoordinatorDelegatingRouter finish failed after "
                         f"{attempt} attempts: {e}")
                     return
-                logger.warning(
-                    f"CoordinatorDelegatingRouter finish attempt {attempt} "
-                    f"failed: {e}; retrying")
-                await asyncio.sleep(COORDINATOR_FINISH_RETRY_DELAY_S *
-                                    (2**(attempt - 1)))
+                if attempt < COORDINATOR_FINISH_MAX_ATTEMPTS or attempt % 100 == 0:
+                    logger.warning(
+                        f"CoordinatorDelegatingRouter finish attempt {attempt} "
+                        f"failed: {e}; retrying")
+                await asyncio.sleep(delay)
 
     async def close(self):
         if self._finish_workers:

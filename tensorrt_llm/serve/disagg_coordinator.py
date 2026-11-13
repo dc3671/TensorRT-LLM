@@ -88,8 +88,10 @@ __all__ = [
 
 COORDINATOR_RESERVATION_TIMEOUT_ENV = "TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT"
 COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S = 180.0
-# A pooled generation seat is released by its /finish; this expiry only reclaims the seat of a
-# request whose frontend died without one, so it must outlast the longest generation.
+# A pooled generation seat is released by its /finish, which the fleet worker retries until
+# delivered; this expiry only reclaims the seat of a request whose frontend died without one,
+# so it must outlast the longest generation. The env timeout above (main's soft-load expiry)
+# can lengthen it but not shorten it: a shorter expiry would hand on a seat still streaming.
 POOLED_RESERVATION_TIMEOUT_S = 6 * 3600.0
 COORDINATOR_RESERVATION_LOCK_STRIPES = 256
 COORDINATOR_STATE_SYNC_INTERVAL_S = 3.0
