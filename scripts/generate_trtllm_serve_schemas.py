@@ -558,7 +558,7 @@ def generate_disagg_schema() -> dict:
     # Mirror extract_disagg_cfg(): output-length prediction needs the context-first schedule.
     schema.setdefault("allOf", []).append(
         {
-            "if": _set("output_length_prediction", {"type": "object"}),
+            "if": _is_set_to("output_length_prediction", {"type": "object"}),
             "then": {"properties": {"schedule_style": {"not": {"const": "generation_first"}}}},
         }
     )
