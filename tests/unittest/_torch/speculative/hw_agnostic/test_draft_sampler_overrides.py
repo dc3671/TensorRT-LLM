@@ -120,5 +120,5 @@ def test_the_greedy_step_fills_out_on_every_override(cls) -> None:
         return  # takes no tokens_out: only calls without ``out`` reach it unchanged
     out = torch.full((5,), -1, dtype=torch.int32)
     tokens = w.sample_draft_tokens(logits, _META, 5, draft_step=0, out=out)
-    assert tokens is out
+    assert tokens.data_ptr() == out.data_ptr()  # the tokens are out's storage
     assert torch.equal(out, want)

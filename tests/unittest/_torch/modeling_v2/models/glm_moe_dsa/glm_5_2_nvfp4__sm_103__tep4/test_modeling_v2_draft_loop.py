@@ -448,6 +448,6 @@ def test_greedy_draft_pick_through_the_engine_entry(argmax_on) -> None:
     assert torch.equal(worker.sample_draft_tokens(logits, spec, 5, draft_step=0), want)
     out = torch.full((5,), -1, dtype=torch.int32, device=DEV)
     tokens = worker.sample_draft_tokens(logits, spec, 5, draft_step=0, out=out)
-    assert tokens is out
+    assert tokens.data_ptr() == out.data_ptr()  # the tokens are out's storage
     assert torch.equal(out, want)
     assert counts == ({("greedy_draft", True): 2} if argmax_on else {})
