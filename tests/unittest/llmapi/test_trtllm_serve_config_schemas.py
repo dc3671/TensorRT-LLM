@@ -585,6 +585,33 @@ def test_load_balancer_schema_matches_runtime(
             MoeConfig(load_balancer=load_balancer)
 
 
+@pytest.mark.parametrize(
+    ("config", "valid"),
+    [
+        ({"output_length_prediction": {}}, True),
+        ({"output_length_prediction": {"predictor": "ridge"}}, True),
+        ({"output_length_prediction": {"predictor": "ridge_gbm"}}, True),
+        ({"output_length_prediction": None, "schedule_style": "generation_first"}, True),
+        ({"output_length_prediction": {}, "schedule_style": "context_first"}, True),
+        ({"output_length_prediction": {"predictor": "ema"}}, False),
+        ({"output_length_prediction": {"unknown": 1}}, False),
+        ({"output_length_prediction": {}, "schedule_style": "generation_first"}, False),
+    ],
+)
+def test_output_length_prediction_schema_matches_runtime(
+    schemas: dict[str, dict], config: dict, valid: bool
+) -> None:
+    from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
+
+    errors = list(Draft202012Validator(schemas[generator.DISAGG_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+    if valid:
+        extract_disagg_cfg(**config)
+    else:
+        with pytest.raises(ValueError):
+            extract_disagg_cfg(**config)
+
+
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
 @pytest.mark.parametrize(
     ("settings", "valid"),

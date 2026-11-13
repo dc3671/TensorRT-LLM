@@ -479,26 +479,39 @@ def child_sys_path() -> List[str]:
     ]
 
 
+# Startup check of the fit process: a tiny fit read through the same fitted-model attributes as
+# _GBM_FIT_SCRIPT (scikit-learn has no public tree export), so a scikit-learn that lacks them
+# fails here rather than at every refit.
+_GBM_CHECK_SCRIPT = r"""
+import json, sys
+sys.path[:0] = json.loads(sys.argv[1])
+import numpy as np
+from sklearn.ensemble import HistGradientBoostingRegressor
+X = np.arange(64.0).reshape(32, 2)
+model = HistGradientBoostingRegressor(max_iter=2, min_samples_leaf=4).fit(X, X[:, 0])
+nodes = model._predictors[0][0].nodes
+for field in ("is_leaf", "value", "feature_idx", "num_threshold", "missing_go_to_left", "left",
+              "right", "is_categorical"):
+    nodes[field]
+float(np.asarray(model._baseline_prediction).ravel()[0])
+"""
+
+
 def check_gbm_dependencies(python: Optional[str] = None) -> None:
-    """Raise ImportError unless the fit process can import numpy and scikit-learn."""
+    """Raise ImportError unless the fit process can fit and export trees with scikit-learn."""
     python = python or sys.executable
     result = subprocess.run(
-        [
-            python,
-            "-I",
-            "-c",
-            "import json, sys; sys.path[:0] = json.loads(sys.argv[1]); import numpy, sklearn.ensemble",
-            json.dumps(child_sys_path()),
-        ],
+        [python, "-I", "-c", _GBM_CHECK_SCRIPT, json.dumps(child_sys_path())],
         capture_output=True,
         timeout=120,
         check=False,
     )
     if result.returncode != 0:
         raise ImportError(
-            "output_length_prediction.predictor='ridge_gbm' fits its trees with numpy and scikit-learn, "
-            f"which {python} cannot import ({result.stderr.decode(errors='replace').strip()[-300:]}); "
-            "install scikit-learn or use predictor='ridge'"
+            "output_length_prediction.predictor='ridge_gbm' fits its trees with numpy and "
+            "scikit-learn and reads them from HistGradientBoostingRegressor's fitted predictors, "
+            f"which {python} cannot do ({result.stderr.decode(errors='replace').strip()[-300:]}); "
+            "install a scikit-learn that provides them or use predictor='ridge'"
         )
 
 
@@ -939,8 +952,13 @@ class OutputLengthPriority:
         self._maybe_log_stats()
         return ticket
 
+    def assign_prior(self, gen_req: GenerationRequest) -> None:
+        """Give a request served without a context phase the prior's priority (nothing is learned)."""
+        if "priority" in getattr(type(gen_req), "model_fields", {}):
+            gen_req.priority = self.prior_priority
+
     @staticmethod
-    def _request_usage(gen_req: Any, ticket: _Ticket) -> None:
+    def _request_usage(gen_req: GenerationRequest, ticket: _Ticket) -> None:
         if not getattr(gen_req, "stream", False):
             return
         options = getattr(gen_req, "stream_options", None)

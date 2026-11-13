@@ -7175,11 +7175,11 @@
     },
     "OutputLengthPredictionConfig": {
       "additionalProperties": false,
-      "description": "Generation priority from an online prediction of each request's output length.\n\nAfter the context phase the orchestrator predicts the reply's length from the\nconversation's earlier replies (``conversation_params.conversation_id``) and the\nprompt length, never from ``max_tokens``, and sets the generation request's\n``priority`` (higher for shorter replies). The predictor learns online in the\ncoordinator. Generation servers order by it with\n``scheduler_config.waiting_queue_policy: priority``.",
+      "description": "Generation priority from an online prediction of each request's output length.\n\nAfter the context phase the orchestrator predicts the reply's length from the\nconversation's earlier replies (``conversation_params.conversation_id``) and the\nprompt length, never from ``max_tokens``, and sets the generation request's\n``priority`` (higher for shorter replies). The predictor learns online in the\ncoordinator. Generation servers order by it with\n``scheduler_config.waiting_queue_policy: priority``. Requires\n``schedule_style: context_first``; a request served without a context\nphase (conditional disaggregation) gets the prior's priority.",
       "properties": {
         "predictor": {
-          "default": "ridge_gbm",
-          "description": "'ridge': a ridge regression on the request's history features, refit every 120 s. 'ridge_gbm': also a gradient-boosted tree ensemble refit every 300 s in a separate process, which needs numpy and scikit-learn in the server's Python environment.",
+          "default": "ridge",
+          "description": "'ridge': a ridge regression on the request's history features, refit every 120 s. 'ridge_gbm': also a gradient-boosted tree ensemble refit every 300 s in a separate process, which needs numpy and scikit-learn in the server's Python environment (checked at startup).",
           "enum": [
             "ridge",
             "ridge_gbm"
@@ -9605,6 +9605,27 @@
           },
           "pipeline_parallel_size": {
             "maximum": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "output_length_prediction": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "output_length_prediction"
+        ]
+      },
+      "then": {
+        "properties": {
+          "schedule_style": {
+            "not": {
+              "const": "generation_first"
+            }
           }
         }
       }

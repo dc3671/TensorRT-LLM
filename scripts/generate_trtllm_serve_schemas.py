@@ -507,6 +507,13 @@ def generate_disagg_schema() -> dict:
         "maximum": (1 << DISAGG_NODE_ID_BITS) - 1,
     }
     properties.update(orchestrator)
+    # Mirror extract_disagg_cfg(): output-length prediction needs the context-first schedule.
+    schema.setdefault("allOf", []).append(
+        {
+            "if": _set("output_length_prediction", {"type": "object"}),
+            "then": {"properties": {"schedule_style": {"not": {"const": "generation_first"}}}},
+        }
+    )
     _cross_field_rules(schema["$defs"])
     return schema
 

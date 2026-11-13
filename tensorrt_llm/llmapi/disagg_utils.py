@@ -226,16 +226,19 @@ class OutputLengthPredictionConfig(StrictBaseModel):
     prompt length, never from ``max_tokens``, and sets the generation request's
     ``priority`` (higher for shorter replies). The predictor learns online in the
     coordinator. Generation servers order by it with
-    ``scheduler_config.waiting_queue_policy: priority``.
+    ``scheduler_config.waiting_queue_policy: priority``. Requires
+    ``schedule_style: context_first``; a request served without a context
+    phase (conditional disaggregation) gets the prior's priority.
     """
 
     predictor: Literal["ridge", "ridge_gbm"] = Field(
-        default="ridge_gbm",
+        default="ridge",
         description=(
             "'ridge': a ridge regression on the request's history features, "
             "refit every 120 s. 'ridge_gbm': also a gradient-boosted tree "
             "ensemble refit every 300 s in a separate process, which needs "
-            "numpy and scikit-learn in the server's Python environment."))
+            "numpy and scikit-learn in the server's Python environment "
+            "(checked at startup)."))
 
 
 @dataclass
@@ -545,6 +548,11 @@ def extract_disagg_cfg(
         config.output_length_prediction = (
             OutputLengthPredictionConfig.model_validate(
                 output_length_prediction))
+        if config.schedule_style == "generation_first":
+            # The prediction needs the context phase's prompt length; a
+            # generation_first request reaches its generation server without it.
+            raise ValueError("output_length_prediction requires schedule_style "
+                             "'context_first'")
     _warn_if_subagent_affinity_inactive(config)
     return config
 

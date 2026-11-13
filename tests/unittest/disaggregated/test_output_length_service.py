@@ -58,7 +58,7 @@ def _config(predictor="ridge"):
 def test_config_parsing():
     assert extract_disagg_cfg().output_length_prediction is None
     assert extract_disagg_cfg(output_length_prediction={}).output_length_prediction.predictor == (
-        "ridge_gbm"
+        "ridge"
     )
     config = extract_disagg_cfg(output_length_prediction={"predictor": "ridge"})
     assert config.output_length_prediction.predictor == "ridge"
@@ -359,6 +359,34 @@ async def test_fleet_worker_gets_the_prediction_from_select(monkeypatch):
     assert server == "g:1" and request.priority == 0.5 and info[olp.OUTPUT_LENGTH_KEY]["key"] == 3
     assert sent[0]["routing_key"][olp.OUTPUT_LENGTH_KEY] == {"conv": "c", "isl": 777.0}
     await router.close()
+
+
+def test_prediction_requires_context_first():
+    """generation_first requests reach the generation server without a prompt length to predict from."""
+    with pytest.raises(ValueError, match="context_first"):
+        extract_disagg_cfg(output_length_prediction={}, schedule_style="generation_first")
+    config = extract_disagg_cfg(output_length_prediction={}, schedule_style="context_first")
+    assert config.output_length_prediction.predictor == "ridge"
+
+
+@pytest.mark.asyncio
+async def test_request_without_a_context_phase_gets_the_prior_priority(monkeypatch):
+    """Conditional disaggregation served locally: a client-sent priority never passes through."""
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    config = _config()
+    coordinator = DisaggCoordinatorService(config, client_factory=_client_factory)
+    coordinator._ctx_router = AsyncMock(spec=Router)
+    coordinator._gen_router = AsyncMock(spec=Router)
+    service = OpenAIDisaggregatedService(config, coordinator, client_factory=_client_factory)
+    service._check_conditional_disagg = AsyncMock(return_value=("gen:1", False))
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_client.send_request.return_value = "response"
+    request = CompletionRequest(model="m", prompt="hi", priority=1.0)
+    assert await service._send_disagg_request_ctx_first(request) == "response"
+    gen_req = service._gen_client.send_request.call_args.args[0]
+    assert gen_req.priority == pytest.approx(olp.priority_of(olp.PRIOR_TOKENS))
+    service._ctx_client.send_request.assert_not_called()
 
 
 @pytest.mark.asyncio

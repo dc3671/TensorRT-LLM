@@ -366,6 +366,10 @@ class OpenAIDisaggregatedService(OpenAIService):
             # benchmark-only path above is the only trusted source here.
             if not benchmark_gen_only:
                 gen_req = request.model_copy(update={"disaggregated_params": None})
+            if self._output_length_priority is not None:
+                # No context phase, so no prompt length to predict from; a priority the
+                # client sent must not go ahead of the predicted ones.
+                self._output_length_priority.assign_prior(gen_req)
         self._strip_gen_subagent_affinity(gen_req)
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:

@@ -347,6 +347,24 @@ def test_missing_sklearn_fails_at_start(tmp_path):
         olp.check_gbm_dependencies(str(fake_python))
 
 
+def test_sklearn_without_the_fitted_trees_fails_at_start(tmp_path, monkeypatch):
+    """The trees are read from scikit-learn internals; a release without them fails at startup."""
+    pytest.importorskip("numpy")
+    package = tmp_path / "sklearn"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "ensemble.py").write_text(
+        "class HistGradientBoostingRegressor:\n"
+        "    def __init__(self, **kwargs):\n"
+        "        pass\n"
+        "    def fit(self, X, y):\n"
+        "        return self\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(ImportError, match="(?s)fitted predictors.*_predictors"):
+        olp.check_gbm_dependencies()
+
+
 # ---------------------------------------------------------------------------------- frontend
 
 
