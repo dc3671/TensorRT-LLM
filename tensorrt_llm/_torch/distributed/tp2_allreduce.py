@@ -17,11 +17,18 @@ from typing import Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceFusionOp
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from .ops import MNNVLAllReduce
+from .ops import (
+    MNNVLAllReduce,
+    _get_mnnvl_workspace_comm,
+    _make_mnnvl_mcast_buffer,
+    _mnnvl_workspace_all_succeeded,
+    use_mnnvl_fabric_handle,
+)
 
 # Fusion op -> (quantized output, normalized output): the fusions of the CuTe DSL norm kernels.
 _OUTPUTS = MNNVLAllReduce._FUSED_NORM_OUTPUTS
@@ -30,10 +37,6 @@ _OUTPUTS = MNNVLAllReduce._FUSED_NORM_OUTPUTS
 def _setup_failures(comm, rank: int, error: Optional[BaseException]) -> str:
     """Agree on a setup step over the TP pair's communicator: "" when every rank succeeded, else "rank r: <cause>"
     for each failed rank (this rank's own cause only where the communicator is a ProcessGroup)."""
-    from tensorrt_llm._utils import mpi_disabled
-
-    from .ops import _mnnvl_workspace_all_succeeded
-
     if mpi_disabled():
         if _mnnvl_workspace_all_succeeded(comm, error is None):
             return ""
@@ -61,12 +64,6 @@ class Tp2AllReduceNorm:
         return Tp2WarpAllReduceNormKernel.supports_hidden(hidden)
 
     def __init__(self, mapping: Mapping, hidden: int, max_tokens: int) -> None:
-        from .ops import (
-            _get_mnnvl_workspace_comm,
-            _make_mnnvl_mcast_buffer,
-            use_mnnvl_fabric_handle,
-        )
-
         self.mapping = mapping
         self.hidden = hidden
         self.max_tokens = max_tokens
@@ -109,6 +106,11 @@ class Tp2AllReduceNorm:
             self._bufs = (own, peer)
             self._fns = {}
             self._dummy_scale = torch.ones((1,), dtype=torch.float32, device=dev)
+            # CuTe views of the operands fixed across calls, built at the first call: the pointer table, the
+            # dummy scale, and each layer's norm weight (keyed by its data pointer; the view keeps it alive).
+            self._table_view = None
+            self._dummy_scale_view = None
+            self._norm_weight_views = {}
             torch.cuda.synchronize()
         except RuntimeError as e:  # e.g. out of memory or a CUDA error on this rank only
             error = e
@@ -171,7 +173,15 @@ class Tp2AllReduceNorm:
             if quant
             else None
         )
+        if self._table_view is None:
+            self._table_view = graph_safe_cute_tensor(self.table)
+            self._dummy_scale_view = graph_safe_cute_tensor(self._dummy_scale)
+        weight_view = self._norm_weight_views.get(norm_weight.data_ptr())
+        if weight_view is None:
+            weight_view = graph_safe_cute_tensor(norm_weight.reshape(-1))
+            self._norm_weight_views[norm_weight.data_ptr()] = weight_view
         sc = scale.reshape(1).float() if quant else self._dummy_scale
+        sc_view = graph_safe_cute_tensor(sc) if quant else self._dummy_scale_view
         fn = self._fns.get(key)
         if fn is None:
             if torch.cuda.is_current_stream_capturing():
@@ -206,12 +216,12 @@ class Tp2AllReduceNorm:
         fn(
             t(input),
             t(residual),
-            graph_safe_cute_tensor(norm_weight.reshape(-1)),
-            graph_safe_cute_tensor(sc),
+            weight_view,
+            sc_view,
             t(res_out),
             t(norm),
             t(qv),
-            graph_safe_cute_tensor(self.table),
+            self._table_view,
             cutlass.Int32(self.mapping.tp_rank),
             cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )

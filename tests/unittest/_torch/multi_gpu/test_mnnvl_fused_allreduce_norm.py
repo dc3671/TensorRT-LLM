@@ -617,6 +617,18 @@ def _tp2_hidden_cases(tp, rank, mapping, hidden, max_tokens):
             fp8.float() * scale, ref_norm.clamp(-448 * 0.05, 448 * 0.05), ("tp2 fp8", m), rtol=7e-2
         )
         _check(res, ref_res, ("tp2 fp8 residual", m))
+    # The table, dummy-scale and norm-weight views are built once and reused by every later call; another
+    # layer's norm weight gets its own view.
+    assert len(ar._norm_weight_views) == 1
+    other_weight = _rand((hidden,), 7, 0.1) + 1
+    m = Tp2AllReduceNorm.MIN_TOKENS
+    xs = [_rand((m, hidden), 11 + r) for r in range(tp)]
+    residual = _rand((m, hidden), 13)
+    ref_norm, ref_res = _ref_norm(sum(x.float() for x in xs), residual, other_weight)
+    norm, res = ar(xs[rank], residual, other_weight, EPS, AllReduceFusionOp.RESIDUAL_RMS_NORM, None)
+    _check(norm, ref_norm, ("tp2 norm, second weight", m))
+    _check(res, ref_res, ("tp2 residual, second weight", m))
+    assert len(ar._norm_weight_views) == 2
     big = _rand((max_tokens + 1, hidden), 1)
     assert not ar.supports(big, AllReduceFusionOp.RESIDUAL_RMS_NORM, big, norm_weight)
 
