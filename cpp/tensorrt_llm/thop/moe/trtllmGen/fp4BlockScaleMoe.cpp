@@ -628,7 +628,7 @@ public:
         {
             if (chosen.find(tileN) == chosen.end())
                 continue;
-            auto* nlRunner = getRunnerOrNull(tileN, /* useFineGrained */ false);
+            auto* nlRunner = getRunnerOrNull(tileN, /*useFineGrained=*/false);
             if (nlRunner == nullptr)
                 continue;
             for (auto cfg :
@@ -658,7 +658,7 @@ public:
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
             routed_scaling_factor, routing_method_type, do_finalize, moeConfigIndex, topk_weights, topk_ids, output,
-            nullptr, -1, false);
+            /*prerouted=*/nullptr, /*routing_tile_n=*/-1, /*fc1_only=*/false);
     }
 
     // run() up to FC1 + activation of a do_finalize == false call, without gemm2 bias or output; the FC2 operands
@@ -682,8 +682,8 @@ public:
             gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
             gemm2_weights_scale, std::nullopt, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
-            routed_scaling_factor, routing_method_type, /* do_finalize */ false, moeConfigIndex, topk_weights, topk_ids,
-            torch::nullopt, nullptr, -1, true);
+            routed_scaling_factor, routing_method_type, /*do_finalize=*/false, moeConfigIndex, topk_weights, topk_ids,
+            torch::nullopt, /*prerouted=*/nullptr, /*routing_tile_n=*/-1, /*fc1_only=*/true);
     }
 
     // run() with caller-computed routing tables for tile routing_tile_n (see PreRoutedBuffers), used in place of the
@@ -715,7 +715,7 @@ public:
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
             routed_scaling_factor, routing_method_type, do_finalize, moeConfigIndex, topk_weights, topk_ids, output,
-            &prerouted, routing_tile_n, false);
+            &prerouted, routing_tile_n, /*fc1_only=*/false);
     }
 
     // runPrerouted() up to FC1 + activation, with the arguments and outputs of runFc1.
@@ -743,14 +743,14 @@ public:
             gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
             gemm2_weights_scale, std::nullopt, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
-            routed_scaling_factor, routing_method_type, /* do_finalize */ false, moeConfigIndex, topk_weights, topk_ids,
-            torch::nullopt, &prerouted, routing_tile_n, true);
+            routed_scaling_factor, routing_method_type, /*do_finalize=*/false, moeConfigIndex, topk_weights, topk_ids,
+            torch::nullopt, &prerouted, routing_tile_n, /*fc1_only=*/true);
     }
 
     // Kernel name of the FC2 cubin a tactic [tileN, config] runs (non-FineGrained runner).
     [[nodiscard]] std::string getGemm2KernelName(int64_t tileN, int64_t config)
     {
-        return getRunner(static_cast<int32_t>(tileN), /* useFineGrained */ false).getGemm2KernelName(config);
+        return getRunner(static_cast<int32_t>(tileN), /*useFineGrained=*/false).getGemm2KernelName(config);
     }
 
 private:
@@ -784,7 +784,7 @@ private:
             float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / local_num_experts;
             tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(), mSupportedTileN.back());
             config
-                = getRunner(tileN, /* useFineGrained */ false)
+                = getRunner(tileN, /*useFineGrained=*/false)
                       .getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
         }
 
@@ -798,7 +798,7 @@ private:
         TORCH_CHECK(!fc1_only || !useFineGrained, "fc1_only does not support FineGrained sync.");
         if (useFineGrained)
         {
-            auto* fineGrainedRunner = getRunnerOrNull(tileN, /* useFineGrained */ true);
+            auto* fineGrainedRunner = getRunnerOrNull(tileN, /*useFineGrained=*/true);
             if (fineGrainedRunner != nullptr)
             {
                 try
@@ -815,7 +815,7 @@ private:
         }
         if (runner == nullptr)
         {
-            runner = &getRunner(tileN, /* useFineGrained */ false);
+            runner = &getRunner(tileN, /*useFineGrained=*/false);
             configToRun = config;
         }
         return run_fp4_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, hidden_states_scale,

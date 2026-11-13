@@ -150,7 +150,7 @@ py::dict generateKernel(int64_t sm, int64_t numSms, int64_t numHeadsQ, int64_t n
     cfg.mGenCfgJsonStr.insert(open.size(), "\"emitsNvRtcSource\": true,\n\"emitsCubin\": true,\n");
     // The generator reads the kernel headers from, and writes its dumps to, the exec path.
     cfg.mExecPath = execPath.c_str();
-    fmha::FmhaInterface const fmhaInterface{/* exportsCubin */ true, 1, /* verbose */ true};
+    fmha::FmhaInterface const fmhaInterface{/*exportsCubin=*/true, /*numRotations=*/1, /*verbose=*/true};
     fmhaInterface.generateAndCompileKernel(cfg);
     py::dict d = describe(cfg, cfg.mFunctionName);
     return d;
