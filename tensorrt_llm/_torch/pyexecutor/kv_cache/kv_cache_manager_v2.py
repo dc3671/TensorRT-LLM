@@ -22,6 +22,7 @@ from enum import IntEnum
 from functools import cached_property
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Dict,
     Iterable,
@@ -31,7 +32,9 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    TypeVar,
     Union,
+    cast,
 )
 
 import numpy as np
@@ -2022,7 +2025,10 @@ class _BasePageTableMaterializer:
         )
 
 
-def _withdraws_remote_donation_on_error(init):
+_InitT = TypeVar("_InitT", bound=Callable[..., None])
+
+
+def _withdraws_remote_donation_on_error(init: _InitT) -> _InitT:
     """Wrap ``__init__`` so a construction that raises undoes what it set up (``_abandon_construction``).
 
     A subclass wraps its ``__init__`` too, so that its own finalization after ``super().__init__()`` is guarded; the
@@ -2030,7 +2036,7 @@ def _withdraws_remote_donation_on_error(init):
     """
 
     @functools.wraps(init)
-    def wrapper(self, *args, **kwargs):
+    def wrapper(self: "KVCacheManagerV2", *args: Any, **kwargs: Any) -> None:
         if self.__dict__.get("_guarding_construction", False):
             init(self, *args, **kwargs)
             return
@@ -2043,7 +2049,7 @@ def _withdraws_remote_donation_on_error(init):
         finally:
             self._guarding_construction = False
 
-    return wrapper
+    return cast(_InitT, wrapper)
 
 
 class KVCacheManagerV2(BaseResourceManager):

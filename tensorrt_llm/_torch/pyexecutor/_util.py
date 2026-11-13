@@ -16,7 +16,7 @@ import copy
 import dataclasses
 import os
 from contextlib import ExitStack
-from typing import Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -94,6 +94,10 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
 from .scheduler.gen_preemption import (headroom_for_args,
                                        unsupported_headroom_reason)
 from .seq_slot_manager import SeqSlotManager
+
+if TYPE_CHECKING:
+    from .kv_cache.remote_donor import RemoteMemDonor
+    from .resource_manager import BaseResourceManager
 
 GB = 1 << 30
 _DEFAULT_INDEX_MAPPER_RESERVED_SLOTS = 1
@@ -3725,7 +3729,9 @@ class KvCacheCreator:
             estimating_kv_cache: bool, self_kv_cache_config: KvCacheConfig,
             draft_kv_cache_config: Optional[KvCacheConfig],
             cross_kv_cache_config: Optional[KvCacheConfig],
-            cold_page_codec_provider, early_donor):
+            cold_page_codec_provider: Optional[object],
+            early_donor: Optional["RemoteMemDonor"]
+    ) -> tuple[Optional["BaseResourceManager"], Optional["BaseResourceManager"]]:
         """The one-model draft and encoder-decoder cross managers built beside the target; the draft waits for
         `early_donor`, the target's donation, before measuring host memory."""
         draft_kv_cache_manager = None
