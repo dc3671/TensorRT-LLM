@@ -668,9 +668,17 @@ class OpenAIDisaggregatedService(OpenAIService):
             #
             # Fix: eagerly start consuming the gen generator in a background
             # task so the HTTP POST fires, then pipe chunks through a queue.
-            gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
-            )
+            try:
+                gen_response = await self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+                )
+            except (Exception, asyncio.CancelledError):
+                # No context task owns the context reservation yet (e.g. a pooled
+                # generation router found no seat): release it here.
+                await self._ctx_router.finish_request(
+                    request, success=False, req_id=disagg_request_id
+                )
+                raise
 
             queue: asyncio.Queue = asyncio.Queue()
             gen_error: asyncio.Future[None] = asyncio.get_running_loop().create_future()

@@ -359,3 +359,28 @@ async def test_fleet_worker_gets_the_prediction_from_select(monkeypatch):
     assert server == "g:1" and request.priority == 0.5 and info[olp.OUTPUT_LENGTH_KEY]["key"] == 3
     assert sent[0]["routing_key"][olp.OUTPUT_LENGTH_KEY] == {"conv": "c", "isl": 777.0}
     await router.close()
+
+
+@pytest.mark.asyncio
+async def test_generation_first_stream_releases_the_context_server_without_a_seat(monkeypatch):
+    """No generation seat (503): the context reservation made before it is released at once."""
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.router import LoadBalancingRouter
+    from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
+
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    config = _config(None)
+    config.schedule_style = "generation_first"
+    coordinator = DisaggCoordinatorService(config, client_factory=_client_factory)
+    ctx_router = LoadBalancingRouter(ServerRole.CONTEXT, ["ctx:1"])
+    coordinator._ctx_router = ctx_router
+    coordinator._gen_router = AsyncMock(spec=Router)
+    service = OpenAIDisaggregatedService(config, coordinator, client_factory=_client_factory)
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._gen_client.send_request.side_effect = NoGenerationSeatError("no seat within 60 s")
+    request = CompletionRequest(model="m", prompt="hi", stream=True)
+    with pytest.raises(NoGenerationSeatError):
+        await service._send_disagg_request_gen_first(request)
+    assert ctx_router._get_server_load("ctx:1") == 0 and ctx_router._req_routing_table == {}
+    service._ctx_client.send_request.assert_not_called()
