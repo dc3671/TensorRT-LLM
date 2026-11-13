@@ -2817,10 +2817,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             // Per pool group of one cache level: slot count, bytes per slot, and the layer groups it holds.
             auto const& storage = manager.storage();
             kv::CacheLevel const level{cacheLevel};
-            if (cacheLevel < 0 || level >= storage.numCacheLevels())
-            {
-                throw std::invalid_argument("cache_level " + std::to_string(cacheLevel) + " is out of range");
-            }
+            TLLM_CHECK_WITH_INFO(
+                cacheLevel >= 0 && level < storage.numCacheLevels(), "cache_level %d is out of range", cacheLevel);
             std::vector<std::tuple<int64_t, size_t, std::vector<int>>> groups(
                 static_cast<size_t>(storage.numPoolGroups(level).value()));
             for (kv::PoolGroupIndex pg{0}; pg < storage.numPoolGroups(level); ++pg)
