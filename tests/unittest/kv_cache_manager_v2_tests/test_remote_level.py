@@ -958,7 +958,7 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
         directory = tempfile.mkdtemp(prefix="kvcm2_reported_")
         donor = _Donor(directory, 128 << 20, self.transport)
         with open(os.path.join(directory, "donor.gone.failed"), "w") as f:
-            f.write("version 1\nname gone\n")
+            f.write(f"version 1\nname gone\ntransport {self.transport}\n")
         try:
             self.cfg = self._config(
                 with_host=False,
