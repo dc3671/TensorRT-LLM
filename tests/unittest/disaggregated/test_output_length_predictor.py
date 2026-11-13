@@ -15,7 +15,6 @@
 """Online output-length prediction (serve/output_length_predictor.py)."""
 
 import asyncio
-import gc
 import json
 import math
 import random
@@ -279,7 +278,8 @@ def test_busy_fitter_skips_the_boundary():
 
 
 def test_fit_does_not_block_predictions():
-    """A fit that takes 1 s in its thread does not delay the predictions made meanwhile."""
+    """A fit runs on its own thread; predictions keep being served (by the other models) meanwhile."""
+    release = threading.Event()
 
     class SlowFitter(_FakeFitter):
         def start(self, rows, n, meta):
@@ -287,7 +287,8 @@ def test_fit_does_not_block_predictions():
             self._busy = True
 
             def run():
-                time.sleep(1.0)
+                self.fit_thread = threading.get_ident()
+                release.wait(30)
                 self._ready = dict(_good_fit(), **meta)
                 self._busy = False
 
@@ -296,22 +297,23 @@ def test_fit_does_not_block_predictions():
     fitter = SlowFitter()
     predictor = olp.OnlineLengthPredictor("ridge_gbm", gbm_fitter=fitter)
     _learn(predictor, olp.GBM_MIN_ROWS, 0.0)
-    gc_was_enabled = gc.isenabled()
-    gc.disable()  # a full collection of a large process takes longer than the bound below
-    try:
-        worst, start, sources = 0.0, time.monotonic(), set()
-        while time.monotonic() - start < 2.0:
-            t0 = time.perf_counter()
-            tokens, _ = predictor.predict("x", 1000, olp.GBM_REFIT_S + time.monotonic() - start)
-            worst = max(worst, time.perf_counter() - t0)
-            sources.add("gbm" if tokens == pytest.approx(99.0) else "other")
-            time.sleep(0.005)
-    finally:
-        if gc_was_enabled:
-            gc.enable()
+    t = olp.GBM_REFIT_S
+    tokens, _ = predictor.predict("x", 1000, t)  # starts the fit, which waits for `release`
+    assert len(fitter.started) == 1 and fitter.busy()
+    while_busy = []
+    for _ in range(100):
+        t += 0.01
+        tokens, _ = predictor.predict("x", 1000, t)
+        while_busy.append(tokens)
+    assert fitter.busy() and predictor.gbm is None
+    assert all(tokens != pytest.approx(99.0) for tokens in while_busy)
+    release.set()
+    deadline = time.monotonic() + 30
+    while fitter.busy() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert fitter.fit_thread != threading.get_ident()
+    assert predictor.predict("x", 1000, t + 0.01)[0] == pytest.approx(99.0)
     assert len(fitter.started) == 1 and predictor.gbm_fits == 1
-    assert sources == {"gbm", "other"}
-    assert worst < 0.05
 
 
 def test_real_tree_fit_matches_sklearn():
