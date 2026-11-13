@@ -547,9 +547,22 @@ std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope, To
         std::move(priorityCb), expectedPromptLength, textOnly, enableRequestStats, std::move(retentionConfig));
 }
 
+void KvCacheManager::_unlinkPagesIfARemoteLevelFailed()
+{
+    if (mStorage->numFailedRemoteClients() <= mNumFailedRemoteClientsUnlinked.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    auto const apiLock = lockExclusive();
+    _unlinkPagesOfFailedRemoteLevels();
+}
+
 void KvCacheManager::_unlinkPagesOfFailedRemoteLevels()
 {
+    // Counted before the levels are taken: a client failing in between is unlinked by the next call.
+    auto const numFailed = mStorage->numFailedRemoteClients();
     auto const levels = mStorage->takeNewlyFailedRemoteLevels();
+    mNumFailedRemoteClientsUnlinked.store(numFailed, std::memory_order_release);
     if (levels.empty())
     {
         return;
@@ -629,17 +642,20 @@ BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
     return mRadixTree->match(reuseScope, inputTokens, knownNoDigest, enablePartialMatch(), mConfig.reuseMatchBackoff);
 }
 
-int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest)
 {
     KVCM2_REJECT_IF_POISONED();
+    _unlinkPagesIfARemoteLevelFailed();
     // Shared: the traversal is read-only and the matched Block* never escape this call.
     auto const apiLock = lockShared();
     return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
 }
 
 std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
-    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest)
 {
+    KVCM2_REJECT_IF_POISONED();
+    _unlinkPagesIfARemoteLevelFailed();
     // The matched Block* remain protected until the key has been copied out.
     // Call matchReuse directly: probeReuse would nest shared-lock acquisitions.
     auto const apiLock = lockShared();

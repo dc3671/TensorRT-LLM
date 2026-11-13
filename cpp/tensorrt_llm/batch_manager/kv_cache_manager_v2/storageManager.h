@@ -188,8 +188,10 @@ public:
     //! The caller unlinks the pages still held there from the radix tree, so that reuse no longer finds them.
     [[nodiscard]] std::vector<CacheLevel> takeNewlyFailedRemoteLevels();
     //! Whether any remote level failed (a transfer, or a claim from a donor that went away). Cheap: one atomic flag
-    //! per client.
+    //! per client, read without the manager lock.
     [[nodiscard]] bool anyRemoteLevelFailed() const noexcept;
+    //! How many remote clients have failed; only grows. Lock-free, like anyRemoteLevelFailed().
+    [[nodiscard]] size_t numFailedRemoteClients() const noexcept;
 
     // Force-evict pages from a level to free space.
     void forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages,

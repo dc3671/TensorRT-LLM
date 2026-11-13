@@ -658,6 +658,12 @@ bool StorageManager::anyRemoteLevelFailed() const noexcept
         mRemoteClients.begin(), mRemoteClients.end(), [](auto const& client) { return client->failed(); });
 }
 
+size_t StorageManager::numFailedRemoteClients() const noexcept
+{
+    return static_cast<size_t>(std::count_if(
+        mRemoteClients.begin(), mRemoteClients.end(), [](auto const& client) { return client->failed(); }));
+}
+
 bool StorageManager::remoteLevelFailed(CacheLevel level) const
 {
     // One flag per client while none has failed: this runs whenever a page is scheduled for eviction.

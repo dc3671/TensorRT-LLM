@@ -639,6 +639,47 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
 
         self._with_dying_donor("kvcm2_held_", body)
 
+    def test_a_probe_after_the_failure_counts_no_page_of_the_failed_level(self) -> None:
+        """Probes stop counting a failed level's pages as soon as the failure happened.
+
+        Schedulers and the ADP router call probe_reuse and probe_first_new_block_key before any allocation.
+        """
+
+        def body(stream, donor) -> None:
+            # `prompt` is cached on the remote level only (droppable); `held` is held there by a suspended request.
+            prompt = self._prompt(4 * self.tokens_per_block)
+            held = self._prompt(4 * self.tokens_per_block)
+            self._prefill(prompt, stream)
+            holder = self.manager.create_kv_cache()
+            self.assertTrue(holder.resume(stream))
+            holder.capacity = len(held)
+            holder.history_length = len(held)
+            self.engine.execute([Step(holder, held, [])], stream)
+            holder.commit(held)
+            holder.suspend()
+            self._push_to_last_level(prompt, stream)
+            self._push_to_last_level(held, stream)
+            # Free GPU slots (an uncommitted cache's), so that the failing resume evicts nothing: only its READ fails.
+            spacer = self.manager.create_kv_cache()
+            self.assertTrue(spacer.resume(stream))
+            spacer.capacity = 12 * self.tokens_per_block
+            spacer.close()
+            self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), len(prompt))
+            _sync_device()
+            donor.stop()
+            with self.assertRaisesRegex(RemoteMemError, "remote level"):
+                holder.resume(stream)
+            # No create_kv_cache(input_tokens=...) in between, which would drop and unlink the level's pages itself.
+            probed = self.manager.probe_reuse(input_tokens=prompt)
+            new_key = self.manager.probe_first_new_block_key(input_tokens=prompt)
+            self.assertEqual(probed, 0)
+            self.assertIsNotNone(new_key)
+            self.assertEqual(sum(self._residency(prompt)), 0)
+            holder.close()
+            del holder
+
+        self._with_dying_donor("kvcm2_probe_", body)
+
     def test_a_failed_eviction_write_still_offloads_to_the_host(self) -> None:
         """The GPU pages a failed host -> remote WRITE was making room for reach the host on the retry.
 
