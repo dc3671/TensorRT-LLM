@@ -1167,12 +1167,12 @@ def make_donor(
 
 
 def _donor_for(remote_config: "RemoteCacheConfig", device: Optional[int]) -> RemoteMemDonor:
-    transport_cls = DONOR_TRANSPORTS[remote_config.transport]
-    return RemoteMemDonor(
+    return make_donor(
         os.path.expandvars(os.path.expanduser(remote_config.directory)),
         remote_config.donate_size,
-        transport_cls(**transport_cls.options_from(remote_config)),
+        remote_config.transport,
         device=device,
+        **DONOR_TRANSPORTS[remote_config.transport].options_from(remote_config),
     )
 
 
