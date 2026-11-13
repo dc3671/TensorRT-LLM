@@ -593,6 +593,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         rank=0,
         tp_rank=0,
         tp_size=4,
+        world_size=4,
         pp_size=1,
         cp_size=1,
         mapping=object(),
@@ -666,7 +667,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         resource_manager,
         scheduler,
         engine,
-        SimpleNamespace(),
+        SimpleNamespace(warmup=lambda model_engine: None),
         dist,
         max_num_sequences=8,
         kv_cache_transceiver=transceiver,
@@ -740,6 +741,7 @@ def test_rank_state_appends_forward_counts_without_changing_legacy_stats() -> No
             state.num_active_requests,
             state.num_active_tokens,
             state.num_retiring_requests,
+            state.num_pending_new_requests,
             *state.iter_stats.serialize(),
         ]
     )

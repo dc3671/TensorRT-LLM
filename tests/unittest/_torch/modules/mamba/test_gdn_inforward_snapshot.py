@@ -22,9 +22,9 @@ import torch
 from tensorrt_llm._torch.modules.mamba import gdn_inforward_split
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import (
+    _gdn_prefill_uses_flashinfer,
     _inforward_split_conv_states,
     _inforward_split_prefill_core,
-    _use_flashinfer_gdn_prefill,
     chunk_gated_delta_rule,
 )
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -93,7 +93,10 @@ def _chunk(q, k, v, g, beta, initial, start, end):
     return out, final[0]
 
 
-def test_split_prefill_core_matches_two_iterations():
+@pytest.mark.parametrize("linear_gate", [False, True], ids=["log_gate", "linear_gate"])
+def test_split_prefill_core_matches_two_iterations(linear_gate):
+    if linear_gate and not _gdn_prefill_uses_flashinfer():
+        pytest.skip("only the FlashInfer scan takes the linear-space gate")
     split = _split()
     total = sum(length for _, _, length, _ in _BATCH)
     q, k, v, g, beta = _inputs(total)
@@ -120,7 +123,20 @@ def test_split_prefill_core_matches_two_iterations():
             expected_stage[entry.row] = end_state.to(stage.dtype)
         start += length
 
-    out = _inforward_split_prefill_core(q, k, v, g, beta, ssm_states, split, stage, None)
+    # The reference scans take the log-space gate; the split path gets what the mixer passes it:
+    # alpha = exp(g) when the FlashInfer scan is the resolved one.
+    out = _inforward_split_prefill_core(
+        q,
+        k,
+        v,
+        g.exp() if linear_gate else g,
+        beta,
+        ssm_states,
+        split,
+        stage,
+        None,
+        g_is_linear=linear_gate,
+    )
     torch.cuda.synchronize()
     # Batched and per-request chunked prefill may round differently in bf16, and the
     # tails start from the unrounded state at P: compare to bf16 tolerance.
@@ -279,7 +295,17 @@ def test_split_prefill_core_fused_copies_bitwise():
         ssm_states = _random_states(NUM_SLOTS, seed=9) * 0.01
         stage = torch.zeros(4, NUM_V_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
         out = _inforward_split_prefill_core(
-            q, k, v, g, beta, ssm_states, split, stage, None, fused_copies=fused_copies
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states,
+            split,
+            stage,
+            None,
+            g_is_linear=False,
+            fused_copies=fused_copies,
         )
         results.append((out, ssm_states, stage))
     for reference, fused in zip(*results):
@@ -288,18 +314,28 @@ def test_split_prefill_core_fused_copies_bitwise():
 
 @pytest.mark.parametrize("fused_copies", [False, True])
 def test_split_prefill_core_alpha_bitwise(fused_copies):
-    """alpha = exp(g) passed as g_linear (the tails gather it in place of g) gives the bits of g alone."""
-    if not _use_flashinfer_gdn_prefill():
-        pytest.skip("alpha (g_linear) feeds only the FlashInfer prefill")
+    """alpha = exp(g) as the gate (g_is_linear; the tails gather it in place of g) gives the bits of g alone."""
+    if not _gdn_prefill_uses_flashinfer():
+        pytest.skip("only the FlashInfer scan takes the linear-space gate")
     split = _split()
     total = sum(length for _, _, length, _ in _BATCH)
     q, k, v, g, beta = _inputs(total, seed=10)
     results = []
-    for alpha in (None, torch.exp(g)):
+    for linear_gate in (False, True):
         ssm_states = _random_states(NUM_SLOTS, seed=11) * 0.01
         stage = torch.zeros(4, NUM_V_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
         out = _inforward_split_prefill_core(
-            q, k, v, g, beta, ssm_states, split, stage, None, alpha=alpha, fused_copies=fused_copies
+            q,
+            k,
+            v,
+            torch.exp(g) if linear_gate else g,
+            beta,
+            ssm_states,
+            split,
+            stage,
+            None,
+            g_is_linear=linear_gate,
+            fused_copies=fused_copies,
         )
         results.append((out, ssm_states, stage))
     for reference, with_alpha in zip(*results):

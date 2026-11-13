@@ -158,33 +158,54 @@ def _multirow_pdl(grid_size: int, device_index: int) -> bool:
 
 
 @triton.jit
-def _gated_rows_load(X, Z, rows, cols, M, stride_x_row, stride_z_tok,
-                     N: tl.constexpr, HEADS_PER_TOK: tl.constexpr):
-    """One ROWS-row tile of X and its gate rows of Z (see the kernel below)."""
-    mask2d = (rows < M)[:, None]
-    x = tl.load(X + rows[:, None].to(tl.int64) * stride_x_row + cols[None, :],
-                mask=mask2d,
-                other=0.0)
+def _gated_rows_load(X, Z, r0, M, stride_x_row, stride_z_tok, N: tl.constexpr,
+                     ROWS: tl.constexpr, HEADS_PER_TOK: tl.constexpr,
+                     CONTIG: tl.constexpr, EVEN: tl.constexpr):
+    """Rows [r0, r0 + ROWS) of X and their gate rows of Z (see the kernel below)."""
+    rows = r0 + tl.arange(0, ROWS)
+    cols = tl.arange(0, N)
+    if CONTIG:
+        flat = tl.arange(0, ROWS * N)
+        x_ptr = X + tl.cast(r0, tl.int64) * N + flat
+        if EVEN:
+            x = tl.load(x_ptr)
+        else:
+            x = tl.load(x_ptr, mask=(r0 + flat // N) < M, other=0.0)
+        x = tl.reshape(x, (ROWS, N))
+    else:
+        x_ptr = X + rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
+        if EVEN:
+            x = tl.load(x_ptr)
+        else:
+            x = tl.load(x_ptr, mask=rows[:, None] < M, other=0.0)
     tok = rows // HEADS_PER_TOK
     head = rows % HEADS_PER_TOK
-    z = tl.load(Z + (tok[:, None].to(tl.int64) * stride_z_tok +
-                     head[:, None] * N + cols[None, :]),
-                mask=mask2d,
-                other=0.0)
+    z_ptr = Z + (tok[:, None].to(tl.int64) * stride_z_tok + head[:, None] * N +
+                 cols[None, :])
+    if EVEN:
+        z = tl.load(z_ptr)
+    else:
+        z = tl.load(z_ptr, mask=rows[:, None] < M, other=0.0)
     return x, z
 
 
 @triton.jit
-def _gated_rows_store(X, Y, Rstd, FP8_SCALE, x, z, w, rows, cols, M, eps,
-                      stride_y_row, N: tl.constexpr, GATE_SIGMOID: tl.constexpr,
-                      SAVE_RSTD: tl.constexpr, OUTPUT_FP8: tl.constexpr):
+def _gated_rows_store(X, Y, Rstd, FP8_SCALE, x, z, w, r0, M, eps, stride_y_row,
+                      N: tl.constexpr, ROWS: tl.constexpr,
+                      GATE_SIGMOID: tl.constexpr, SAVE_RSTD: tl.constexpr,
+                      OUTPUT_FP8: tl.constexpr, CONTIG: tl.constexpr,
+                      EVEN: tl.constexpr):
     """Gated RMSNorm of one loaded tile, stored to Y (and Rstd)."""
-    row_mask = rows < M
+    rows = r0 + tl.arange(0, ROWS)
+    cols = tl.arange(0, N)
     x = x.to(tl.float32)
     var = tl.sum(x * x, axis=1) / N
     rstd = 1.0 / tl.sqrt(var + eps)
     if SAVE_RSTD:
-        tl.store(Rstd + rows, rstd, mask=row_mask)
+        if EVEN:
+            tl.store(Rstd + rows, rstd)
+        else:
+            tl.store(Rstd + rows, rstd, mask=rows < M)
     y = x * rstd[:, None] * w[None, :]
     z = z.to(tl.float32)
     gate = tl.sigmoid(z)
@@ -197,9 +218,20 @@ def _gated_rows_store(X, Y, Rstd, FP8_SCALE, x, z, w, rows, cols, M, eps,
         # rounded reciprocal of its input scale.
         y = y.to(X.dtype.element_ty).to(tl.float32)
         y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
-    tl.store(Y + rows[:, None].to(tl.int64) * stride_y_row + cols[None, :],
-             y.to(Y.dtype.element_ty),
-             mask=row_mask[:, None])
+    if CONTIG:
+        flat = tl.arange(0, ROWS * N)
+        y_ptr = Y + tl.cast(r0, tl.int64) * N + flat
+        y = tl.reshape(y, (ROWS * N, )).to(Y.dtype.element_ty)
+        if EVEN:
+            tl.store(y_ptr, y)
+        else:
+            tl.store(y_ptr, y, mask=(r0 + flat // N) < M)
+    else:
+        y_ptr = Y + rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
+        if EVEN:
+            tl.store(y_ptr, y.to(Y.dtype.element_ty))
+        else:
+            tl.store(y_ptr, y.to(Y.dtype.element_ty), mask=rows[:, None] < M)
 
 
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
@@ -226,6 +258,9 @@ def _rms_norm_gated_fwd_multirow_kernel(
     OUTPUT_FP8: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     EARLY_TRIGGER: tl.constexpr = False,
+    # Fast-path hints; the defaults take the general strided, masked path.
+    CONTIG: tl.constexpr = False,  # X and Y rows dense (stride == N)
+    EVEN: tl.constexpr = False,  # M % (ROWS * GROUPS) == 0: no row masks
     GROUPS: tl.constexpr = 1,
 ):
     """Gated rmsnorm(x), several short rows per program.
@@ -238,6 +273,10 @@ def _rms_norm_gated_fwd_multirow_kernel(
     of a wider projection. A program runs GROUPS ROWS-row tiles, loading tile
     g + 1 before it computes tile g; each row's arithmetic does not depend on
     GROUPS.
+
+    When CONTIG, x is loaded and y stored through flat [ROWS * N] offsets so
+    each tile is one contiguous span (widest possible global accesses); EVEN
+    additionally drops the bounds masks.
     """
     base = tl.program_id(0) * (ROWS * GROUPS)
     cols = tl.arange(0, N)
@@ -252,20 +291,19 @@ def _rms_norm_gated_fwd_multirow_kernel(
         w += 1.0
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
-    x_next, z_next = _gated_rows_load(X, Z, base + tl.arange(0, ROWS), cols, M,
-                                      stride_x_row, stride_z_tok, N,
-                                      HEADS_PER_TOK)
+    x_next, z_next = _gated_rows_load(X, Z, base, M, stride_x_row, stride_z_tok,
+                                      N, ROWS, HEADS_PER_TOK, CONTIG, EVEN)
     for g in tl.static_range(GROUPS):
-        rows = base + g * ROWS + tl.arange(0, ROWS)
+        r0 = base + g * ROWS
         x_cur = x_next
         z_cur = z_next
         if g + 1 < GROUPS:
-            x_next, z_next = _gated_rows_load(X, Z, rows + ROWS, cols, M,
-                                              stride_x_row, stride_z_tok, N,
-                                              HEADS_PER_TOK)
-        _gated_rows_store(X, Y, Rstd, FP8_SCALE, x_cur, z_cur, w, rows, cols, M,
-                          eps, stride_y_row, N, GATE_SIGMOID, SAVE_RSTD,
-                          OUTPUT_FP8)
+            x_next, z_next = _gated_rows_load(X, Z, r0 + ROWS, M, stride_x_row,
+                                              stride_z_tok, N, ROWS,
+                                              HEADS_PER_TOK, CONTIG, EVEN)
+        _gated_rows_store(X, Y, Rstd, FP8_SCALE, x_cur, z_cur, w, r0, M, eps,
+                          stride_y_row, N, ROWS, GATE_SIGMOID, SAVE_RSTD,
+                          OUTPUT_FP8, CONTIG, EVEN)
     if LAUNCH_WITH_PDL and not EARLY_TRIGGER:
         # Release only after both Rstd (when present) and Y have been stored.
         tl.extra.cuda.gdc_launch_dependents()
@@ -332,6 +370,8 @@ def rms_norm_gated_token_major(
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     out = torch.empty_like(x, dtype=out_dtype)
+    # rstd is not consumed on this path; Rstd=None skips both the scratch
+    # allocation and the (measurably expensive) extra store in the kernel.
     device_index = x.device.index
     groups = _MULTIROW_GROUPS if M >= _MULTIROW_GROUPS_MIN_ROWS else 1
     grid_size = triton.cdiv(M, _MULTIROW_ROWS * groups)
@@ -355,6 +395,8 @@ def rms_norm_gated_token_major(
             GATE_SIGMOID=gate_sigmoid,
             WEIGHT_IS_DELTA=False,
             LAUNCH_WITH_PDL=launch_with_pdl,
+            CONTIG=(x.stride(0) == N and out.stride(0) == N),
+            EVEN=(M % (_MULTIROW_ROWS * groups) == 0),
             num_warps=_MULTIROW_NUM_WARPS,
             # Dependents (out_proj) prefetch their weights; they read Y only
             # after their own griddepcontrol.wait.
@@ -450,6 +492,9 @@ def _layer_norm_fwd(
                 GATE_SIGMOID=gate_sigmoid,
                 WEIGHT_IS_DELTA=weight_is_delta,
                 LAUNCH_WITH_PDL=launch_with_pdl,
+                CONTIG=(x.stride(0) == group_size
+                        and out.stride(0) == group_size),
+                EVEN=(M % _MULTIROW_ROWS == 0),
                 num_warps=_MULTIROW_NUM_WARPS,
                 launch_pdl=launch_with_pdl,
             )
