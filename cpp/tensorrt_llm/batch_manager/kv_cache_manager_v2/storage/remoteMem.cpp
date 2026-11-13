@@ -208,7 +208,7 @@ void RemoteMemClient::refreshDonors()
         std::string line;
         int version = 0;
         std::string agentName;
-        std::string transport = "nixl";
+        std::string transport;
         while (std::getline(meta, line))
         {
             std::istringstream fields(line);
@@ -243,10 +243,12 @@ void RemoteMemClient::refreshDonors()
             }
         }
         // Donors publish one segment (remote_donor.py): more could overlap or sum past the chunk bound.
-        if (version != 1 || agentName != name || donor.chunkBytes == 0 || donor.segments.size() != 1)
+        if (version != 1 || agentName != name || transport.empty() || donor.chunkBytes == 0
+            || donor.segments.size() != 1)
         {
-            TLLM_LOG_WARNING("KVCM2 remote level: ignoring donor %s: malformed meta (version %d, name '%s')",
-                name.c_str(), version, agentName.c_str());
+            TLLM_LOG_WARNING(
+                "KVCM2 remote level: ignoring donor %s: malformed meta (version %d, name '%s', transport '%s')",
+                name.c_str(), version, agentName.c_str(), transport.c_str());
             continue;
         }
         if (transport != mBackend->kind())

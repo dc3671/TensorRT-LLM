@@ -66,8 +66,7 @@ def _publish(
         f"host {host}",
         "pid 1",
         f"chunk_bytes {chunk_gib * _GIB}",
-        # A NIXL donor's .meta names no transport.
-        *([f"transport {transport}"] if transport != "nixl" else []),
+        f"transport {transport}",
         "numa 0",
         f"segment 0 {gib * _GIB}",
         *extra,
@@ -100,6 +99,31 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertEqual([f["name"] for f in failed], ["c"])
         self.assertEqual(failed[0]["planned_bytes"], 160 * _GIB)
         self.assertIn("OUT_OF_MEMORY", failed[0]["error"])
+
+    def test_a_donor_file_without_its_transport_is_malformed(self):
+        """Every writer names its transport; a .meta or .failed without it counts as no donor."""
+        _publish(self.dir, "ok", 4)
+        _publish(self.dir, "bare", 4)
+        meta = os.path.join(self.dir, "donor.bare.meta")
+        lines = [line for line in open(meta) if not line.startswith("transport ")]
+        with open(meta, "w") as f:
+            f.writelines(lines)
+        with open(os.path.join(self.dir, "donor.lost.failed"), "w") as f:
+            f.write("version 1\nname lost\nhost h\npid 1\nplanned_bytes 1\nerror e\n")
+        published, failed = scan_donors(self.dir)
+        self.assertEqual([p["name"] for p in published], ["ok"])
+        self.assertEqual(failed, [])
+
+    def test_every_donor_names_its_transport(self):
+        for kind in remote_donor.TRANSPORTS:
+            donor = make_donor(self.dir, _GIB, kind, chunk_bytes=_GIB, name=f"named-{kind}")
+            donor._publish([], ["segment 0 1"], "test")
+            donor.publish_failure(RuntimeError("e"))
+            fields = remote_donor._meta_fields(os.path.join(self.dir, f"donor.named-{kind}.meta"))
+            self.assertEqual(fields["transport"], kind)
+            failed = remote_donor._meta_fields(os.path.join(self.dir, f"donor.named-{kind}.failed"))
+            self.assertEqual(failed["transport"], kind)
+            donor.close()
 
     def test_only_donors_of_the_clients_transport_count(self):
         """Clients skip donors of another transport, so their capacity does not cover the need."""

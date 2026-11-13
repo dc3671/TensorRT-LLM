@@ -507,14 +507,15 @@ def scan_donors(directory: str) -> tuple[list[dict], list[dict]]:
         try:
             if file.endswith(".ready"):
                 fields = _meta_fields(os.path.join(directory, f"donor.{name}.meta"))
+                if "transport" not in fields:
+                    continue  # malformed: every donor names its transport, as clients require
                 chunk = int(fields.get("chunk_bytes", 0))
                 offered = sum(b - b % chunk for _, b in fields["segments"]) if chunk else 0
                 published.append(
                     {
                         "name": name,
                         "host": fields.get("host", "?"),
-                        # The NIXL transport's .meta predates the field.
-                        "transport": fields.get("transport", "nixl"),
+                        "transport": fields["transport"],
                         "offered_bytes": offered,
                         "short_bytes": int(fields.get("short_bytes", 0)),
                         "numa_chunks": fields.get("numa_chunks", ""),
@@ -522,11 +523,13 @@ def scan_donors(directory: str) -> tuple[list[dict], list[dict]]:
                 )
             elif file.endswith(".failed"):
                 fields = _meta_fields(os.path.join(directory, file))
+                if "transport" not in fields:
+                    continue  # malformed, as for .meta
                 failed.append(
                     {
                         "name": name,
                         "host": fields.get("host", "?"),
-                        "transport": fields.get("transport"),
+                        "transport": fields["transport"],
                         "planned_bytes": int(fields.get("planned_bytes", 0)),
                         "error": fields.get("error", "?"),
                     }
@@ -550,8 +553,7 @@ def check_remote_capacity(
     `need_bytes`, then raise if the offer falls short, naming the failed and short donors. A job whose donors cannot
     cover its clients thus stops when the last donor reports instead of after the clients' claim wait.
 
-    With `transport`, only donors of that transport count, as the clients skip the others; a failure marker that
-    names no transport counts."""
+    With `transport`, only donors of that transport count, as the clients skip the others."""
     log = log or _log
     need = need_bytes
     expected = num_donors
@@ -560,7 +562,7 @@ def check_remote_capacity(
         published, failed = scan_donors(directory)
         if transport is not None:
             published = [p for p in published if p["transport"] == transport]
-            failed = [f for f in failed if f["transport"] in (None, transport)]
+            failed = [f for f in failed if f["transport"] == transport]
         offered = sum(p["offered_bytes"] for p in published)
         reported = len(published) + len(failed)
         if offered >= need or reported >= expected or time.monotonic() >= deadline:
@@ -713,6 +715,7 @@ class RemoteMemDonor:
                 f"host {self.host}",
                 f"pid {os.getpid()}",
                 f"chunk_bytes {self.chunk_bytes}",
+                f"transport {self.transport.kind}",
                 *meta_lines,
                 "",
             ]
@@ -1078,7 +1081,6 @@ class FabricDonorTransport(DonorTransport):
         short = planned - donor.nbytes
         placement = ",".join(f"{n}:{c}" for n, c in per_node.items() if c)
         meta = [
-            "transport fabric",
             f"numa {numa}",
             f"numa_chunks {placement}",
             f"segment 0 {donor.nbytes}",
