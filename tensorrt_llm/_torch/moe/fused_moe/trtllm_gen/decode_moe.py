@@ -19,11 +19,14 @@ import enum
 import functools
 import re
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 
+from tensorrt_llm._torch.utils import ActType_TrtllmGen
+
 from .decode_front import max_num_tiles
+from .kernel_inputs import get_data_or_none, to_trtllm_gen_act_type
 
 if TYPE_CHECKING:
     from ....custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoEInputs
@@ -89,8 +92,6 @@ def _cute_fc2_fits(
 def _engine_fits(args: "FP4BlockScaleMoEInputs", act_type: int, top_k: int) -> bool:
     """The engine's operands and shapes, with the K tile :func:`tile_k_for` picks for this call dividing both GEMMs'
     K and the call's (expert, row chunk) segments within the engine's segment table."""
-    from tensorrt_llm._torch.utils import ActType_TrtllmGen
-
     if act_type != ActType_TrtllmGen.SwiGlu or args.hidden_states_scale is None:
         return False
     if any(
@@ -156,9 +157,6 @@ def engine_routes(
         QUANT_ROWS_PER_TILE,
         MoeRouterGemmKernel,
     )
-    from tensorrt_llm._torch.utils import ActType_TrtllmGen
-
-    from .kernel_inputs import get_data_or_none, to_trtllm_gen_act_type
 
     if not backend.decode_tuning or not 0 < num_rows <= ROUTE_MAX_ROWS:
         return False
@@ -326,14 +324,28 @@ def run_engine(
     return [out]
 
 
-def fc1_only_args(run_args: Sequence) -> tuple:
+#: Positions of ``gemm2_bias``, ``do_finalize`` and ``output`` in the runner's ``run_moe`` / ``run_moe_prerouted``
+#: arguments (``FP4BlockScaleMoeRunner::run`` / ``runPrerouted`` in fp4BlockScaleMoe.cpp), which its FC1-only entries
+#: (``runFc1`` / ``runPreroutedFc1``) do not take.
+GEMM2_BIAS_ARG, DO_FINALIZE_ARG, OUTPUT_ARG = 12, 25, 29
+
+
+def fc1_only_args(run_args: Sequence[object]) -> Tuple[object, ...]:
     """The runner's ``run_moe`` / ``run_moe_prerouted`` arguments as its FC1-only entries take them: without
     ``gemm2_bias``, ``do_finalize`` and ``output``, which must be None, False and None."""
     run_args = tuple(run_args)
-    gemm2_bias, do_finalize, output = run_args[12], run_args[25], run_args[29]
-    if gemm2_bias is not None or do_finalize or output is not None:
+    if (
+        run_args[GEMM2_BIAS_ARG] is not None
+        or run_args[DO_FINALIZE_ARG]
+        or run_args[OUTPUT_ARG] is not None
+    ):
         raise ValueError("an FC1-only call is un-finalized, without FC2 bias or output tensor")
-    return run_args[:12] + run_args[13:25] + run_args[26:29] + run_args[30:]
+    return (
+        run_args[:GEMM2_BIAS_ARG]
+        + run_args[GEMM2_BIAS_ARG + 1 : DO_FINALIZE_ARG]
+        + run_args[DO_FINALIZE_ARG + 1 : OUTPUT_ARG]
+        + run_args[OUTPUT_ARG + 1 :]
+    )
 
 
 def run_cute_fc2(
@@ -369,21 +381,6 @@ def run_cute_fc2(
         out,
     )
     return [out, expert_weights, expanded_idx_to_permuted_idx]
-
-
-def copy_to_lamport(
-    outputs: List[torch.Tensor], expanded_to_permuted: torch.Tensor, lamport_out: torch.Tensor
-) -> List[torch.Tensor]:
-    """The runner's own un-finalized ``outputs`` with their gemm2 rows moved into ``lamport_out``: only the rows of
-    real (token, expert) pairs (``expanded_to_permuted`` >= 0), so the others keep 0xFFFFFFFF."""
-    rows = outputs[0]
-    cap, hidden = rows.shape
-    out = _lamport_rows(lamport_out, cap, hidden)
-    idx = expanded_to_permuted.reshape(-1).long()
-    real = torch.zeros((cap + 1,), dtype=torch.bool, device=rows.device)
-    real[torch.where(idx >= 0, idx, cap)] = True
-    torch.where(real[:cap].unsqueeze(1), rows, out, out=out)
-    return [out, *outputs[1:]]
 
 
 def rows_in_lamport(rows: torch.Tensor, lamport_out: Optional[torch.Tensor]) -> bool:
@@ -443,7 +440,6 @@ class LamportFc2Buffer:
         if buf is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("allocate the Lamport FC2 buffer before CUDA graph capture")
-            from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
             runner = torch.classes.trtllm.FP4BlockScaleMoERunner(int(ActType_TrtllmGen.SwiGlu))
             rows = lamport_rows(runner, self.max_rows, hidden, inter, top_k, local_experts)

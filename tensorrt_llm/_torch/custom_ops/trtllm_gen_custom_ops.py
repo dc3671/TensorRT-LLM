@@ -537,41 +537,45 @@ class FP4BlockScaleMoERunner(TunableRunner):
 
         args = FP4BlockScaleMoEInputs(*inputs)
         kernel_runner = self.get_runner()
+        # The positional arguments of the runner's run_moe / run_moe_prerouted
+        # (fp4BlockScaleMoe.cpp; decode_moe.GEMM2_BIAS_ARG and its siblings
+        # name the ones its FC1-only entries drop).
+        run_args: Tuple[object, ...]
         if prerouted is not None:
             tables, topk_ids, topk_weights = prerouted
-            layout = (None, None, args.hidden_states, args.hidden_states_scale,
-                      args.gemm1_weights, args.gemm1_weights_scale,
-                      args.gemm1_bias, args.gemm1_alpha, args.gemm1_beta,
-                      args.gemm1_clamp_limit, args.gemm2_weights,
-                      args.gemm2_weights_scale, args.gemm2_bias,
-                      args.output1_scale_scalar, args.output1_scale_gate_scalar,
-                      args.output2_scale_scalar, self.local_num_experts,
-                      self.top_k, self.n_group, self.topk_group,
-                      self.intermediate_size, 0, self.local_num_experts,
-                      self.routed_scaling_factor, self.routing_method_type,
-                      self.do_finalize, tactic, topk_weights, topk_ids, output,
-                      *tables, tactic[0])
+            run_args = (
+                None, None, args.hidden_states, args.hidden_states_scale,
+                args.gemm1_weights, args.gemm1_weights_scale, args.gemm1_bias,
+                args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit,
+                args.gemm2_weights, args.gemm2_weights_scale, args.gemm2_bias,
+                args.output1_scale_scalar, args.output1_scale_gate_scalar,
+                args.output2_scale_scalar, self.local_num_experts, self.top_k,
+                self.n_group, self.topk_group, self.intermediate_size, 0,
+                self.local_num_experts, self.routed_scaling_factor,
+                self.routing_method_type, self.do_finalize, tactic,
+                topk_weights, topk_ids, output, *tables, tactic[0])
             run = kernel_runner.run_moe_prerouted
         else:
-            layout = (args.routing_logits, args.routing_bias,
-                      args.hidden_states, args.hidden_states_scale,
-                      args.gemm1_weights, args.gemm1_weights_scale,
-                      args.gemm1_bias, args.gemm1_alpha, args.gemm1_beta,
-                      args.gemm1_clamp_limit, args.gemm2_weights,
-                      args.gemm2_weights_scale, args.gemm2_bias,
-                      args.output1_scale_scalar, args.output1_scale_gate_scalar,
-                      args.output2_scale_scalar, self.num_experts, self.top_k,
-                      self.n_group, self.topk_group, self.intermediate_size,
-                      self.local_expert_offset, self.local_num_experts,
-                      self.routed_scaling_factor, self.routing_method_type,
-                      self.do_finalize, tactic, args.topk_weights,
-                      args.topk_ids, output)
+            run_args = (args.routing_logits, args.routing_bias,
+                        args.hidden_states, args.hidden_states_scale,
+                        args.gemm1_weights, args.gemm1_weights_scale,
+                        args.gemm1_bias, args.gemm1_alpha, args.gemm1_beta,
+                        args.gemm1_clamp_limit, args.gemm2_weights,
+                        args.gemm2_weights_scale, args.gemm2_bias,
+                        args.output1_scale_scalar,
+                        args.output1_scale_gate_scalar,
+                        args.output2_scale_scalar, self.num_experts, self.top_k,
+                        self.n_group, self.topk_group, self.intermediate_size,
+                        self.local_expert_offset, self.local_num_experts,
+                        self.routed_scaling_factor, self.routing_method_type,
+                        self.do_finalize, tactic, args.topk_weights,
+                        args.topk_ids, output)
             run = kernel_runner.run_moe
         if not self.decode_tuning and candidates is None:
             # Every model's call (no decode kernels declared): the runner's
             # own kernels; a Lamport buffer only goes to ENGINE / CUTE_FC2.
-            return run(*layout)
-        return self._forward_decode(args, kernel_runner, run, layout, tactic,
+            return run(*run_args)
+        return self._forward_decode(args, kernel_runner, run, run_args, tactic,
                                     output, prerouted, engine_state,
                                     lamport_out, candidates)
 
@@ -580,7 +584,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
         args: FP4BlockScaleMoEInputs,
         kernel_runner: torch.ScriptObject,
         run: Callable[..., List[torch.Tensor]],
-        layout: tuple,
+        run_args: Tuple[object, ...],
         tactic: List[int],
         output: Optional[torch.Tensor],
         prerouted: Optional[Tuple[List[torch.Tensor], torch.Tensor,
@@ -590,7 +594,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
         candidates: Optional[torch.Tensor],
     ) -> List[torch.Tensor]:
         """``forward`` of a call that may take the decode kernels
-        (``decode_moe.select``); ``run`` / ``layout``: the runner entry point
+        (``decode_moe.select``); ``run`` / ``run_args``: the runner entry point
         and its arguments for the CUBIN call."""
         from ..moe.fused_moe.trtllm_gen import decode_moe
         kernel = decode_moe.DecodeKernel.CUBIN
@@ -635,8 +639,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
             fc1 = (kernel_runner.run_moe_prerouted_fc1
                    if prerouted is not None else kernel_runner.run_moe_fc1)
             return decode_moe.run_cute_fc2(
-                fc1(*decode_moe.fc1_only_args(layout)), args, lamport_out)
-        return run(*layout)
+                fc1(*decode_moe.fc1_only_args(run_args)), args, lamport_out)
+        return run(*run_args)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,

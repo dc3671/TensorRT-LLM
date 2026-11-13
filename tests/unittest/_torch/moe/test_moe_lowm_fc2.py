@@ -244,3 +244,26 @@ def test_runner_forward_dispatch(decode_tuning, monkeypatch):
     torch.cuda.synchronize()
     assert bool(called) == decode_tuning
     _assert_same_expert_rows(got, ref)
+
+
+@pytest.mark.parametrize("prerouted", [False, True])
+def test_fc1_only_args_drop_exactly_the_fc2_arguments(prerouted):
+    """The FC1-only entries take run_moe's / run_moe_prerouted's arguments without gemm2_bias, do_finalize and
+    output; the pre-routed tables and tile that follow output stay in order."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import (
+        DO_FINALIZE_ARG,
+        GEMM2_BIAS_ARG,
+        OUTPUT_ARG,
+        fc1_only_args,
+    )
+
+    # run_moe: 30 arguments; run_moe_prerouted adds 6 routing tables and the routing tile.
+    run_args = [f"arg{i}" for i in range(30 + (7 if prerouted else 0))]
+    run_args[GEMM2_BIAS_ARG], run_args[DO_FINALIZE_ARG], run_args[OUTPUT_ARG] = None, False, None
+    dropped = {GEMM2_BIAS_ARG, DO_FINALIZE_ARG, OUTPUT_ARG}
+    assert fc1_only_args(run_args) == tuple(a for i, a in enumerate(run_args) if i not in dropped)
+    for i, value in ((GEMM2_BIAS_ARG, "bias"), (DO_FINALIZE_ARG, True), (OUTPUT_ARG, "out")):
+        bad = list(run_args)
+        bad[i] = value
+        with pytest.raises(ValueError):
+            fc1_only_args(bad)
