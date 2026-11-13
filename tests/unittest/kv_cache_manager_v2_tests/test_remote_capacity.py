@@ -14,7 +14,7 @@
 # limitations under the License.
 """The remote level's capacity check, donor failure markers and fabric chunk placement.
 
-No GPU, except TestFabricPlacement (the fabric transport).
+No GPU, except TestFabricPlacement (the fabric transport) and TestFailedStartReleaseCudaState.
 
 check_remote_capacity waits until the expected donors have published (donor.<name>.ready + .meta) or failed
 (donor.<name>.failed), then compares what they offer with what the clients claim. It must fail as soon as the
@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -49,7 +50,7 @@ _ADDED_TEST_DIR = _TEST_DIR not in sys.path
 if _ADDED_TEST_DIR:
     sys.path.insert(0, _TEST_DIR)
 try:
-    from remote_test_utils import fabric_available
+    from remote_test_utils import fabric_available, gpu_count
 finally:
     if _ADDED_TEST_DIR:
         sys.path.remove(_TEST_DIR)
@@ -366,6 +367,87 @@ class TestCapacityCheck(unittest.TestCase):
     def test_donor_names_are_unique_within_a_process(self):
         names = {make_donor(self.dir, _GIB, chunk_bytes=_GIB).name for _ in range(64)}
         self.assertEqual(len(names), 64)
+
+
+def _capture_mode():
+    """The calling thread's stream-capture mode."""
+    from cuda.bindings import driver as drv
+
+    relaxed = drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
+    err, mode = drv.cuThreadExchangeStreamCaptureMode(relaxed)
+    assert err == drv.CUresult.CUDA_SUCCESS, err
+    drv.cuThreadExchangeStreamCaptureMode(mode)
+    return mode
+
+
+@unittest.skipUnless(gpu_count() > 0, "needs a GPU")
+class TestFailedStartReleaseCudaState(unittest.TestCase):
+    """A start that fails after registration releases on the donor thread, in the start's relaxed capture mode.
+
+    The serving thread may capture a CUDA graph in global mode meanwhile, which a capture-unsafe call made in global
+    mode on another thread (e.g. deregistering host memory) would invalidate.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="kvcm2_release_mode_")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_nixl_donation_deregisters_in_relaxed_mode(self):
+        modes = []
+
+        class _Agent:
+            def __init__(self, config):
+                pass
+
+            def register_memory(self, descs):
+                pass
+
+            def deregister_memory(self, descs):
+                modes.append(_capture_mode())
+
+            def get_local_agent_desc(self):
+                raise RuntimeError("no agent descriptor")
+
+        binding = types.ModuleType("tensorrt_llm.tensorrt_llm_transfer_agent_binding")
+        binding.BaseAgentConfig = types.SimpleNamespace
+        binding.NixlTransferAgent = _Agent
+        binding.MemoryDesc = lambda *args: args
+        binding.MemoryDescs = lambda *args: args
+        binding.MemoryType = types.SimpleNamespace(DRAM="DRAM")
+        donor = make_donor(self.dir, 4 << 20, "nixl", chunk_bytes=2 << 20, device=0)
+        with mock.patch.dict(sys.modules, {binding.__name__: binding}):
+            donor.start_in_background()
+            donor.wait_started()
+        from cuda.bindings import driver as drv
+
+        self.assertEqual(modes, [drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED])
+        _, failed = scan_donors(self.dir)
+        self.assertIn("no agent descriptor", failed[0]["error"])
+
+    @unittest.skipUnless(fabric_available(), "needs the fabric transport")
+    def test_a_fabric_donation_releases_its_chunks_in_relaxed_mode(self):
+        modes = []
+        real_release = FabricDonorTransport._release_fabric
+
+        def release(transport):
+            if transport._fabric:
+                modes.append(_capture_mode())
+            real_release(transport)
+
+        def failing_publish(*args, **kwargs):
+            raise OSError("publish failed")
+
+        donor = make_donor(self.dir, 2 * (16 << 20), "fabric", chunk_bytes=16 << 20, device=0)
+        donor._publish = failing_publish
+        with mock.patch.object(FabricDonorTransport, "_release_fabric", release):
+            donor.start_in_background()
+            donor.wait_started()
+        from cuda.bindings import driver as drv
+
+        self.assertEqual(modes, [drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED])
+        self.assertEqual(donor.transport._fabric, [])
 
 
 @pytest.mark.cpu_only

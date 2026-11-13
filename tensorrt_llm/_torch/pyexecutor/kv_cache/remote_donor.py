@@ -60,12 +60,7 @@ from tensorrt_llm.llmapi.llm_args import REMOTE_CACHE_CHUNK_BYTES, REMOTE_CACHE_
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
-    from cuda.bindings.driver import (
-        CUdevice,
-        CUmemAllocationProp,
-        CUmemGenericAllocationHandle,
-        CUstreamCaptureMode,
-    )
+    from cuda.bindings.driver import CUdevice, CUmemAllocationProp, CUmemGenericAllocationHandle
 
     from tensorrt_llm.llmapi.llm_args import RemoteCacheConfig
     from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
@@ -629,8 +624,8 @@ class DonorTransport:
 
 
 @contextlib.contextmanager
-def _donor_thread_cuda(device: Optional[int]):
-    """CUDA state of the thread that starts a donation, for the duration of the start.
+def _donor_thread_cuda(device: Optional[int]) -> Iterator[None]:
+    """CUDA state of the thread that starts or releases a donation, for the duration of that step.
 
     Relaxed stream-capture mode: the start may run in the background while the serving thread captures a CUDA graph
     in global mode, and a capture-unsafe CUDA call here (e.g. host-memory registration) would invalidate that capture.
@@ -660,6 +655,18 @@ def _donor_thread_cuda(device: Optional[int]):
                 _cuda_check(step())
             except RuntimeError as error:
                 _log(f"leaving the donor thread's CUDA state failed: {error}")
+
+
+@contextlib.contextmanager
+def _donor_release_cuda(device: Optional[int], name: str) -> Iterator[None]:
+    """``_donor_thread_cuda`` for a release, which keeps going without it: e.g. a failed start's cleanup on the donor
+    thread, which may run while the serving thread captures a CUDA graph in global mode, or a finalizer at exit."""
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(_donor_thread_cuda(device))
+        except (ImportError, RuntimeError) as error:
+            _log(f"{name}: releasing without the donor thread's CUDA state: {error}")
+        yield
 
 
 class RemoteMemDonor:
@@ -859,6 +866,8 @@ class AgentDonorTransport(DonorTransport):
     _name: str = ""  # the donor's, for logs
     _agent = None
     _registered: bool = False
+    # The donor's CUDA device, current while the agent is made or released.
+    _device: Optional[int] = None
 
     def __init__(
         self,
@@ -874,6 +883,7 @@ class AgentDonorTransport(DonorTransport):
         self._name = ""
         self._agent = None
         self._registered = False
+        self._device = None
 
     @classmethod
     def options_from(cls, remote_config: "RemoteCacheConfig") -> dict:
@@ -896,6 +906,7 @@ class AgentDonorTransport(DonorTransport):
         )
         self._name = donor.name
         self._nbytes = donor.nbytes
+        self._device = donor.device
         t0 = time.monotonic()
         flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_NORESERVE
         self._map = mmap.mmap(-1, donor.nbytes, flags=flags)
@@ -929,22 +940,27 @@ class AgentDonorTransport(DonorTransport):
         )
 
     def release_unowned(self) -> None:
-        # Clients still holding chunks fail their next transfer at the NIC.
-        if self._agent is not None and self._registered:
-            from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
-                MemoryDesc,
-                MemoryDescs,
-                MemoryType,
-            )
+        # Clients still holding chunks fail their next transfer at the NIC. Deregistering and dropping the agent run in
+        # the start's CUDA state (_donor_thread_cuda), like registering: NIXL/UCX may make CUDA calls there too.
+        if self._agent is not None:
+            with _donor_release_cuda(self._device, self._name):
+                if self._registered:
+                    from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
+                        MemoryDesc,
+                        MemoryDescs,
+                        MemoryType,
+                    )
 
-            try:
-                self._agent.deregister_memory(
-                    MemoryDescs(MemoryType.DRAM, [MemoryDesc(self._address, self._nbytes, 0)])
-                )
-            except Exception as error:  # noqa: BLE001 - teardown keeps going
-                _log(f"{self._name}: deregistering failed: {error}")
-            self._registered = False
-        self._agent = None
+                    try:
+                        self._agent.deregister_memory(
+                            MemoryDescs(
+                                MemoryType.DRAM, [MemoryDesc(self._address, self._nbytes, 0)]
+                            )
+                        )
+                    except Exception as error:  # noqa: BLE001 - teardown keeps going
+                        _log(f"{self._name}: deregistering failed: {error}")
+                    self._registered = False
+                self._agent = None
         if self._map is not None:
             try:
                 self._map.close()
@@ -965,15 +981,13 @@ class FabricDonorTransport(DonorTransport):
     chunk_bytes: int = REMOTE_CACHE_CHUNK_BYTES
     reserve_bytes: int = REMOTE_CACHE_DONOR_RESERVE_BYTES
     _fabric: Optional[list] = None  # the cuMemCreate handles, one per chunk
-    _fabric_ctx = None
-    # The device whose primary context _fabric_ctx retains; close() releases it.
-    _fabric_device = None
+    # The CUDA device ordinal whose primary context the donation retains while it lives (None: not started).
+    _device: Optional[int] = None
 
     def __init__(self, *, reserve_bytes: int = REMOTE_CACHE_DONOR_RESERVE_BYTES) -> None:
         self.reserve_bytes = reserve_bytes
         self._fabric = []
-        self._fabric_ctx = None
-        self._fabric_device = None
+        self._device = None
 
     @classmethod
     def options_from(cls, remote_config: "RemoteCacheConfig") -> dict:
@@ -1017,79 +1031,72 @@ class FabricDonorTransport(DonorTransport):
         self.name = donor.name
         self.chunk_bytes = donor.chunk_bytes
         ensure_rendezvous_directory(donor.directory)
-        _cuda_check(drv.cuInit(0))
-        device = _cuda_check(drv.cuDeviceGet(0 if donor.device is None else donor.device))
-        self._fabric_ctx = _cuda_check(drv.cuDevicePrimaryCtxRetain(device))
-        self._fabric_device = device
-        # cuMemCreate and the export may run while the serving thread captures a CUDA graph in global mode.
-        capture_mode = _cuda_check(
-            drv.cuThreadExchangeStreamCaptureMode(
-                drv.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
-            )
-        )
         handles = []
         planned = donor.nbytes
         chunk_gib = self.chunk_bytes / _GIB
         reserve_gib = self.reserve_bytes / _GIB
-        pushed = started = False
-        try:
-            _cuda_check(drv.cuCtxPushCurrent(self._fabric_ctx))
-            pushed = True
-            numa = (
-                donor.numa_node if donor.numa_node is not None else _host_numa_node_of(drv, device)
-            )
-            nodes = [numa] + [n for n in _host_numa_nodes() if n != numa]
-            props = {n: self._fabric_prop(drv, n) for n in nodes}
-            gran = _cuda_check(
-                drv.cuMemGetAllocationGranularity(
-                    props[numa],
-                    drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+        ordinal = 0 if donor.device is None else donor.device
+        # cuMemCreate and the export may run while the serving thread captures a CUDA graph in global mode.
+        with _donor_thread_cuda(ordinal):
+            device = _cuda_check(drv.cuDeviceGet(ordinal))
+            # Held for the donation's life; release_unowned releases it after the chunks.
+            _cuda_check(drv.cuDevicePrimaryCtxRetain(device))
+            self._device = ordinal
+            try:
+                numa = (
+                    donor.numa_node
+                    if donor.numa_node is not None
+                    else _host_numa_node_of(drv, device)
                 )
-            )
-            if self.chunk_bytes % gran:
-                raise ValueError(
-                    f"chunk size {self.chunk_bytes} is not a multiple of the fabric allocation granularity {gran}"
-                )
-
-            def create(node):
-                handle = self._try_create(drv, props[node])
-                if handle is not None:
-                    # Released by the except below if anything fails later.
-                    self._fabric.append(handle)
-                return handle
-
-            t0 = time.monotonic()
-            placed, per_node = _place_chunks(
-                planned // self.chunk_bytes,
-                nodes,
-                create,
-                chunk_gib=chunk_gib,
-                reserve_gib=reserve_gib,
-                node_lock=lambda node: _node_compaction_lock(donor.directory, donor.host, node),
-            )
-            for handle in placed:
-                exported = _cuda_check(
-                    drv.cuMemExportToShareableHandle(
-                        handle, drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC, 0
+                nodes = [numa] + [n for n in _host_numa_nodes() if n != numa]
+                props = {n: self._fabric_prop(drv, n) for n in nodes}
+                gran = _cuda_check(
+                    drv.cuMemGetAllocationGranularity(
+                        props[numa],
+                        drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
                     )
                 )
-                handles.append(bytes(exported.data))
-                # The C++ client reads 64-byte CUmemFabricHandles back to back.
-                if len(handles[-1]) != 64:
-                    raise RuntimeError(f"fabric handle of {len(handles[-1])} B, expected 64")
-            t1 = time.monotonic()
-            if not handles:
-                raise RuntimeError(
-                    f"no NUMA node can hold a {chunk_gib:.2f} GiB fabric chunk and keep its "
-                    f"{reserve_gib:.0f} GiB reserve"
+                if self.chunk_bytes % gran:
+                    raise ValueError(
+                        f"chunk size {self.chunk_bytes} is not a multiple of the fabric allocation granularity {gran}"
+                    )
+
+                def create(node: int) -> Optional["CUmemGenericAllocationHandle"]:
+                    handle = self._try_create(drv, props[node])
+                    if handle is not None:
+                        # Released by the except below if anything fails later.
+                        self._fabric.append(handle)
+                    return handle
+
+                t0 = time.monotonic()
+                placed, per_node = _place_chunks(
+                    planned // self.chunk_bytes,
+                    nodes,
+                    create,
+                    chunk_gib=chunk_gib,
+                    reserve_gib=reserve_gib,
+                    node_lock=lambda node: _node_compaction_lock(donor.directory, donor.host, node),
                 )
-            started = True
-        except BaseException:
-            # Nothing is published: release what was made.
-            self._release_fabric()
-            raise
-        finally:
-            self._leave_fabric_context(drv, capture_mode, pop=pushed, raise_errors=started)
+                for handle in placed:
+                    exported = _cuda_check(
+                        drv.cuMemExportToShareableHandle(
+                            handle, drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC, 0
+                        )
+                    )
+                    handles.append(bytes(exported.data))
+                    # The C++ client reads 64-byte CUmemFabricHandles back to back.
+                    if len(handles[-1]) != 64:
+                        raise RuntimeError(f"fabric handle of {len(handles[-1])} B, expected 64")
+                t1 = time.monotonic()
+                if not handles:
+                    raise RuntimeError(
+                        f"no NUMA node can hold a {chunk_gib:.2f} GiB fabric chunk and keep its "
+                        f"{reserve_gib:.0f} GiB reserve"
+                    )
+            except BaseException:
+                # Nothing is published: release what was made.
+                self._release_fabric()
+                raise
         donor.nbytes = len(handles) * self.chunk_bytes
         short = planned - donor.nbytes
         placement = ",".join(f"{n}:{c}" for n, c in per_node.items() if c)
@@ -1111,46 +1118,20 @@ class FabricDonorTransport(DonorTransport):
             f"{t1 - t0:.1f} s",
         )
 
-    def _leave_fabric_context(
-        self,
-        drv: ModuleType,
-        capture_mode: "CUstreamCaptureMode",
-        *,
-        pop: bool,
-        raise_errors: bool,
-    ) -> None:
-        """Pop the fabric context (if `pop`) and restore the thread's capture mode. A failure raises only after a
-        successful start, so it never replaces the start error."""
-        steps = [lambda: drv.cuThreadExchangeStreamCaptureMode(capture_mode)]
-        if pop:
-            steps.append(drv.cuCtxPopCurrent)
-        for step in steps:
-            try:
-                _cuda_check(step())
-            except RuntimeError as error:
-                if raise_errors:
-                    raise
-                _log(f"{self.name}: leaving the fabric context failed: {error}")
-
     def release_unowned(self) -> None:
-        if self._fabric_ctx is not None:
+        if self._device is not None:
             from cuda.bindings import driver as drv
 
-            if self._fabric:
+            # In the start's CUDA state: a failed start releases on the donor thread, possibly during a capture.
+            with _donor_release_cuda(self._device, self.name):
+                self._release_fabric()
                 try:
-                    _cuda_check(drv.cuCtxPushCurrent(self._fabric_ctx))
-                    try:
-                        self._release_fabric()
-                    finally:
-                        _cuda_check(drv.cuCtxPopCurrent())
+                    _cuda_check(
+                        drv.cuDevicePrimaryCtxRelease(_cuda_check(drv.cuDeviceGet(self._device)))
+                    )
                 except Exception as error:  # noqa: BLE001 - teardown keeps going
-                    _log(f"{self.name}: releasing the fabric donation failed: {error}")
-            try:
-                _cuda_check(drv.cuDevicePrimaryCtxRelease(self._fabric_device))
-            except Exception as error:  # noqa: BLE001 - teardown keeps going
-                _log(f"{self.name}: releasing the primary context failed: {error}")
-            self._fabric_ctx = None
-            self._fabric_device = None
+                    _log(f"{self.name}: releasing the primary context failed: {error}")
+            self._device = None
         self._fabric = []
 
 
