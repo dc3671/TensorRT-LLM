@@ -277,6 +277,34 @@ class TestCapacityCheck(unittest.TestCase):
         start_threads[0].join(10)  # it still writes the failure marker after its close
         self.assertFalse(start_threads[0].is_alive())
 
+    def test_wait_started_returns_once_a_failed_start_is_released(self):
+        """A failed background start closes itself; wait_started() must not return while that release still runs."""
+        released = threading.Event()
+
+        class _SlowRelease(remote_donor.DonorTransport):
+            kind = "nixl"
+
+            def start(self, donor):
+                time.sleep(0.2)
+                raise RuntimeError("registration failed")
+
+            def release_unowned(self):
+                time.sleep(0.8)
+                released.set()
+
+        donor = remote_donor.RemoteMemDonor(
+            self.dir, 4 * _GIB, _SlowRelease(), chunk_bytes=_GIB, name="slow"
+        )
+        donor.start_in_background()
+        time.sleep(0.4)  # the start failed at 0.2 s; its release runs until 1.0 s
+        donor.wait_started()
+        self.assertTrue(
+            released.is_set(), "wait_started() returned during the failed start's release"
+        )
+        _, failed = scan_donors(self.dir)
+        self.assertEqual([f["name"] for f in failed], ["slow"])
+        donor.close()
+
     def _started(self, name):
         donor = make_donor(self.dir, 4 * _GIB, "fabric", chunk_bytes=_GIB, name=name)
         with mock.patch.object(

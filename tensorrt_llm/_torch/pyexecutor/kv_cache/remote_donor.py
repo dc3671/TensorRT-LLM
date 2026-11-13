@@ -788,9 +788,13 @@ class RemoteMemDonor:
 
     def close(self, error: Optional[BaseException] = None) -> None:
         """Wait for a background start, then withdraw the files and the transport's memory; with `error`, leave the
-        failure marker too. Clients still holding chunks fail their next transfer instead of reading stale bytes."""
-        thread, self._start_thread = self._start_thread, None
-        if thread is not None and thread is not threading.current_thread():
+        failure marker too. Clients still holding chunks fail their next transfer instead of reading stale bytes.
+
+        A failed background start closes on its own thread; ``_start_thread`` stays set until that close ends, so
+        ``wait_started()`` returns only once the failed donation is released and marked."""
+        thread = self._start_thread
+        on_start_thread = thread is threading.current_thread()
+        if thread is not None and not on_start_thread:
             thread.join()
         with self._close_lock:
             if self._finalizer is not None:
@@ -798,6 +802,8 @@ class RemoteMemDonor:
             self._withdraw()
         if error is not None:
             self.publish_failure(error)
+        if not on_start_thread:
+            self._start_thread = None
 
     def _withdraw(self) -> None:
         for path in reversed(self._published):
