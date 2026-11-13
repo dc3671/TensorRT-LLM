@@ -1113,3 +1113,33 @@ def test_rope_gather_launches_only_with_a_resident_grid(
         ("gather", 21),
         ("plain", 14),
     ]
+
+
+@pytest.mark.parametrize("q_len, armed", [(1, True), (7, True), (8, True), (9, False), (16, False)])
+def test_rope_gather_is_armed_only_where_the_fused_library_is_selected(
+    monkeypatch: pytest.MonkeyPatch, q_len: int, armed: bool
+) -> None:
+    """kv_append_plan arms the RoPE kernel's q all-gather on the selection-cache cell bound that _is_supported uses:
+    q_len 9..16 share the cell up to 31 > MAX_Q_LEN, which another library serves, so no gather runs there."""
+    from tensorrt_llm._torch.attention.backends.fmha.manager import generation_cell_bound
+
+    class _Attn:
+        num_heads, num_kv_heads, head_dim = 4, 1, F.HEAD_DIM
+
+    attn = _Attn()
+    lib = GqaKvReplicaFusedFmha.__new__(GqaKvReplicaFusedFmha)
+    lib._attn_ref = weakref.ref(attn)
+    lib._kv_replicas = 2
+    lib._multi_processor_count = 148
+    x = torch.zeros(1)
+    batch = 2
+    plan = KvAppendPlan(0, batch * q_len, batch, q_len, x, x, x, x, x, 1.0)
+    monkeypatch.setattr(GqaDecodeFmha, "kv_append_plan", lambda self, metadata, num_tokens: plan)
+    monkeypatch.setattr(
+        GqaKvReplicaFusedFmha, "_rope_gather", lambda self, attn, num_tokens: "gather"
+    )
+    metadata = SimpleNamespace(tokens_per_block=F.PAGE)
+    got = lib.kv_append_plan(metadata, batch * q_len)
+    assert (got.rope_gather == "gather") is armed
+    # The library's selection (_is_supported) at this call's cell agrees.
+    assert lib._takes(*generation_cell_bound(batch, q_len), metadata) is armed

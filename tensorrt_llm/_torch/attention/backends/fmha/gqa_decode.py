@@ -1001,8 +1001,13 @@ class GqaKvReplicaFusedFmha(_GqaKvReplicaFmha):
         if plan is not None:
             if self._multi_processor_count is None:
                 self._multi_processor_count = self._get_multi_processor_count(plan.seq_lens.device)
-            # Only for calls this library takes (_is_supported), so the exchange calls stay identical on every member.
-            if plan.num_requests >= 2 and self._takes(plan.num_requests, plan.q_len, metadata):
+            from .manager import generation_cell_bound
+
+            # Only for calls this library takes: _is_supported's check, at the same selection-cache cell bound (the
+            # members' exchange calls stay identical, and no gather runs for a call another library serves).
+            if plan.num_requests >= 2 and self._takes(
+                *generation_cell_bound(plan.num_requests, plan.q_len), metadata
+            ):
                 plan.rope_gather = self._rope_gather(self.attn, num_tokens)
         return plan
 
