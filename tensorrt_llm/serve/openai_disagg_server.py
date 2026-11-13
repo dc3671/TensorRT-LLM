@@ -424,8 +424,8 @@ class OpenAIDisaggServer:
 
         # Give parent-only requests an independent conversation identity.
         if req.conversation_params is None:
-            req.conversation_params = ConversationParams(
-                conversation_id=f"subagent:{uuid.uuid4()}")
+            req.conversation_params = ConversationParams.for_one_request(
+                f"subagent:{uuid.uuid4()}")
         req.conversation_params.subagent_affinity_id = parent
 
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:

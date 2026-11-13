@@ -677,3 +677,27 @@ async def test_prediction_from_the_generation_placement():
     # A request placed before its context phase (conditional disaggregation) asks separately.
     early = _gen_request("c3", 2000)
     assert (await frontend.assign(early)).key == 7 and coordinator.predicted == [("c3", 2000.0)]
+
+
+def test_generated_subagent_ids_stay_out_of_the_conversation_table():
+    """A parent-only sub-agent request gets a fresh id per request: it trains the global models only."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+
+    predictor = olp.OnlineLengthPredictor("ridge")
+    for i in range(3):
+        request = _gen_request(None, 1000 + i)
+        OpenAIDisaggServer._extract_conversation_id(
+            request, SimpleNamespace(headers={"x-parent-id": "parent"}), "x-parent-id"
+        )
+        assert request.conversation_params.conversation_id.startswith("subagent:")
+        conv, isl = olp.request_inputs(request)
+        assert conv is None and isl == 1000 + i
+        _, key = predictor.predict(conv, isl, 0.0)
+        assert predictor.record(conv, isl, 300.0, key, 0.0)
+    assert len(predictor.table) == 0 and predictor.learned == 3
+    assert predictor.without_conversation == 3 and predictor.unmatched == 0
+    # The context request's copy keeps the mark; a client-sent id with that prefix is a conversation.
+    assert ConversationParams.for_one_request("x").model_copy().generated_for_one_request
+    assert olp.request_inputs(_gen_request("subagent:mine", 1000))[0] == "subagent:mine"

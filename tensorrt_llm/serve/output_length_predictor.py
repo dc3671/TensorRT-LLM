@@ -751,10 +751,13 @@ def request_inputs(request: Any) -> Tuple[Optional[str], Optional[float]]:
     """(conversation id, prompt tokens) of a generation request after its context phase.
 
     Reads ``conversation_params.conversation_id`` and ``disaggregated_params.ctx_usage.prompt_tokens``
-    only; in particular never ``max_tokens``.
+    only; in particular never ``max_tokens``. An id the server generated for one request (a
+    sub-agent call with only its parent's header) names no conversation: None.
     """
     conversation = getattr(request, "conversation_params", None)
-    conv_id = getattr(conversation, "conversation_id", None) if conversation is not None else None
+    conv_id = None
+    if conversation is not None and not getattr(conversation, "generated_for_one_request", False):
+        conv_id = getattr(conversation, "conversation_id", None)
     params = getattr(request, "disaggregated_params", None)
     usage = getattr(params, "ctx_usage", None) if params is not None else None
     isl = getattr(usage, "prompt_tokens", None) if usage is not None else None
