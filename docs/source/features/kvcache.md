@@ -441,6 +441,18 @@ claims instead of after a claim wait.
   30 seconds), for example because its donor died, retires the remote level for
   the rest of the process. Its pages leave the reuse tree, nothing more is written
   to it, and the tiers above it keep serving.
+- Donors send no heartbeat: a claimant treats a donor as live while its `.ready`
+  file exists, and notices that the donor went away only at its next transfer to
+  or from that donor's chunks. Every exit of a donor process takes its donated
+  memory with it. A graceful shutdown or scale-down withdraws its files and
+  deregisters the memory; a process killed by `SIGKILL` or `MPI_Abort` (such as a
+  lock-step rank stopped as described below) leaves its files in place. With NIXL,
+  the claimants' next transfer to the exited donor's chunks fails and retires
+  their level, and a claimant that starts later can still claim chunks from a
+  killed donor's leftover files and fails at its first transfer to them. With
+  `transport: fabric`, a claimant passes over a donor whose chunks it cannot
+  import, and what a copy from an already mapped chunk of an exited donor does is
+  up to the CUDA driver.
 - A request whose KV cache pages were on a retired level does not fail if its
   pages can be recomputed. If it has not computed anything yet (including a
   disaggregated generation request being admitted), it is matched against the
@@ -451,7 +463,13 @@ claims instead of after a claim wait.
   requests in lock step (tensor parallelism without attention data parallelism,
   context parallelism, pipeline parallelism) cannot recover a failure only some
   of them saw: a rank whose remote level retires stops its executor with
-  `RemoteMemError`, and the server fails.
+  `RemoteMemError`, whether or not a request lost pages, and the server fails.
+  A donor process that exits or restarts therefore stops every lock-step
+  claimant holding chunks from it, and, where those ranks donate too, their own
+  lock-step claimants in turn; claimants with per-request recovery keep serving
+  from the tiers above. Share a rendezvous directory only among workers that start
+  and stop together (no independent restarts or scale-down of donating workers),
+  or give the claimants a single-rank or attention-data-parallel layout.
 - A transfer that never completes keeps its staging buffers and chunk claims
   until the process exits.
 
