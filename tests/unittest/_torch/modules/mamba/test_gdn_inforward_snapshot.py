@@ -304,3 +304,49 @@ def test_split_prefill_core_alpha_bitwise(fused_copies):
         results.append((out, ssm_states, stage))
     for reference, with_alpha in zip(*results):
         assert torch.equal(reference, with_alpha)
+
+
+def test_split_kernels_compile_once_for_every_batch():
+    """The state-row split and the tail scatter take the batch's live / split counts at run time: one compiled
+    variant each serves counts of 1, 2, 16 and 3 (no in-step compile for a new count class)."""
+    from _torch.helpers import triton_num_compiled
+
+    def states(rows, seed):
+        return _random_states(rows, seed)
+
+    def run(n_live, k):
+        cuda = torch.device("cuda")
+        split = types.SimpleNamespace(
+            live=torch.arange(n_live, dtype=torch.int32, device=cuda) % NUM_SLOTS,
+            main_rows=torch.arange(n_live, dtype=torch.int32, device=cuda),
+            split_rows=torch.arange(k, dtype=torch.int32, device=cuda),
+            k=k,
+            stage_rows=torch.arange(k, dtype=torch.int32, device=cuda),
+            tail_tok=torch.arange(2, dtype=torch.int32, device=cuda),
+        )
+        final = states(max(n_live, k), seed=n_live)
+        ssm = states(NUM_SLOTS, seed=k)
+        expected_ssm = ssm.clone()
+        expected_ssm.index_copy_(0, split.live, final.index_select(0, split.main_rows))
+        tail_init = gdn_inforward_split.split_state_rows(final, ssm, split)
+        if n_live <= NUM_SLOTS:  # distinct live slots
+            assert torch.equal(ssm, expected_ssm)
+        assert torch.equal(tail_init, final.index_select(0, split.split_rows))
+        stage = states(k, seed=7)
+        tail_final = states(k, seed=8)
+        tail_out = torch.randn(1, 2, NUM_V_HEADS, HEAD_DIM, device=cuda).to(torch.bfloat16)
+        core_out = torch.zeros(1, 4, NUM_V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=cuda)
+        assert gdn_inforward_split.scatter_tail(tail_final, stage, tail_out, core_out, split)
+        assert torch.equal(stage, tail_final)
+
+    run(3, 3)
+    before = (
+        triton_num_compiled(gdn_inforward_split._split_state_rows_kernel),
+        triton_num_compiled(gdn_inforward_split._tail_scatter_kernel),
+    )
+    for n_live, k in ((1, 1), (2, 2), (16, 16), (8, 3)):
+        run(n_live, k)
+    assert (
+        triton_num_compiled(gdn_inforward_split._split_state_rows_kernel),
+        triton_num_compiled(gdn_inforward_split._tail_scatter_kernel),
+    ) == before

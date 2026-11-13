@@ -57,7 +57,9 @@ def _split_conv_state_kernel(
         tl.store(cs + w * stride_cs_l, tl.load(x_ptr + tok * stride_x_tok + cols, mask=m), mask=m)
 
 
-@triton.jit
+# The per-batch counts (n_live here, k in _tail_scatter_kernel) only pick a row's branch: not specialized, so one
+# compiled variant serves every batch (Triton would otherwise compile 1, multiples of 16 and other counts apart).
+@triton.jit(do_not_specialize=["n_live"])
 def _split_state_rows_kernel(
     final_ptr,
     ssm_ptr,
@@ -125,7 +127,7 @@ def _tail_token_gather_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["k"])
 def _tail_scatter_kernel(
     tail_final_ptr,
     stage_ptr,
