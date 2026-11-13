@@ -5312,6 +5312,11 @@ class KvPoolRebalanceConfig(StrictBaseModel):
 REMOTE_CACHE_CHUNK_BYTES = 1 << 30
 # Default of RemoteCacheConfig.donor_reserve_size.
 REMOTE_CACHE_DONOR_RESERVE_BYTES = 24 << 30
+# One RemoteCacheConfig.ucx_devices entry, stripped: a name without ':' or ',',
+# then optionally ':' or ':1' (NIXL's UCX backend uses port 1 of each device).
+_UCX_DEVICE_ENTRY = r"\s*[^\s,:][^,:]*(:1?)?\s*"
+REMOTE_CACHE_UCX_DEVICES_PATTERN = (
+    rf"^{_UCX_DEVICE_ENTRY}(,{_UCX_DEVICE_ENTRY})*$")
 
 
 class RemoteCacheConfig(StrictBaseModel):
@@ -5320,6 +5325,11 @@ class RemoteCacheConfig(StrictBaseModel):
     A rank with ``cache_size`` gets a cache level below the host tier whose slots
     live in memory that ranks with ``donate_size`` publish in ``directory``.
     """
+
+    # Fields only a rank with a remote cache level (cache_size > 0) reads.
+    CLAIMANT_ONLY_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "pool_ratio", "expected_num_donors", "expected_claim_size",
+        "donor_wait_timeout_s", "transfer_timeout_s")
 
     directory: str = Field(
         min_length=1,
@@ -5366,11 +5376,12 @@ class RemoteCacheConfig(StrictBaseModel):
 
     ucx_devices: Optional[str] = Field(
         default=None,
+        pattern=REMOTE_CACHE_UCX_DEVICES_PATTERN,
         status="prototype",
         description=
         "NIXL transport only: comma-separated UCX devices of the remote level's "
-        "and the donor's NIXL agents (for example 'mlx5_0:1'), each on port 1 "
-        "(NIXL's UCX backend takes device names and uses port 1); '{GPU}' is "
+        "and the donor's NIXL agents (for example 'mlx5_0:1'), each '<device>' "
+        "or '<device>:1' (NIXL's UCX backend uses port 1); '{GPU}' is "
         "replaced by the rank's physical GPU index. None uses the process's "
         "UCX environment.")
 
@@ -5438,9 +5449,7 @@ class RemoteCacheConfig(StrictBaseModel):
         if self.cache_size == 0:
             # Read only by a rank with a remote cache level.
             ignored += [
-                name for name in ("pool_ratio", "expected_num_donors",
-                                  "expected_claim_size", "donor_wait_timeout_s",
-                                  "transfer_timeout_s") if name in given
+                name for name in self.CLAIMANT_ONLY_FIELDS if name in given
             ]
         elif "transfer_timeout_s" in given and self.transport != "nixl":
             ignored.append("transfer_timeout_s")
@@ -5459,13 +5468,6 @@ class RemoteCacheConfig(StrictBaseModel):
             raise ValueError(
                 "remote_cache_config.ucx_devices applies to transport='nixl' only"
             )
-        for entry in (self.ucx_devices or "").split(","):
-            name, _, port = entry.strip().partition(":")
-            if self.ucx_devices is not None and (not name
-                                                 or port not in ("", "1")):
-                raise ValueError(
-                    f"remote_cache_config.ucx_devices entry {entry.strip()!r} "
-                    "is not '<device>' or '<device>:1'")
         return self
 
 

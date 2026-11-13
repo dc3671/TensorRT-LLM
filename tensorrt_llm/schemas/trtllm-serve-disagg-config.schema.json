@@ -8016,13 +8016,6 @@
               }
             }
           }
-        },
-        {
-          "properties": {
-            "ucx_devices": {
-              "pattern": "^\\s*[^\\s,:][^,:]*(:1?)?\\s*(,\\s*[^\\s,:][^,:]*(:1?)?\\s*)*$"
-            }
-          }
         }
       ],
       "description": "KV cache manager v2 remote cache level in host memory that other ranks donate.\n\nA rank with ``cache_size`` gets a cache level below the host tier whose slots\nlive in memory that ranks with ``donate_size`` publish in ``directory``.",
@@ -8139,6 +8132,7 @@
         "ucx_devices": {
           "anyOf": [
             {
+              "pattern": "^\\s*[^\\s,:][^,:]*(:1?)?\\s*(,\\s*[^\\s,:][^,:]*(:1?)?\\s*)*$",
               "type": "string"
             },
             {
@@ -8146,7 +8140,7 @@
             }
           ],
           "default": null,
-          "description": "NIXL transport only: comma-separated UCX devices of the remote level's and the donor's NIXL agents (for example 'mlx5_0:1'), each on port 1 (NIXL's UCX backend takes device names and uses port 1); '{GPU}' is replaced by the rank's physical GPU index. None uses the process's UCX environment.",
+          "description": "NIXL transport only: comma-separated UCX devices of the remote level's and the donor's NIXL agents (for example 'mlx5_0:1'), each '<device>' or '<device>:1' (NIXL's UCX backend uses port 1); '{GPU}' is replaced by the rank's physical GPU index. None uses the process's UCX environment.",
           "status": "prototype",
           "title": "Ucx Devices"
         }

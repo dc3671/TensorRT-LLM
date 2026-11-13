@@ -218,11 +218,6 @@ def _launch_rules() -> list[dict]:
     ]
 
 
-# One RemoteCacheConfig.ucx_devices entry, stripped: a name without ':' or ',', then optionally ':' or ':1'.
-_UCX_DEVICE_ENTRY = r"\s*[^\s,:][^,:]*(:1?)?\s*"
-_UCX_DEVICES_PATTERN = rf"^{_UCX_DEVICE_ENTRY}(,{_UCX_DEVICE_ENTRY})*$"
-
-
 def _cross_field_rules(definitions: dict) -> None:
     """Mirror the model validators of the KV cache, scheduler and attention-DP options.
 
@@ -244,14 +239,7 @@ def _cross_field_rules(definitions: dict) -> None:
     unset_or_zero = {"not": _is_set_to("cache_size", {"minimum": 1})}
     # RemoteCacheConfig.validate_remote_cache().
     remote_unread = {
-        name: default(RemoteCacheConfig, name)
-        for name in (
-            "pool_ratio",
-            "expected_num_donors",
-            "expected_claim_size",
-            "donor_wait_timeout_s",
-            "transfer_timeout_s",
-        )
+        name: default(RemoteCacheConfig, name) for name in RemoteCacheConfig.CLAIMANT_ONLY_FIELDS
     }
     definitions["RemoteCacheConfig"].setdefault("allOf", []).extend(
         [
@@ -299,8 +287,6 @@ def _cross_field_rules(definitions: dict) -> None:
                 _is_set_to("ucx_devices", {"type": "string"}),
                 {"properties": {"transport": {"const": "nixl"}}},
             ),
-            # Comma-separated '<device>' or '<device>:1' entries (NIXL's UCX backend uses port 1).
-            {"properties": {"ucx_devices": {"pattern": _UCX_DEVICES_PATTERN}}},
         ]
     )
     # KvCacheConfig.validate_remote_cache_config() and validate_defer_generation_only_release().
