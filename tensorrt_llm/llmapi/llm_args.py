@@ -2328,8 +2328,9 @@ class AttentionDpConfig(StrictBaseModel):
         "rank is full waits for a slot there for up to this many scheduling "
         "rounds in which another rank had room, then overflows by "
         "kv_cache_routing_new_conv_placement (keeping its home rank). Later "
-        "requests of the same admission group may pass a waiting one. None "
-        "overflows at once. Requires "
+        "requests of the same admission group (priority) may pass a waiting "
+        "one on any rank; later groups may pass it on other ranks only, not "
+        "into its home rank. None overflows at once. Requires "
         "kv_cache_routing_conversation_affinity=True.",
         status="prototype")
 

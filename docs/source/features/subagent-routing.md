@@ -103,8 +103,10 @@ sub-agent routed by its parent's key) whose home rank is full then stays in the
 waiting queue until a slot frees there, for up to that many scheduling rounds in
 which another rank had room. After that it overflows as above; its conversation
 stays bound to the home rank. While it waits, later requests can be admitted
-ahead of it; with `scheduler_config.waiting_queue_policy: priority`, only
-requests of the same priority.
+ahead of it. With `scheduler_config.waiting_queue_policy: priority`, later
+requests of the same priority can take any rank, and lower-priority requests
+can take other ranks but not the held request's home rank, so each rank still
+admits in priority order.
 
 ## Gateway trust boundary
 
