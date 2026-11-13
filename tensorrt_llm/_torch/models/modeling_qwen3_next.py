@@ -897,14 +897,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
+        routed_hidden_states = hidden_states
         use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         if self.enable_attention_dp and self.mapping.tp_size > 1 and is_sm_120f(
         ):
             use_dp_padding = True
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
+            # Padding improves context-phase MoE communication on SM120. Keep
+            # it local to the routed experts: the shared expert operates on
+            # this rank's real tokens and must retain the unpadded row count.
+            routed_hidden_states = torch.nn.functional.pad(
+                routed_hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
         if not do_finalize and not (self.can_defer_finalize
@@ -920,7 +924,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         # Context sizes: NVFP4 for the routed experts and E4M3 for the shared
         # expert's gate_up from one pass; the router and the shared-expert gate
         # keep the BF16 input.
-        dual_quant = self._moe_input_dual_quant(hidden_states, lora_params)
+        # Not with the SM120 attention-DP padding: the routed input then has more rows than the shared one.
+        dual_quant = None if use_dp_padding else self._moe_input_dual_quant(
+            hidden_states, lora_params)
         shared_input = hidden_states if dual_quant is None else dual_quant[1]
 
         # On the fold path the experts may write their FC2 rows into the
@@ -945,7 +951,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             out = self._decode_front(
                 self.gate,
                 experts,
-                hidden_states,
+                routed_hidden_states,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
                 do_finalize=do_finalize,
@@ -953,11 +959,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
             if out is not None:
                 return out
-            router_logits = self.gate(hidden_states)
+            router_logits = self.gate(routed_hidden_states)
             return experts(
-                hidden_states if dual_quant is None else dual_quant[0],
+                routed_hidden_states if dual_quant is None else dual_quant[0],
                 router_logits,
-                output_dtype=hidden_states.dtype,
+                output_dtype=routed_hidden_states.dtype,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
                 do_finalize=do_finalize,
