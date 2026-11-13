@@ -53,6 +53,7 @@ class _Worker:
     _sample_and_accept_draft_tokens_base = SpecWorkerBase._sample_and_accept_draft_tokens_base
     _fused_force_params = SpecWorkerBase._fused_force_params
     _prepare_next_new_tokens = SpecWorkerBase._prepare_next_new_tokens
+    fused_sample_accept = SpecWorkerBase.fused_sample_accept
 
     def __init__(self, target: torch.Tensor, force: float) -> None:
         self._target = target
