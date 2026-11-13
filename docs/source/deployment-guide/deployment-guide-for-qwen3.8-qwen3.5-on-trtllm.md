@@ -313,6 +313,14 @@ mpirun --allow-run-as-root -np 2 --bind-to none \
     --publish-metrics
 ```
 
+If you also enable MTP (`speculative_config`) on the prefill worker, add
+`export TRTLLM_DISAGG_ROLE=context` to the prefill shell. Ranks started by
+`trtllm-llmapi-launch` do not receive a server role, so without it the prefill
+worker reserves the GDN replay-state KV region that only decode uses. With
+`pool_ratio` set, startup then fails with `initial_pool_ratio length must match
+number of layer groups`. The profile above runs MTP on decode only and needs no
+role setting.
+
 The container runs as root; omit `--allow-run-as-root` when using a non-root user.
 The rank counts must
 match `tensor_parallel_size * pipeline_parallel_size` for each worker; launch a
