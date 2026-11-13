@@ -168,25 +168,36 @@ class _Donor:
         self._log.close()
 
 
-# Per transport: the rendezvous directory of the module's donor, and the donor.
+# Per transport: the rendezvous directory of the module's donor, the donor, and why it could not start. A transport's
+# donor starts with the first test that reads its directory, so that a run selecting one transport ("-k fabric")
+# starts only that donor.
 _module_dirs: "dict[str, str]" = {}
-_module_donors: "list[_Donor]" = []
+_module_donors: "dict[str, _Donor]" = {}
+_module_donor_errors: "dict[str, BaseException]" = {}
 
 
-def setUpModule() -> None:
-    try:
-        for transport in _TRANSPORTS:
-            _module_dirs[transport] = tempfile.mkdtemp(prefix=f"kvcm2_remote_{transport}_")
-            _module_donors.append(_Donor(_module_dirs[transport], _DONOR_BYTES, transport))
-    except BaseException:
-        tearDownModule()  # unittest skips it after a failed setUpModule
-        raise
+def _module_dir(transport: str) -> str:
+    if transport in _module_donor_errors:
+        raise RuntimeError(
+            f"the module's {transport} donor failed to start"
+        ) from _module_donor_errors[transport]
+    if transport not in _module_donors:
+        directory = _module_dirs.setdefault(
+            transport, tempfile.mkdtemp(prefix=f"kvcm2_remote_{transport}_")
+        )
+        try:
+            _module_donors[transport] = _Donor(directory, _DONOR_BYTES, transport)
+        except BaseException as error:
+            _module_donor_errors[transport] = error
+            raise
+    return _module_dirs[transport]
 
 
 def tearDownModule() -> None:
-    for donor in _module_donors:
+    for donor in _module_donors.values():
         donor.stop()
     _module_donors.clear()
+    _module_donor_errors.clear()
     for directory in _module_dirs.values():
         shutil.rmtree(directory, ignore_errors=True)
     _module_dirs.clear()
@@ -204,7 +215,7 @@ class _Transport:
 
     @property
     def module_dir(self) -> str:
-        return _module_dirs[self.transport]
+        return _module_dir(self.transport)
 
     def remote_tier(
         self,
@@ -231,6 +242,7 @@ class _Transport:
 class TestRemoteMemDonor(_Transport, unittest.TestCase):
     def test_donor_publishes_whole_chunks_and_withdraws_them(self) -> None:
         directory = tempfile.mkdtemp(prefix="kvcm2_donor_")
+        donor = None
         try:
             donor = _Donor(directory, (64 << 20) + (3 << 20), self.transport, chunk_bytes=16 << 20)
             meta = open(os.path.join(directory, f"donor.{donor.name}.meta")).read().split("\n")
@@ -255,6 +267,8 @@ class TestRemoteMemDonor(_Transport, unittest.TestCase):
             donor.stop()
             self.assertEqual(glob.glob(os.path.join(directory, f"donor.{donor.name}.*")), [])
         finally:
+            if donor is not None:
+                donor.stop()  # a no-op once stopped
             shutil.rmtree(directory, ignore_errors=True)
 
 
