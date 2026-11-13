@@ -111,7 +111,8 @@ def _capture_manager_kwargs(
     )
     model_engine = (
         SimpleNamespace(
-            model=SimpleNamespace(model_config=model_config),
+            # No GDN layers: _create_kv_cache_manager scans modules() for them.
+            model=SimpleNamespace(model_config=model_config, modules=lambda: []),
             max_cuda_graph_batch_size=4,
             input_processor=Mock(spec=BaseMultimodalInputProcessor) if is_multimodal else None,
         )
