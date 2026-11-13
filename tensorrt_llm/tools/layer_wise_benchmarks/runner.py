@@ -941,12 +941,26 @@ class Runner:
             else:
                 run_moe_orig = None
 
+            # A backend that routes inside its op from the router logits (FlashInfer BF16 with
+            # MoEDecodeOptions.bf16_logits_routing) never calls `routing_method.apply`: route on
+            # the host while the replacement is in place (the flag is read per forward).
+            backend = getattr(moe_module, "backend", None)
+            routes_from_logits_orig = getattr(backend, "routes_from_logits", False)
+            if routes_from_logits_orig:
+                backend.routes_from_logits = False
+
             # Replace `forward_impl` to ensure that routing results are replaced
             forward_impl_orig = moe_module.forward_impl
             moe_module.forward_impl = make_forward_impl_check(moe_module, forward_impl_orig)
 
             original_methods.append(
-                (apply_method_orig, apply_with_sort_orig, run_moe_orig, forward_impl_orig)
+                (
+                    apply_method_orig,
+                    apply_with_sort_orig,
+                    run_moe_orig,
+                    forward_impl_orig,
+                    routes_from_logits_orig,
+                )
             )
         try:
             yield
@@ -956,12 +970,15 @@ class Runner:
                 apply_with_sort_orig,
                 run_moe_orig,
                 forward_impl_orig,
+                routes_from_logits_orig,
             ) in zip(moe_modules, original_methods):
                 moe_module.routing_method.apply = apply_method_orig
                 moe_module.routing_method.apply_with_sort = apply_with_sort_orig
                 if isinstance(moe_module, TRTLLMGenFusedMoE):
                     moe_module.run_moe = run_moe_orig
                 moe_module.forward_impl = forward_impl_orig
+                if routes_from_logits_orig:
+                    moe_module.backend.routes_from_logits = True
 
     @staticmethod
     def create_kv_cache_manager(

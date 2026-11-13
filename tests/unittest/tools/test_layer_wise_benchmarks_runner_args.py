@@ -114,3 +114,37 @@ def test_runner_rejects_load_balancers_a_layer_slice_cannot_run(
 )
 def test_runner_accepts_load_balancers_a_layer_slice_can_run(load_balancer, use_cuda_graph):
     runner_module._check_load_balancer_support(load_balancer, use_cuda_graph)
+
+
+def test_balanced_routing_routes_logits_routed_backends_on_the_host():
+    """Balanced routing reaches backends that route inside their op from the logits.
+
+    Such a backend (FlashInfer BF16 under bf16_logits_routing) never calls routing_method.apply; while the balanced
+    replacement is active it routes on the host, and afterwards in the op again.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm.tools.layer_wise_benchmarks.runner import BalanceMethod, Runner
+
+    routing = SimpleNamespace(
+        apply=lambda logits, input_ids=None: (None, None),
+        apply_with_sort=lambda *args, **kwargs: None,
+        top_k=2,
+    )
+    backend = SimpleNamespace(routes_from_logits=True)
+    moe = SimpleNamespace(
+        routing_method=routing, num_experts=8, forward_impl=lambda *a, **k: None, backend=backend
+    )
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            moe_backend="TRTLLM",
+            mapping=SimpleNamespace(enable_attention_dp=False, tp_rank=0, dp_size=1, moe_ep_size=1),
+        ),
+        layer_indices=[0],
+        model=SimpleNamespace(
+            model=SimpleNamespace(layers=[SimpleNamespace(mlp=SimpleNamespace(experts=moe))])
+        ),
+    )
+    with Runner.replace_routing_method_ctx(runner, BalanceMethod.Balanced, 1.0):
+        assert backend.routes_from_logits is False
+    assert backend.routes_from_logits is True
