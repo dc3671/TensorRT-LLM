@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """gdn_prefill_conv_post against the stock GDN prefill pipeline.
 
-extract_transpose_prefill_slice + causal_conv1d_fn + fused_gdn_post_conv: v, g, beta and the new conv states are
-bitwise equal; q / k differ only in the FP32 summation order of their L2 norms. The value-head counts include ones
-that are not powers of two (24 / 48 per rank).
+extract_transpose_prefill_slice + causal_conv1d_fn + fused_gdn_post_conv: g, beta and the new conv states are
+bitwise equal; q / k differ in the FP32 summation order of their L2 norms, and q / k / v in the SiLU, which the
+stock CUDA conv takes through tanh.approx above -7 (causalConv1d.cu) and the fused kernel exactly. The value-head
+counts include ones that are not powers of two (24 / 48 per rank).
 """
 
 import pytest
@@ -127,7 +128,9 @@ def test_matches_stock_pipeline(num_k_heads, num_v_heads, lens, pad_seqs, extra_
     x = _inputs(lens, num_k_heads, num_v_heads, pad_seqs=pad_seqs, extra_tokens=extra_tokens)
     q_ref, k_ref, v_ref, g_ref, beta_ref, cs_ref = _stock(x, num_k_heads, num_v_heads)
     q, k, v, g, beta, cs, alpha = _fused(x, num_k_heads, num_v_heads)
-    assert torch.equal(v, v_ref)
+    # tanh.approx (max relative error 2^-11) in the stock SiLU: |error| <= |pre-activation| / 2 * 2^-11 on top of
+    # the bf16 rounding.
+    torch.testing.assert_close(v.float(), v_ref.float(), atol=4e-3, rtol=2**-7)
     assert torch.equal(g, g_ref)
     assert torch.equal(beta, beta_ref)
     assert torch.equal(cs, cs_ref)
