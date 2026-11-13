@@ -1220,6 +1220,10 @@ def _fp4_block_scale_moe_fake(
         prerouted_tactic: Optional[List[int]] = None,
         lamport_fc2_out: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
     """The fake of both ops (the decode op's state arguments do not shape the outputs)."""
+    if lamport_fc2_out is not None:
+        # Whether the rows come back in the buffer depends on the kernel the
+        # host picks per call; the model hands the buffer in eager calls only.
+        raise NotImplementedError("the Lamport FC2 output is eager-only")
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2
@@ -1234,8 +1238,6 @@ def _fp4_block_scale_moe_fake(
         top_k,
         routing_bias,
     )
-    if lamport_fc2_out is not None and not do_finalize:
-        outputs[0] = hidden_states.new_empty((0, ), dtype=torch.bfloat16)
     return outputs[:1] if prerouted_tables is not None else outputs
 
 

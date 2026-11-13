@@ -267,3 +267,27 @@ def test_fc1_only_args_drop_exactly_the_fc2_arguments(prerouted):
         bad[i] = value
         with pytest.raises(ValueError):
             fc1_only_args(bad)
+
+
+def test_fp4_moe_fake_refuses_the_lamport_output():
+    """The ops' fake fails closed with a Lamport buffer: whether the rows come back in it depends on the kernel the
+    host picks per call, which a trace cannot know."""
+    import inspect
+
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _fp4_block_scale_moe_fake
+
+    params = inspect.signature(_fp4_block_scale_moe_fake).parameters
+    kwargs = {name: None for name, p in params.items() if p.default is inspect.Parameter.empty}
+    kwargs.update(
+        hidden_states=torch.empty((4, 64), dtype=torch.uint8, device="meta"),
+        num_experts=8,
+        top_k=2,
+        do_finalize=False,
+        lamport_fc2_out=torch.empty((16, 128), dtype=torch.bfloat16, device="meta"),
+    )
+    with pytest.raises(NotImplementedError, match="eager-only"):
+        _fp4_block_scale_moe_fake(**kwargs)
+    kwargs["lamport_fc2_out"] = None
+    assert (
+        len(_fp4_block_scale_moe_fake(**kwargs)) == 3
+    )  # rows, top-k weights, expanded -> permuted
