@@ -47,7 +47,8 @@ pytestmark = [
 
 H = 4096
 EPS = 1e-6
-# Kernel launch: slot below 64 rows, two-shot from 64. ``ar(...)`` takes the CuTe kernels only up to the 1 MiB
+# Kernel launch: the slot kernel up to 128 rows (with the two-shot arithmetic from 64), the two-shot kernel above
+# (SLOT_MAX_ROWS, TWO_SHOT_ROWS). ``ar(...)`` takes the CuTe kernels only up to the 1 MiB
 # one-shot message (rows * H * tp * 2 bytes), the library op above, so the two-shot rows are also checked through
 # ``ar.fused_norm`` directly. Consecutive calls also cycle the Lamport buffers.
 ROWS = (1, 7, 32, 63, 64, 96, 200)
@@ -355,6 +356,10 @@ def _moe_fold_lamport_cases(tp, top_k=10):
                 m,
             )
         assert bool((buf.view(torch.int32) == -1).all()), ("lamport rows not reset", m)
+    # A Lamport buffer needs the un-finalized fold; the call refuses before any launch.
+    for fold in (None, (shared, shared, gate)):
+        with pytest.raises(ValueError, match="un-finalized MoE fold"):
+            ar.fused_norm(residual, norm_weight, EPS, x=shared, moe_fold=fold, fc2_lamport=True)
 
 
 def _large_moe_fold_cases(tp: int) -> None:

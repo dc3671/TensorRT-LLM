@@ -16,8 +16,8 @@
 
 * ``MnnvlAllReduceNorm``: all-reduce + residual + RMSNorm (+ FP8 output), optionally with the MoE fold
   ``routed + sigmoid(gate) * shared`` computed in-kernel (``routed`` finalized, or finalized in-kernel from
-  the fc2 rows). Calls below ``TWO_SHOT_ROWS`` rows run the
-  one-shot slot kernel on its own multicast workspace, larger ones the two-shot kernel on the library's Lamport
+  the fc2 rows). Calls of up to ``SLOT_MAX_ROWS`` rows run the
+  slot kernel on its own multicast workspace, larger ones the two-shot kernel on the library's Lamport
   workspace and flags. Both produce the library op's outputs. Calls of ``TWO_SHOT_ROWS`` to ``SLOT_MAX_ROWS``
   rows run the slot transport with the two-shot kernel's arithmetic, so their outputs are the two-shot's.
 * ``GemmAllReduceNorm``: FP8 per-tensor row-parallel GEMM (low-M warp MMA) + one-shot all-reduce + residual +
@@ -42,7 +42,8 @@ from tensorrt_llm.mapping import Mapping
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, graph_safe_cute_tensor
 from ..flashinfer_utils import get_env_enable_pdl
 
-# Rows from which a call takes the two-shot kernel.
+# Rows from which a call takes the two-shot kernel's arithmetic (on the slot transport up to SLOT_MAX_ROWS rows, on
+# the two-shot kernel above).
 TWO_SHOT_ROWS = 64
 
 
@@ -428,9 +429,10 @@ class MnnvlAllReduceNorm:
         topk = fc2_row = 0
         lamport = False
         fc2_ptr = topw_ptr = perm_ptr = 0
-        assert not fc2_lamport or (
-            moe_fold is not None and not isinstance(moe_fold[0], torch.Tensor)
-        )
+        if fc2_lamport and (moe_fold is None or isinstance(moe_fold[0], torch.Tensor)):
+            raise ValueError(
+                "fc2_lamport needs the un-finalized MoE fold (fc2 rows, top-k weights, permutation)"
+            )
         if moe_fold is not None:
             routed, shared, gate = moe_fold
             if isinstance(routed, torch.Tensor):
