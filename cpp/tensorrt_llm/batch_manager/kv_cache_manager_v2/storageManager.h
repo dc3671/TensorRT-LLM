@@ -213,7 +213,8 @@ public:
 
     // Best-effort migration of grouped pages to a destination cache level. Returns how many pages
     // it moved off the disk tier, counted per migrated batch rather than per page. A throw reports
-    // nothing, which in practice means slot preparation failed before anything moved.
+    // nothing, which in practice means slot preparation failed before anything moved. Pages moved
+    // off a remote level are not counted: the disk prefetch statistic stays disk-only.
     int64_t prefetch(
         CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
 
