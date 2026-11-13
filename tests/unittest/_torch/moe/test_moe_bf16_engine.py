@@ -329,7 +329,7 @@ def test_flashinfer_leaf_returns_the_index_tokens_by_top_k(monkeypatch):
     monkeypatch.setattr(flashinfer_bf16, "prepare_kernel_inputs", lambda impl, ctx: k)
     impl = SimpleNamespace(
         **vars(leaf),
-        _draft_engine_state=None,
+        _decode_engine_state=None,
         op_backend=FlashinferOpBackend(),
         intermediate_size_per_partition=INTER,
         _unfinalized=lambda outputs: outputs,

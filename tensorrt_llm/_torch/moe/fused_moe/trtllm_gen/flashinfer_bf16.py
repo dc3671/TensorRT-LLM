@@ -84,12 +84,12 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
     #: Declared by the model (``MoEDecodeOptions.bf16_logits_routing``), for every BF16 FlashInfer MoE layer it builds:
     #: plain Renormalize routes inside the op from the router logits (TopK -> Softmax), without the host-side top-k
     #: and pack launches.
+    #: Un-finalized logits-routed SwiGLU runs of up to 32 rows of such a layer also take the one-launch BF16 decode
+    #: MoE engine (decode_moe_bf16.py).
     routes_from_logits: bool = False
-    #: With ``routes_from_logits`` (``MoEDecodeOptions.bf16_logits_routing``), for every such layer: un-finalized
-    #: logits-routed SwiGLU runs of up to 32 rows take the one-launch BF16 decode MoE engine (decode_moe_bf16.py).
-    use_draft_engine: bool = False
-    #: The engine's call state, created with the weights (``cache_derived_state``).
-    _draft_engine_state: torch.Tensor | None = None
+    #: The BF16 decode MoE engine's call state, created with the weights (``cache_derived_state``) where
+    #: ``routes_from_logits`` holds.
+    _decode_engine_state: torch.Tensor | None = None
 
     #: What the FlashInfer bf16 kernels implement. Read from both sides here:
     #: the eligibility gate below and ``_check_configs``.
@@ -102,7 +102,6 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         super().__init__(model_config=model_config, **kwargs)
         decode = MoEDecodeOptions.of(model_config.extra_attrs)
         self.routes_from_logits = decode.bf16_logits_routing
-        self.use_draft_engine = self.routes_from_logits
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
@@ -149,12 +148,13 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         return True
 
     def cache_derived_state(self) -> None:
-        """Also create the draft engine's call state once storage is bound (before any CUDA-graph capture)."""
+        """Also create the BF16 decode MoE engine's call state once storage is bound (before any CUDA-graph
+        capture)."""
         super().cache_derived_state()
-        if self.use_draft_engine and self._draft_engine_state is None:
+        if self.routes_from_logits and self._decode_engine_state is None:
             from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
 
-            self._draft_engine_state = new_state(self.w3_w1_weight.device)
+            self._decode_engine_state = new_state(self.w3_w1_weight.device)
 
     def _check_configs(self) -> None:
         """The unquantized kernels take no activation constants at all.
@@ -220,11 +220,11 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         del workspace  # TRTLLMGen kernels allocate their own intermediates.
         k = prepare_kernel_inputs(self, ctx)
 
-        if self._draft_engine_state is not None:
+        if self._decode_engine_state is not None:
             from . import decode_moe_bf16
 
             if decode_moe_bf16.applies(self, k):
-                return self._unfinalized(decode_moe_bf16.run(self, k, self._draft_engine_state))
+                return self._unfinalized(decode_moe_bf16.run(self, k, self._decode_engine_state))
 
         result = self.op_backend.run_bf16_moe(
             router_logits=k.router_logits,
