@@ -386,6 +386,12 @@ def copy_to_lamport(
     return [out, *outputs[1:]]
 
 
+def rows_in_lamport(rows: torch.Tensor, lamport_out: Optional[torch.Tensor]) -> bool:
+    """Whether an un-finalized call's FC2 ``rows`` are the Lamport buffer ``lamport_out`` (``ENGINE`` / ``CUTE_FC2``
+    wrote them there); a ``CUBIN`` call returns rows of its own and leaves the buffer untouched."""
+    return lamport_out is not None and rows.data_ptr() == lamport_out.data_ptr()
+
+
 def _lamport_rows(lamport_out: torch.Tensor, rows: int, hidden: int) -> torch.Tensor:
     if lamport_out.shape[0] < rows or lamport_out.shape[1] != hidden:
         raise RuntimeError(

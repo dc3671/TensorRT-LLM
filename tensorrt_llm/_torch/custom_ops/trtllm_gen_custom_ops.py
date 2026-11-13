@@ -960,11 +960,12 @@ def _run_fp4_block_scale_moe(
             tactic=[-1, -1] if best_tactic == -1 else best_tactic,
             output=output,
             lamport_out=lamport_fc2_out)
-    # A call that took the Lamport buffer (ENGINE / CUTE_FC2) left its FC2 rows
-    # there (an output may not alias an input); a CUBIN call returns its own.
-    if (lamport_fc2_out is not None and not do_finalize
-            and result[0].data_ptr() == lamport_fc2_out.data_ptr()):
-        return [result[0].new_empty(0), *result[1:]]
+    # Rows written into the Lamport buffer come back as the empty placeholder
+    # (an output may not alias an input; moe_op_backend hands the buffer on).
+    if lamport_fc2_out is not None and not do_finalize:
+        from ..moe.fused_moe.trtllm_gen.decode_moe import rows_in_lamport
+        if rows_in_lamport(result[0], lamport_fc2_out):
+            return [result[0].new_empty(0), *result[1:]]
     # When output is provided and do_finalize=True, the result is written in-place to output.
     # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
     # (custom op output cannot be the same tensor as input).

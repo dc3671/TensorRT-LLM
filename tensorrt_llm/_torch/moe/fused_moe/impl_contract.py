@@ -731,8 +731,9 @@ class MoECommPlan:
 
 @dataclass(frozen=True)
 class PreroutedRouting:
-    """Routing a caller computed for one ``run_moe`` of an impl that declares
-    ``supports_prerouted_routing``: the routing tables of the kernels' tile
+    """Routing for one ``run_moe`` of an impl that declares
+    ``supports_prerouted_routing``, done by the caller or (with ``candidates``)
+    by the decode MoE engine before it reads it: the routing tables of the kernels' tile
     (flat int32, layout of ``trtllm_gen.decode_front.prerouted_table_views``),
     the [tile, config] tactic they are built for, and the [num_tokens, top_k]
     expert ids (int32) and BF16 weights. The impl runs that tactic and skips
@@ -836,8 +837,9 @@ class MoERunContext:
     all_rank_num_tokens: Optional[List[int]] = None
     # produced by the comm strategy, one object per forward
     comm_plan: Optional[MoECommPlan] = None
-    # produced by a decode front end that routed the tokens itself; single
-    # chunk, no communication (see PreroutedRouting)
+    # produced by a decode front end: the routing it computed, or (with
+    # candidates) left to the decode MoE engine, which writes it before it
+    # reads it; single chunk, no communication (see PreroutedRouting)
     prerouted: Optional[PreroutedRouting] = None
     # produced by a caller whose all-reduce polls the un-finalized FC2 rows
     # (trtllm_gen.decode_moe.LamportFc2Buffer); one un-finalized chunk of a

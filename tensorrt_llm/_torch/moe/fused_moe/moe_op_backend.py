@@ -496,7 +496,8 @@ class TRTLLMOpBackend(MoEOpBackend):
                 )
                 if not do_finalize:
                     if lamport_fc2_out is not None and outputs[0].numel() == 0:
-                        # The rows went to the Lamport buffer (ENGINE / CUTE_FC2 calls).
+                        # The op's ABI for rows it wrote into the Lamport buffer
+                        # (decode_moe.rows_in_lamport): an empty first output.
                         outputs = [lamport_fc2_out, *outputs[1:]]
                     if prerouted is not None:
                         # The op returns the FC2 rows; the top-k weights and the

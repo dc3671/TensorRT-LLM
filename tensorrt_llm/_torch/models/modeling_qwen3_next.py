@@ -80,7 +80,8 @@ from ..moe.fused_moe.trtllm_gen.decode_front import (FUSED_FRONT_MAX_TOKENS,
                                                      ROUTER_MAX_TOKENS,
                                                      DecodeFront,
                                                      route_front_steps)
-from ..moe.fused_moe.trtllm_gen.decode_moe import LamportFc2Buffer
+from ..moe.fused_moe.trtllm_gen.decode_moe import (LamportFc2Buffer,
+                                                   rows_in_lamport)
 from ..speculative import SpecMetadata
 from ..speculative.kept_rows import DraftKeptRows, gather_rows2
 from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
@@ -733,14 +734,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 and not FORCE_SEPARATED_ROUTING)
 
     def _experts_take_lamport(self) -> bool:
-        """Experts whose un-finalized output goes to ``lamport_fc2`` when
-        handed in (``takes_lamport_fc2_out``)."""
+        """Experts that take ``lamport_fc2`` (``takes_lamport_fc2_out``): an
+        un-finalized call may write its FC2 rows there and then returns the
+        buffer as its rows, else its own rows."""
         from ..moe.fused_moe.configurable_moe import ConfigurableMoE
-        from ..moe.fused_moe.trtllm_gen.fp4_block_scale import \
-            TRTLLMGenFp4BlockScaleBase
         experts = self.experts
         return (self.can_defer_finalize and isinstance(experts, ConfigurableMoE)
-                and isinstance(experts.backend, TRTLLMGenFp4BlockScaleBase)
                 and experts.backend.takes_lamport_fc2_out)
 
     def _bf16_experts_defer_finalize(self, experts, backend) -> bool:
@@ -1021,15 +1020,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         shared_expert_output, shared_expert_gate_logits = shared_expert_outputs
         if not do_finalize:
-            # Calls on the runner's own FC2 (CUBIN) hand back their rows
-            # instead of writing the Lamport buffer.
             return _DeferredSharedExpertFinalize(
                 tuple(final_hidden_states),
                 shared_expert_output,
                 shared_expert_gate_logits,
-                fc2_lamport=(lamport_out is not None
-                             and final_hidden_states[0].data_ptr()
-                             == lamport_out.data_ptr()),
+                fc2_lamport=rows_in_lamport(final_hidden_states[0],
+                                            lamport_out),
             )
         if fold_shared_expert:
             return _DeferredSharedExpertFinalize(
