@@ -327,7 +327,7 @@ def test_split_kernels_compile_once_for_every_batch():
         final = states(max(n_live, k), seed=n_live)
         ssm = states(NUM_SLOTS, seed=k)
         expected_ssm = ssm.clone()
-        expected_ssm.index_copy_(0, split.live, final.index_select(0, split.main_rows))
+        expected_ssm.index_copy_(0, split.live.long(), final.index_select(0, split.main_rows))
         tail_init = gdn_inforward_split.split_state_rows(final, ssm, split)
         if n_live <= NUM_SLOTS:  # distinct live slots
             assert torch.equal(ssm, expected_ssm)
