@@ -4650,10 +4650,8 @@ _PositiveFiniteFloat = Annotated[float,
                                  PydanticField(gt=0, allow_inf_nan=False)]
 # Remote cache timeouts become C++ millisecond deadlines; 1e6 s (11.6 days) is
 # far past any wait yet far inside their range.
-_RemoteTimeoutSeconds = Annotated[float,
-                                  PydanticField(gt=0,
-                                                le=1e6,
-                                                allow_inf_nan=False)]
+_RemoteTimeoutSeconds = Annotated[
+    float, PydanticField(gt=0, le=1e6, allow_inf_nan=False)]
 
 
 class GenPreemptionConfig(StrictBaseModel):
