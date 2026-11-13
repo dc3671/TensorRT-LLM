@@ -8698,10 +8698,18 @@ class KVCacheManagerV2(BaseResourceManager):
     def _abandon_construction(self, error: BaseException) -> None:
         """Undo a construction that raised `error`: withdraw the donation with it, whose failure marker tells the
         peers counting on this donor to stop waiting, and shut the runtime down, which returns this rank's remote
-        chunk claims now rather than at garbage collection."""
+        chunk claims now rather than at garbage collection. The caches construction opened (the guard page's) close
+        first: the runtime's shutdown refuses while one is open."""
         self._close_remote_donor(error)
         impl = self.__dict__.get("impl")
         if impl is not None:
+            for kv_cache in list(self.__dict__.get("kv_cache_map", {}).values()):
+                try:
+                    kv_cache.close()
+                except Exception as close_error:  # noqa: BLE001 - `error` is the one to report
+                    logger.warning(
+                        f"KV cache manager v2: closing a cache after a failed construction failed: {close_error!r}"
+                    )
             try:
                 impl.shutdown()  # a no-op when it is shut down already
             except Exception as shutdown_error:  # noqa: BLE001 - `error` is the one to report

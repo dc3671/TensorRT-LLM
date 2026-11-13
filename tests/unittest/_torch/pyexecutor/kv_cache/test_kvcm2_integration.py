@@ -2081,6 +2081,39 @@ class TestRemoteTierInitStatus:
         assert str(donor.close.call_args.args[0]) == "state pool too small"
 
     @pytest.mark.cpu_only
+    def test_a_failed_construction_closes_its_open_caches_before_the_shutdown(
+        self, tmp_path
+    ) -> None:
+        """The runtime's shutdown refuses while a cache is open, e.g. the guard page's (TRTLLM_KV_GUARD_PAGE)."""
+        donor, add_remote_level = self._starting_donor()
+        order = Mock()
+        guard_cache = order.guard_cache
+        impl = order.impl
+
+        class OpensACacheThenFails(KVCacheManagerV2):
+            @_withdraws_remote_donation_on_error
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.kv_cache_map[-1] = guard_cache
+                raise ValueError("late failure")
+
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ),
+            pytest.raises(ValueError, match="late failure"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, donate_size=1 << 30),
+                [impl],
+                manager_cls=OpensACacheThenFails,
+            )
+        calls = [name for name, _, _ in order.mock_calls]
+        assert calls.index("guard_cache.close") < calls.index("impl.shutdown")
+
+    @pytest.mark.cpu_only
     def test_the_mamba_hybrid_manager_guards_its_own_finalization(self) -> None:
         from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
             MambaHybridCacheManagerV2,
