@@ -84,8 +84,7 @@ class MoEDecodeOptions:
     shared_expert_rows: int = 0
     # CuTe DSL NVFP4 calls of up to this many rows load the FC2 weights evict-first (0: none).
     fc2_weights_evict_first_rows: int = 0
-    # FlashInfer BF16: plain Renormalize routes inside the op from the router logits, and its logits-routed
-    # un-finalized SwiGLU runs take the BF16 decode MoE engine.
+    # TRTLLM-Gen BF16: logits-routed un-finalized SwiGLU runs of up to 32 rows take the BF16 decode MoE engine.
     bf16_logits_routing: bool = False
 
     @classmethod

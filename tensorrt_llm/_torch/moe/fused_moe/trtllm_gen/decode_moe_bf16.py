@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Decode MoE engine on FlashInfer's BF16 trtllm-gen path (declared by ``MoEDecodeOptions.bf16_logits_routing``): an
+"""Decode MoE engine on the BF16 trtllm-gen path (declared by ``MoEDecodeOptions.bf16_logits_routing``): an
 un-finalized logits-routed SwiGLU run of up to ``M_MAX`` rows takes one launch (``moe_bf16_engine.py``)
-instead of ``trtllm_bf16_moe``'s routing + two GEMMs and returns its ``do_finalize=False`` outputs: the same gemm2 row
-and BF16 top-k weight per (token, k) bit for bit, through the engine's own expanded -> permuted index (rows packed).
+instead of ``bf16_moe_runner``'s routing + two GEMMs and returns its ``do_finalize=False`` outputs: per (token, k) a
+gemm2 row and the BF16 top-k weight, through the engine's own expanded -> permuted index (rows packed).
 """
 
 from typing import TYPE_CHECKING
@@ -22,11 +22,11 @@ from ..quantization import TRTLLM_GEN_WEIGHT_LAYOUT_BLOCK_MAJOR_K
 from ..routing import RoutingMethodType
 
 if TYPE_CHECKING:
-    from .flashinfer_bf16 import FlashinferTrtllmGenBf16Impl
     from .kernel_inputs import KernelInputs
+    from .trtllm_bf16 import TrtllmTrtllmGenBf16Impl
 
 
-def applies(impl: "FlashinferTrtllmGenBf16Impl", k: "KernelInputs") -> bool:
+def applies(impl: "TrtllmTrtllmGenBf16Impl", k: "KernelInputs") -> bool:
     """Whether this run fits the engine (host-side checks only)."""
     if k.do_finalize or k.router_logits is None or k.routing_bias is not None:
         return False
@@ -73,7 +73,7 @@ def applies(impl: "FlashinferTrtllmGenBf16Impl", k: "KernelInputs") -> bool:
 
 
 def run(
-    impl: "FlashinferTrtllmGenBf16Impl", k: "KernelInputs", state: torch.Tensor
+    impl: "TrtllmTrtllmGenBf16Impl", k: "KernelInputs", state: torch.Tensor
 ) -> list[torch.Tensor]:
     x = k.x
     m = x.shape[0]
@@ -97,5 +97,5 @@ def run(
         top_k=top_k,
         local_start=impl.slot_start,
     )
-    # trtllm_bf16_moe's un-finalized ABI: gemm2 rows, top-k weights [m, top_k], expanded -> permuted index [m, top_k]
+    # bf16_moe_runner's un-finalized ABI: gemm2 rows, top-k weights [m, top_k], expanded -> permuted index [m, top_k]
     return [out, wts, e2p]

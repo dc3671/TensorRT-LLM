@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Decode MoE engine for BF16 experts routed from the router logits: Renormalize routing and one rank's routed experts
-in one persistent launch, returning what FlashInfer's ``trtllm_bf16_moe`` returns un-finalized (per (token, k) the
-same gemm2 row and BF16 top-k weight bit for bit; the local picks' rows packed).
+in one persistent launch, returning what ``trtllm::bf16_moe_runner`` returns un-finalized (per (token, k) a gemm2 row
+and the BF16 top-k weight; the local picks' rows packed).
 
 Every CTA routes the step's rows in its prologue (as FlashInfer's routing kernels under -use_fast_math), then runs
 FC1 -> SwiGLU -> FC2 with ``kind::f16`` MMAs over the whole K in order on the BlockMajorK weights in place.
@@ -964,7 +964,7 @@ def moe_bf16_engine(
     m <= M_MAX; ``w31`` [L, H/64, 2I, 64] / ``w2`` [L, I/64, H, 64] bf16 (BlockMajorK, trtllm-gen row shuffle),
     local experts [local_start, local_start + L); ``h`` [>= m top_k, I] bf16 (scratch), ``out`` [>= m top_k, H]
     bf16, ``wts`` [m, top_k] bf16 and ``e2p`` [m, top_k] int32 (outputs), ``state`` from :func:`new_state`.
-    Returns (out, wts, e2p): what trtllm_bf16_moe returns with do_finalize=False."""
+    Returns (out, wts, e2p): what bf16_moe_runner returns with do_finalize=False."""
     import torch
 
     e, hb, two_i, kb = w31.shape

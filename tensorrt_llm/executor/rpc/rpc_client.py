@@ -402,8 +402,7 @@ class RPCClient:
                             # Re-raise cancellation to exit cleanly
                             raise
                         except Exception as e:
-                            # Log the error but continue reading unless it's a critical error.
-                            # TRT-LLM's logger takes no exc_info keyword.
+                            # Log the error but continue reading unless it's a critical error
                             logger.error(f"Error processing response: {e}\n"
                                          f"{traceback.format_exc()}")
 

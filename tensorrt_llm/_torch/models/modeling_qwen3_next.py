@@ -713,9 +713,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
     def _experts_defer_finalize(self) -> bool:
         """trtllm-gen NVFP4 experts with in-kernel routing (their do_finalize=False output carries valid top-k
-        weights) and no MoE communication / load balancer. With the Qwen3.5 decode kernels also FlashInfer's BF16
+        weights) and no MoE communication / load balancer. With the Qwen3.5 decode kernels also the BF16
         trtllm-gen experts (the MTP draft layer), whose routing kernel writes the BF16 top-k weights it returns with
-        ``do_finalize=False`` whether it routes from the logits or from precomputed packed top-k."""
+        ``do_finalize=False`` whether it routes from the logits or from precomputed top-k."""
         from ..moe.fused_moe.configurable_moe import ConfigurableMoE
         from ..moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
         from ..moe.fused_moe.interface import FORCE_SEPARATED_ROUTING
@@ -743,13 +743,13 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 and experts.backend.takes_lamport_fc2_out)
 
     def _bf16_experts_defer_finalize(self, experts, backend) -> bool:
-        """FlashInfer BF16 trtllm-gen experts, no attention DP, no MoE communication, load balancer or
+        """BF16 trtllm-gen experts, no attention DP, no MoE communication, load balancer or
         model-owned combine: the MoE-output all-reduce can finalize their (fc2 rows, BF16 top-k weights,
         expanded -> permuted index) output."""
         from ..moe.fused_moe.configurable_moe import ConfigurableMoE
-        from ..moe.fused_moe.trtllm_gen.flashinfer_bf16 import \
-            FlashinferTrtllmGenBf16Impl
-        if not isinstance(backend, FlashinferTrtllmGenBf16Impl):
+        from ..moe.fused_moe.trtllm_gen.trtllm_bf16 import \
+            TrtllmTrtllmGenBf16Impl
+        if not isinstance(backend, TrtllmTrtllmGenBf16Impl):
             return False
         if not backend.supports_unfinalized_output(
         ) or self.enable_attention_dp:

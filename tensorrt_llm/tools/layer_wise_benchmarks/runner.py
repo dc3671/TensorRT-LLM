@@ -28,6 +28,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     BaseMoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.trtllm_bf16 import TrtllmTrtllmGenBf16Impl
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor._util import _mamba_conv_layout_kwargs, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -941,13 +942,13 @@ class Runner:
             else:
                 run_moe_orig = None
 
-            # A backend that routes inside its op from the router logits (FlashInfer BF16 with
-            # MoEDecodeOptions.bf16_logits_routing) never calls `routing_method.apply`: route on
-            # the host while the replacement is in place (the flag is read per forward).
+            # The TRTLLM-Gen BF16 leaf routes inside its op from the router logits and never calls
+            # `routing_method.apply`: route on the host while the replacement is in place (the leaf
+            # asks `_requires_separated_routing` per forward).
             backend = getattr(moe_module, "backend", None)
-            routes_from_logits_orig = getattr(backend, "routes_from_logits", False)
-            if routes_from_logits_orig:
-                backend.routes_from_logits = False
+            host_routed_backend = backend if isinstance(backend, TrtllmTrtllmGenBf16Impl) else None
+            if host_routed_backend is not None:
+                host_routed_backend._requires_separated_routing = lambda: True
 
             # Replace `forward_impl` to ensure that routing results are replaced
             forward_impl_orig = moe_module.forward_impl
@@ -959,7 +960,7 @@ class Runner:
                     apply_with_sort_orig,
                     run_moe_orig,
                     forward_impl_orig,
-                    routes_from_logits_orig,
+                    host_routed_backend,
                 )
             )
         try:
@@ -970,15 +971,15 @@ class Runner:
                 apply_with_sort_orig,
                 run_moe_orig,
                 forward_impl_orig,
-                routes_from_logits_orig,
+                host_routed_backend,
             ) in zip(moe_modules, original_methods):
                 moe_module.routing_method.apply = apply_method_orig
                 moe_module.routing_method.apply_with_sort = apply_with_sort_orig
                 if isinstance(moe_module, TRTLLMGenFusedMoE):
                     moe_module.run_moe = run_moe_orig
                 moe_module.forward_impl = forward_impl_orig
-                if routes_from_logits_orig:
-                    moe_module.backend.routes_from_logits = True
+                if host_routed_backend is not None:
+                    del host_routed_backend._requires_separated_routing
 
     @staticmethod
     def create_kv_cache_manager(

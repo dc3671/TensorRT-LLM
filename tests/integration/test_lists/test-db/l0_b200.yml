@@ -156,11 +156,10 @@ l0_b200:
   - unittest/_torch/modules/test_gate_up_swiglu_quack.py
   - unittest/_torch/modules/test_multi_stream_utils.py
   - unittest/_torch/modules/test_megamoe_shared_mlp_scales.py
-  # Qwen3.5 decode MoE: NVFP4 and BF16 draft engines, CuTe FC2, BF16 top-k packing (decode / route fronts below).
+  # Qwen3.5 decode MoE: NVFP4 and BF16 draft engines, CuTe FC2 (decode / route fronts below).
   - unittest/_torch/moe/test_moe_nvfp4_engine.py
   - unittest/_torch/moe/test_moe_bf16_engine.py
   - unittest/_torch/moe/test_moe_lowm_fc2.py
-  - unittest/_torch/moe/test_topk_pack.py
   - unittest/_torch/modules/test_expert_l2_prefetch.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
@@ -273,6 +272,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_nvfp4_awq_matches_cutlass
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_in_kernel_routing_256_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method

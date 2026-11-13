@@ -76,9 +76,8 @@ l0_b300:
   - unittest/_torch/modules/test_qwen4_exp_ple_offload.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
-  # Qwen3.5 decode kernels: top-k packing, MoE engines and CuTe FC2; FP8 / BF16 GEMMs with weights loaded before
+  # Qwen3.5 decode kernels: MoE engines and CuTe FC2; FP8 / BF16 GEMMs with weights loaded before
   # the PDL wait (bitwise against SM103 cuBLAS).
-  - unittest/_torch/moe/test_topk_pack.py
   - unittest/_torch/moe/test_moe_nvfp4_engine.py
   - unittest/_torch/moe/test_moe_bf16_engine.py
   - unittest/_torch/moe/test_moe_lowm_fc2.py
