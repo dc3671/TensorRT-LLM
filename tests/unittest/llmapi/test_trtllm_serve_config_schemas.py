@@ -1325,6 +1325,77 @@ def test_disagg_router_default_is_derived(monkeypatch: pytest.MonkeyPatch) -> No
     assert disagg_utils.extract_router_config({"router": {"type": "explicit"}}).type == "explicit"
 
 
+_LB = "load_balancing"
+
+
+@pytest.mark.parametrize(
+    ("section", "router", "valid"),
+    [
+        ("generation_servers", {"type": _LB, "max_requests_per_server": 64}, True),
+        (
+            "generation_servers",
+            {"type": _LB, "max_requests_per_server": 1, "max_queue_wait_s": 30},
+            True,
+        ),
+        ("generation_servers", {"type": "Load_Balancing", "max_requests_per_server": 2}, True),
+        (
+            "generation_servers",
+            {"type": _LB, "max_requests_per_server": 2, "use_tokens": False},
+            True,
+        ),
+        (
+            "generation_servers",
+            {"type": "round_robin", "max_requests_per_server": None, "max_queue_wait_s": None},
+            True,
+        ),
+        ("generation_servers", {"type": _LB, "max_requests_per_server": 0}, False),
+        ("generation_servers", {"type": _LB, "max_requests_per_server": 1.5}, False),
+        ("generation_servers", {"type": _LB, "max_requests_per_server": True}, False),
+        ("generation_servers", {"type": _LB, "max_requests_per_server": "4"}, False),
+        ("generation_servers", {"type": "round_robin", "max_requests_per_server": 4}, False),
+        ("generation_servers", {"max_requests_per_server": 4}, False),
+        (
+            "generation_servers",
+            {"type": _LB, "max_requests_per_server": 4, "use_tokens": True},
+            False,
+        ),
+        ("generation_servers", {"type": _LB, "max_queue_wait_s": 30}, False),
+        (
+            "generation_servers",
+            {"type": _LB, "max_requests_per_server": 4, "max_queue_wait_s": 0},
+            False,
+        ),
+        (
+            "generation_servers",
+            {"type": _LB, "max_requests_per_server": 4, "max_queue_wait_s": -1},
+            False,
+        ),
+        ("context_servers", {"type": _LB, "max_requests_per_server": None}, True),
+        ("context_servers", {"type": _LB, "max_requests_per_server": 64}, False),
+        ("context_servers", {"type": _LB, "max_queue_wait_s": 30}, False),
+    ],
+)
+def test_pooled_router_keys_match_runtime(
+    schemas: dict[str, dict], section: str, router: dict, valid: bool
+) -> None:
+    """The disagg schema accepts the pooled generation dispatch keys exactly when startup does."""
+    from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
+    from tensorrt_llm.serve.router import create_router
+
+    def start() -> None:
+        config = extract_disagg_cfg(**{section: {"router": copy.deepcopy(router)}})
+        for router_config in (config.ctx_router_config, config.gen_router_config):
+            create_router(router_config, ["s"])
+
+    if valid:
+        start()
+    else:
+        with pytest.raises((ValueError, TypeError)):
+            start()
+    validator = Draft202012Validator(schemas[generator.DISAGG_SCHEMA])
+    assert validator.is_valid({section: {"router": router}}) == valid
+
+
 def test_disagg_node_id_matches_runtime(schemas: dict[str, dict]) -> None:
     from tensorrt_llm.llmapi.disagg_utils import DISAGG_NODE_ID_BITS
 

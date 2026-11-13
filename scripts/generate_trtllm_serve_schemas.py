@@ -462,6 +462,53 @@ def _serve_schema() -> dict:
     return schema
 
 
+def _router_schema(router_type: dict) -> dict:
+    """A disaggregated server block's ``router`` mapping, with pooled generation dispatch's startup rules.
+
+    Mirrors extract_disagg_cfg() (``max_queue_wait_s`` needs ``max_requests_per_server``), create_router()
+    (pooling needs the ``load_balancing`` type, matched case-insensitively), PooledLoadBalancingRouter (no
+    ``use_tokens``) and SeatPool (seats an integer >= 1, wait > 0). A null value is unset, as at runtime.
+    """
+    pooled_type = "load_balancing"
+    any_case = "".join(f"[{c.lower()}{c.upper()}]" if c.isalpha() else c for c in pooled_type)
+    falsy = [False, None, 0, "", [], {}]
+    return {
+        "type": "object",
+        "properties": {
+            "type": router_type,
+            "max_requests_per_server": {
+                "type": ["integer", "null"],
+                "minimum": 1,
+                "description": "Pooled generation dispatch: requests each generation server runs at once "
+                "(load_balancing generation router only).",
+            },
+            "max_queue_wait_s": {
+                "type": ["number", "null"],
+                "exclusiveMinimum": 0,
+                "description": "Pooled generation dispatch: seconds after which a waiting request goes "
+                "first (needs max_requests_per_server).",
+            },
+        },
+        "additionalProperties": True,
+        "allOf": [
+            {
+                "if": _is_set_to("max_queue_wait_s", {"type": "number"}),
+                "then": _is_set_to("max_requests_per_server", {"type": "integer"}),
+            },
+            {
+                "if": _is_set_to("max_requests_per_server", {"type": "integer"}),
+                "then": {
+                    "properties": {
+                        "type": {"type": "string", "pattern": f"^{any_case}$"},
+                        "use_tokens": {"enum": falsy},
+                    },
+                    "required": ["type"],
+                },
+            },
+        ],
+    }
+
+
 def generate_disagg_schema() -> dict:
     """Describe orchestrator options and the inherited per-role worker options."""
     from tensorrt_llm.llmapi.disagg_utils import (
@@ -485,12 +532,11 @@ def generate_disagg_schema() -> dict:
     worker["properties"].pop("type")
     worker.pop("required", None)
     worker["properties"] = properties | worker["properties"]
-    # YAML flattens router-specific args alongside the shared type field.
-    worker["properties"]["router"] = {
-        "type": "object",
-        "properties": {"type": _schema_for(RouterConfig, schema)["properties"]["type"]},
-        "additionalProperties": True,
-    }
+    # YAML flattens router-specific args alongside the shared type field. Unknown args stay accepted;
+    # the pooled generation dispatch keys are typed.
+    worker["properties"]["router"] = _router_schema(
+        _schema_for(RouterConfig, schema)["properties"]["type"]
+    )
     worker["additionalProperties"] = False
     worker["allOf"] = _launch_rules()
     schema["$defs"]["DisaggServerBlock"] = worker
@@ -499,6 +545,17 @@ def generate_disagg_schema() -> dict:
     # Update these refinements when extract_disagg_cfg() changes its untyped mapping inputs.
     for name in ("context_servers", "generation_servers"):
         orchestrator[name] = _nullable({"$ref": "#/$defs/DisaggServerBlock"})
+    # PooledLoadBalancingRouter refuses the context role.
+    orchestrator["context_servers"]["anyOf"][0] = {
+        "allOf": [
+            {"$ref": "#/$defs/DisaggServerBlock"},
+            {
+                "properties": {
+                    "router": {"properties": {"max_requests_per_server": {"type": "null"}}}
+                }
+            },
+        ]
+    }
     orchestrator["conditional_disagg_config"] = _nullable(
         _schema_for(ConditionalDisaggConfig, schema)
     )

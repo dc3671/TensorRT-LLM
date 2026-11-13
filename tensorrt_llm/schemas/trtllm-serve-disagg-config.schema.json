@@ -3331,7 +3331,80 @@
         },
         "router": {
           "additionalProperties": true,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "max_queue_wait_s": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "max_queue_wait_s"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "max_requests_per_server": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "max_requests_per_server"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "max_requests_per_server": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "max_requests_per_server"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "type": {
+                    "pattern": "^[lL][oO][aA][dD]_[bB][aA][lL][aA][nN][cC][iI][nN][gG]$",
+                    "type": "string"
+                  },
+                  "use_tokens": {
+                    "enum": [
+                      false,
+                      null,
+                      0,
+                      "",
+                      [],
+                      {}
+                    ]
+                  }
+                },
+                "required": [
+                  "type"
+                ]
+              }
+            }
+          ],
           "properties": {
+            "max_queue_wait_s": {
+              "description": "Pooled generation dispatch: seconds after which a waiting request goes first (needs max_requests_per_server).",
+              "exclusiveMinimum": 0,
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "max_requests_per_server": {
+              "description": "Pooled generation dispatch: requests each generation server runs at once (load_balancing generation router only).",
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "type": {
               "default": "round_robin",
               "title": "Type",
@@ -9807,7 +9880,22 @@
     "context_servers": {
       "anyOf": [
         {
-          "$ref": "#/$defs/DisaggServerBlock"
+          "allOf": [
+            {
+              "$ref": "#/$defs/DisaggServerBlock"
+            },
+            {
+              "properties": {
+                "router": {
+                  "properties": {
+                    "max_requests_per_server": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          ]
         },
         {
           "type": "null"
