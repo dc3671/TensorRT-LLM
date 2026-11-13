@@ -19,6 +19,7 @@ arguments and stops construction before any model is built.
 """
 
 import pytest
+import torch
 
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
@@ -132,8 +133,9 @@ def test_balanced_routing_routes_logits_routed_backends_on_the_host():
         apply_with_sort=lambda *args, **kwargs: None,
         top_k=2,
     )
-    # A stand-in built without __init__: only the routing decision is exercised.
-    backend = object.__new__(TrtllmTrtllmGenBf16Impl)
+    # A stand-in built without the leaf's __init__ (no weights): only the routing decision is exercised.
+    backend = TrtllmTrtllmGenBf16Impl.__new__(TrtllmTrtllmGenBf16Impl)
+    torch.nn.Module.__init__(backend)
     moe = SimpleNamespace(
         routing_method=routing, num_experts=8, forward_impl=lambda *a, **k: None, backend=backend
     )
