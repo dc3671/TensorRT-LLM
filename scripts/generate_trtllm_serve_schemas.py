@@ -193,8 +193,8 @@ def _dwdp_launch_rules() -> list[dict]:
     ]
 
 
-def _set(name: str, schema: dict) -> dict:
-    """``schema`` must hold for ``name`` when the mapping sets it."""
+def _is_set_to(name: str, schema: dict) -> dict:
+    """The mapping sets ``name`` (it is required) to a value that matches ``schema``."""
     return {"properties": {name: schema}, "required": [name]}
 
 
@@ -204,10 +204,10 @@ def _launch_rules() -> list[dict]:
     ``_dwdp_launch_rules()``, plus ``TorchLlmArgs.validate_defer_generation_only_release()`` (the overlap loop
     without pipeline parallelism). As there, values the YAML does not set are left to runtime validation.
     """
-    defer = {"type": "object", **_set("defer_generation_only_release", {"const": True})}
+    defer = {"type": "object", **_is_set_to("defer_generation_only_release", {"const": True})}
     return _dwdp_launch_rules() + [
         {
-            "if": _set("kv_cache_config", defer),
+            "if": _is_set_to("kv_cache_config", defer),
             "then": {
                 "properties": {
                     "disable_overlap_scheduler": {"not": {"const": True}},
@@ -241,7 +241,7 @@ def _cross_field_rules(definitions: dict) -> None:
     def when(condition: dict, then: dict) -> dict:
         return {"if": condition, "then": then}
 
-    unset_or_zero = {"not": _set("cache_size", {"minimum": 1})}
+    unset_or_zero = {"not": _is_set_to("cache_size", {"minimum": 1})}
     # RemoteCacheConfig.validate_remote_cache().
     remote_unread = {
         name: default(RemoteCacheConfig, name)
@@ -255,14 +255,19 @@ def _cross_field_rules(definitions: dict) -> None:
     }
     definitions["RemoteCacheConfig"].setdefault("allOf", []).extend(
         [
-            {"anyOf": [_set("cache_size", {"minimum": 1}), _set("donate_size", {"minimum": 1})]},
+            {
+                "anyOf": [
+                    _is_set_to("cache_size", {"minimum": 1}),
+                    _is_set_to("donate_size", {"minimum": 1}),
+                ]
+            },
             when(
-                _set("donate_size", {"exclusiveMinimum": 0}),
+                _is_set_to("donate_size", {"exclusiveMinimum": 0}),
                 {"properties": {"donate_size": {"minimum": REMOTE_CACHE_CHUNK_BYTES}}},
             ),
             when(unset_or_zero, {"properties": remote_unread}),
             when(
-                _set("transport", {"const": "fabric"}),
+                _is_set_to("transport", {"const": "fabric"}),
                 {
                     "properties": {
                         "transfer_timeout_s": default(RemoteCacheConfig, "transfer_timeout_s")
@@ -272,8 +277,8 @@ def _cross_field_rules(definitions: dict) -> None:
             when(
                 {
                     "anyOf": [
-                        {"not": _set("donate_size", {"minimum": 1})},
-                        {"not": _set("transport", {"const": "fabric"})},
+                        {"not": _is_set_to("donate_size", {"minimum": 1})},
+                        {"not": _is_set_to("transport", {"const": "fabric"})},
                     ]
                 },
                 {
@@ -283,15 +288,15 @@ def _cross_field_rules(definitions: dict) -> None:
                 },
             ),
             when(
-                _set("expected_num_donors", {"type": "integer"}),
-                _set("expected_claim_size", {"type": "integer"}),
+                _is_set_to("expected_num_donors", {"type": "integer"}),
+                _is_set_to("expected_claim_size", {"type": "integer"}),
             ),
             when(
-                _set("expected_claim_size", {"type": "integer"}),
-                _set("expected_num_donors", {"type": "integer"}),
+                _is_set_to("expected_claim_size", {"type": "integer"}),
+                _is_set_to("expected_num_donors", {"type": "integer"}),
             ),
             when(
-                _set("ucx_devices", {"type": "string"}),
+                _is_set_to("ucx_devices", {"type": "string"}),
                 {"properties": {"transport": {"const": "nixl"}}},
             ),
             # Comma-separated '<device>' or '<device>:1' entries (NIXL's UCX backend uses port 1).
@@ -302,10 +307,10 @@ def _cross_field_rules(definitions: dict) -> None:
     kv_v2 = {"properties": {"use_kv_cache_manager_v2": {"not": {"const": False}}}}
     definitions["KvCacheConfig"].setdefault("allOf", []).extend(
         [
-            when(_set("remote_cache_config", {"type": "object"}), kv_v2),
-            when(_set("defer_generation_only_release", {"const": True}), kv_v2),
+            when(_is_set_to("remote_cache_config", {"type": "object"}), kv_v2),
+            when(_is_set_to("defer_generation_only_release", {"const": True}), kv_v2),
             when(
-                _set("remote_cache_config", _set("cache_size", {"minimum": 1})),
+                _is_set_to("remote_cache_config", _is_set_to("cache_size", {"minimum": 1})),
                 {
                     "properties": {
                         "disk_cache_size": {"enum": [0, None]},
@@ -318,15 +323,15 @@ def _cross_field_rules(definitions: dict) -> None:
     # AttentionDpConfig.validate_attention_dp_config().
     definitions["AttentionDpConfig"].setdefault("allOf", []).append(
         when(
-            _set("kv_cache_routing_home_wait_rounds", {"type": "integer"}),
-            _set("kv_cache_routing_conversation_affinity", {"const": True}),
+            _is_set_to("kv_cache_routing_home_wait_rounds", {"type": "integer"}),
+            _is_set_to("kv_cache_routing_conversation_affinity", {"const": True}),
         )
     )
     # SchedulerConfig.validate_waiting_queue_max_wait_s().
     definitions["SchedulerConfig"].setdefault("allOf", []).append(
         when(
             {
-                "not": _set(
+                "not": _is_set_to(
                     "waiting_queue_policy",
                     {"const": WaitingQueuePolicy.PRIORITY.value},
                 )
