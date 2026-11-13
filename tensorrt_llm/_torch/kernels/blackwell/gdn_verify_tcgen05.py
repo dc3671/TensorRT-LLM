@@ -1589,7 +1589,17 @@ def gdn_verify_tcgen05(
     assert n > 0 and T_ * n == x.shape[0]
     assert gdn_verify_tcgen05_supported(T_, HV, HK, fp8_scale is not None), (T_, HV, HK)
     assert x.shape[1] >= (2 * HK + HV) * D and x.stride(1) == 1 and x.stride(0) % 8 == 0
+    assert (
+        old_u.dim() == 5 and old_u.shape[1] == 2 and old_u.shape[2] == HIST and old_u.shape[4] == D
+    )
+    assert (
+        old_k.dim() == 5 and old_k.shape[1] == 2 and old_k.shape[2] == HIST and old_k.shape[4] == D
+    )
+    assert z.dim() == 3 and tuple(z.shape) == (x.shape[0], HV, D)
     assert z.stride(-1) == 1 and z.stride(-2) == D and a.stride(1) == 1 and b.stride(1) == 1
+    assert (
+        a.dim() == 2 and tuple(a.shape) == (x.shape[0], HV) and tuple(b.shape) == (x.shape[0], HV)
+    )
     assert a.stride(0) == b.stride(0)
     assert state.shape[1] == HV and state.shape[-1] == D and state.shape[-2] == D
     assert (

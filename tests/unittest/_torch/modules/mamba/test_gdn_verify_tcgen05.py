@@ -320,3 +320,32 @@ def test_gdn_verify_tcgen05_addresses_the_history_by_replay_slot(heads, n):
     other[slots] = False
     assert torch.equal(ssm_p[other], mut["ssm"][other])
     assert torch.equal(ssm_r[other], mut["ssm"][other])
+
+
+@pytest.mark.parametrize(
+    "bad", ["z_rows", "z_heads", "a_heads", "b_rows", "old_u_buffers", "old_k_hist"]
+)
+def test_gdn_verify_tcgen05_checks_the_op_shapes(bad):
+    """The wrapper refuses, before any launch, the z / a / b and history shapes trtllm::gdn_verify refuses."""
+    n = 4
+    HV, cd, proj, ba, st, mut = _verify_case((2, 8), n, _T, 0)
+    z = proj[:, cd:].view(n * _T, HV, _DIM)
+    a, b = ba[:, HV:], ba[:, :HV]
+    old_u, old_k = mut["old_u"], mut["old_k"]
+    if bad == "z_rows":
+        z = z[:-1]
+    elif bad == "z_heads":
+        z = z[:, : HV // 2]
+    elif bad == "a_heads":
+        a = ba[:, HV + 1 :]
+    elif bad == "b_rows":
+        b = b[:-1]
+    elif bad == "old_u_buffers":
+        old_u = old_u[:, :1]
+    else:
+        old_k = old_k[:, :, : _HIST // 2]
+    with pytest.raises(AssertionError):
+        gdn_verify_tcgen05(
+            proj[:, :cd], z, a, b, st["a_log"], st["dt_bias"], st["norm_w"], st["fp8_scale"], 1e-6,
+            mut["ssm"].clone(), st["state_indices"], old_u, old_k, mut["old_g"], st["buf"], st["pnat"],
+        )  # fmt: skip
