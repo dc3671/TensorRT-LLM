@@ -418,7 +418,11 @@ donates CUDA fabric memory, which claimants in the same multi-node NVLink domain
 copy over NVLink. A fabric donation fills the GPU's host NUMA node first, then the
 other nodes, keeping `donor_reserve_size` bytes free on each node, and is
 published short when it does not fit. Every rank that shares a directory must use
-the same transport.
+the same transport. Both move pages through a pinned host staging ring. A NIXL
+batch is waited for on the scheduling thread (up to `transfer_timeout_s`), so
+offloading to a NIXL level under host-memory pressure adds that wait to the step
+that evicts; fabric copies are queued on the caller's stream. The cost of the NIXL
+wait on decode step time has not been measured.
 
 **Sizing.** The donors' published memory must cover the claims. A claimant splits
 `cache_size` across layer groups (by the hot tier's split, or `pool_ratio`) and
