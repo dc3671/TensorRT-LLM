@@ -2350,9 +2350,10 @@ class SpecWorkerBase(nn.Module, ABC):
                 _FORCE_ACCEPT_RNG_COUNTER_STRIDE, _FORCE_ACCEPT_RNG_SLOT_STRIDE,
                 _FORCE_ACCEPT_RNG_POOL_SIZE)
 
-    def _sample_and_accept_in_one_launch(self, logits, draft_tokens,
-                                         num_contexts, batch_size,
-                                         spec_metadata):
+    def _sample_and_accept_in_one_launch(
+            self, logits: torch.Tensor, draft_tokens: torch.Tensor,
+            num_contexts: int, batch_size: int,
+            spec_metadata: "SpecMetadata") -> Optional[tuple]:
         """The sharded temperature sample (``_sample_sharded_temperature``)
         and the strict acceptance below as one launch, or None where the
         launches below run: another sampling mode, a ragged verify, the eager

@@ -23,7 +23,7 @@ differ, which the finalize does not depend on. The kernels serve ``KERNEL_NUM_EX
 hidden size (``router_front_supports``); other steps take the stock path.
 """
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -75,7 +75,9 @@ MIN_KEY = tl.constexpr(-2147483648)
 
 
 def route_front_steps(
-    cuda_graph_batch_sizes, tokens_per_gen_step: int, min_rows: int = ROUTER_MAX_TOKENS + 1
+    cuda_graph_batch_sizes: Iterable[int],
+    tokens_per_gen_step: int,
+    min_rows: int = ROUTER_MAX_TOKENS + 1,
 ) -> frozenset:
     """Token counts the route front takes: the CUDA-graph decode steps (``b`` draft and ``tokens_per_gen_step * b``
     target rows per graph batch size ``b``) from ``min_rows`` rows (default: above the router GEMM's range; a caller
@@ -937,7 +939,9 @@ class RouteFront:
     def __init__(self, lean: bool = False) -> None:
         self.lean = lean
 
-    def compiled(self, x: torch.Tensor, n: int, tile: int, num_local: int, top_k: int):
+    def compiled(
+        self, x: torch.Tensor, n: int, tile: int, num_local: int, top_k: int
+    ) -> Optional[Tuple[Callable[..., None], Any]]:
         """The compiled launch for this call, or None when the kernel does not take it (checked before the router
         GEMM runs, so the caller can still take the stock path)."""
         m, k = x.shape
@@ -949,7 +953,7 @@ class RouteFront:
 
     def __call__(
         self,
-        fn,
+        fn: Tuple[Callable[..., None], Any],
         logits: torch.Tensor,
         x: torch.Tensor,
         global_scale: torch.Tensor,
@@ -958,7 +962,7 @@ class RouteFront:
         local_start: int,
         num_local: int,
         top_k: int,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """(xq [m, H/2] u8, xsf [m, H/16] u8, ids [m, K] int32, bf16 weights [m, K]) with the tables written into
         ``flat`` (prerouted_table_views layout for (m, top_k, num_local, tile))."""
         import cuda.bindings.driver as cuda

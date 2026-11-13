@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import enum
 import functools
+from typing import Callable
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -420,12 +421,12 @@ class PersistentMoeEngine:
 
 # ----------------------------------------------------------------------------------------------------------------
 @functools.lru_cache(maxsize=None)
-def ring_smem_bytes(device) -> int:
+def ring_smem_bytes(device: torch.device) -> int:
     """Shared memory an engine's operand ring may take on ``device``: a block's opt-in maximum but NON_RING_SMEM."""
     return torch.cuda.get_device_properties(device).shared_memory_per_block_optin - NON_RING_SMEM
 
 
-def new_state(device) -> torch.Tensor:
+def new_state(device: torch.device) -> torch.Tensor:
     """An engine's call state, zero-initialized; it must exist before CUDA-graph capture."""
     return torch.zeros(_CNT_OFFSET // 4 + 2 * CNT_CAP, dtype=torch.int32, device=device)
 
@@ -437,7 +438,12 @@ def gmem_ptr(dtype: type, t: torch.Tensor, align: int) -> cute.Pointer:
 
 
 def launch(
-    make_engine, key, args, device: torch.device, spare_sms: int = 0, tail_args: tuple = ()
+    make_engine: Callable[[], object],
+    key: tuple,
+    args: tuple,
+    device: torch.device,
+    spare_sms: int = 0,
+    tail_args: tuple = (),
 ) -> None:
     """Compile ``make_engine()`` once per ``key`` (the engine class and its compile-time configuration) and the PDL
     setting, and launch it with ``args`` on the current stream, one CTA per SM of ``device`` but ``spare_sms`` (the

@@ -13,7 +13,7 @@ mapping is built, before the KV cache is sized and any CUDA graph is captured.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -34,8 +34,9 @@ from .ops import (
 _OUTPUTS = MNNVLAllReduce._FUSED_NORM_OUTPUTS
 
 
-def _setup_failures(comm, rank: int, error: Optional[BaseException]) -> str:
-    """Agree on a setup step over the TP pair's communicator: "" when every rank succeeded, else "rank r: <cause>"
+def _setup_failures(comm: Any, rank: int, error: Optional[BaseException]) -> str:
+    """Agree on a setup step over the TP pair's communicator (``_get_mnnvl_workspace_comm``: an MPI communicator, or
+    the TP ProcessGroup under Ray): "" when every rank succeeded, else "rank r: <cause>"
     for each failed rank (this rank's own cause only where the communicator is a ProcessGroup)."""
     if mpi_disabled():
         if _mnnvl_workspace_all_succeeded(comm, error is None):

@@ -869,10 +869,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             pre_draft_seq_lens)
 
     @staticmethod
-    def _draft_kept_rows(spec_metadata, step0_seq_lens, num_accepted_tokens,
-                         num_contexts, num_gens, runtime_draft_len,
-                         num_ctx_tokens,
-                         use_epilogue) -> Optional[DraftKeptRows]:
+    def _draft_kept_rows(spec_metadata: SpecMetadata,
+                         step0_seq_lens: torch.Tensor,
+                         num_accepted_tokens: torch.Tensor, num_contexts: int,
+                         num_gens: int, runtime_draft_len: int,
+                         num_ctx_tokens: int,
+                         use_epilogue: bool) -> Optional[DraftKeptRows]:
         """Pass 0's kept rows when the step is generation-only on every rank.
 
         Pass 0 then computes past attention only the rows the draft loop keeps

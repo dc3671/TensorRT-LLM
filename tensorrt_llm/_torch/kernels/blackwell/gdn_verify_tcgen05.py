@@ -1542,7 +1542,9 @@ def gdn_verify_tcgen05_supported(T: int, HV: int, HK: int, fp8_out: bool) -> boo
     return bool(fp8_out) and MIN_T <= T <= MAX_T and HK > 0 and HV > 0 and HV % HK == 0
 
 
-def compile_gdn_verify_tcgen05(T: int, HV: int, HK: int, device=None) -> None:
+def compile_gdn_verify_tcgen05(
+    T: int, HV: int, HK: int, device: torch.device | None = None
+) -> None:
     """Compile (and cache) the kernel for (T, HV, HK) and the current ``TRTLLM_ENABLE_PDL`` ahead of any call, e.g. at
     model construction, so that no compilation runs inside a warm-up or a CUDA-graph capture."""
     assert gdn_verify_tcgen05_supported(T, HV, HK, True), (T, HV, HK)

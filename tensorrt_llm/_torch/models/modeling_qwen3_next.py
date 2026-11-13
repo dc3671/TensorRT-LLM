@@ -24,7 +24,7 @@ import copy
 import os
 from types import SimpleNamespace
 from typing import (TYPE_CHECKING, Dict, List, Literal, NamedTuple, Optional,
-                    Tuple, Union)
+                    Sequence, Tuple, Union)
 
 import torch
 
@@ -1854,7 +1854,7 @@ class Qwen3NextModel(DecoderModel):
             use_gemma=True,
         )
 
-    def _init_expert_prefetch(self, model_config) -> None:
+    def _init_expert_prefetch(self, model_config: ModelConfig) -> None:
         """The routed-expert L2 prefetch of the TP decode layouts, attached to every MoE layer."""
         self.aux_stream_dict[
             AuxStreamType.MoeExpertPrefetch] = torch.cuda.Stream()
@@ -1872,7 +1872,7 @@ class Qwen3NextModel(DecoderModel):
                 if isinstance(layer, Qwen3NextLinearDecoderLayer) else
                 _EXPERT_PREFETCH_ATTN_BUDGET_NS)
 
-    def share_lamport_fc2(self, layers) -> None:
+    def share_lamport_fc2(self, layers: Sequence[nn.Module]) -> None:
         """Hand ``lamport_fc2`` to the MoE blocks of ``layers``."""
         for layer in layers:
             if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
@@ -1894,7 +1894,7 @@ class Qwen3NextModel(DecoderModel):
         elif _uses_decode_kernels(self.model_config):
             self._cache_post_moe_norm_folds(layers)
 
-    def _cache_post_moe_norm_folds(self, layers) -> None:
+    def _cache_post_moe_norm_folds(self, layers: Sequence[nn.Module]) -> None:
         """Attention DP: the layers whose MoE output, residual add,
         ``next_layer_layernorm`` and the next layer's FP8 quant run as one
         launch (_post_moe_norm_fold)."""
@@ -1912,7 +1912,7 @@ class Qwen3NextModel(DecoderModel):
                                         and norm is not None and norm.use_gemma
                                         and not norm.use_cuda_tile)
 
-    def _cache_tp_decode_gates(self, layers) -> None:
+    def _cache_tp_decode_gates(self, layers: Sequence[nn.Module]) -> None:
         """Row gates of the input projections that follow a MoE-output
         all-reduce (see _RESIDENT_MIN_REQUESTS)."""
         from ..kernels.blackwell.resident_fp8_gemm import \
