@@ -96,6 +96,20 @@ def test_attach_reaches_the_router_gate(monkeypatch) -> None:
     assert root.gate._low_m_gemm_name == "gate"
 
 
+def test_a_later_attach_keeps_the_models_own_dispatcher(monkeypatch) -> None:
+    """The loader's prepare_low_m_gemm after load must not replace a dispatcher the model attached itself
+    (Qwen3.5: limit_rows, whole_bucket_direct_tiles, per_rank_tuning); new modules still get the later one."""
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    root = torch.nn.Module()
+    root.own = torch.nn.Linear(8, 8)
+    model_dispatcher = _mod.prepare_low_m_gemm(root, force=True, whole_bucket_direct_tiles=True)
+    root.later = torch.nn.Linear(8, 8)
+    loader_dispatcher = _mod.prepare_low_m_gemm(root)
+
+    assert root.own._low_m_gemm_dispatcher is model_dispatcher
+    assert root.later._low_m_gemm_dispatcher is loader_dispatcher
+
+
 # ---------------------------------------------------------------------------
 # linear.py fast pre-filter
 # ---------------------------------------------------------------------------

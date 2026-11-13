@@ -573,6 +573,10 @@ class LowMGemmDispatcher:
         if not LOW_M_GEMM_ACTIVE and not force:
             return
         for name, module in model.named_modules():
+            if getattr(module, "_low_m_gemm_dispatcher", None) is not None:
+                # A model that prepared its own dispatcher (e.g. Qwen3.5, with its row limits and tactics) keeps it:
+                # the loader's generic one must not replace it.
+                continue
             if module.__class__.__name__.endswith("Linear") or getattr(
                 module, LOW_M_GEMM_OPT_IN_ATTR, False
             ):
