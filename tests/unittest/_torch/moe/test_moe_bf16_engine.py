@@ -258,8 +258,16 @@ def test_decode_moe_bf16_applies_to_the_engine_shapes():
     assert decode_moe_bf16.applies(*_leaf_and_inputs(7, 128, 64, 1))
     assert decode_moe_bf16.applies(*_leaf_and_inputs(M_MAX, 64, 0, 1))
     assert not decode_moe_bf16.applies(*_leaf_and_inputs(M_MAX + 1, 128, 64, 1))
-    lg = _inputs(7, E, 64, 128, 1)[1]
+    x, lg = _inputs(7, E, 64, 128, 1)
+    # 16-byte row strides on an 8-byte-offset start: the kernel's 16-byte loads would be misaligned.
+    hidden = x.shape[1]
+    x_pad = torch.zeros((7, hidden + 8), dtype=x.dtype, device=x.device)
+    x_pad[:, 4 : 4 + hidden] = x
+    lg_pad = torch.zeros(lg.numel() + 4, dtype=lg.dtype, device=lg.device)
+    lg_pad[4:] = lg.reshape(-1)
     for overrides in (
+        dict(x=x_pad[:, 4 : 4 + hidden]),
+        dict(router_logits=lg_pad[4:].view(lg.shape)),
         dict(do_finalize=True),
         dict(router_logits=None),
         dict(routing_bias=torch.zeros(E, device="cuda")),

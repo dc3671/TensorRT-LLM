@@ -12,6 +12,7 @@ import torch
 
 from tensorrt_llm._torch.kernels.blackwell.moe_bf16_engine import (
     M_MAX,
+    moe_bf16_engine,
     supports_local_experts,
     supports_routing,
 )
@@ -46,12 +47,14 @@ def applies(impl: "FlashinferTrtllmGenBf16Impl", k: "KernelInputs") -> bool:
     if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16 or x.dim() != 2:
         return False
     m = x.shape[0]
-    if not 1 <= m <= M_MAX or x.stride(1) != 1 or (x.stride(0) * 2) % 16:
+    # The kernel reads x rows with 16-byte cp.async and logits rows with 16-byte vector loads.
+    if not 1 <= m <= M_MAX or x.stride(1) != 1 or (x.stride(0) * 2) % 16 or x.data_ptr() % 16:
         return False
     if (
         lg.dtype != torch.bfloat16
         or tuple(lg.shape) != (m, impl.num_slots)
         or not lg.is_contiguous()
+        or lg.data_ptr() % 16
     ):
         return False
     w13, w2 = impl.w3_w1_weight, impl.w2_weight
@@ -72,8 +75,6 @@ def applies(impl: "FlashinferTrtllmGenBf16Impl", k: "KernelInputs") -> bool:
 def run(
     impl: "FlashinferTrtllmGenBf16Impl", k: "KernelInputs", state: torch.Tensor
 ) -> list[torch.Tensor]:
-    from tensorrt_llm._torch.kernels.blackwell.moe_bf16_engine import moe_bf16_engine
-
     x = k.x
     m = x.shape[0]
     top_k = k.top_k

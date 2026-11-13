@@ -975,9 +975,13 @@ def moe_bf16_engine(
     assert 1 <= m <= M_MAX, "m <= M_MAX rows routed in the prologue"
     assert supports_routing(num_experts, top_k) and supports_local_experts(num_experts, e)
     assert (
-        x.dim() == 2 and x.shape == (m, hidden) and x.stride(1) == 1 and (x.stride(0) * 2) % 16 == 0
+        x.dim() == 2
+        and x.shape == (m, hidden)
+        and x.stride(1) == 1
+        and (x.stride(0) * 2) % 16 == 0
+        and x.data_ptr() % 16 == 0
     )
-    assert logits.dtype == torch.bfloat16 and logits.is_contiguous()
+    assert logits.dtype == torch.bfloat16 and logits.is_contiguous() and logits.data_ptr() % 16 == 0
     assert (
         h.dtype == torch.bfloat16
         and h.shape[0] >= m * top_k
