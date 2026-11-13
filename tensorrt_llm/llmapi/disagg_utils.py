@@ -471,14 +471,15 @@ def extract_disagg_cfg(
     gen_router_config = extract_router_config(generation_servers)
     ctx_router_config.server_role = ServerRole.CONTEXT
     gen_router_config.server_role = ServerRole.GENERATION
-    for section, router_config in (("context_servers", ctx_router_config),
-                                   ("generation_servers", gen_router_config)):
-        if (router_config.args.get("max_queue_wait_s") is not None
-                and router_config.args.get("max_requests_per_server") is None):
-            raise ValueError(
-                f"{section}.router.max_queue_wait_s only applies to pooled "
-                "generation dispatch; set generation_servers.router."
-                "max_requests_per_server too")
+    if ctx_router_config.args.get("max_queue_wait_s") is not None:
+        raise ValueError(
+            "context_servers.router.max_queue_wait_s is a generation router "
+            "option (pooled generation dispatch); remove it, or set it on "
+            "generation_servers.router together with max_requests_per_server")
+    if (gen_router_config.args.get("max_queue_wait_s") is not None
+            and gen_router_config.args.get("max_requests_per_server") is None):
+        raise ValueError("generation_servers.router.max_queue_wait_s needs "
+                         "max_requests_per_server")
     if gen_router_config.args.get("max_requests_per_server") is not None:
         # The pooled generation router fails a request that waits for a seat past
         # the context servers' KV transfer timeout. This is the fallback until the

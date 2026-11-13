@@ -534,8 +534,12 @@ def test_max_queue_wait_without_pooling_is_rejected():
         extract_disagg_cfg(
             generation_servers={"router": {"type": "load_balancing", "max_queue_wait_s": 30}}
         )
-    with pytest.raises(ValueError, match="max_requests_per_server"):
-        extract_disagg_cfg(context_servers={"router": {"max_queue_wait_s": 30}})
+    for context_router in (
+        {"max_queue_wait_s": 30},
+        {"max_queue_wait_s": 30, "max_requests_per_server": 4},
+    ):
+        with pytest.raises(ValueError, match="context_servers.router.* generation router option"):
+            extract_disagg_cfg(context_servers={"router": context_router})
 
 
 def test_router_declares_pooled():
