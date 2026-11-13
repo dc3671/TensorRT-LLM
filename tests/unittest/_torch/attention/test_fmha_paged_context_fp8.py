@@ -481,3 +481,22 @@ def test_stage_kv_cubins_match_the_kernel_params_they_were_built_against():
         (fmha / "cubin/kernelMetaInfoStageKv.h").read_text(),
     )
     assert recorded and set(recorded) == {h.hexdigest()}
+
+
+def test_fmha_paged_context_fp8_fake_declines():
+    """Traced, the op answers False (whether a cubin exists is known only at run time): a trace keeps the FlashInfer
+    kernel the caller runs on False, which is always valid."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        q = torch.empty((8, 4, 256), dtype=torch.float8_e4m3fn, device="cuda")
+        kv_pool = torch.empty((4, 2, 1, 32, 256), dtype=torch.float8_e4m3fn, device="cuda")
+        block_tables = torch.zeros((1, 4), dtype=torch.int32, device="cuda")
+        seq_lens = torch.full((1,), 8, dtype=torch.int32, device="cuda")
+        cu = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+        out = torch.empty((8, 4, 256), dtype=torch.bfloat16, device="cuda")
+        scale = torch.ones(1, dtype=torch.float32, device="cuda")
+        took = torch.ops.trtllm.fmha_paged_context_fp8(
+            q, kv_pool, block_tables, seq_lens, cu, cu, out, scale, scale, 8, 8, 256
+        )
+    assert took is False

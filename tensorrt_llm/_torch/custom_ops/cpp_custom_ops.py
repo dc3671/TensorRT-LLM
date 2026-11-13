@@ -1946,7 +1946,9 @@ def _register_fake():
         head_dim_per_stage_kv: int,
         allow_nvrtc: bool = False,
     ) -> bool:
-        return True
+        # The fail-safe answer: whether a cubin exists is known only at run
+        # time, and on False the caller runs FlashInfer, which is always valid.
+        return False
 
     @torch.library.register_fake("trtllm::dit_v_amax")
     def _(qkv: torch.Tensor, num_heads: int, head_dim: int):
