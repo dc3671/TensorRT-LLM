@@ -5327,9 +5327,11 @@ class RemoteCacheConfig(StrictBaseModel):
     """
 
     # Fields only a rank with a remote cache level (cache_size > 0) reads.
-    CLAIMANT_ONLY_FIELDS: ClassVar[Tuple[str, ...]] = (
-        "pool_ratio", "expected_num_donors", "expected_claim_size",
-        "donor_wait_timeout_s", "transfer_timeout_s")
+    CLAIMANT_ONLY_FIELDS: ClassVar[Tuple[str, ...]] = ("pool_ratio",
+                                                       "expected_num_donors",
+                                                       "expected_claim_size",
+                                                       "donor_wait_timeout_s",
+                                                       "transfer_timeout_s")
 
     directory: str = Field(
         min_length=1,

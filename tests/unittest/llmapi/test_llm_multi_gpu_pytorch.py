@@ -168,7 +168,10 @@ def test_llm_attention_dp_home_wait_tp2():
     from tensorrt_llm.conversation_params import ConversationParams
     from tensorrt_llm.llmapi import AttentionDpConfig
 
-    prompts = {"conv-a": "The capital of France is", "conv-b": "One, two, three, four,"}
+    prompts = {
+        "conv-a": "The capital of France is",
+        "conv-b": "One, two, three, four,"
+    }
     params = SamplingParams(max_tokens=8, temperature=0, end_id=-1)
     with LLM(model=llama_model_path,
              kv_cache_config=global_kv_cache_config,
@@ -179,19 +182,20 @@ def test_llm_attention_dp_home_wait_tp2():
                  kv_cache_routing_conversation_affinity=True,
                  kv_cache_routing_home_wait_rounds=4)) as llm:
         first = {
-            conv: llm.generate(prompt,
-                               params,
-                               conversation_params=ConversationParams(
-                                   conversation_id=conv)).outputs[0].token_ids
+            conv:
+            llm.generate(prompt,
+                         params,
+                         conversation_params=ConversationParams(
+                             conversation_id=conv)).outputs[0].token_ids
             for conv, prompt in prompts.items()
         }
         convs = [conv for conv in prompts for _ in range(3)]
-        results = llm.generate(
-            [prompts[conv] for conv in convs],
-            params,
-            conversation_params=[
-                ConversationParams(conversation_id=conv) for conv in convs
-            ])
+        results = llm.generate([prompts[conv] for conv in convs],
+                               params,
+                               conversation_params=[
+                                   ConversationParams(conversation_id=conv)
+                                   for conv in convs
+                               ])
     for conv, result in zip(convs, results):
         assert len(first[conv]) == 8
         assert result.outputs[0].token_ids == first[conv], conv

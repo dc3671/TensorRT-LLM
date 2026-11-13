@@ -3725,13 +3725,14 @@ class KvCacheCreator:
                 compression_manager)
 
     def _build_secondary_managers(
-            self, has_separate_one_model_draft: bool, original_max_seq_len: int,
-            estimating_kv_cache: bool, self_kv_cache_config: KvCacheConfig,
-            draft_kv_cache_config: Optional[KvCacheConfig],
-            cross_kv_cache_config: Optional[KvCacheConfig],
-            cold_page_codec_provider: Optional[object],
-            early_donor: Optional["RemoteMemDonor"]
-    ) -> tuple[Optional["BaseResourceManager"], Optional["BaseResourceManager"]]:
+        self, has_separate_one_model_draft: bool, original_max_seq_len: int,
+        estimating_kv_cache: bool, self_kv_cache_config: KvCacheConfig,
+        draft_kv_cache_config: Optional[KvCacheConfig],
+        cross_kv_cache_config: Optional[KvCacheConfig],
+        cold_page_codec_provider: Optional[object],
+        early_donor: Optional["RemoteMemDonor"]
+    ) -> tuple[Optional["BaseResourceManager"],
+               Optional["BaseResourceManager"]]:
         """The one-model draft and encoder-decoder cross managers built beside the target; the draft waits for
         `early_donor`, the target's donation, before measuring host memory."""
         draft_kv_cache_manager = None

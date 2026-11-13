@@ -1574,8 +1574,10 @@ def test_priority_wait_cap_admits_an_aged_request_first():
     finally:
         llm.shutdown()
 
-    assert slot_busy_at_request3 == [True], (
-        "Request 1 finished before Request 3 arrived; the test needs it to hold the slot")
+    assert slot_busy_at_request3 == [
+        True
+    ], ("Request 1 finished before Request 3 arrived; the test needs it to hold the slot"
+        )
     assert completion_order.index(2) < completion_order.index(3), (
         f"Request 2 (waited past the cap) should complete before Request 3 (priority=0.9). "
         f"Completion order: {completion_order}")
