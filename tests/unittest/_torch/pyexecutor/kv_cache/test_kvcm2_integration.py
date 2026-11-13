@@ -1983,6 +1983,55 @@ class TestRemoteTierInitStatus:
         assert [p.name.endswith(".failed") for p in tmp_path.iterdir()] == [True]
 
     @pytest.mark.cpu_only
+    def test_an_unstarted_donation_is_marked_before_the_sync(self, tmp_path) -> None:
+        """Peers waiting in check_remote_capacity for this donor stop at once only if the marker precedes the
+        init-status collective, which waits for them."""
+        config = KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            remote_cache_config={"directory": str(tmp_path), "donate_size": 1 << 50},
+        )
+        markers_at_sync = []
+
+        def sync(status, mapping):
+            markers_at_sync.append(sorted(p.suffix for p in tmp_path.iterdir()))
+            return status
+
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", Mock()),
+            patch(f"{self.module}._sync_kv_cache_manager_init_status", side_effect=sync),
+            pytest.raises(ValueError, match="host_cache_size"),
+        ):
+            _make_manager_for_cache_tier_test(config, [Mock()])
+        assert markers_at_sync == [[".failed"]]
+        # One marker, not a second one from the construction guard.
+        assert len(list(tmp_path.iterdir())) == 1
+
+    @pytest.mark.cpu_only
+    def test_a_remote_setup_failure_before_the_donation_is_marked_before_the_sync(
+        self, tmp_path
+    ) -> None:
+        markers_at_sync = []
+
+        def sync(status, mapping):
+            markers_at_sync.append(sorted(p.suffix for p in tmp_path.iterdir()))
+            return status
+
+        with (
+            patch.object(
+                KVCacheManagerV2,
+                "_add_remote_level",
+                Mock(side_effect=ValueError("UCX devices: unknown token")),
+            ),
+            patch(f"{self.module}._sync_kv_cache_manager_init_status", side_effect=sync),
+            pytest.raises(ValueError, match="unknown token"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, cache_size=1 << 30, donate_size=1 << 30), [Mock()]
+            )
+        assert markers_at_sync == [[".failed"]]
+        assert "unknown token" in (next(tmp_path.iterdir())).read_text()
+
+    @pytest.mark.cpu_only
     def test_failure_after_the_sync_withdraws_the_donation(self, tmp_path) -> None:
         donor, add_remote_level = self._starting_donor()
         with (

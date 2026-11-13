@@ -2852,6 +2852,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"{mem_available / (1 << 30):.2f}GiB available host memory to the automatic "
                         "host tier; set kv_cache_config.host_cache_size."
                     )
+                    self._report_unstarted_donation(remote_init_error)
                 else:
                     mem_available -= donated
             host_quota = _compute_auto_host_tier_quota(
@@ -2920,6 +2921,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._add_remote_level(kv_cache_config.remote_cache_config, cache_tiers)
             except Exception as error:
                 remote_init_error = error
+                self._report_unstarted_donation(error)
         if self._sparse_kv_offload is not None:
             self._warn_if_lower_tiers_cannot_take_history(cache_tiers)
 
@@ -8685,6 +8687,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache manager v2 remote cache quota set to "
                 f"{remote_config.cache_size / (1 << 30):.2f}GiB via {remote_dir} ({remote_config.transport})"
             )
+
+    def _report_unstarted_donation(self, error: BaseException) -> None:
+        """Leave the failure marker of this rank's planned donation now if it never started, before the init-status
+        collective: peers waiting in check_remote_capacity for this donor then stop at once, instead of after
+        donor_wait_timeout_s with no word of this error. A started donation reports through its donor."""
+        if self._remote_donor is None:
+            self._close_remote_donor(error)
 
     def _abandon_construction(self, error: BaseException) -> None:
         """Undo a construction that raised `error`: withdraw the donation with it, whose failure marker tells the
