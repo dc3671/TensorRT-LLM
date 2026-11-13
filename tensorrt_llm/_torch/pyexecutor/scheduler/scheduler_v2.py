@@ -2274,7 +2274,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         pages leave only this rank's reuse tree, so the group's matches, admissions and collectives would diverge.
         """
         for manager in self._lockstep_remote_managers:
-            if manager.remote_level_failed():
+            if manager.any_remote_level_failed:
                 raise RemoteMemError(
                     "A remote KV cache level failed on this rank. Its TP/CP/PP peers schedule in lock step and cannot "
                     "drop the same pages or requests, so the executor stops instead of diverging from them."

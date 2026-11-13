@@ -588,9 +588,11 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             self._prefill(prompt, stream)
             self._push_to_last_level(prompt, stream)
             donor.stop()
+            self.assertFalse(self.manager.any_remote_level_failed)
             # The host tier is full: every prefill evicts toward the remote level.
             for _ in range(8):
                 self._prefill(self._prompt(256), stream)
+            self.assertTrue(self.manager.any_remote_level_failed)
             self.assertEqual(self._residency(prompt)[-1], 0, "the failed level still offers pages")
             fresh = self._prompt(2 * self.tokens_per_block)
             self._prefill(fresh, stream)

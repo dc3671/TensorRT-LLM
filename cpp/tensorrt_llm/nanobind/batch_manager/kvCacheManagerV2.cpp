@@ -3753,8 +3753,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             { return std::dynamic_pointer_cast<kv::EventManager>(self.eventSink()); })
         .def_prop_ro("init_config", [](kv::KvCacheManager const& self) { return self.config(); })
         .def_prop_ro("cache_tier_list", [](kv::KvCacheManager const& self) { return self.cacheTierList().raw(); })
-        .def_prop_ro("remote_level_failed",
-            // A lock-step scheduler stops once any remote level failed on this rank.
+        .def_prop_ro("any_remote_level_failed",
+            // A lock-step scheduler stops once any remote level failed on this rank. Lock-free (atomic flags).
             [](kv::KvCacheManager& self) { return self.storage().anyRemoteLevelFailed(); })
         .def_prop_ro("all_buffer_ids", &kv::KvCacheManager::allBufferIds)
         .def_prop_ro("pool_group_descs",

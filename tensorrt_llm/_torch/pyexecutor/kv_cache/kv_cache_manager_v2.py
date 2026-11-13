@@ -6626,9 +6626,10 @@ class KVCacheManagerV2(BaseResourceManager):
         """True when this manager has a remote cache level (remote_cache_config.cache_size)."""
         return CacheTier.REMOTE in self.impl.cache_tier_list
 
-    def remote_level_failed(self) -> bool:
-        """Whether a remote cache level of this manager failed on this rank (a transfer or its donor did)."""
-        return self.impl.remote_level_failed
+    @property
+    def any_remote_level_failed(self) -> bool:
+        """Whether any remote cache level of this manager failed on this rank (a transfer or its donor did)."""
+        return self.impl.any_remote_level_failed
 
     def has_pending_preemption(self) -> bool:
         """True while a deferred preemption is still waiting on a connector."""

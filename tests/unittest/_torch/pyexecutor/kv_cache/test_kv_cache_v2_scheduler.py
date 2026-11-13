@@ -20,7 +20,7 @@ No GPU required.
 
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, PropertyMock, call, patch
 
 import pytest
 
@@ -1493,7 +1493,7 @@ class TestKVPagesLostToAFailedRemoteLevel:
             prepare_disagg_gen_init_fn=lose if path == "disagg_generation_init" else None,
         )
         mgr.has_remote_cache_level = True
-        mgr.remote_level_failed.return_value = False
+        mgr.any_remote_level_failed = False
         sched = make_scheduler(mgr, max_num_tokens=1000, recover_lost_kv_per_rank=False)
         request = {
             "generation": lambda: make_gen_request(0),
@@ -1518,7 +1518,7 @@ class TestKVPagesLostToAFailedRemoteLevel:
             return True
 
         mgr.try_allocate_generation.side_effect = alloc_fn
-        mgr.remote_level_failed.side_effect = lambda: failed[0]
+        type(mgr).any_remote_level_failed = PropertyMock(side_effect=lambda: failed[0])
         sched = make_scheduler(mgr, max_num_tokens=1000, recover_lost_kv_per_rank=False)
 
         with pytest.raises(RemoteMemError, match="lock step"):
@@ -1529,11 +1529,13 @@ class TestKVPagesLostToAFailedRemoteLevel:
         """TP1 and attention DP recover per request: no per-pass query."""
         mgr = make_kv_cache_manager()
         mgr.has_remote_cache_level = True
+        polled = PropertyMock(return_value=False)
+        type(mgr).any_remote_level_failed = polled
         sched = make_scheduler(mgr, max_num_tokens=1000)
 
         sched.schedule_request([make_gen_request(0)], set())
 
-        mgr.remote_level_failed.assert_not_called()
+        polled.assert_not_called()
 
     def test_the_executor_fails_lost_requests_under_the_multimodal_scheduler(self):
         """MultimodalScheduler forwards the wrapped scheduler's lost requests to PyExecutor._schedule."""
