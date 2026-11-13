@@ -98,9 +98,13 @@ class _Bucket:
         self.live += 1
 
     def discard(self) -> None:
-        """One of its waiters left; drop the entries of departed waiters once they dominate."""
+        """One of its waiters left; drop the entries of departed waiters once they dominate.
+
+        Either heap can hold them: a granted waiter leaves ``by_priority`` at its head, while
+        ``by_arrival`` is popped only with a wait cap.
+        """
         self.live -= 1
-        if len(self.by_priority) > 2 * self.live + _COMPACT_SLACK:
+        if max(len(self.by_priority), len(self.by_arrival)) > 2 * self.live + _COMPACT_SLACK:
             self.by_priority = [e for e in self.by_priority if e[2].queued]
             heapq.heapify(self.by_priority)
             self.by_arrival = [e for e in self.by_arrival if e[2].queued]

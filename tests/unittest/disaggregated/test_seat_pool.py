@@ -178,6 +178,23 @@ def test_pool_pick_does_not_scan_every_waiter(monkeypatch):
     assert len(pool.expire()) == live and len(pool) == 0 and pool.pick(["s"]) is None
 
 
+@pytest.mark.parametrize("cap", [None, 600.0])
+def test_pool_heaps_stay_bounded_under_a_queue_that_never_drains(cap):
+    """Granted waiters leave both heaps, with or without a wait cap: no growth per placement."""
+    pool = SeatPool(1, max_wait_s=cap, clock=_Clock())
+    live = 9
+    for rid in range(live):
+        pool.add(rid, 0.5, None, None)
+    for rid in range(live, live + 20000):
+        pool.add(rid, 0.5, None, None)
+        waiter, _ = pool.pick(["s"])
+        pool.record_grant(waiter)
+        bucket = pool._buckets[None]
+        assert len(bucket.by_arrival) <= 2 * bucket.live + 64
+        assert len(bucket.by_priority) <= 2 * bucket.live + 64
+    assert len(pool) == live
+
+
 def test_pool_skips_excluded_server():
     pool = SeatPool(1, clock=_Clock())
     pool.add(1, 0.9, "s0", None)
