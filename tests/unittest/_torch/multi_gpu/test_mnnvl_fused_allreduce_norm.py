@@ -559,7 +559,8 @@ def test_slot_kernel_takes_every_supported_hidden_size() -> None:
                 built = False
                 continue
             # The launch reserves the kernel's shared memory: warp sums, the cluster sums (one per warp of the
-            # token with the two-shot arithmetic), flags and mbarrier; 512 bytes up to hidden 16384.
+            # token with the two-shot arithmetic), flags and mbarrier; up to hidden 16384 they fit in the 512-byte
+            # floor smem_bytes keeps for the measured launches.
             nsum = kernel.ctas * kernel.num_warps if ts else kernel.ctas
             assert kernel.smem_bytes() >= 4 * (kernel.num_warps + nsum) + 32 + 8, (hidden, m)
             assert hidden > 16384 or kernel.smem_bytes() == 512, (hidden, m)

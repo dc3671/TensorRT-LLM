@@ -346,8 +346,9 @@ class MnnvlSlotAllReduceNormKernel:
 
     def smem_bytes(self) -> int:
         """Dynamic shared memory of a launch: ``kernel``'s allocations (warp sums, cluster sums, flags, mbarrier,
-        each 16-byte aligned), at least the 512 bytes every launch reserved before the cluster sums grew with the
-        hidden size."""
+        each 16-byte aligned), and at least 512 bytes. Nothing in the kernel reads beyond its allocations; the floor
+        keeps the launch of every hidden size up to 16384, whose allocations fit in it, at the shared-memory size
+        its decode-step timings were measured with (occupancy is bound by threads and registers, not by this)."""
 
         def up16(n: int) -> int:
             return (n + 15) // 16 * 16
