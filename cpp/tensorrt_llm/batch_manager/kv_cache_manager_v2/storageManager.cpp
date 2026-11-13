@@ -1509,8 +1509,9 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
         }
         catch (RemoteMemError const&)
         {
-            // An eviction WRITE failed the level before pointing any page at it, and the rollback put the evicted
-            // pages back: retire the level and evict past it, instead of failing whoever needed the room.
+            // An eviction WRITE failed the level before pointing any page at it, and the rollback guards put the
+            // evicted pages back (kept alive through the unwinding by _prepareFreeSlots' keepAlive): retire the level
+            // and evict past it, instead of failing whoever needed the room.
             if (numFailedClients() == failedBefore)
             {
                 throw;
@@ -1554,12 +1555,16 @@ void StorageManager::_prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex
     }
 
     PagesByLifeCycle fallenPages(numLifeCycles());
-    _prepareFreeSlots(goals, level, fallenPages, migrationRecorder, dropRecorder);
+    std::vector<SharedPtr<Page>> keepAlive;
+    _prepareFreeSlots(goals, level, fallenPages, keepAlive, migrationRecorder, dropRecorder);
 }
 
 void StorageManager::forceEvict(
     CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages, DropRecorder const& dropRecorder)
 {
+    // Declared before the rollback guard, so that the pages they hold outlive it on failure.
+    PagesByLifeCycle fallen(numLifeCycles());
+    std::vector<SharedPtr<Page>> keepAlive;
     auto evicted = mLevels.at(level).controller.evict(minNumPages);
     auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
 
@@ -1594,7 +1599,6 @@ void StorageManager::forceEvict(
     }
     CacheLevel nextLvl = level + 1;
 
-    PagesByLifeCycle fallen(numLifeCycles());
     for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
     {
         for (auto& sp : evicted.at(pgIdx))
@@ -1604,7 +1608,7 @@ void StorageManager::forceEvict(
         }
     }
     sortFallenPagesByPriority(fallen);
-    _prepareFreeSlots(goals, nextLvl, fallen, MigrationRecorder{}, dropRecorder);
+    _prepareFreeSlots(goals, nextLvl, fallen, keepAlive, MigrationRecorder{}, dropRecorder);
     rescheduleEvictedPagesOnFailure.cancel();
 }
 
@@ -1613,8 +1617,8 @@ void StorageManager::forceEvict(
 // ---------------------------------------------------------------------------
 
 void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals,
-    CacheLevel lvlId, PagesByLifeCycle& fallenPages, MigrationRecorder const& migrationRecorder,
-    DropRecorder const& dropRecorder)
+    CacheLevel lvlId, PagesByLifeCycle& fallenPages, std::vector<SharedPtr<Page>>& keepAlive,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
     TypedVec<LifeCycleId, std::vector<SharedPtr<Page>>> belowOffloadThreshold(numLifeCycles());
     auto restoreBelowThreshold = FuncGuard(
@@ -1821,7 +1825,8 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 if (dropRecorder && !rejected.empty() && !isLastLevel(lvlId))
                 {
                     // Above failed trailing levels these droppable pages would have been migrated down: count them
-                    // as dropped from the level they leave. (At the last level the behaviour is unchanged.)
+                    // as dropped from the level they leave. At the last level, rejected pages are cleared below
+                    // without a drop record.
                     std::map<CacheLevel, std::vector<SharedPtr<Page>>> byLevel;
                     for (auto const& page : rejected)
                     {
@@ -1847,10 +1852,16 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         }
     }
 
+    // The accepted pages live only in this frame from here on (the eviction lists let go of them): if a migration
+    // below or here throws, they would die before the rollback guards of this frame and the ones above run.
+    for (auto const& pages : acceptedPages)
+    {
+        keepAlive.insert(keepAlive.end(), pages.begin(), pages.end());
+    }
     if (!isLast)
     {
         sortFallenPagesByPriority(fallenPages);
-        _prepareFreeSlots(goals, lvlId + 1, fallenPages, migrationRecorder, dropRecorder);
+        _prepareFreeSlots(goals, lvlId + 1, fallenPages, keepAlive, migrationRecorder, dropRecorder);
     }
 
     TLLM_CHECK_DEBUG_WITH_INFO(

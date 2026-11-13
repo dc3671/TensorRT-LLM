@@ -554,14 +554,22 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             base.take_poison()
             shutil.rmtree(directory, ignore_errors=True)
 
-    def _with_dying_donor(self, prefix: str, body) -> None:
-        """Run body(stream, donor) against a remote level whose donor the body stops; the manager must stay usable."""
+    def _with_dying_donor(self, prefix: str, body, attention_only: bool = False) -> None:
+        """Run body(stream, donor) against a remote level whose donor the body stops; the manager must stay usable.
+
+        attention_only: two attention layers, 8 MiB GPU and host tiers (8 blocks each), so that every page is tracked.
+        """
         if self.transport == "fabric":
             self.skipTest(_NIXL_DEATH_ONLY)
         directory = tempfile.mkdtemp(prefix=prefix)
         donor = _Donor(directory, 1 << 30, self.transport)
         try:
             self.cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=10_000)
+            if attention_only:
+                tiers = list(self.cfg.cache_tiers)
+                tiers[0] = GpuCacheTierConfig(quota=8 << 20)
+                tiers[1] = HostCacheTierConfig(quota=8 << 20)
+                self.cfg = replace(self.cfg, cache_tiers=tiers, layers=self.cfg.layers[:2])
             self.manager = KVCacheManager(self.cfg)
             self.engine = FakeEngine(self.cfg)
             stream_holder = base.CachedCudaStream()
@@ -630,6 +638,42 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             self._reuse_and_check(prompt, stream)
 
         self._with_dying_donor("kvcm2_held_", body)
+
+    def test_a_failed_eviction_write_still_offloads_to_the_host(self) -> None:
+        """The GPU pages a failed host -> remote WRITE was making room for reach the host on the retry.
+
+        The failed attempt had accepted them for migration; they must survive its unwinding so that its rollback puts
+        them back, and the retry past the failed level then offloads them to the host instead of losing them.
+        """
+
+        def body(stream, donor) -> None:
+            older = self._prompt(2 * self.tokens_per_block)
+            self._prefill(older, stream)
+            # Two-block prompts until the GPU and host tiers hold only these, the remote level the older ones.
+            recent = [self._prompt(2 * self.tokens_per_block) for _ in range(16)]
+            for prompt in recent:
+                self._prefill(prompt, stream)
+            levels = {i: self._residency(prompt) for i, prompt in enumerate(recent)}
+            on_gpu = [i for i, lv in levels.items() if lv[0] == len(recent[i])]
+            self.assertTrue(on_gpu, levels)
+            self.assertGreater(
+                self._residency(older)[-1], 0, "the older prompt is not on the remote level"
+            )
+            _sync_device()
+            donor.stop()
+            # Needs GPU room: GPU -> host, whose own eviction WRITEs to the dead donor and fails the level.
+            self._prefill(self._prompt(2 * self.tokens_per_block), stream)
+            self.assertEqual(
+                self._residency(older)[-1], 0, "the remote level did not fail in this prefill"
+            )
+            # The oldest GPU prompt left the GPU for the host; no GPU prompt lost a cached token.
+            after = {i: self._residency(recent[i]) for i in on_gpu}
+            self.assertEqual(
+                {i: sum(lv) for i, lv in after.items()}, {i: len(recent[i]) for i in on_gpu}
+            )
+            self.assertGreater(after[on_gpu[0]][1], 0, after)
+
+        self._with_dying_donor("kvcm2_offload_", body, attention_only=True)
 
     def test_a_transfer_past_its_deadline_keeps_its_staging_until_it_quiesces(self) -> None:
         """A READ past its deadline keeps its staging lease out of use until it concludes, then is reaped.

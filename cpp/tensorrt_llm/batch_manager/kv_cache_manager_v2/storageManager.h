@@ -476,9 +476,12 @@ private:
 
     void _prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
         MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
+    //! `keepAlive` collects the pages each level accepts for migration. A frame's own containers die as an exception
+    //! unwinds it, before the rollback guards of the frames above run; whoever owns `keepAlive` keeps those pages
+    //! alive until then, so that the guards can put them back.
     void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
-        PagesByLifeCycle& fallenPages, MigrationRecorder const& migrationRecorder = {},
-        DropRecorder const& dropRecorder = {});
+        PagesByLifeCycle& fallenPages, std::vector<SharedPtr<Page>>& keepAlive,
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
     std::optional<std::vector<Slot>> _batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
         std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder = {},
