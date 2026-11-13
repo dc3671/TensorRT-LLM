@@ -165,7 +165,9 @@ class CoordinatorServer:
         return self._response({})
 
     @staticmethod
-    def _output_length_error(conv, isl, out=0.0, key=None) -> Optional[str]:
+    def _output_length_error(
+        conv: object, isl: object, out: object = 0.0, key: object = None
+    ) -> Optional[str]:
         """Why a prediction's or reply's fields are invalid, or None."""
         if conv is not None and not isinstance(conv, str):
             return "conv must be a string or null"

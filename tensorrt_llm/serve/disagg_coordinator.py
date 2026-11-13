@@ -68,6 +68,7 @@ from tensorrt_llm.serve.output_length_predictor import (
     OnlineLengthPredictor,
     is_token_count,
     priority_of,
+    throttled,
 )
 from tensorrt_llm.serve.render.fingerprint import fingerprint_summary
 from tensorrt_llm.serve.router import (
@@ -266,8 +267,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
         return cache[name]
 
     async def select(
-        self, role: str, routing_key, req_id, exclude_server: Optional[str]
-    ) -> Tuple[Optional[str], dict, Optional[str]]:
+        self, role: str, routing_key: Any, req_id: int, exclude_server: Optional[str]
+    ) -> Tuple[Optional[str], dict, Optional[int]]:
         _t0 = time.monotonic()
         normalized_role = self._normalize_role(role)
         router = self._router_for_role(normalized_role)
@@ -318,7 +319,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
             tokens, key = self._output_length_predictor.predict(conv, float(isl), time.monotonic())
         except Exception as e:  # noqa: BLE001  (an admission hint is never worth failing a placement)
             self._output_length_errors += 1
-            if self._output_length_errors <= 10 or self._output_length_errors % 1000 == 0:
+            if throttled(self._output_length_errors):
                 logger.warning(
                     f"[output_length] prediction #{self._output_length_errors} in /select failed, "
                     f"prior used: {type(e).__name__}: {e}"
@@ -344,11 +345,11 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self,
         router: Router,
         role: str,
-        routing_key,
-        req_id,
+        routing_key: Any,
+        req_id: int,
         exclude_server: Optional[str],
         t0: float,
-    ) -> Tuple[Optional[str], dict, Optional[str]]:
+    ) -> Tuple[Optional[str], dict, Optional[int]]:
         """Select through a pooled router, which may wait for a free seat.
 
         The wait happens before the striped reservation lock is taken: ``finish`` takes

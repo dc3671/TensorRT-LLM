@@ -64,11 +64,35 @@ import time
 from array import array
 from bisect import bisect_left, insort
 from collections import OrderedDict, deque
-from typing import Any, AsyncIterator, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Tuple,
+    get_args,
+)
 
 from tensorrt_llm.logger import logger
 
-PREDICTORS = ("ridge", "ridge_gbm")
+if TYPE_CHECKING:
+    from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
+    from tensorrt_llm.serve.openai_protocol import (
+        ChatCompletionRequest,
+        CompletionRequest,
+        ResponsesRequest,
+    )
+    from tensorrt_llm.serve.responses_utils import UCompletionResponseOrGenerator
+
+    # A request the orchestrator sends to a generation server.
+    GenerationRequest = CompletionRequest | ChatCompletionRequest | ResponsesRequest
+
+# OutputLengthPredictionConfig.predictor.
+PredictorName = Literal["ridge", "ridge_gbm"]
+PREDICTORS = get_args(PredictorName)
 
 # priority = 1 / (1 + tokens / scale); the admission order does not depend on the scale.
 PRIORITY_SCALE_TOKENS = 1024.0
@@ -550,6 +574,16 @@ class SubprocessGbmFitter:
         return result
 
 
+class GbmFitter(Protocol):
+    """What :class:`OnlineLengthPredictor` needs of a tree fitter (:class:`SubprocessGbmFitter`)."""
+
+    def busy(self) -> bool: ...
+
+    def start(self, rows: array, n: int, meta: dict) -> None: ...
+
+    def poll(self) -> Optional[dict]: ...
+
+
 class OnlineLengthPredictor:
     """The coordinator's predictor: the conversation table and the online models.
 
@@ -559,7 +593,7 @@ class OnlineLengthPredictor:
     ``MEDIAN_WINDOW`` replies for the median and ``GBM_MAX_ROWS`` training rows for the trees.
     """
 
-    def __init__(self, predictor: str, gbm_fitter: Any = None) -> None:
+    def __init__(self, predictor: PredictorName, gbm_fitter: Optional[GbmFitter] = None) -> None:
         if predictor not in PREDICTORS:
             raise ValueError(f"predictor must be one of {PREDICTORS}, got {predictor!r}")
         self.predictor = predictor
@@ -821,7 +855,8 @@ class _Ticket:
         self.strip_usage = False
 
 
-def _throttled(count: int) -> bool:
+def throttled(count: int) -> bool:
+    """Whether the ``count``-th occurrence of a repeated warning is logged: the first 10, then every 1000th."""
     return count <= 10 or count % 1000 == 0
 
 
@@ -837,8 +872,8 @@ class OutputLengthPriority:
 
     def __init__(
         self,
-        coordinator: Any,
-        predictor: str,
+        coordinator: DisaggCoordinator,
+        predictor: PredictorName,
         via_select: bool = False,
         record_flush_s: float = 0.0,
     ) -> None:
@@ -867,7 +902,9 @@ class OutputLengthPriority:
             f"is never read; /v1/responses requests are not predicted"
         )
 
-    async def assign(self, gen_req: Any, placed_later: bool = False) -> Optional[_Ticket]:
+    async def assign(
+        self, gen_req: GenerationRequest, placed_later: bool = False
+    ) -> Optional[_Ticket]:
         """Set ``gen_req.priority`` from the prediction; the ticket (None: nothing to learn) records the reply.
 
         With ``placed_later`` and ``via_select`` the prediction comes with the placement
@@ -915,7 +952,9 @@ class OutputLengthPriority:
         gen_req.stream_options = StreamOptions(include_usage=True, continuous_usage_stats=False)
         ticket.strip_usage = True
 
-    def placed(self, ticket: Optional[_Ticket], gen_req: Any, route_info: Any) -> None:
+    def placed(
+        self, ticket: Optional[_Ticket], gen_req: GenerationRequest, route_info: Optional[dict]
+    ) -> None:
         """Take the prediction from the generation placement's route info (``via_select``)."""
         if ticket is None or not ticket.via_select:
             return
@@ -928,10 +967,10 @@ class OutputLengthPriority:
         self.assigned += 1
         self._maybe_log_stats()
 
-    def _miss(self, gen_req: Any, reason: str) -> None:
+    def _miss(self, gen_req: GenerationRequest, reason: str) -> None:
         self.missing += 1
         gen_req.priority = self.prior_priority
-        if _throttled(self.missing):
+        if throttled(self.missing):
             logger.warning(f"[output_length] no prediction #{self.missing}, prior used: {reason}")
 
     def _record(self, ticket: _Ticket, out: Optional[int]) -> None:
@@ -968,7 +1007,7 @@ class OutputLengthPriority:
                 )
             except Exception as e:  # noqa: BLE001  (learning must not fail the request)
                 self.record_errors += 1
-                if _throttled(self.record_errors):
+                if throttled(self.record_errors):
                     logger.warning(
                         f"[output_length] recording {len(batch)} replies failed "
                         f"(#{self.record_errors}): {type(e).__name__}: {e}"
@@ -978,7 +1017,9 @@ class OutputLengthPriority:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    def track(self, response: Any, ticket: Optional[_Ticket]) -> Any:
+    def track(
+        self, response: UCompletionResponseOrGenerator, ticket: Optional[_Ticket]
+    ) -> UCompletionResponseOrGenerator:
         """Report the reply's ``usage.completion_tokens``: wraps a stream, reads a complete response."""
         if ticket is None:
             return response
@@ -989,7 +1030,7 @@ class OutputLengthPriority:
         self._record(ticket, int(out) if out is not None else None)
         return response
 
-    async def _track_stream(self, stream: AsyncIterator, ticket: _Ticket):
+    async def _track_stream(self, stream: AsyncIterator, ticket: _Ticket) -> AsyncIterator[bytes]:
         """Relay ``stream``; learn from its final usage-only chunk only (an interrupted stream is not learned).
 
         With ``ticket.strip_usage`` the stream is relayed in whole SSE events, without that chunk.

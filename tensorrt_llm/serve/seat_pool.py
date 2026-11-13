@@ -32,6 +32,7 @@ Waiters sit in heaps per excluded server, so a placement costs O(E log W) for E 
 excluded servers and W waiters, and expiry pops a deadline heap.
 """
 
+import asyncio
 import heapq
 import itertools
 import math
@@ -71,7 +72,7 @@ class Waiter:
     arrival: float
     priority: float
     exclude: Optional[str]
-    future: Any = None
+    future: Optional["asyncio.Future[str]"] = None
     holders: int = 0
     arriving: bool = True
     # When the context server's KV transfer times out; None: no bound.
@@ -207,7 +208,7 @@ class SeatPool:
         rid: int,
         priority: Any,
         exclude: Optional[str],
-        future: Any,
+        future: Optional["asyncio.Future[str]"],
         orig_elapsed_s: Any = None,
     ) -> Waiter:
         """A new waiter: it arrived ``orig_elapsed_s`` ago (a context phase has run), else now."""
