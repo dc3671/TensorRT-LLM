@@ -35,6 +35,7 @@
 #include <cuda.h>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -57,6 +58,30 @@ struct RemoteMemOptions
     bool operator==(RemoteMemOptions const&) const = default;
 };
 
+//! A file descriptor, closed with its owner.
+class OwnedFd
+{
+public:
+    explicit OwnedFd(FileDescriptor fd = kBadFileDescriptor) noexcept
+        : mFd(fd)
+    {
+    }
+
+    ~OwnedFd();
+    OwnedFd(OwnedFd&& other) noexcept;
+    OwnedFd(OwnedFd const&) = delete;
+    OwnedFd& operator=(OwnedFd const&) = delete;
+    OwnedFd& operator=(OwnedFd&&) = delete;
+
+    [[nodiscard]] FileDescriptor get() const noexcept
+    {
+        return mFd;
+    }
+
+private:
+    FileDescriptor mFd;
+};
+
 //! One chunk of donated memory this process owns.
 struct RemoteChunk
 {
@@ -72,7 +97,9 @@ class RemoteMemClient
 {
 public:
     //! Reads the donors published so far. `name` is unique among the process's clients and names each claim's owner.
-    RemoteMemClient(std::string name, RemoteMemOptions options, RemoteTransferConfig transferConfig,
+    //! `directory` is options.directory, opened and checked (openRendezvousDirectory): every later access goes through
+    //! it, so that the path is never resolved again.
+    RemoteMemClient(std::string name, RemoteMemOptions options, OwnedFd directory, RemoteTransferConfig transferConfig,
         std::unique_ptr<RemoteTransferBackend> backend);
     ~RemoteMemClient();
 
@@ -148,8 +175,13 @@ private:
     //! Caller holds mMutex. Throws RemoteMemError when an earlier transfer failed.
     void throwIfFailed() const;
 
+    //! The contents of the donor file `file` in the directory, or nullopt when it cannot be read or is not a regular
+    //! file of this user's: the donor withdrew after the listing, or the file is not trusted.
+    [[nodiscard]] std::optional<std::string> readDonorFile(std::string const& file) const;
+
     std::string mName;
     RemoteMemOptions mOptions;
+    OwnedFd mDirectory;
     RemoteTransferConfig mTransferConfig;
     std::unique_ptr<RemoteTransferBackend> mBackend;
     bool mStreamOrdered = false;
@@ -157,15 +189,19 @@ private:
     mutable std::mutex mMutex;
     std::unordered_map<std::string, size_t> mDonorIndex;
     std::vector<RemoteChunk> mFreeChunks;
-    std::vector<std::string> mClaims;
+    std::vector<std::string> mClaims; // claim file names in the directory
     uint64_t mClaimedBytes = 0;
-    size_t mReportedDonors = 0; // donors of this transport with a .ready or .failed file at the last refresh
+    size_t mReportedDonors = 0;       // donors of this transport with a .ready or .failed file at the last refresh
     std::unordered_set<std::string> mForeignDonors; // ready donors of another transport, passed over
     std::string mLastClaimError;                    // why the last donor was withdrawn at claim time
     bool mAbandoned = false;
     std::string mFailure;                           // the first transfer failure
     std::atomic<bool> mFailed{false};
 };
+
+//! Open `path` as a rendezvous directory: a directory, not a symlink, owned by this user and not writable by group or
+//! others, as remote_donor.ensure_rendezvous_directory makes it. Throws otherwise.
+[[nodiscard]] OwnedFd openRendezvousDirectory(std::string const& path);
 
 //! The client of `options.directory`, moving pages through the backend `transferConfig` selects.
 [[nodiscard]] SharedPtr<RemoteMemClient> makeRemoteMemClient(

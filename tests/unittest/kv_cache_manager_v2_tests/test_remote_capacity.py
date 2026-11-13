@@ -391,6 +391,27 @@ class TestRendezvousPermissions(unittest.TestCase):
         os.chmod(self.dir, 0o755)
         remote_donor.ensure_rendezvous_directory(self.dir)
 
+    def test_a_symlinked_directory_is_refused(self):
+        """The leaf is checked without following a link: a link can be pointed elsewhere after the check."""
+        target = os.path.join(self.dir, "target")
+        os.mkdir(target, 0o700)
+        link = os.path.join(self.dir, "rendezvous")
+        os.symlink(target, link)
+        with self.assertRaises(PermissionError):
+            remote_donor.ensure_rendezvous_directory(link)
+
+    def test_a_planted_tmp_link_is_not_written_through(self):
+        """Files are written through fresh exclusive temporaries, never through a file or link already there."""
+        victim = os.path.join(self.dir, "victim")
+        with open(victim, "w") as f:
+            f.write("keep")
+        path = os.path.join(self.dir, "donor.x.failed")
+        os.symlink(victim, f"{path}.tmp.{os.getpid()}")
+        remote_donor._write_atomically(path, b"marker")
+        self.assertEqual(open(victim).read(), "keep")
+        self.assertEqual(open(path, "rb").read(), b"marker")
+        self.assertFalse(os.path.islink(path))
+
     def test_donor_files_are_private(self):
         make_donor(self.dir, _GIB, chunk_bytes=_GIB, name="x").publish_failure(RuntimeError("e"))
         self.assertEqual(os.stat(os.path.join(self.dir, "donor.x.failed")).st_mode & 0o077, 0)

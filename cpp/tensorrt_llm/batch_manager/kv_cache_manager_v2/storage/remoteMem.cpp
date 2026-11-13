@@ -17,20 +17,20 @@
 
 #include "kv_cache_manager_v2/storage/remoteMem.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
-#include <filesystem>
-#include <fstream>
 #include <functional>
-#include <iterator>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -55,24 +55,7 @@ std::string hostName()
     return buf;
 }
 
-//! The contents of a donor's file, or nullopt when it cannot be read: the donor withdrew after the directory was
-//! listed, or the file is unreadable, which only passes over that donor until the next refresh.
-std::optional<std::string> readDonorFile(std::filesystem::path const& path)
-{
-    std::ifstream file(path, std::ios::binary);
-    if (!file)
-    {
-        std::error_code ec;
-        if (std::filesystem::exists(path, ec) || ec)
-        {
-            TLLM_LOG_WARNING("KVCM2 remote level: cannot read %s; passing over its donor", path.c_str());
-        }
-        return std::nullopt;
-    }
-    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-}
-
-//! The transport a donor's .failed file names, or nullopt when it names none.
+//! The transport a donor's .failed file names, or nullopt when it names none (malformed: every donor names it).
 std::optional<std::string> failedDonorTransport(std::string const& text)
 {
     std::istringstream lines(text);
@@ -98,17 +81,51 @@ constexpr uint64_t kMaxChunksPerDonor = 1ULL << 20;
 constexpr std::string_view kDonorPrefix = "donor.";
 constexpr std::string_view kReadySuffix = ".ready";
 constexpr std::string_view kFailedSuffix = ".failed";
+constexpr mode_t kOthersWrite = S_IWGRP | S_IWOTH;
 
 } // namespace
+
+OwnedFd::~OwnedFd()
+{
+    if (mFd != kBadFileDescriptor)
+    {
+        ::close(mFd);
+    }
+}
+
+OwnedFd::OwnedFd(OwnedFd&& other) noexcept
+    : mFd(std::exchange(other.mFd, kBadFileDescriptor))
+{
+}
+
+OwnedFd openRendezvousDirectory(std::string const& path)
+{
+    // O_NOFOLLOW: a symlink in the directory's place could be pointed elsewhere after this check.
+    OwnedFd dir(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+    TLLM_CHECK_WITH_INFO(dir.get() != kBadFileDescriptor,
+        "KVCM2 remote level: cannot open rendezvous directory '%s' (a directory, not a symlink): %s", path.c_str(),
+        std::strerror(errno));
+    struct stat st = {};
+    TLLM_CHECK_WITH_INFO(::fstat(dir.get(), &st) == 0, "KVCM2 remote level: cannot stat rendezvous directory '%s': %s",
+        path.c_str(), std::strerror(errno));
+    // Donor files hold memory registration keys and fabric handles: only this user may add or replace them.
+    TLLM_CHECK_WITH_INFO(st.st_uid == ::geteuid() && (st.st_mode & kOthersWrite) == 0,
+        "KVCM2 remote level: rendezvous directory '%s' must be owned by uid %u and not writable by group or others "
+        "(owner uid %u, mode %o)",
+        path.c_str(), static_cast<unsigned>(::geteuid()), static_cast<unsigned>(st.st_uid),
+        static_cast<unsigned>(st.st_mode & 0777));
+    return dir;
+}
 
 // ---------------------------------------------------------------------------
 // RemoteMemClient
 // ---------------------------------------------------------------------------
 
-RemoteMemClient::RemoteMemClient(std::string name, RemoteMemOptions options, RemoteTransferConfig transferConfig,
-    std::unique_ptr<RemoteTransferBackend> backend)
+RemoteMemClient::RemoteMemClient(std::string name, RemoteMemOptions options, OwnedFd directory,
+    RemoteTransferConfig transferConfig, std::unique_ptr<RemoteTransferBackend> backend)
     : mName(std::move(name))
     , mOptions(std::move(options))
+    , mDirectory(std::move(directory))
     , mTransferConfig(std::move(transferConfig))
     , mBackend(std::move(backend))
 {
@@ -137,38 +154,109 @@ RemoteMemClient::~RemoteMemClient()
     // The claims go last, after the backend's teardown: another client may write into a chunk as soon as its claim
     // is gone.
     mBackend.reset();
-    for (auto const& path : mClaims)
+    for (auto const& claim : mClaims)
     {
-        ::unlink(path.c_str());
+        ::unlinkat(mDirectory.get(), claim.c_str(), 0);
+    }
+}
+
+std::optional<std::string> RemoteMemClient::readDonorFile(std::string const& file) const
+{
+    // Read through the directory checked at construction, never through a symlink, and only from this user's files.
+    OwnedFd const fd(::openat(mDirectory.get(), file.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
+    if (fd.get() == kBadFileDescriptor)
+    {
+        if (errno != ENOENT)
+        {
+            TLLM_LOG_WARNING("KVCM2 remote level: cannot read %s in %s (%s); passing over its donor", file.c_str(),
+                mOptions.directory.c_str(), std::strerror(errno));
+        }
+        return std::nullopt; // ENOENT: withdrawn since the listing
+    }
+    struct stat st = {};
+    if (::fstat(fd.get(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != ::geteuid())
+    {
+        TLLM_LOG_WARNING("KVCM2 remote level: ignoring %s in %s: not a regular file of this user (owner uid %u)",
+            file.c_str(), mOptions.directory.c_str(), static_cast<unsigned>(st.st_uid));
+        return std::nullopt;
+    }
+    std::string text;
+    constexpr size_t kReadChunkBytes = 4096;
+    std::array<char, kReadChunkBytes> buf{};
+    for (;;)
+    {
+        ssize_t const n = ::read(fd.get(), buf.data(), buf.size());
+        if (n < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (n < 0)
+        {
+            TLLM_LOG_WARNING("KVCM2 remote level: cannot read %s in %s (%s); passing over its donor", file.c_str(),
+                mOptions.directory.c_str(), std::strerror(errno));
+            return std::nullopt;
+        }
+        if (n == 0)
+        {
+            return text;
+        }
+        text.append(buf.data(), static_cast<size_t>(n));
     }
 }
 
 void RemoteMemClient::refreshDonors()
 {
-    namespace fs = std::filesystem;
-    std::error_code ec;
     std::vector<std::string> ready;
-    size_t failed = 0;
-    for (auto const& entry : fs::directory_iterator(mOptions.directory, ec))
+    std::vector<std::string> failedFiles;
     {
-        auto const file = entry.path().filename().string();
-        if (file.size() > kDonorPrefix.size() + kReadySuffix.size() && file.starts_with(kDonorPrefix)
-            && file.ends_with(kReadySuffix))
+        // A fresh open of the checked directory: its own read position, closed by closedir.
+        int const listFd = ::openat(mDirectory.get(), ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        DIR* const listing = listFd == kBadFileDescriptor ? nullptr : ::fdopendir(listFd);
+        if (listing == nullptr)
         {
-            ready.push_back(file.substr(kDonorPrefix.size(), file.size() - kDonorPrefix.size() - kReadySuffix.size()));
+            int const error = errno;
+            if (listFd != kBadFileDescriptor)
+            {
+                ::close(listFd);
+            }
+            throw RemoteMemError(
+                "KVCM2 remote level: cannot list " + mOptions.directory + ": " + std::string(std::strerror(error)));
         }
-        else if (file.size() > kDonorPrefix.size() + kFailedSuffix.size() && file.starts_with(kDonorPrefix)
-            && file.ends_with(kFailedSuffix))
+        auto closeListing = FuncGuard([listing]() { ::closedir(listing); });
+        for (;;)
         {
-            // A failed donor of another transport is not one of the donors this client counts on.
-            auto const text = readDonorFile(entry.path());
-            auto const transport = text ? failedDonorTransport(*text) : std::nullopt;
-            failed += !transport || *transport == mBackend->kind() ? 1 : 0;
+            errno = 0;
+            dirent const* const entry = ::readdir(listing);
+            if (entry == nullptr)
+            {
+                if (errno != 0)
+                {
+                    throw RemoteMemError("KVCM2 remote level: cannot list " + mOptions.directory + ": "
+                        + std::string(std::strerror(errno)));
+                }
+                break;
+            }
+            std::string_view const file(entry->d_name);
+            if (file.size() > kDonorPrefix.size() + kReadySuffix.size() && file.starts_with(kDonorPrefix)
+                && file.ends_with(kReadySuffix))
+            {
+                ready.emplace_back(
+                    file.substr(kDonorPrefix.size(), file.size() - kDonorPrefix.size() - kReadySuffix.size()));
+            }
+            else if (file.size() > kDonorPrefix.size() + kFailedSuffix.size() && file.starts_with(kDonorPrefix)
+                && file.ends_with(kFailedSuffix))
+            {
+                failedFiles.emplace_back(file);
+            }
         }
     }
-    if (ec)
+    size_t failed = 0;
+    for (auto const& file : failedFiles)
     {
-        throw RemoteMemError("KVCM2 remote level: cannot list " + mOptions.directory + ": " + ec.message());
+        // A failed donor of another transport is not one of the donors this client counts on.
+        auto const text = readDonorFile(file);
+        auto const transport = text ? failedDonorTransport(*text) : std::nullopt;
+        failed += transport && *transport == mBackend->kind() ? 1 : 0;
     }
     std::sort(ready.begin(), ready.end());
     for (auto& donor : mDonors)
@@ -184,25 +272,12 @@ void RemoteMemClient::refreshDonors()
         {
             continue;
         }
-        fs::path const dir(mOptions.directory);
         RemoteDonor donor;
-        auto const metaPath = dir / ("donor." + name + ".meta");
-        // Donor files hold memory registration keys and fabric handles: only this user's donors are trusted.
-        struct stat metaStat = {};
-        if (::stat(metaPath.c_str(), &metaStat) != 0)
-        {
-            continue; // withdrawn since the listing
-        }
-        if (metaStat.st_uid != ::geteuid())
-        {
-            TLLM_LOG_WARNING("KVCM2 remote level: ignoring donor %s: owned by uid %u, not this user", name.c_str(),
-                static_cast<unsigned>(metaStat.st_uid));
-            continue;
-        }
-        auto const metaText = readDonorFile(metaPath);
+        // Donor files hold memory registration keys and fabric handles: only this user's files are read.
+        auto const metaText = readDonorFile("donor." + name + ".meta");
         if (!metaText)
         {
-            continue; // withdrawn since the listing
+            continue; // withdrawn since the listing, or not trusted
         }
         std::istringstream meta(*metaText);
         std::string line;
@@ -277,7 +352,7 @@ void RemoteMemClient::refreshDonors()
                 donor.chunks.emplace_back(base + chunk * donor.chunkBytes, donor.chunkBytes);
             }
         }
-        auto payload = readDonorFile(dir / ("donor." + name + "." + mBackend->payloadSuffix()));
+        auto payload = readDonorFile("donor." + name + "." + mBackend->payloadSuffix());
         if (!payload)
         {
             continue; // withdrawn since the listing
@@ -303,9 +378,9 @@ bool RemoteMemClient::stillPublished(RemoteDonor& donor)
 {
     if (!donor.withdrawn)
     {
-        std::error_code ec;
-        auto const ready = std::filesystem::path(mOptions.directory) / ("donor." + donor.name + ".ready");
-        if (!std::filesystem::exists(ready, ec) && !ec)
+        auto const ready = "donor." + donor.name + ".ready";
+        struct stat st = {};
+        if (::fstatat(mDirectory.get(), ready.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT)
         {
             // Donor names are unique per donor process, so a withdrawn one never comes back.
             donor.withdrawn = true;
@@ -364,10 +439,9 @@ bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
         for (size_t probe = 0; probe < numChunks; ++probe)
         {
             size_t const chunk = (donor.nextClaim + probe) % numChunks;
-            auto const path
-                = (std::filesystem::path(mOptions.directory) / ("claim." + donor.name + "." + std::to_string(chunk)))
-                      .string();
-            int const fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+            auto const claim = "claim." + donor.name + "." + std::to_string(chunk);
+            auto const path = mOptions.directory + "/" + claim; // for messages; files go through mDirectory
+            int const fd = ::openat(mDirectory.get(), claim.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
             if (fd < 0)
             {
                 if (errno == EEXIST)
@@ -381,7 +455,7 @@ bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
             ::close(fd);
             if (written != static_cast<ssize_t>(owner.size()))
             {
-                ::unlink(path.c_str());
+                ::unlinkat(mDirectory.get(), claim.c_str(), 0);
                 throw RemoteMemError("KVCM2 remote level: writing claim " + path + " failed");
             }
             uint64_t address = 0;
@@ -392,7 +466,7 @@ bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
             catch (RemoteMemError const& e)
             {
                 // E.g. a crashed donor whose .ready file stayed: no claims from it, the next donor is tried.
-                ::unlink(path.c_str());
+                ::unlinkat(mDirectory.get(), claim.c_str(), 0);
                 donor.withdrawn = true;
                 mLastClaimError = e.what();
                 TLLM_LOG_WARNING("KVCM2 remote level: no claims from donor %s (%s): %s", donor.name.c_str(),
@@ -401,12 +475,12 @@ bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
             }
             catch (...)
             {
-                ::unlink(path.c_str());
+                ::unlinkat(mDirectory.get(), claim.c_str(), 0);
                 throw;
             }
             out = RemoteChunk{index, address, donor.chunks[chunk].second};
             donor.nextClaim = chunk + 1;
-            mClaims.push_back(path);
+            mClaims.push_back(claim);
             mClaimedBytes += out.bytes;
             return true;
         }
@@ -519,15 +593,15 @@ void RemoteMemClient::abandon() noexcept
 
 SharedPtr<RemoteMemClient> makeRemoteMemClient(RemoteMemOptions options, RemoteTransferConfig const& transferConfig)
 {
-    TLLM_CHECK_WITH_INFO(std::filesystem::is_directory(options.directory),
-        "KVCM2 remote level: rendezvous directory '%s' does not exist", options.directory.c_str());
+    auto directory = openRendezvousDirectory(options.directory);
     // Unique among the process's clients, past and present: it names the transfer agent and the owner of each claim.
     static std::atomic<uint64_t> sClients{0};
     std::string name = "kvcm2-remote-" + hostName() + "-" + std::to_string(::getpid()) + "-"
         + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "-"
         + std::to_string(sClients.fetch_add(1));
     auto backend = makeRemoteTransferBackend(transferConfig, name);
-    return makeShared<RemoteMemClient>(std::move(name), std::move(options), transferConfig, std::move(backend));
+    return makeShared<RemoteMemClient>(
+        std::move(name), std::move(options), std::move(directory), transferConfig, std::move(backend));
 }
 
 // ---------------------------------------------------------------------------

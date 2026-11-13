@@ -1028,6 +1028,44 @@ class TestRemotePoolRatio(_Transport, unittest.TestCase):
 class TestRemoteTierCombinations(_Transport, unittest.TestCase):
     """A remote level stages pages through pinned host memory, so it cannot sit next to a file-backed disk level."""
 
+    def _single_level_manager(self, directory: str):
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=DataRole("key"), size=64 << 10)],
+            )
+        ]
+        return KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=32,
+                cache_tiers=[
+                    GpuCacheTierConfig(quota=32 << 20),
+                    self.remote_tier(64 << 20, directory=directory, wait_timeout_ms=5_000),
+                ],
+                layers=layers,
+            )
+        )
+
+    def test_the_rendezvous_directory_must_be_this_users_private_directory(self) -> None:
+        """The client reads donor files only through the directory it checked.
+
+        Never through a symlink in its place, never from a directory others can write.
+        """
+        parent = tempfile.mkdtemp(prefix="kvcm2_pin_")
+        try:
+            link = os.path.join(parent, "link")
+            os.symlink(self.module_dir, link)
+            with self.assertRaisesRegex(Exception, "symlink"):
+                self._single_level_manager(link)
+            shared = os.path.join(parent, "shared")
+            os.mkdir(shared)
+            os.chmod(shared, 0o770)
+            with self.assertRaisesRegex(Exception, "not writable by group or others"):
+                self._single_level_manager(shared)
+        finally:
+            gc.collect()
+            shutil.rmtree(parent, ignore_errors=True)
+
     def test_a_file_backed_disk_level_is_rejected(self) -> None:
         disk_dir = tempfile.mkdtemp(prefix="kvcm2_disk_")
         try:

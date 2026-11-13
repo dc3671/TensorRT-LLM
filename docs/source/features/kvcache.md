@@ -406,7 +406,11 @@ The Slurm launcher in `examples/disaggregated/slurm/benchmark` fills in `directo
 the job sees; environment variables in it are expanded. Use a new directory for
 each job. Donor files hold NIXL memory registration keys or fabric handles, so the
 directory is created with mode 0700, every file in it is 0600, and a rank refuses
-a directory that another user owns or that group or others can write.
+a directory that another user owns, that group or others can write, or that is a
+symlink. A claimant opens the directory once, checks it, and reads every donor
+file through that handle, only from files the job's user owns. Put the directory
+where only users you trust can rename or replace it: a user who can write one of
+its parent directories can move it aside before a rank opens it.
 
 **Transport.** `transport: nixl` (the default) moves pages with one-sided NIXL
 RDMA; `ucx_devices` selects the UCX devices of its agents. `transport: fabric`

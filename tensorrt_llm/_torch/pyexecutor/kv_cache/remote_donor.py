@@ -46,6 +46,7 @@ import fcntl
 import mmap
 import os
 import socket
+import stat
 import threading
 import time
 import uuid
@@ -149,9 +150,14 @@ def _log(message: str) -> None:
 
 
 def ensure_rendezvous_directory(directory: str) -> None:
-    """Create `directory` as 0700, or accept an existing one only if this user owns it and nobody else can write it."""
+    """Create `directory` as 0700, or accept an existing one only if it is a directory (not a symlink to one) that this
+    user owns and nobody else can write. Clients pin the directory they checked (C++ ``RemoteMemClient``)."""
     os.makedirs(directory, mode=0o700, exist_ok=True)
-    st = os.stat(directory)
+    st = os.lstat(directory)
+    if not stat.S_ISDIR(st.st_mode):
+        raise PermissionError(
+            f"KVCM2 remote rendezvous directory {directory} must be a directory, not a symlink or another file"
+        )
     if st.st_uid != os.geteuid() or st.st_mode & 0o022:
         raise PermissionError(
             f"KVCM2 remote rendezvous directory {directory} must be owned by uid {os.geteuid()} and not writable by "
@@ -160,13 +166,20 @@ def ensure_rendezvous_directory(directory: str) -> None:
 
 
 def _write_atomically(path: str, data: bytes) -> None:
-    tmp = f"{path}.tmp.{os.getpid()}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    # A fresh name, created exclusively and never through a symlink: a planted file or link is not written through.
+    tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def _withdraw_unowned(
