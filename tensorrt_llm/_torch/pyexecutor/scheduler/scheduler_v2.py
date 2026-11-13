@@ -2240,7 +2240,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not self.recover_lost_kv_per_rank:
             raise RemoteMemError(
                 f"Request {req.py_request_id} lost KV pages to a failed remote cache level on this rank, whose "
-                f"TP/CP/PP peers schedule in lock step and did not see the failure; stopping the executor: {error}"
+                f"TP/CP/PP peers schedule in lock step and did not see the failure; stopping the executor"
             ) from error
         if not self._is_started_request(req):
             logger.warning(
