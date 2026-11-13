@@ -555,6 +555,93 @@ async def test_coordinator_stop_fails_seat_waiters():
     await asyncio.wait_for(coordinator.stop(), timeout=5)
     with pytest.raises(NoGenerationSeatError, match="stopping"):
         await asyncio.wait_for(waiting, timeout=5)
+    # A request arriving after that is refused at once rather than queued.
+    with pytest.raises(NoGenerationSeatError, match="stopping"):
+        await asyncio.wait_for(coordinator.select("generation", {}, 3, None), timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uds", [False, True], ids=["lifespan", "uds_and_tcp"])
+async def test_coordinator_shutdown_answers_parked_selects_at_once(tmp_path, monkeypatch, uds):
+    """Uvicorn's graceful shutdown waits for in-flight requests: a parked /select gets 503 first."""
+    import socket
+
+    import aiohttp
+
+    from tensorrt_llm.serve import coordinator_server
+
+    created = []
+    real_create = coordinator_server.create_uvicorn_server
+
+    def create(config):
+        created.append(real_create(config))
+        return created[-1]
+
+    monkeypatch.setattr(coordinator_server, "create_uvicorn_server", create)
+    coordinator = _coordinator()
+    coordinator.start = AsyncMock()  # no servers to prepare or wait for
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    monkeypatch.chdir(tmp_path)  # a relative path keeps the socket under AF_UNIX's 108-byte limit
+    uds_path = "coordinator.sock" if uds else None
+    serving = asyncio.create_task(
+        CoordinatorServer(coordinator)("127.0.0.1", port, uds=uds_path, sockets=[sock])
+    )
+    connector = aiohttp.UnixConnector(path=uds_path) if uds else aiohttp.TCPConnector()
+    base = "http://localhost" if uds else f"http://127.0.0.1:{port}"
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+
+            async def select(rid):
+                body = msgpack.packb({"role": "generation", "routing_key": {}, "req_id": rid})
+                async with session.post(f"{base}/select", data=body) as resp:
+                    return resp.status, msgpack.unpackb(await resp.read(), raw=False)
+
+            for _ in range(200):
+                try:
+                    status, _ = await select(1)  # takes the only seat
+                    break
+                except aiohttp.ClientConnectionError:
+                    await asyncio.sleep(0.05)
+            assert status == 200
+            parked = asyncio.create_task(select(2))
+            await asyncio.sleep(0.3)
+            assert not parked.done()
+            for server in created:
+                server.should_exit = True  # what SIGINT / SIGTERM do
+            status, body = await asyncio.wait_for(parked, timeout=3)
+            assert status == 503 and body["no_generation_seat"] is True
+        await asyncio.wait_for(asyncio.shield(serving), timeout=3)
+    finally:
+        await coordinator.stop()
+        for server in created:
+            server.force_exit = True
+        await asyncio.wait_for(serving, timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_finish_before_select_refuses_the_late_select(monkeypatch):
+    """A cancelled request's /finish can overtake its /select; that select must not queue."""
+    coordinator = _coordinator()
+    assert (await coordinator.select("generation", {}, 1, None))[0] == "g:1"
+    await coordinator.finish("generation", 2)
+    with pytest.raises(ValueError, match="finished before its placement"):
+        await asyncio.wait_for(coordinator.select("generation", {}, 2, None), timeout=5)
+    router = coordinator.gen_router
+    assert len(router._pool) == 0 and ("generation", 2) not in coordinator._reservation_tasks
+    await coordinator.finish("generation", 1)
+    assert (await coordinator.select("generation", {}, 3, None))[0] == "g:1"
+    await coordinator.finish("generation", 3)
+    # The memory is bounded in count and in time.
+    monkeypatch.setattr("tensorrt_llm.serve.router.POOLED_FINISHED_MAX", 4)
+    for rid in range(10, 20):
+        await coordinator.finish("generation", rid)
+    assert list(router._finished_ids) == [16, 17, 18, 19]
+    monkeypatch.setattr("tensorrt_llm.serve.router.POOLED_FINISHED_TTL_S", 0.0)
+    assert (await coordinator.select("generation", {}, 19, None))[0] == "g:1"
+    await coordinator.finish("generation", 19)
 
 
 @pytest.mark.asyncio

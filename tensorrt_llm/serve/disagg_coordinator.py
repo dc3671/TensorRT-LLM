@@ -493,13 +493,20 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 )
             await self._wait_for_all_servers_ready()
 
-    async def stop(self) -> None:
-        # Requests waiting for a generation seat would otherwise hold their /select open.
+    async def fail_seat_waiters(self) -> None:
+        """Fail the requests waiting for a generation seat and refuse new ones (shutdown).
+
+        They would otherwise hold their /select open until a seat frees or their KV transfer
+        deadline passes. Idempotent.
+        """
         for router in (self._ctx_router, self._gen_router):
             if router.pooled:
                 failed = await router.fail_waiters("the disaggregated coordinator is stopping")
                 if failed:
                     logger.info(f"Failed {failed} requests waiting for a seat at shutdown")
+
+    async def stop(self) -> None:
+        await self.fail_seat_waiters()
         reservations = list(self._reservation_tasks.values())
         self._reservation_tasks.clear()
         for reservation in reservations:

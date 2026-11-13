@@ -58,6 +58,8 @@ TIMEOUT_KEEP_ALIVE = 10  # seconds
 # The kernel caps the value at net.core.somaxconn.
 COORDINATOR_UDS_BACKLOG = 16384
 MSGPACK_MEDIA_TYPE = "application/msgpack"
+# How often serving checks whether a uvicorn server began its shutdown (uvicorn's own tick).
+SHUTDOWN_POLL_S = 0.1
 
 
 def _effective_uds_backlog() -> int:
@@ -74,6 +76,8 @@ class CoordinatorServer:
 
     def __init__(self, coordinator: DisaggCoordinatorService) -> None:
         self._coordinator = coordinator
+        # The uvicorn servers of the running __call__.
+        self.servers: list[uvicorn.Server] = []
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -271,8 +275,6 @@ class CoordinatorServer:
         if uds:
             # uvicorn.Config binds uds XOR host:port, so run two Servers: UDS for
             # the fleet (hot path) and TCP for health/external clients.
-            import asyncio as _asyncio
-
             await self._coordinator.start()
             backlog = _effective_uds_backlog()
             if backlog < COORDINATOR_UDS_BACKLOG:
@@ -286,15 +288,45 @@ class CoordinatorServer:
                     self.app, uds=uds, lifespan="off", backlog=COORDINATOR_UDS_BACKLOG, **kwargs
                 )
                 tcp_cfg = uvicorn.Config(self.app, host=host, port=port, lifespan="off", **kwargs)
-                await _asyncio.gather(
-                    create_uvicorn_server(uds_cfg).serve(),
-                    create_uvicorn_server(tcp_cfg).serve(sockets=sockets),
+                await self._serve(
+                    [
+                        (create_uvicorn_server(uds_cfg), None),
+                        (create_uvicorn_server(tcp_cfg), sockets),
+                    ]
                 )
             finally:
                 await self._coordinator.stop()
         else:
             config = uvicorn.Config(self.app, host=host, port=port, **kwargs)
-            await create_uvicorn_server(config).serve(sockets=sockets)
+            await self._serve([(create_uvicorn_server(config), sockets)])
+
+    async def _serve(
+        self, servers: list[tuple[uvicorn.Server, Optional[list[socket.socket]]]]
+    ) -> None:
+        """Run ``servers`` (with their sockets); fail the seat waiters once one of them stops.
+
+        uvicorn's graceful shutdown waits for every request in flight, and a pooled /select
+        waiting for a generation seat ends only at its seat or its KV transfer deadline (none
+        without one), so the lifespan exit or the caller's ``stop()`` would come too late.
+        """
+        self.servers = [server for server, _ in servers]
+        watcher = asyncio.create_task(self._fail_seat_waiters_at_shutdown())
+        try:
+            # A listener without sockets (UDS) binds its own.
+            await asyncio.gather(
+                *(
+                    server.serve() if socks is None else server.serve(sockets=socks)
+                    for server, socks in servers
+                )
+            )
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    async def _fail_seat_waiters_at_shutdown(self) -> None:
+        while not any(server.should_exit for server in self.servers):
+            await asyncio.sleep(SHUTDOWN_POLL_S)
+        await self._coordinator.fail_seat_waiters()
 
 
 def serve_coordinator(host: str, port: int, coordinator: DisaggCoordinatorService) -> None:

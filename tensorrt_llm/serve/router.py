@@ -58,6 +58,10 @@ COORDINATOR_FINISH_DRAIN_TIMEOUT_S = 5.0
 COORDINATOR_POOLED_FINISH_MAX_RETRY_DELAY_S = 5.0
 # A fleet worker's bound on a pooled generation /select, which waits for a free seat.
 POOLED_SELECT_TIMEOUT_S = 3600.0
+# How long, and for how many request ids, a pooled router placed by id remembers a /finish: a
+# /select for that id arriving later (it raced the finish of a cancelled request) is refused.
+POOLED_FINISHED_TTL_S = 600.0
+POOLED_FINISHED_MAX = 1 << 17
 _UNREAD = object()
 
 # Max number of conversations whose home-server pin is retained (LRU).
@@ -898,6 +902,11 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
     A seat is released on the server state it was taken from: a server that leaves while
     requests hold its seats keeps that state, and gets it back if it rejoins, so its seat
     count stays right across a re-registration.
+
+    Placed by request id (the coordinator), the router remembers each finished id for
+    ``POOLED_FINISHED_TTL_S`` and refuses a later select for it: a cancelled request's
+    /finish can overtake its own /select. After :meth:`fail_waiters` (shutdown) it refuses
+    every new request.
     """
 
     pooled = True
@@ -938,11 +947,16 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
         self._context_router: Optional[Router] = None
         # The value last read from the context servers (_UNREAD: none yet).
         self._reported_kv_timeout_ms: Any = _UNREAD
+        # Request ids finished by id -> when, oldest first.
+        self._finished_ids: OrderedDict[int, float] = OrderedDict()
+        # Set by fail_waiters: why new requests are refused.
+        self._stopping_reason: Optional[str] = None
         logger.info(f"PooledLoadBalancingRouter: "
                     f"{self._pool.describe(len(self._servers))}")
         self._warn_if_cap_exceeds_kv_timeout(kv_transfer_timeout_ms)
 
-    def _warn_if_cap_exceeds_kv_timeout(self, kv_transfer_timeout_ms) -> None:
+    def _warn_if_cap_exceeds_kv_timeout(
+            self, kv_transfer_timeout_ms: Optional[float]) -> None:
         max_queue_wait_s = self._pool.max_wait_s
         if (max_queue_wait_s is not None and kv_transfer_timeout_ms is not None
                 and max_queue_wait_s * 1000.0 > kv_transfer_timeout_ms):
@@ -1036,8 +1050,9 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                     NoGenerationSeatError(self._pool.expiry_message(expired)))
 
     async def fail_waiters(self, reason: str) -> int:
-        """Fail every request still waiting for a seat (the coordinator stops)."""
+        """Fail the requests waiting for a seat and refuse new ones (shutdown)."""
         async with self._lock:
+            self._stopping_reason = reason
             waiters = self._pool.waiters()
             for waiter in waiters:
                 self._pool.remove(waiter.rid)
@@ -1074,12 +1089,16 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                        rid: int,
                        priority: Optional[float],
                        exclude_server: Optional[str],
-                       orig_elapsed_s: Optional[float] = None) -> str:
+                       orig_elapsed_s: Optional[float] = None,
+                       by_id: bool = False) -> str:
         """Wait for a seat and return its server.
 
         A repeated call for a request that holds a seat returns that seat; one for a
-        waiting request shares its place in the queue. Raises ``ValueError`` once a
-        request past its context phase has waited the KV transfer timeout.
+        waiting request shares its place in the queue. Raises ``NoGenerationSeatError``
+        once the request has waited the context servers' KV transfer timeout (every
+        waiter, when that timeout is known) or when :meth:`fail_waiters` runs at
+        shutdown (also for a new request afterwards), and ``ValueError`` if the request
+        is finished while it waits or, with ``by_id``, was finished before this call.
         """
         async with self._lock:
             server = self._req_routing_table.get(rid)
@@ -1087,6 +1106,11 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                 return server
             waiter = self._pool.waiter(rid)
             if waiter is None:
+                if self._stopping_reason is not None:
+                    raise NoGenerationSeatError(self._stopping_reason)
+                if by_id and self._was_finished_locked(rid):
+                    raise ValueError(f"generation request {rid} was finished "
+                                     f"before its placement")
                 self._refresh_kv_timeout()
                 waiter = self._pool.add(
                     rid, priority, exclude_server,
@@ -1167,9 +1191,11 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                 "request ID")
         self._validate_servers_available()
         routing_key = routing_key or {}
-        server = await self._acquire(req_id, routing_key.get("priority"),
+        server = await self._acquire(req_id,
+                                     routing_key.get("priority"),
                                      exclude_server,
-                                     routing_key.get("orig_elapsed_s"))
+                                     routing_key.get("orig_elapsed_s"),
+                                     by_id=True)
         return server, {
             "server_info": self._server_info.get(server, {})
         }, req_id
@@ -1181,7 +1207,22 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
         if req_id is None:
             return
         async with self._lock:
+            self._remember_finished_locked(req_id)
             await self._release_locked(req_id)
+
+    def _remember_finished_locked(self, rid: int) -> None:
+        now = time.monotonic()
+        finished = self._finished_ids
+        finished[rid] = now
+        finished.move_to_end(rid)
+        while finished and (len(finished) > POOLED_FINISHED_MAX or next(
+                iter(finished.values())) <= now - POOLED_FINISHED_TTL_S):
+            finished.popitem(last=False)
+
+    def _was_finished_locked(self, rid: int) -> bool:
+        finished_at = self._finished_ids.get(rid)
+        return (finished_at is not None
+                and time.monotonic() - finished_at < POOLED_FINISHED_TTL_S)
 
 
 class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
@@ -2300,8 +2341,8 @@ class CoordinatorDelegatingRouter(Router):
         if self.pooled:
             from tensorrt_llm.serve.disagg_coordinator import (
                 POOLED_RESERVATION_TIMEOUT_S, coordinator_reservation_timeout)
-            self._pooled_finish_window_s = max(coordinator_reservation_timeout(),
-                                               POOLED_RESERVATION_TIMEOUT_S)
+            self._pooled_finish_window_s = max(
+                coordinator_reservation_timeout(), POOLED_RESERVATION_TIMEOUT_S)
         # Coordinator HTTP-client API latency (includes network round-trip to the
         # coordinator + its in-process handler). Compare against the owner-side
         # [coord_api] to isolate the fleet /select|/finish HTTP overhead.
@@ -2613,8 +2654,9 @@ class CoordinatorDelegatingRouter(Router):
                     delay = min(delay,
                                 COORDINATOR_POOLED_FINISH_MAX_RETRY_DELAY_S)
                     give_up = (isinstance(e, _CoordinatorFinishError)
-                               and 400 <= e.status < 500) or (
-                                   time.monotonic() + delay >= give_up_at)
+                               and 400 <= e.status < 500) or (time.monotonic() +
+                                                              delay
+                                                              >= give_up_at)
                 if give_up:
                     logger.warning(
                         f"CoordinatorDelegatingRouter finish failed after "
