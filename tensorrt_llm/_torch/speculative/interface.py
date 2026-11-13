@@ -3328,7 +3328,10 @@ class SpecWorkerBase(nn.Module, ABC):
 
         ``tokens_out`` (int32 ``[num_tokens]``, optional, not with
         ``mapping_lm_head_tp``): the tokens are written there and it is
-        returned (the one-launch LL exchange writes it directly).
+        returned (the one-launch LL exchange writes it directly). Overrides
+        take the same parameters (``sample_draft_tokens`` passes
+        ``tokens_out`` by keyword, only when it has one) and return
+        ``tokens_out`` when given; see ``_tokens_into``.
 
         Under ADP + LM-head TP (``mapping_lm_head_tp`` given) the logits are the
         LM-head-TP group's row-stacked batch (``tp_size`` segments of
@@ -3593,11 +3596,20 @@ class SpecWorkerBase(nn.Module, ABC):
                     and mapping_lm_head_tp is None and out.dtype == torch.int32
                     and out.is_contiguous() and out.numel() == logits.shape[0]):
                 tokens_out = out
-            tokens = self.greedy_sample_draft_with_tp_gather(
-                logits.reshape(-1, logits.shape[-1]),
-                spec_metadata,
-                mapping_lm_head_tp,
-                tokens_out=tokens_out)
+            flat_logits = logits.reshape(-1, logits.shape[-1])
+            if tokens_out is None:
+                tokens = self.greedy_sample_draft_with_tp_gather(
+                    flat_logits, spec_metadata, mapping_lm_head_tp)
+            else:
+                tokens = self.greedy_sample_draft_with_tp_gather(
+                    flat_logits,
+                    spec_metadata,
+                    mapping_lm_head_tp,
+                    tokens_out=tokens_out)
+                # The contract is that the sampler returns tokens_out; hold
+                # an override that returned its own tensor to it.
+                if tokens is not tokens_out:
+                    tokens = self._tokens_into(tokens.reshape(-1), tokens_out)
             if mapping_lm_head_tp is None:
                 tokens = tokens.reshape(batch_shape)
             # else: ADP+LM-head-TP (2D step form only) -- the sampler returned
