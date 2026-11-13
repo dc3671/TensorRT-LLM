@@ -328,6 +328,35 @@ def test_children_need_their_slots_on_one_rank():
     assert _round(router, queue, [5, 0, 0, 0], 8) == {1: 0}
 
 
+def test_a_request_no_rank_can_take_whole_is_admitted_at_once():
+    """1 + children over the per-rank cap fits no home, so it is not held (it would never age): as without home-wait."""
+    router = _router(rounds=10)
+    _bind(router, {"A": 0})
+    queue = FCFSWaitingQueue()
+    queue.add_request(_item(1, "A", children=2))  # needs 3 slots, the cap is 2
+    pos = _round(router, queue, [0, 0, 0, 0], 2)
+    assert list(pos) == [1]
+    assert len(queue) == 0
+    assert router._conv_to_rank["A"] == 0
+
+
+def test_no_kv_balance_admits_in_queue_order():
+    """Warmup and the benchmark fill phase pass kv_balance=False: FIFO, no request held for its home rank."""
+    router = _router(rounds=10)
+    ref = ConversationAwareADPRouter(dist=_dist(4))
+    _bind(router, {"A": 0})
+    _bind(ref, {"A": 0})
+    q1, q2 = FCFSWaitingQueue(), FCFSWaitingQueue()
+    for queue in (q1, q2):
+        queue.add_requests([_item(1, "A"), _item(2, "C")])
+    states = _states([1, 0, 0, 0])
+    got, plan = router.pop_requests(q1, states, 3, 1, kv_balance=False)
+    want, _ = ref.pop_requests(q2, states, 3, 1, kv_balance=False)
+    assert [x.id for x in got] == [x.id for x in want] == [1, 2]
+    assert plan == {}
+    assert router._home_wait_age == {}
+
+
 def test_strict_explicit_rank_waits_relaxed_one_moves():
     router = _router(rounds=10)
     queue = FCFSWaitingQueue()

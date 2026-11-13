@@ -1206,8 +1206,15 @@ class ConversationAwareADPRouter(ADPRouter):
         Other requests are admitted as without home-wait. Later requests of a held request's admission group
         may pass it; a later group may too, except into its home rank, so that each rank still admits in group
         (priority) order. Held requests stay in order. A round passes over at most ``HOME_WAIT_MAX_PASSED`` requests.
+        A request no single rank can take (1 + children > ``max_num_active_requests``) is never held, and with
+        ``kv_balance`` False (warmup, benchmark fill phase) the base FIFO pop runs.
         """
-        if self._home_wait_rounds is None or max_new_requests <= 0 or len(all_rank_states) <= 1:
+        if (
+            self._home_wait_rounds is None
+            or not kv_balance
+            or max_new_requests <= 0
+            or len(all_rank_states) <= 1
+        ):
             return super().pop_requests(
                 waiting_queue,
                 all_rank_states,
@@ -1272,7 +1279,11 @@ class ConversationAwareADPRouter(ADPRouter):
                         for r in range(tp_size)
                         if r != home
                     )
-                    if other_room and ages.get(item.id, 0) >= self._home_wait_rounds:
+                    # A request that no rank can take whole (1 + children over the per-rank cap) is never planned:
+                    # its home would never have room, so it is admitted unplanned at once, as without home-wait.
+                    if need > max_num_active_requests or (
+                        other_room and ages.get(item.id, 0) >= self._home_wait_rounds
+                    ):
                         budget -= need
                         chosen_idx.append(idx)
                     else:
