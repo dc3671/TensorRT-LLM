@@ -118,10 +118,10 @@ enum class RemoteTransport : int
     FABRIC = 1,
 };
 
-//! How a remote tier's pages move, apart from what memory it declares (RemoteCacheTierConfig).
 //! Upper bound of the remote tier's timeouts: 1e6 s, as RemoteCacheConfig allows.
 inline constexpr int64_t kMaxRemoteTimeoutMs = 1'000'000'000;
 
+//! How a remote tier's pages move, apart from what memory it declares (RemoteCacheTierConfig).
 struct RemoteTransferConfig
 {
     RemoteTransport transport = RemoteTransport::NIXL;
