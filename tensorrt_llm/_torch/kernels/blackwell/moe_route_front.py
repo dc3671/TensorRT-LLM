@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """MoE decode route front (512 experts, top-10) for DecodeFront's steps above the one-launch front
-(``decode_front.route_front_steps``: from 33 rows, or from 17 where the model declares the TP decode kernels).
+(``decode_front.route_front_steps``: from ``ROUTER_MAX_TOKENS + 1`` rows, or from ``FUSED_FRONT_MAX_TOKENS + 1``
+where the model declares the TP decode kernels).
 
-After the router GEMM (the stock one; with the decode kernels, the CuTe router GEMM for 33-128 rows), routing +
+After the router GEMM (the stock one; with the decode kernels, the CuTe router GEMM for ``ROUTER_MAX_TOKENS + 1`` to
+``ROUTER_GEMM_MAX_TOKENS`` rows; constants of ``decode_front``), routing +
 trtllm-gen pre-routed tables + NVFP4 quantization of the MoE input run in one launch of thread-block clusters.
 :mod:`moe_decode_front` covers the smaller steps with a single routing CTA. Outputs are
 bitwise: ids / BF16 weights as :mod:`moe_decode_front`, xq / xsf as ``fp4_quantize`` (linear scale layout), tables

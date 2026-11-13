@@ -235,8 +235,9 @@ def _compiled(
     import cuda.bindings.driver as cuda
     import cutlass.cute as cute
 
-    from ..kernels.blackwell.low_m_mma_gemm import LowMMmaGemmKernel
+    from ..kernels.blackwell.low_m_mma_gemm import MAX_ROWS, LowMMmaGemmKernel
 
+    assert SHARED_EXPERT_MAX_M <= MAX_ROWS
     kernel = LowMMmaGemmKernel(
         num_rows=m,
         k_extent=k,
@@ -594,7 +595,8 @@ def fused_shared_expert(
     return out, gate_logits
 
 
-# Most rows of the shared expert's raced two-launch path (the kernel's row bound).
+# Most rows of the shared expert's raced two-launch path: the kernel's row bound
+# (kernels/blackwell/low_m_mma_gemm.MAX_ROWS, checked where the kernel is built).
 SHARED_EXPERT_MAX_M = 128
 _SHARED_EXPERT_BUCKETS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, SHARED_EXPERT_MAX_M)
 
