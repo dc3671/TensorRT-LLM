@@ -463,7 +463,7 @@ def test_delegating_router_waits_longer_for_a_pooled_select():
     assert plain._select_timeout_s == 5.0
 
 
-# ---------------------------------------------------------------------------------- review fixes
+# ------------------------------------------------ server churn, seat lifecycle and /finish delivery
 
 
 async def _set_servers(router, servers):
