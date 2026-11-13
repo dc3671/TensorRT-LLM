@@ -209,9 +209,11 @@ def test_routes_from_logits_yields_to_host_top_k_readers(monkeypatch):
     with monkeypatch.context() as m:
         m.setattr(ExpertStatistic, "expert_statistic_obj", object())
         assert separated()
-    with monkeypatch.context() as m:
-        m.setattr(get_calibrator(), "mode", Mode.COLLECT)
-        assert separated()
+    # MARK reads no ids, but its trace must run the kernels of the COLLECT / REPLAY traces it is matched with.
+    for mode in (Mode.COLLECT, Mode.REPLAY, Mode.MARK):
+        with monkeypatch.context() as m:
+            m.setattr(get_calibrator(), "mode", mode)
+            assert separated(), mode
     assert not separated()
 
 

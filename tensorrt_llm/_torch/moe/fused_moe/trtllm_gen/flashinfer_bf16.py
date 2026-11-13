@@ -53,7 +53,11 @@ _LOGITS_ROUTING_MAX_TOP_K = 16
 
 def _host_top_k_observed() -> bool:
     """Whether a reader of the host-side top-k is active: the running engine's Router Replay capturer, expert
-    statistics, or the layer-wise calibrator (``moe_scheduler`` hands them the separated routing's ids only)."""
+    statistics, or the layer-wise calibrator (``moe_scheduler`` hands them the separated routing's ids only).
+
+    Every calibrator mode counts: COLLECT and REPLAY read / write the ids, and MARK, which reads none, records the
+    eager trace whose kernels ``correlation.py`` matches against the COLLECT trace and the layer-wise replay, so it
+    runs their kernel sequence (host top-k + pack) too."""
     return (
         get_active_route_capture() is not None
         or ExpertStatistic.get() is not None
