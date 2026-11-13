@@ -56,6 +56,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import subprocess  # nosec B404 - runs sys.executable -I with a fixed argv, no shell
 import sys
 import threading
@@ -765,6 +766,9 @@ def request_inputs(request: Any) -> Tuple[Optional[str], Optional[float]]:
 
 
 _USAGE_MARK = b'"completion_tokens"'
+# A line with a ``choices`` key that is an empty list or null; a line with a non-empty one is
+# not a usage-only chunk, so it is not decoded (with continuous usage every chunk has usage).
+_NO_CHOICES = re.compile(rb'"choices"\s*:\s*(?:\[\s*\]|null)')
 
 
 def _sse_json(event: bytes) -> Optional[dict]:
@@ -785,11 +789,16 @@ def _sse_json(event: bytes) -> Optional[dict]:
 
 
 def completion_tokens_in(data: bytes) -> Tuple[Optional[int], bool]:
-    """Scan SSE ``data:`` lines for ``usage.completion_tokens``: (value, from a final usage-only chunk)."""
+    """Scan SSE ``data:`` lines for a usage-only chunk's ``usage.completion_tokens``: (value, True).
+
+    (None, False) without one. Only lines that may be such a chunk are decoded.
+    """
     if _USAGE_MARK not in data:
         return None, False
     found, final = None, False
     for line in data.split(b"\n"):
+        if (b'"choices"' in line and not _NO_CHOICES.search(line)) or _USAGE_MARK not in line:
+            continue
         obj = _sse_json(line)
         usage = obj.get("usage") if obj is not None else None
         if isinstance(usage, dict) and usage.get("completion_tokens") is not None:

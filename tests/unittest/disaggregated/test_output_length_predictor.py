@@ -406,8 +406,36 @@ def test_completion_tokens_in():
     assert olp.completion_tokens_in(b"data: {}\n") == (None, False)
     usage = {"usage": {"completion_tokens": 42}}
     assert olp.completion_tokens_in(_sse(dict(usage, choices=[]))) == (42, True)
-    assert olp.completion_tokens_in(_sse(dict(usage, choices=[{"x": 1}]))) == (42, False)
+    assert olp.completion_tokens_in(_sse(dict(usage, choices=[{"x": 1}]))) == (None, False)
+    assert olp.completion_tokens_in(_sse(dict(usage, choices=None))) == (42, True)
+    assert olp.completion_tokens_in(_sse(usage)) == (42, True)
     assert olp.completion_tokens_in(b"data: [DONE]\n") == (None, False)
+
+
+@pytest.mark.asyncio
+async def test_continuous_usage_stream_decodes_only_its_final_chunk(monkeypatch):
+    """With continuous usage stats every chunk carries usage; only the usage-only one is decoded."""
+    decoded = []
+    real = olp._sse_json
+    monkeypatch.setattr(olp, "_sse_json", lambda event: decoded.append(event) or real(event))
+    coordinator = _FakeCoordinator()
+    frontend = olp.OutputLengthPriority(coordinator, "ridge")
+    ticket = olp._Ticket("c1", 2000.0, 7)
+    compact = json.dumps(
+        {"choices": [], "usage": {"completion_tokens": 300}}, separators=(",", ":")
+    )
+
+    async def stream():
+        for i in range(1, 300):
+            yield _sse(
+                {"choices": [{"delta": {"content": "x"}}], "usage": {"completion_tokens": i}}
+            )
+        yield f"data: {compact}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    assert len([chunk async for chunk in frontend.track(stream(), ticket)]) == 301
+    await asyncio.sleep(0.01)
+    assert coordinator.recorded == [("c1", 2000.0, 300.0, 7)] and len(decoded) == 1
 
 
 @pytest.mark.asyncio
