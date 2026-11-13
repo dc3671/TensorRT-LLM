@@ -445,9 +445,12 @@ def executor_for_preemption(p, reqs, scheduler):
         _cancelled_disagg_model_request_ids=set,
         _maybe_record_hang_diagnostic_phase=Mock(),
     )
-    executor._cancelled_disagg_model_request_ids = MethodType(
-        PyExecutor._cancelled_disagg_model_request_ids, executor
-    )
+    for name in (
+        "_cancelled_disagg_model_request_ids",
+        "_encoder_requests_in_arrival_order",
+        "_fit_encoder_requests_to_encoder_step",
+    ):
+        setattr(executor, name, MethodType(getattr(PyExecutor, name), executor))
     return executor
 
 
