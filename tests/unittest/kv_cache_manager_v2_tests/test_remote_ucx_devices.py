@@ -22,6 +22,8 @@ import types
 import unittest
 from unittest import mock
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
 from tensorrt_llm._torch.pyexecutor.kv_cache.remote_donor import (
     make_donor,
@@ -37,6 +39,7 @@ def _visible(value=None):
     return mock.patch.dict(os.environ, env, clear=True)
 
 
+@pytest.mark.cpu_only
 class TestRemoteUcxDevices(unittest.TestCase):
     def test_unset_and_literal_values_pass_through(self):
         self.assertIsNone(resolve_ucx_devices(None, device=0))
@@ -80,6 +83,7 @@ class TestRemoteUcxDevices(unittest.TestCase):
 class TestNixlUcxBackendParams(unittest.TestCase):
     """NIXL 1.5.2's UCX backend reads `device_list` (names split on ", ", port 1 appended); `ucx_devices` is ignored."""
 
+    @pytest.mark.cpu_only
     def test_devices_become_the_device_list_nixl_reads(self):
         self.assertEqual(nixl_ucx_backend_params(None), {})
         self.assertEqual(nixl_ucx_backend_params("mlx5_0:1"), {"device_list": "mlx5_0"})
@@ -88,11 +92,13 @@ class TestNixlUcxBackendParams(unittest.TestCase):
             {"device_list": "rdma_vf_rail0, rdma_vf_rail2, mlx5_3"},
         )
 
+    @pytest.mark.cpu_only
     def test_a_port_other_than_1_raises(self):
         for devices in ("mlx5_0:2", "mlx5_0:1,", ":1"):
             with self.subTest(devices=devices), self.assertRaises(ValueError):
                 nixl_ucx_backend_params(devices)
 
+    # Not cpu_only: the NIXL donor registers its memory with a CUDA context current.
     def test_the_donor_agent_gets_the_device_list(self):
         """The donor's NIXL agent is created with `device_list` in its backend parameters."""
         configs = []
@@ -137,6 +143,7 @@ class TestNixlUcxBackendParams(unittest.TestCase):
         self.assertEqual(len(configs), 1)
         self.assertEqual(configs[0].backend_params, {"device_list": "mlx5_0, mlx5_3"})
 
+    @pytest.mark.cpu_only
     def test_the_remote_level_agent_gets_the_device_list(self):
         """The remote level's tier carries `device_list` to its NIXL agent's backend parameters."""
         from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2

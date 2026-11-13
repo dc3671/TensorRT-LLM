@@ -26,9 +26,15 @@ import unittest
 import weakref
 from unittest import mock
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
 
 _SIZE = 96 << 20
+
+
+# Host-only (no GPU): runs in the CPU stages.
+pytestmark = pytest.mark.cpu_only
 
 
 def _resident_bytes(address: int, size: int) -> int:

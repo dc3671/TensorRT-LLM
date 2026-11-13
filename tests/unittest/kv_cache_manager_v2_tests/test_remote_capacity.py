@@ -34,6 +34,8 @@ import time
 import unittest
 from unittest import mock
 
+import pytest
+
 from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
 from tensorrt_llm._torch.pyexecutor.kv_cache.remote_donor import (
     FabricDonorTransport,
@@ -77,6 +79,7 @@ def _publish(
     open(os.path.join(directory, f"donor.{name}.ready"), "w").close()
 
 
+@pytest.mark.cpu_only
 class TestCapacityCheck(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="kvcm2_capacity_")
@@ -313,6 +316,7 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertEqual(len(names), 64)
 
 
+@pytest.mark.cpu_only
 class TestRendezvousPermissions(unittest.TestCase):
     """Donor files hold NIXL registration keys and fabric handles: the directory and its files are the user's."""
 
@@ -340,6 +344,7 @@ class TestRendezvousPermissions(unittest.TestCase):
         self.assertEqual(os.stat(os.path.join(self.dir, "donor.x.failed")).st_mode & 0o077, 0)
 
 
+@pytest.mark.cpu_only
 class TestPopulate(unittest.TestCase):
     """Populate errors other than a missing MADV_POPULATE_WRITE (test_remote_donor_memory) raise."""
 
@@ -357,6 +362,7 @@ class TestPopulate(unittest.TestCase):
                 self._populate_with(OSError(code, os.strerror(code)))
 
 
+@pytest.mark.cpu_only
 class TestPlaceChunks(unittest.TestCase):
     """Chunk placement when the driver refuses chunks on a node that still has room.
 
@@ -564,6 +570,7 @@ class TestPlaceChunks(unittest.TestCase):
         self.assertNotIn(0, calls)
 
 
+@pytest.mark.cpu_only
 class TestNodeCompactionLock(unittest.TestCase):
     """The flock that lets one donor per host and NUMA node run reclaim-and-compact passes at a time."""
 
@@ -605,6 +612,7 @@ class TestNodeCompactionLock(unittest.TestCase):
             self.assertFalse(locked)
 
 
+@pytest.mark.cpu_only
 class TestBuddyInfo(unittest.TestCase):
     TEXT = (
         "Node 0, zone   Normal     10      5      3      2      1      0      0      0      0      4      2\n"
