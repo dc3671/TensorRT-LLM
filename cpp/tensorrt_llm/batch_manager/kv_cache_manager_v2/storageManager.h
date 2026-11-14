@@ -501,6 +501,8 @@ private:
     //! Drop the evictable pages of every failed remote level, which could not be read back, so reuse no longer finds
     //! them. Pages a request holds stay until it lets go of them (scheduleForEviction then drops them).
     void dropPagesOfFailedRemoteLevels();
+    //! The pages of `level`'s eviction queues with `status`, collected before any leaves a queue.
+    [[nodiscard]] std::vector<SharedPtr<Page>> queuedPages(CacheLevel level, PageStatus status);
     //! Run one remote transfer of a migration batch and act on its outcome: stream-ordered, the enqueue's; on the
     //! host, waited for up to the transfer timeout, and a transfer not quiesced by then keeps `staging` out of use.
     //! A fault or timeout fails the client (RemoteMemError).
@@ -520,6 +522,13 @@ private:
     template <typename Submit>
     bool submitColdPageCodec(PageIndexLocation location, PageIndexPair const* pageIndices, size_t numPages,
         CUstream stream, Submit&& submit);
+    //! Encode hot pages (PageIndexPair::src) of `layerGroup` into cold pages at `dstBase` (PageIndexPair::dst), the
+    //! cold level's base or a staging buffer; false if the codec rejects the batch.
+    bool encodeColdPages(LayerGroupId layerGroup, void* dstBase, PageIndexPair const* pageIndices, size_t numPages,
+        CUstream stream);
+    //! The reverse of encodeColdPages: cold pages at `srcBase` (src) into hot pages (dst).
+    bool decodeColdPages(LayerGroupId layerGroup, void const* srcBase, PageIndexPair const* pageIndices,
+        size_t numPages, CUstream stream);
 
     PoolGroupBase& poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx);
 

@@ -209,6 +209,22 @@ TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> computeSlotToPageIndices(Storage
     return result;
 }
 
+SlotId toSlotId(int32_t pageIndex)
+{
+    TLLM_CHECK_DEBUG(pageIndex >= 0);
+    return SlotId{pageIndex};
+}
+
+//! Drop a page-index buffer kept across calls (thread_local) once a large batch has grown it past 1 MiB.
+void trimRetainedPageIndices(std::vector<PageIndexPair>& pageIndices)
+{
+    constexpr size_t kMaxRetainedPageIndexPairs = (1u << 20u) / sizeof(PageIndexPair);
+    if (pageIndices.capacity() > kMaxRetainedPageIndexPairs)
+    {
+        std::vector<PageIndexPair>().swap(pageIndices);
+    }
+}
+
 void sortFallenPagesByPriority(TypedVec<LifeCycleId, std::deque<SharedPtr<Page>>>& fallenPages)
 {
     for (auto& pages : fallenPages)
@@ -675,6 +691,24 @@ bool StorageManager::remoteLevelFailed(CacheLevel level) const
     return remote != nullptr && remote->client().failed();
 }
 
+std::vector<SharedPtr<Page>> StorageManager::queuedPages(CacheLevel level, PageStatus status)
+{
+    auto& controller = mLevels.at(level).controller;
+    std::vector<SharedPtr<Page>> pages;
+    for (PoolGroupIndex pgIdx{0}; pgIdx < controller.numPoolGroups(); ++pgIdx)
+    {
+        auto next = controller.pageGenerator(pgIdx);
+        while (auto const* page = next())
+        {
+            if ((*page)->status() == status)
+            {
+                pages.push_back(*page);
+            }
+        }
+    }
+    return pages;
+}
+
 void StorageManager::dropPagesOfFailedRemoteLevels()
 {
     if (!mUnquiescedRemoteTransfers.empty())
@@ -687,19 +721,7 @@ void StorageManager::dropPagesOfFailedRemoteLevels()
         {
             continue;
         }
-        auto& controller = mLevels.at(level).controller;
-        std::vector<SharedPtr<Page>> dropped;
-        for (PoolGroupIndex pgIdx{0}; pgIdx < controller.numPoolGroups(); ++pgIdx)
-        {
-            auto next = controller.pageGenerator(pgIdx);
-            while (auto const* page = next())
-            {
-                if ((*page)->status() == PageStatus::DROPPABLE)
-                {
-                    dropped.push_back(*page);
-                }
-            }
-        }
+        auto const dropped = queuedPages(level, PageStatus::DROPPABLE);
         for (auto const& page : dropped)
         {
             excludeFromEviction(*page);
@@ -721,20 +743,7 @@ void StorageManager::dropPagesOfFailedRemoteLevels()
     if (lastLive < mLastLiveLevel)
     {
         mLastLiveLevel = lastLive;
-        auto& controller = mLevels.at(lastLive).controller;
-        std::vector<SharedPtr<Page>> held;
-        for (PoolGroupIndex pgIdx{0}; pgIdx < controller.numPoolGroups(); ++pgIdx)
-        {
-            auto next = controller.pageGenerator(pgIdx);
-            while (auto const* page = next())
-            {
-                if ((*page)->status() == PageStatus::HELD)
-                {
-                    held.push_back(*page);
-                }
-            }
-        }
-        for (auto const& page : held)
+        for (auto const& page : queuedPages(lastLive, PageStatus::HELD))
         {
             excludeFromEviction(*page);
         }
@@ -936,6 +945,28 @@ Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, Slot
     return mLevels.at(level).storage->slotAddress(pgIdx, slotId).at(poolIdx);
 }
 
+bool StorageManager::encodeColdPages(
+    LayerGroupId layerGroup, void* dstBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+{
+    return submitColdPageCodec(mPageIndexLocations.at(layerGroup), pageIndices, numPages, stream,
+        [this, layerGroup, dstBase](PageIndexPair const* submitted, size_t submittedPages, CUstream submittedStream)
+        {
+            return mColdPageCodec->encode(
+                layerGroup, dstBase, submitted, submittedPages, reinterpret_cast<cudaStream_t>(submittedStream));
+        });
+}
+
+bool StorageManager::decodeColdPages(
+    LayerGroupId layerGroup, void const* srcBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
+{
+    return submitColdPageCodec(mPageIndexLocations.at(layerGroup), pageIndices, numPages, stream,
+        [this, layerGroup, srcBase](PageIndexPair const* submitted, size_t submittedPages, CUstream submittedStream)
+        {
+            return mColdPageCodec->decode(
+                layerGroup, srcBase, submitted, submittedPages, reinterpret_cast<cudaStream_t>(submittedStream));
+        });
+}
+
 void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
     PageIndexPair const* pageIndices, size_t numPages, CUstream stream)
 {
@@ -947,11 +978,6 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     auto& srcPoolGroup = poolGroup(srcLevel, srcPgIdx);
     auto& dstPoolGroup = poolGroup(dstLevel, dstPgIdx);
 
-    auto toSlotId = [](int32_t pageIndex)
-    {
-        TLLM_CHECK_DEBUG(pageIndex >= 0);
-        return SlotId{pageIndex};
-    };
 
     if (srcIsHot == dstIsHot)
     {
@@ -994,29 +1020,12 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     // poolMedium() agree.
     CacheTier const coldTier = cacheTier(coldLevel);
     size_t const coldPageBytes = slotSize(coldLevel, coldPgIdx).at(PoolIndex{0});
-    PageIndexLocation const pageIndexLocation = mPageIndexLocations.at(batchingLayerGroupId);
-    auto encodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
+    auto encodeBatch = [this, batchingLayerGroupId](
                            void* dstBasePtr, PageIndexPair const* indices, size_t count, CUstream batchStream)
-    {
-        return submitColdPageCodec(pageIndexLocation, indices, count, batchStream,
-            [this, batchingLayerGroupId, dstBasePtr](
-                PageIndexPair const* submittedIndices, size_t submittedPages, CUstream submittedStream)
-            {
-                return mColdPageCodec->encode(batchingLayerGroupId, dstBasePtr, submittedIndices, submittedPages,
-                    reinterpret_cast<cudaStream_t>(submittedStream));
-            });
-    };
-    auto decodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
+    { return encodeColdPages(batchingLayerGroupId, dstBasePtr, indices, count, batchStream); };
+    auto decodeBatch = [this, batchingLayerGroupId](
                            void const* srcBasePtr, PageIndexPair const* indices, size_t count, CUstream batchStream)
-    {
-        return submitColdPageCodec(pageIndexLocation, indices, count, batchStream,
-            [this, batchingLayerGroupId, srcBasePtr](
-                PageIndexPair const* submittedIndices, size_t submittedPages, CUstream submittedStream)
-            {
-                return mColdPageCodec->decode(batchingLayerGroupId, srcBasePtr, submittedIndices, submittedPages,
-                    reinterpret_cast<cudaStream_t>(submittedStream));
-            });
-    };
+    { return decodeColdPages(batchingLayerGroupId, srcBasePtr, indices, count, batchStream); };
 
     if (isGpuAccessibleMemory(coldTier))
     {
@@ -1086,11 +1095,7 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
         remaining -= batchSize;
     }
 
-    constexpr size_t kMaxRetainedPageIndexPairs = (1u << 20u) / sizeof(PageIndexPair);
-    if (stagingPageIndices.capacity() > kMaxRetainedPageIndexPairs)
-    {
-        std::vector<PageIndexPair>().swap(stagingPageIndices);
-    }
+    trimRetainedPageIndices(stagingPageIndices);
 }
 
 void StorageManager::submitRemoteHotMigration(CacheLevel dstLevel, CacheLevel srcLevel,
@@ -1101,34 +1106,12 @@ void StorageManager::submitRemoteHotMigration(CacheLevel dstLevel, CacheLevel sr
     CacheLevel const coldLevel = srcIsHot ? dstLevel : srcLevel;
     PoolGroupIndex const coldPgIdx = getPoolGroupIndex(coldLevel, batchingLayerGroupId);
     size_t const coldPageBytes = slotSize(coldLevel, coldPgIdx).at(PoolIndex{0});
-    PageIndexLocation const pageIndexLocation = mPageIndexLocations.at(batchingLayerGroupId);
-    auto toSlotId = [](int32_t pageIndex)
-    {
-        TLLM_CHECK_DEBUG(pageIndex >= 0);
-        return SlotId{pageIndex};
-    };
-    auto encodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
+    auto encodeBatch = [this, batchingLayerGroupId](
                            void* dstBasePtr, PageIndexPair const* indices, size_t count, CUstream batchStream)
-    {
-        return submitColdPageCodec(pageIndexLocation, indices, count, batchStream,
-            [this, batchingLayerGroupId, dstBasePtr](
-                PageIndexPair const* submittedIndices, size_t submittedPages, CUstream submittedStream)
-            {
-                return mColdPageCodec->encode(batchingLayerGroupId, dstBasePtr, submittedIndices, submittedPages,
-                    reinterpret_cast<cudaStream_t>(submittedStream));
-            });
-    };
-    auto decodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
+    { return encodeColdPages(batchingLayerGroupId, dstBasePtr, indices, count, batchStream); };
+    auto decodeBatch = [this, batchingLayerGroupId](
                            void const* srcBasePtr, PageIndexPair const* indices, size_t count, CUstream batchStream)
-    {
-        return submitColdPageCodec(pageIndexLocation, indices, count, batchStream,
-            [this, batchingLayerGroupId, srcBasePtr](
-                PageIndexPair const* submittedIndices, size_t submittedPages, CUstream submittedStream)
-            {
-                return mColdPageCodec->decode(batchingLayerGroupId, srcBasePtr, submittedIndices, submittedPages,
-                    reinterpret_cast<cudaStream_t>(submittedStream));
-            });
-    };
+    { return decodeColdPages(batchingLayerGroupId, srcBasePtr, indices, count, batchStream); };
 
     // Kept across calls, as the disk path's: a migration batch reuses the previous one's allocation.
     thread_local std::vector<PageIndexPair> stagingPageIndices;
@@ -1211,6 +1194,7 @@ void StorageManager::submitRemoteHotMigration(CacheLevel dstLevel, CacheLevel sr
             remaining -= batchSize;
         }
     }
+    trimRetainedPageIndices(stagingPageIndices);
 }
 
 void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel srcLevel, PoolGroupIndex dstPgIdx,
@@ -1223,11 +1207,6 @@ void StorageManager::submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel s
     TLLM_CHECK_DEBUG(sizes == slotSize(dstLevel, dstPgIdx));
     auto& srcGroup = poolGroup(srcLevel, srcPgIdx);
     auto& dstGroup = poolGroup(dstLevel, dstPgIdx);
-    auto toSlotId = [](int32_t pageIndex)
-    {
-        TLLM_CHECK_DEBUG(pageIndex >= 0);
-        return SlotId{pageIndex};
-    };
     // Cold levels hold one pool per group (the codec's single cold page), but nothing here depends on it.
     for (PoolIndex poolIdx{0}; poolIdx < sizes.size(); ++poolIdx)
     {
@@ -1501,12 +1480,7 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
 {
     refreshRetention();
     dropPagesOfFailedRemoteLevels();
-    auto const numFailedClients = [this]()
-    {
-        return std::count_if(
-            mRemoteClients.begin(), mRemoteClients.end(), [](auto const& client) { return client->failed(); });
-    };
-    for (auto failedBefore = numFailedClients();; failedBefore = numFailedClients())
+    for (auto failedBefore = numFailedRemoteClients();; failedBefore = numFailedRemoteClients())
     {
         try
         {
@@ -1518,7 +1492,7 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
             // An eviction WRITE failed the level before pointing any page at it, and the rollback guards put the
             // evicted pages back (kept alive through the unwinding by _prepareFreeSlots' keepAlive): retire the level
             // and evict past it, instead of failing whoever needed the room.
-            if (numFailedClients() == failedBefore)
+            if (numFailedRemoteClients() == failedBefore)
             {
                 throw;
             }
@@ -2013,11 +1987,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         }
         updateReadyEvents.run();
 
-        constexpr size_t kMaxRetainedPageIndexPairs = (1u << 20u) / sizeof(PageIndexPair);
-        if (pageIndices.capacity() > kMaxRetainedPageIndexPairs)
-        {
-            std::vector<PageIndexPair>().swap(pageIndices);
-        }
+        trimRetainedPageIndices(pageIndices);
         if (migrationRecorder && !defrag)
         {
             migrationRecorder(srcPages, dstSlots, srcLevel, dstLevel);
