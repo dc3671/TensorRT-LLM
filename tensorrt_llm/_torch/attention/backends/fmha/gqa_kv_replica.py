@@ -484,6 +484,37 @@ def _allgather_q(exchange, q: torch.Tensor, enable_pdl: bool) -> torch.Tensor:
     )
 
 
+# Per device and O dtype: flat (O, LSE) storage the pushed-mode partial kernel takes as its unwritten out_o / out_lse.
+_PUSHED_PARTIAL_PLACEHOLDERS: dict = {}
+
+
+def _pushed_partial_placeholders(
+    cp: int, rows: int, hq: int, d: int, dtype: torch.dtype, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(o [cp, rows, hq, d], lse [cp, rows, hq] FP32)`` for a partial kernel that pushes its rows to the members
+    (``ll``) and never writes them, nor does ``alltoall_merge(pushed=True)`` read them: prefix views of storage kept
+    per device and dtype (grown on demand), with the shape, strides and base alignment of a fresh ``torch.empty``,
+    so the kernels compile and launch as with one. Under CUDA graph capture a fresh pair, as before (the captured
+    graph keeps its own addresses)."""
+    numel_o, numel_lse = cp * rows * hq * d, cp * rows * hq
+    if torch.cuda.is_current_stream_capturing():
+        return (
+            torch.empty(cp, rows, hq, d, dtype=dtype, device=device),
+            torch.empty(cp, rows, hq, dtype=torch.float32, device=device),
+        )
+    key = (device, dtype)
+    bufs = _PUSHED_PARTIAL_PLACEHOLDERS.get(key)
+    if bufs is None or bufs[0].numel() < numel_o or bufs[1].numel() < numel_lse:
+        grown_o = max(numel_o, bufs[0].numel() if bufs is not None else 0)
+        grown_lse = max(numel_lse, bufs[1].numel() if bufs is not None else 0)
+        bufs = (
+            torch.empty(grown_o, dtype=dtype, device=device),
+            torch.empty(grown_lse, dtype=torch.float32, device=device),
+        )
+        _PUSHED_PARTIAL_PLACEHOLDERS[key] = bufs
+    return bufs[0][:numel_o].view(cp, rows, hq, d), bufs[1][:numel_lse].view(cp, rows, hq)
+
+
 def kv_replica_fused_decode(
     exchange,
     q: torch.Tensor,
@@ -520,9 +551,9 @@ def kv_replica_fused_decode(
         q_all = q_gathered.view(rows, cp, hq, d).permute(1, 0, 2, 3)
     else:
         q_all = _allgather_q(exchange, q, enable_pdl)
-    o = torch.empty(cp, rows, hq, d, dtype=out.dtype, device=q.device)
-    lse = torch.empty(cp, rows, hq, dtype=torch.float32, device=q.device)
-    # The partial kernel's combine pushes its (O, LSE) rows into the members' merge slots.
+    # The partial kernel's combine pushes its (O, LSE) rows into the members' merge slots, so neither it nor the merge
+    # touches o / lse: placeholders of their shapes.
+    o, lse = _pushed_partial_placeholders(cp, rows, hq, d, out.dtype, q.device)
     ll = exchange.merge_push_args(1, rows * hq, d)
     kv_replica_fused_partial(
         q_all,
