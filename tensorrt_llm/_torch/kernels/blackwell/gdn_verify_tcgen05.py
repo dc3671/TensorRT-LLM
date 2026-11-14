@@ -1545,8 +1545,9 @@ def gdn_verify_tcgen05_supported(T: int, HV: int, HK: int, fp8_out: bool) -> boo
 def compile_gdn_verify_tcgen05(
     T: int, HV: int, HK: int, device: torch.device | None = None
 ) -> None:
-    """Compile (and cache) the kernel for (T, HV, HK) and the current ``TRTLLM_ENABLE_PDL`` ahead of any call, e.g. at
-    model construction, so that no compilation runs inside a warm-up or a CUDA-graph capture."""
+    """Compile (and cache) the kernel for (T, HV, HK) and the current ``TRTLLM_ENABLE_PDL`` ahead of any call, e.g.
+    after loading (the GDN mixer's cache_derived_state, for an FP8 out_proj only), so that no compilation runs inside a
+    warm-up or a CUDA-graph capture: a first call compiles lazily, also under capture."""
     assert gdn_verify_tcgen05_supported(T, HV, HK, True), (T, HV, HK)
     dev = (
         torch.device("cuda", torch.cuda.current_device())
@@ -1590,7 +1591,16 @@ def gdn_verify_tcgen05(
     T_ = x.shape[0] // n
     assert n > 0 and T_ * n == x.shape[0]
     assert gdn_verify_tcgen05_supported(T_, HV, HK, fp8_scale is not None), (T_, HV, HK)
+    # gdnVerifyOp.cpp's dtype checks (the kernel reads these operands as BF16) and its FP32 scalar scale.
+    for name, t in (("qkv", x), ("z", z), ("a", a), ("b", b), ("old_u", old_u), ("old_k", old_k)):
+        assert t.dtype == torch.bfloat16, f"{name} must be bfloat16, got {t.dtype}"
+    assert state.dtype == torch.bfloat16, f"ssm_states must be bfloat16, got {state.dtype}"
+    assert fp8_scale.dtype == torch.float32 and fp8_scale.numel() == 1, (
+        "fp8_scale must be a float32 scalar tensor"
+    )
     assert x.shape[1] >= (2 * HK + HV) * D and x.stride(1) == 1 and x.stride(0) % 8 == 0
+    # The kernel is compiled for 16-byte aligned qkv / state bases (TMA and vector loads).
+    assert x.data_ptr() % 16 == 0, "qkv must have a 16-byte aligned base"
     assert (
         old_u.dim() == 5 and old_u.shape[1] == 2 and old_u.shape[2] == HIST and old_u.shape[4] == D
     )
@@ -1609,7 +1619,8 @@ def gdn_verify_tcgen05(
         and state.stride(2) == D
         and state.stride(1) == D * D
         and state.stride(0) % 8 == 0
-    )
+        and state.data_ptr() % 16 == 0
+    ), "ssm_states must be [slots, HV, 128, 128] with packed, 16-byte aligned slots"
     if replay_indices is None:
         replay_indices = slots
     assert replay_indices.numel() == n

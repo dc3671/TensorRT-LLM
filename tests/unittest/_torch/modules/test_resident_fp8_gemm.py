@@ -256,3 +256,23 @@ def test_supports_only_operands_the_kernel_reads():
     assert not supports(buf[16 : 16 + 16 * K].view(16, K), w)  # 16-byte aligned only
     assert not supports(x.t().contiguous().t(), w)
     assert not supports(x.to(torch.bfloat16), w)
+
+
+def test_supports_conv_rejects_strided_slots():
+    """Conv mode reads the slots as one contiguous int32 row (``torch.as_strided(slots, (1,), (1,))``): a strided
+    slot view falls back to the unfused path instead of reading the wrong slots."""
+    from tensorrt_llm._torch.kernels.blackwell import resident_fp8_gemm as R
+
+    qt, c_dim, nreq = 7, 1536, 8
+    x = torch.zeros((nreq * qt, K), dtype=torch.float8_e4m3fn, device="cuda")
+    w = torch.zeros((N, K), dtype=torch.float8_e4m3fn, device="cuda")
+    cw = torch.zeros((c_dim, 4), dtype=torch.bfloat16, device="cuda")
+    st = torch.zeros((32, c_dim, 3), dtype=torch.bfloat16, device="cuda")
+    win = torch.zeros((16, qt, c_dim, 3), dtype=torch.bfloat16, device="cuda")
+    slots = torch.arange(2 * nreq, dtype=torch.int32, device="cuda")
+
+    def conv(s: torch.Tensor) -> "R.ConvUpdate":
+        return R.ConvUpdate(weight=cw, state=st, slots=s, windows=win, tokens=qt)
+
+    assert R.supports_conv(x, w, conv(slots[:nreq]))
+    assert not R.supports_conv(x, w, conv(slots[::2]))

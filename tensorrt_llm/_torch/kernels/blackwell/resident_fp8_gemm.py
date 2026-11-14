@@ -247,6 +247,7 @@ def supports_conv(x: torch.Tensor, w: torch.Tensor, conv: ConvUpdate) -> bool:
         and win.shape[3] == 3
         and sl.dtype == torch.int32
         and sl.dim() == 1
+        and sl.is_contiguous()
         and sl.shape[0] == m // qt
     )
 
@@ -676,7 +677,7 @@ def resident_fp8_gemm(
     w: torch.Tensor,
     sa: torch.Tensor,
     sb: torch.Tensor,
-    out=None,
+    out: torch.Tensor | None = None,
     conv: ConvUpdate | None = None,
     budget: int = SMEM_BUDGET,
 ) -> torch.Tensor:

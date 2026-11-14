@@ -349,3 +349,98 @@ def test_gdn_verify_tcgen05_checks_the_op_shapes(bad):
             proj[:, :cd], z, a, b, st["a_log"], st["dt_bias"], st["norm_w"], st["fp8_scale"], 1e-6,
             mut["ssm"].clone(), st["state_indices"], old_u, old_k, mut["old_g"], st["buf"], st["pnat"],
         )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "qkv_dtype",
+        "z_dtype",
+        "a_dtype",
+        "b_dtype",
+        "old_u_dtype",
+        "old_k_dtype",
+        "ssm_dtype",
+        "scale_dtype",
+        "scale_numel",
+        "qkv_base",
+        "ssm_base",
+    ],
+)
+def test_gdn_verify_tcgen05_checks_the_op_dtypes_and_alignment(bad):
+    """The wrapper refuses, before any launch, the dtypes, the FP8 scale and the 16-byte bases trtllm::gdn_verify
+    refuses (gdnVerifyOp.cpp): the kernel would otherwise read them as BF16 / a FP32 scalar / aligned rows."""
+    n = 4
+    HV, cd, proj, ba, st, mut = _verify_case((2, 8), n, _T, 0)
+    x = proj[:, :cd]
+    z = proj[:, cd:].view(n * _T, HV, _DIM)
+    a, b = ba[:, HV:], ba[:, :HV]
+    old_u, old_k, ssm = mut["old_u"], mut["old_k"], mut["ssm"].clone()
+    scale = st["fp8_scale"]
+    if bad == "qkv_dtype":
+        x = x.to(torch.float16)
+    elif bad == "z_dtype":
+        z = z.to(torch.float16)
+    elif bad == "a_dtype":
+        a = a.float()
+    elif bad == "b_dtype":
+        b = b.float()
+    elif bad == "old_u_dtype":
+        old_u = old_u.to(torch.float16)
+    elif bad == "old_k_dtype":
+        old_k = old_k.to(torch.float16)
+    elif bad == "ssm_dtype":
+        ssm = ssm.to(torch.float16)
+    elif bad == "scale_dtype":
+        scale = scale.to(torch.bfloat16)
+    elif bad == "scale_numel":
+        scale = scale.reshape(1).repeat(2)
+    elif bad == "qkv_base":
+        # Rows keep their 16-byte stride; the base moves by 8 elements (16 bytes) minus one.
+        wide = torch.zeros(x.shape[0], x.shape[1] + 8, dtype=torch.bfloat16, device="cuda")
+        x = wide.view(-1)[7 : 7 + x.numel()].view(x.shape[0], x.shape[1])
+        assert x.stride(0) % 8 == 0 and x.data_ptr() % 16 != 0
+    else:
+        flat = torch.zeros(ssm.numel() + 8, dtype=torch.bfloat16, device="cuda")
+        ssm = flat[1 : 1 + ssm.numel()].view(ssm.shape)
+        assert ssm.data_ptr() % 16 != 0
+    with pytest.raises(AssertionError):
+        gdn_verify_tcgen05(
+            x, z, a, b, st["a_log"], st["dt_bias"], st["norm_w"], scale, 1e-6,
+            ssm, st["state_indices"], old_u, old_k, mut["old_g"], st["buf"], st["pnat"],
+        )  # fmt: skip
+
+
+def test_gdn_compiles_the_tcgen05_verify_only_for_an_fp8_out_proj(monkeypatch):
+    """The tcgen05 verify runs only when the gated norm writes E4M3 (norm.fp8_scale, set for an FP8QDQ out_proj):
+    cache_derived_state compiles it then, and a BF16 out_proj never compiles it."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod, UnquantizedLinearMethod
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+    from tensorrt_llm._torch.modules.mamba.layernorm_gated import RMSNorm
+
+    compiled = []
+    monkeypatch.setattr(
+        gdn_verify_module, "compile_gdn_verify_tcgen05", lambda *args: compiled.append(args)
+    )
+
+    def layer(quant_method):
+        m = Qwen3NextGatedDeltaNet.__new__(Qwen3NextGatedDeltaNet)
+        torch.nn.Module.__init__(m)
+        m.fused_verify = False
+        m.norm = RMSNorm(8)
+        m.num_v_heads_per_tp, m.num_k_heads_per_tp = 16, 4
+        # What __init__ sets for a supported MTP verify (rows gate, draft rows per request).
+        m.verify_tcgen05_min_rows, m.verify_tcgen05_tokens = 64, 7
+        m.out_proj = SimpleNamespace(
+            quant_method=quant_method,
+            input_scale=torch.nn.Parameter(torch.tensor(0.5), requires_grad=False),
+            force_dynamic_quantization=False,
+        )
+        return m
+
+    layer(UnquantizedLinearMethod()).cache_derived_state()
+    assert compiled == []
+    layer(FP8QDQLinearMethod()).cache_derived_state()
+    assert compiled == [(7, 16, 4)]

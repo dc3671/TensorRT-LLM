@@ -94,7 +94,9 @@ bool fmha_paged_context_fp8(torch::Tensor const& q, torch::Tensor const& kv_pool
     TORCH_CHECK(q.dim() == 3 && q.is_contiguous(), "fmha_paged_context_fp8: q must be a contiguous [T, H, D] tensor");
     TORCH_CHECK(kv_pool.dim() == 4 && kv_pool.is_contiguous() && kv_pool.size(3) == q.size(2),
         "fmha_paged_context_fp8: kv_pool must be a contiguous [pages, Hkv, tokens_per_page, D] tensor");
-    TORCH_CHECK(q.size(1) % kv_pool.size(1) == 0, "fmha_paged_context_fp8: Q heads must be a multiple of KV heads");
+    // && short-circuits: the multiple check divides by the KV heads only once there are some.
+    TORCH_CHECK(kv_pool.size(1) > 0 && q.size(1) % kv_pool.size(1) == 0,
+        "fmha_paged_context_fp8: kv_pool must have KV heads and Q heads must be a multiple of them");
     TORCH_CHECK(out.scalar_type() == c10::ScalarType::BFloat16 && out.is_contiguous() && out.numel() == q.numel(),
         "fmha_paged_context_fp8: out must be a contiguous bf16 tensor with q's element count");
     TORCH_CHECK(block_tables.scalar_type() == c10::ScalarType::Int && block_tables.dim() == 3
