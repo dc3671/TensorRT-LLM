@@ -108,6 +108,23 @@ def coordinator_reservation_timeout() -> float:
     )
 
 
+def reservation_timeout(
+    configured_s: Optional[float] = None, request_timeout_s: Optional[float] = None
+) -> float:
+    """A reservation's expiry: ``configured_s`` (else the env timeout), at least the request timeout."""
+    configured = coordinator_reservation_timeout() if configured_s is None else configured_s
+    return max(configured, request_timeout_s or 0)
+
+
+def pooled_reservation_timeout(reservation_timeout_s: float) -> float:
+    """A pooled seat's expiry, given :func:`reservation_timeout`.
+
+    The fleet worker's ``/finish`` retry window uses the same value, so it retries as long as the
+    coordinator holds the seat.
+    """
+    return max(reservation_timeout_s, POOLED_RESERVATION_TIMEOUT_S)
+
+
 class DisaggCoordinator(ABC):
     """Abstract coordinator: ctx/gen routers + readiness + cluster info + lifecycle.
 
@@ -210,14 +227,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
         )
         self._server_start_timeout_secs = server_start_timeout_secs
         self._health_check_interval_secs = health_check_interval_secs
-        configured_reservation_timeout = (
-            coordinator_reservation_timeout()
-            if reservation_timeout_secs is None
-            else reservation_timeout_secs
-        )
-        self._reservation_timeout_secs = max(
-            configured_reservation_timeout,
-            request_timeout_secs or 0,
+        self._reservation_timeout_secs = reservation_timeout(
+            reservation_timeout_secs, request_timeout_secs
         )
         self._reservation_tasks: dict[tuple[str, int], asyncio.Task] = {}
         self._reservation_locks = [
@@ -339,7 +350,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     def _reservation_timeout_for(self, router: Router) -> float:
         if router.pooled:
-            return max(self._reservation_timeout_secs, POOLED_RESERVATION_TIMEOUT_S)
+            return pooled_reservation_timeout(self._reservation_timeout_secs)
         return self._reservation_timeout_secs
 
     async def _select_pooled(

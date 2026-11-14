@@ -965,12 +965,12 @@ async def _finish_through_flaky_coordinator(local_router, fake, rids, monkeypatc
         router = CoordinatorDelegatingRouter(
             f"http://{server.host}:{server.port}", local_router, "generation", 5.0
         )
-        router._finish_queue = asyncio.Queue(maxsize=1)
+        if not router.pooled:
+            router._finish_queue = asyncio.Queue(maxsize=1)
         try:
-            # No await between the puts: the workers have not run, so the second is QueueFull.
+            # No await between the puts: the workers have not run, so a bounded queue is full.
             for rid in rids:
                 await router.finish_request(_gen_request(rid), req_id=rid)
-            # Parked finishes enter the queue as workers take from it, so this covers them too.
             await asyncio.wait_for(router._finish_queue.join(), timeout=30)
         finally:
             await router.close()
@@ -979,14 +979,14 @@ async def _finish_through_flaky_coordinator(local_router, fake, rids, monkeypatc
 
 @pytest.mark.asyncio
 async def test_pooled_finish_is_parked_and_retried_until_the_seat_is_released(monkeypatch):
-    """A pooled /finish is neither dropped on a full queue nor abandoned after 3 failures."""
+    """A pooled /finish is never dropped (its queue is unbounded) nor abandoned after 3 failures."""
     coordinator = _coordinator(seats=2)
     for rid in (1, 2):
         assert (await coordinator.select("generation", {}, rid, None))[0] == "g:1"
     assert coordinator.gen_router._get_server_load("g:1") == 2
     fake = _FlakyCoordinatorFinish(coordinator, failures=5)
     router = await _finish_through_flaky_coordinator(_router(), fake, (1, 2), monkeypatch)
-    assert router._dropped_finishes == 0 and router._parked_finishes == 1
+    assert router._dropped_finishes == 0 and router._finish_queue.maxsize == 0
     assert sorted(fake.finished) == [1, 2]
     assert coordinator.gen_router._get_server_load("g:1") == 0
     assert coordinator._reservation_tasks == {}
@@ -999,7 +999,7 @@ async def test_non_pooled_finish_still_drops_on_a_full_queue_and_gives_up(monkey
     assert not local_router.pooled
     fake = _FlakyCoordinatorFinish(AsyncMock(), failures=5)
     router = await _finish_through_flaky_coordinator(local_router, fake, (1, 2), monkeypatch)
-    assert router._dropped_finishes == 1 and getattr(router, "_parked_finishes", 0) == 0
+    assert router._dropped_finishes == 1
     assert fake.calls == 3 and fake.finished == []
 
 
@@ -1040,3 +1040,11 @@ def test_pooled_finish_window_follows_the_coordinator_expiry(monkeypatch):
     monkeypatch.setenv("TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT", str(longer))
     router = CoordinatorDelegatingRouter("http://c:1", _router(), "generation", 5.0)
     assert router._pooled_finish_window_s == longer
+    # A request timeout above 6 h lengthens both sides alike (one helper computes them).
+    monkeypatch.delenv("TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT")
+    worker = CoordinatorDelegatingRouter("http://c:1", _router(), "generation", longer + 1)
+    coordinator = DisaggCoordinatorService(
+        _coordinator()._config, _client_factory, request_timeout_secs=longer + 1
+    )
+    assert worker._pooled_finish_window_s == longer + 1
+    assert coordinator._reservation_timeout_for(coordinator.gen_router) == longer + 1

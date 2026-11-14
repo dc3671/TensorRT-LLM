@@ -17,7 +17,7 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from array import array
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
@@ -2370,21 +2370,21 @@ class CoordinatorDelegatingRouter(Router):
         # Ask /select for the output-length prediction (output_length_prediction).
         self._predict_output_length = False
         self._session: Optional[aiohttp.ClientSession] = None
+        # A pooled seat is a hard admission cap released only by its /finish: the pooled
+        # queue is unbounded, and each finish is retried until the coordinator would have
+        # expired the reservation itself.
         self._finish_queue: asyncio.Queue[tuple[int, bool]] = asyncio.Queue(
-            maxsize=COORDINATOR_FINISH_QUEUE_SIZE)
+            maxsize=0 if self.pooled else COORDINATOR_FINISH_QUEUE_SIZE)
         self._finish_workers: set[asyncio.Task] = set()
         self._dropped_finishes = 0
-        # A pooled seat is a hard admission cap released only by its /finish: a full
-        # queue parks pooled finishes here instead of dropping them, and each is retried
-        # until the coordinator would have expired the reservation itself.
-        self._finish_overflow: deque[tuple[int, bool]] = deque()
-        self._parked_finishes = 0
         self._pooled_finish_window_s = None
         if self.pooled:
             from tensorrt_llm.serve.disagg_coordinator import (
-                POOLED_RESERVATION_TIMEOUT_S, coordinator_reservation_timeout)
-            self._pooled_finish_window_s = max(
-                coordinator_reservation_timeout(), POOLED_RESERVATION_TIMEOUT_S)
+                pooled_reservation_timeout, reservation_timeout)
+
+            # The coordinator's own expiry of the seat (it gets the same request timeout).
+            self._pooled_finish_window_s = pooled_reservation_timeout(
+                reservation_timeout(request_timeout_s=request_timeout_s))
         # Coordinator HTTP-client API latency (includes network round-trip to the
         # coordinator + its in-process handler). Compare against the owner-side
         # [coord_api] to isolate the fleet /select|/finish HTTP overhead.
@@ -2498,11 +2498,9 @@ class CoordinatorDelegatingRouter(Router):
         }
         _t0 = time.monotonic()
         selection = asyncio.create_task(self._post_select(payload))
-        prediction = None
         try:
             body = await asyncio.shield(selection)
             info = body.get("info") or {}
-            prediction = info.get(OUTPUT_LENGTH_KEY)
             if body["server"] is None and info.get(ROUTING_CONTENT_REQUIRED):
                 # The coordinator placed nothing; repeat with the content key.
                 payload["routing_key"] = await asyncio.to_thread(
@@ -2550,9 +2548,9 @@ class CoordinatorDelegatingRouter(Router):
         if body["server"] is None:
             raise ValueError(f"coordinator /select placed no {self._role} "
                              f"server: {info}")
-        prediction = info.get(OUTPUT_LENGTH_KEY, prediction)
-        if prediction is not None:
-            info = {**info, OUTPUT_LENGTH_KEY: prediction}
+        # Only ConversationRouter asks for content, and it never asks for a prediction.
+        prediction = info.get(OUTPUT_LENGTH_KEY)
+        if isinstance(prediction, dict):
             priority = prediction.get("priority")
             if isinstance(priority, float) and 0.0 <= priority <= 1.0:
                 request.priority = priority
@@ -2609,16 +2607,7 @@ class CoordinatorDelegatingRouter(Router):
         try:
             self._finish_queue.put_nowait((req_id, success))
         except asyncio.QueueFull:
-            if self.pooled:
-                # Dropping it would hold the seat until the reservation expires.
-                self._finish_overflow.append((req_id, success))
-                self._parked_finishes += 1
-                if self._parked_finishes == 1 or self._parked_finishes % 1000 == 0:
-                    logger.warning(
-                        f"CoordinatorDelegatingRouter finish queue full; parked "
-                        f"pooled finishes until it drains "
-                        f"(parked={self._parked_finishes})")
-                return
+            # Non-pooled only (the pooled queue is unbounded).
             self._dropped_finishes += 1
             if self._dropped_finishes == 1 or self._dropped_finishes % 1000 == 0:
                 logger.warning(
@@ -2651,9 +2640,6 @@ class CoordinatorDelegatingRouter(Router):
     async def _finish_worker(self) -> None:
         while True:
             req_id, success = await self._finish_queue.get()
-            if self._finish_overflow:
-                # The get freed a slot; no await since, so this cannot be QueueFull.
-                self._finish_queue.put_nowait(self._finish_overflow.popleft())
             try:
                 await self._finish_async(req_id, success)
             finally:
