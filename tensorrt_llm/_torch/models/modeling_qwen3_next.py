@@ -41,6 +41,7 @@ from tensorrt_llm._torch.moe.fused_shared_expert import \
     fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.pyexecutor.config_utils import \
     get_qwen3_hybrid_layer_types
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._utils import is_blackwell_datacenter, is_sm_120f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -63,8 +64,10 @@ from ..modules.linear import (FP8QDQLinearMethod, FP8RowwiseLinearMethod,
                               is_static_nvfp4_input_eligible)
 from ..modules.low_m_gemm import (LowMGemmDispatcher, _should_apply_low_m_gemm,
                                   apply_low_m_gemm, low_m_gemm_dispatcher,
-                                  prepare_low_m_gemm)
-from ..modules.low_m_mma_gemm import (SHARED_EXPERT_MAX_M, fused_shared_expert,
+                                  low_m_gemm_takes_rows, prepare_low_m_gemm)
+from ..modules.low_m_mma_gemm import MAX_M as LOW_M_MAX_ROWS
+from ..modules.low_m_mma_gemm import (SHARED_EXPERT_MAX_M, default_tactic,
+                                      fused_shared_expert,
                                       fused_shared_expert_weights,
                                       raced_shared_expert, warp_mma_supported)
 from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
@@ -107,9 +110,32 @@ def _is_qwen3_5(model_config: ModelConfig) -> bool:
 
 def _uses_decode_kernels(model_config: ModelConfig) -> bool:
     """Whether the model class declares the attention / GDN / draft decode
-    paths (``Qwen3NextForCausalLM.decode_kernels``) on SM 10.0 / 10.3."""
+    paths (``Qwen3NextForCausalLM.decode_kernels``) on SM 10.0 / 10.3, in a
+    layout they were tuned for (``_decode_kernels_layout``)."""
     return bool(model_config.extra_attrs.get("qwen3_next_decode_kernels",
                                              False))
+
+
+def _decode_kernels_layout(model_config: ModelConfig) -> bool:
+    """Whether the layout is one the decode kernels were tuned for: attention
+    DP, or a TP layout on a multi-node NVLink fabric (GB200 / GB300 NVL
+    racks), where the MNNVL all-reduce kernels that the TP decode paths
+    overlap with and fuse into can run, whatever all-reduce strategy is set.
+    A TP layout without one (the NVLink of an HGX node) keeps the stock
+    paths.
+
+    Args:
+        model_config: The target model's config (mapping, torch dtype).
+
+    Returns:
+        True for attention DP or a TP layout with MNNVL.
+    """
+    mapping = model_config.mapping
+    if mapping.enable_attention_dp:
+        return True
+    return MNNVLAllReduce.is_mnnvl(mapping,
+                                   model_config.pretrained_config.torch_dtype,
+                                   explicitly_requested=True)
 
 
 def _uses_prefill_kernels(model_config: ModelConfig) -> bool:
@@ -143,6 +169,22 @@ def _decode_step_rows(model_config: ModelConfig) -> int:
 # MoE-output all-reduce leaves the low-M race for the resident-weight GEMM, or
 # for cuBLAS with its weight pulled into L2 by that all-reduce.
 _RESIDENT_MIN_REQUESTS = 2
+
+
+def _resident_min_rows(model_config: ModelConfig) -> int:
+    """Rows from which the input projections after a MoE-output all-reduce
+    take the resident-weight GEMM (``_RESIDENT_MIN_REQUESTS`` requests of a TP
+    decode step); 0 without the TP decode kernels.
+
+    Args:
+        model_config: The target model's config.
+
+    Returns:
+        The band's first row count, or 0.
+    """
+    if not _uses_tp_decode_kernels(model_config):
+        return 0
+    return _RESIDENT_MIN_REQUESTS * _rows_per_request(model_config)
 # The routed experts' cross-step L2 prefetch (ExpertL2Prefetch) runs from 2
 # requests below the all-reduces' two-shot rows: beside their slot transport at
 # more rows, its burst slows the layer chain more than the experts gain.
@@ -318,6 +360,35 @@ def _next_layer_l2_prefetch(layer: nn.Module,
     if lo <= rows <= hi:
         return None
     return w
+
+
+def _takes_resident_band(layer: nn.Module, projection: Optional[Linear],
+                         min_rows: int, max_rows: int) -> bool:
+    """Whether ``projection`` (the next layer's input projection) takes the
+    resident-weight GEMM from ``min_rows`` to ``max_rows`` rows: this layer's
+    MoE-output all-reduce hands it an E4M3 input (TP > 1 with POST_MOE_FUSION
+    and the next layer's FP8 input scale), and ``resident_fp8_gemm`` covers
+    its (K, N) at every row count of the band.
+
+    Args:
+        layer: The decoder layer whose MoE-output all-reduce feeds ``projection``.
+        projection: The next layer's FP8 input projection, or None.
+        min_rows: The band's first row count (``_resident_min_rows``).
+        max_rows: Its last (``resident_fp8_gemm.MAX_ROWS``).
+
+    Returns:
+        True where the band applies.
+    """
+    from ..kernels.blackwell.resident_fp8_gemm import plan
+    if (projection is None or not min_rows
+            or layer.next_layer_input_scale is None
+            or not layer.fusion_config.POST_MOE_FUSION
+            or layer.mapping.tp_size == 1 or projection._weights_removed):
+        return False
+    n, k = projection.weight.shape
+    return all(
+        plan(rows, k, n) is not None
+        for rows in range(min_rows, max_rows + 1))
 
 
 def _post_moe_allreduce(layer: nn.Module, mlp_output, residual: torch.Tensor):
@@ -513,6 +584,30 @@ def _with_moe_backend(model_config: ModelConfig, backend: str) -> ModelConfig:
 # Context-sized MoE inputs (at least this many tokens) are quantized for the
 # routed experts (NVFP4) and the shared expert (FP8) in one pass.
 _MOE_INPUT_DUAL_QUANT_MIN_TOKENS = 1024
+
+
+def _shared_expert_default_tactics_exist(gate_up_weight: torch.Tensor,
+                                         down_weight: torch.Tensor) -> bool:
+    """Whether the warp-MMA kernel has a heuristic tactic (``low_m_mma_gemm.default_tactic``, which an untuned
+    launch runs) for both launches of the shared expert's low-M path at up to ``SHARED_EXPERT_MAX_M`` rows (the
+    shared memory grows with the rows): the SwiGLU gate_up launch over the [2I, K] weight and down_proj over
+    [H, I].
+
+    Args:
+        gate_up_weight: The fused gate_up weight [2I, K].
+        down_weight: The down_proj weight [H, I].
+
+    Returns:
+        False where ``default_tactic`` raises for either launch.
+    """
+    try:
+        default_tactic(SHARED_EXPERT_MAX_M, gate_up_weight.shape[0],
+                       gate_up_weight.shape[1], True, True)
+        default_tactic(SHARED_EXPERT_MAX_M, down_weight.shape[0],
+                       down_weight.shape[1], True)
+    except ValueError:
+        return False
+    return True
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
@@ -768,10 +863,19 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         return (self.can_defer_finalize and isinstance(experts, ConfigurableMoE)
                 and experts.backend.takes_lamport_fc2_out)
 
-    def _bf16_experts_defer_finalize(self, experts, backend) -> bool:
+    def _bf16_experts_defer_finalize(self, experts: nn.Module,
+                                     backend: nn.Module) -> bool:
         """BF16 trtllm-gen experts, no attention DP, no MoE communication, load balancer or
         model-owned combine: the MoE-output all-reduce can finalize their (fc2 rows, BF16 top-k weights,
-        expanded -> permuted index) output."""
+        expanded -> permuted index) output.
+
+        Args:
+            experts: The routed experts module (a ``ConfigurableMoE`` or a backend).
+            backend: Its MoE backend (``experts`` itself when it is not a ``ConfigurableMoE``).
+
+        Returns:
+            Whether the MoE-output all-reduce can finalize these experts' un-finalized output.
+        """
         from ..moe.fused_moe.configurable_moe import ConfigurableMoE
         from ..moe.fused_moe.trtllm_gen.trtllm_bf16 import \
             TrtllmTrtllmGenBf16Impl
@@ -786,10 +890,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             return False
         return True
 
-    def _shared_expert_low_m_weights(self):
+    def _shared_expert_low_m_weights(
+            self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Weights of the shared expert's two-launch low-M path (``fused_shared_expert``), built from the loaded
-        (rescaled) weights, or None when the shared expert does not qualify. A rebuild (weight reload) writes
-        into the existing copies, whose addresses captured graphs hold.
+        (rescaled) weights, or None when the shared expert does not qualify (also where the warp-MMA kernel has
+        no heuristic tactic for a launch, ``_shared_expert_default_tactics_exist``). A rebuild (weight reload)
+        writes into the existing copies, whose addresses captured graphs hold.
         """
         mlp = self.shared_expert
         gate_up = getattr(mlp, "gate_up_proj", None)
@@ -808,6 +914,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if (mlp.activation is not torch.nn.functional.silu
                 or not mlp._is_plain_swiglu() or mlp.swiglu_limit is not None
                 or gate.bias is not None):
+            return None
+        if not _shared_expert_default_tactics_exist(gate_up.weight,
+                                                    down.weight):
             return None
         return fused_shared_expert_weights(gate_up.weight.data,
                                            gate.weight,
@@ -831,6 +940,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if (x.shape[0] <= self._shared_expert_raced_rows
                 or (self._shared_expert_raced_rows
                     and AutoTuner.get().is_tuning_mode)):
+            if self._shared_expert_raced_rows and AutoTuner.get(
+            ).is_tuning_mode:
+                self._tune_fused_shared_expert(x, gate_up, down,
+                                               down_input_scale)
             return raced_shared_expert(
                 x,
                 weights,
@@ -854,6 +967,35 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             down_weight=down.weight,
             down_weight_scale=down.weight_scale,
             down_input_scale=down_input_scale)
+
+    def _tune_fused_shared_expert(self, x: torch.Tensor, gate_up: Linear,
+                                  down: Linear,
+                                  down_input_scale: torch.Tensor) -> None:
+        """Tuning mode: time the low-M races that ``fused_shared_expert`` reads for the rows above
+        ``_shared_expert_raced_rows`` (the FP8 race of gate_up_proj with a BF16 input and of down_proj with an
+        E4M3 input), whose stock calls never run while the raced path takes every tuning call. Nothing to tune
+        where the raced rows reach the low-M GEMM's row bound, so fused_shared_expert never runs.
+
+        Args:
+            x: The tuning call's [M, K] BF16 shared-expert input.
+            gate_up: The shared expert's fused gate_up projection (FP8, static input scale).
+            down: Its down projection (FP8, static input scale).
+            down_input_scale: down_proj's static input scale.
+        """
+        dispatcher = low_m_gemm_dispatcher(gate_up)
+        if dispatcher is None or not low_m_gemm_takes_rows(
+                gate_up, self._shared_expert_raced_rows + 1):
+            return
+        # The races time every row bucket of the low-M GEMM whatever rows they are called with.
+        rows = min(x.shape[0], LOW_M_MAX_ROWS)
+        dispatcher.apply_fp8(
+            x[:rows], gate_up.weight, gate_up.weight_scale,
+            gate_up.quant_method.get_static_input_scale(gate_up), x.dtype)
+        hidden = torch.zeros((rows, down.weight.shape[1]),
+                             dtype=torch.float8_e4m3fn,
+                             device=x.device)
+        dispatcher.apply_fp8(hidden, down.weight, down.weight_scale,
+                             down_input_scale, x.dtype)
 
     def _moe_input_dual_quant_supported(self) -> bool:
         """Whether one pass can quantize the MoE input for both expert paths:
@@ -889,9 +1031,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         shared expert's E4M3 gate_up input) from one read of a context-sized
         BF16 MoE input, or None to quantize per path. The values equal
         fp4_quantize (linear SF) and static_quantize_e4m3_per_tensor."""
+        # The compile check before the row count: under torch.compile the
+        # count is symbolic, and comparing it would guard on the row bound.
         if (not self._dual_quant_input or lora_params
-                or hidden_states.shape[0] < _MOE_INPUT_DUAL_QUANT_MIN_TOKENS
-                or torch.compiler.is_compiling()):
+                or torch.compiler.is_compiling()
+                or hidden_states.shape[0] < _MOE_INPUT_DUAL_QUANT_MIN_TOKENS):
             return None
         # None as well when the forward would run in more than one MoE chunk.
         fp4_scale = self.experts.nvfp4_input_scale(hidden_states.shape[0])
@@ -1369,12 +1513,9 @@ class Qwen3NextLinearDecoderLayer(_Qwen3NextDecoderLayerBase):
         shared_gate_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
-        resident_min_rows = resident_ba_min_rows = 0
-        if _uses_tp_decode_kernels(model_config):
-            rows_per_request = _rows_per_request(model_config)
-            resident_min_rows = _RESIDENT_MIN_REQUESTS * rows_per_request
-            # in_proj_ba's replica from one request more.
-            resident_ba_min_rows = resident_min_rows + 1
+        resident_min_rows = _resident_min_rows(model_config)
+        # in_proj_ba's replica from one request more.
+        resident_ba_min_rows = resident_min_rows + 1 if resident_min_rows else 0
         self.linear_attn = self.linear_attn_cls(
             model_config,
             aux_stream,
@@ -1451,7 +1592,22 @@ class Qwen3NextAttention(Qwen3Attention):
     # attention's KV stream, so that the two do not compete for DRAM.
     expert_prefetch: Optional[ExpertL2Prefetch] = None
 
-    def forward_impl(self, q, k, v, *args, **kwargs):
+    def forward_impl(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                     v: Optional[torch.Tensor], *args: object,
+                     **kwargs: object) -> torch.Tensor:
+        """``Attention.forward_impl``, then this layer's expert prefetch (on
+        its side stream).
+
+        Args:
+            q: Query (or fused QKV) rows.
+            k: Key rows, or None with fused QKV.
+            v: Value rows, or None with fused QKV.
+            *args: ``Attention.forward_impl``'s other positional arguments.
+            **kwargs: Its keyword arguments.
+
+        Returns:
+            The attention output rows.
+        """
         attn_output = super().forward_impl(q, k, v, *args, **kwargs)
         if self.expert_prefetch is not None:
             self.expert_prefetch.prefetch(self.layer_idx, attn_output.shape[0])
@@ -1924,8 +2080,40 @@ class Qwen3NextModel(DecoderModel):
                 next_layer, Qwen3NextLinearDecoderLayer)
         if _uses_tp_decode_kernels(self.model_config):
             self._cache_tp_decode_gates(layers)
+            self._drop_expert_prefetch_without_record(layers)
         elif _uses_decode_kernels(self.model_config):
             self._cache_post_moe_norm_folds(layers)
+
+    def _drop_expert_prefetch_without_record(
+            self, layers: Sequence[nn.Module]) -> None:
+        """Unregister from the expert prefetch the layers whose decode front
+        never records their experts, so that they launch no prefetch on an
+        empty or stale selection: the front records only in an un-finalized
+        MoE call, which needs POST_MOE_FUSION, a shared expert, experts that
+        defer their finalize and an all-reduce that folds the MoE output at
+        some row count the prefetch takes (``_Qwen3NextDecoderLayerBase.forward``).
+
+        Args:
+            layers: The decoder layers (not the MTP layers).
+        """
+        prefetch = self.expert_prefetch
+        if prefetch is None:
+            return
+        rows = range(prefetch.min_rows, prefetch.max_rows + 1)
+        for layer in layers:
+            mlp = layer.mlp
+            if (not isinstance(mlp, Qwen3NextSparseMoeBlock)
+                    or not prefetch.registered(layer.layer_idx)):
+                continue
+            # The MoE block's own cache_derived_state (can_defer_finalize) may
+            # run after this one: ask the experts directly.
+            records = (layer.fusion_config.POST_MOE_FUSION
+                       and mlp.has_shared_expert
+                       and mlp._experts_defer_finalize() and any(
+                           layer.allreduce.supports_moe_fold(
+                               r, layer.hidden_size) for r in rows))
+            if not records:
+                prefetch.unregister(layer.layer_idx)
 
     def _cache_post_moe_norm_folds(self, layers: Sequence[nn.Module]) -> None:
         """Attention DP: the layers whose MoE output, residual add,
@@ -1950,7 +2138,7 @@ class Qwen3NextModel(DecoderModel):
         all-reduce (see _RESIDENT_MIN_REQUESTS)."""
         from ..kernels.blackwell.resident_fp8_gemm import \
             MAX_ROWS as resident_max_rows
-        min_rows = _RESIDENT_MIN_REQUESTS * _rows_per_request(self.model_config)
+        min_rows = _resident_min_rows(self.model_config)
         for layer, next_layer in zip(layers, layers[1:]):
             projection = _fp8_input_projection(next_layer)
             # Only the MNNVL all-reduce prefetches; remove_weights (layer-wise
@@ -1965,7 +2153,8 @@ class Qwen3NextModel(DecoderModel):
                 weight if weight is not None and weight.is_cuda
                 and weight.is_contiguous() and weight.numel() > 0 else None)
             layer.l2_prefetch_min_rows = min_rows
-            if projection is not None and layer.next_layer_input_scale is not None:
+            if _takes_resident_band(layer, projection, min_rows,
+                                    resident_max_rows):
                 # Its input arrives in E4M3 from this all-reduce: from min_rows
                 # the resident-weight GEMM takes it instead of the low-M race.
                 projection.resident_fp8_min_rows = min_rows
@@ -2011,9 +2200,15 @@ class Qwen3NextModel(DecoderModel):
                 spec_metadata=spec_metadata,
                 mamba_metadata=mamba_metadata,
                 lora_params=lora_params)
+        self.after_decoder_layers()
+        return hidden_states
+
+    def after_decoder_layers(self) -> None:
+        """What a forward runs after its last decoder layer, also for a caller
+        that runs the layers itself (the layer-wise benchmark): join the side
+        stream the layers fork for the expert L2 prefetch."""
         if self.expert_prefetch is not None:
             self.expert_prefetch.join()
-        return hidden_states
 
 
 @register_auto_model("Qwen3NextForCausalLM")
@@ -2033,6 +2228,18 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
     # Declared by the Qwen3.5 subclasses: on SM 10.0 / 10.3 the attention, GDN, MoE and MTP draft layers build their
     # decode paths (_uses_decode_kernels).
     decode_kernels = False
+    # The step-loop hooks of the speculative fast paths (supports_spec_decode_fast_paths): the overlap loop on the
+    # execution stream, the sampler's Philox state staged with the step inputs, the timing events off the current
+    # stream.
+    spec_decode_fast_path_runtime_hooks = RuntimeHooks(
+        loop_on_execution_stream=True,
+        pack_spec_rng_uploads=True,
+        iteration_timing_one_event=True,
+        perf_metrics_timing_side_stream=True)
+    # Construction-time declarations of its decode kernels in extra_attrs, kept out of a drafter built from another
+    # checkpoint (which shares extra_attrs): the MoE decode options and the fused-norm all-reduces.
+    target_only_extra_attrs = (MOE_DECODE_OPTIONS, "allreduce_mnnvl_fused_norm",
+                               "allreduce_tp2_fused_norm")
 
     @classmethod
     def supports_spec_decode_fast_paths(
@@ -2043,10 +2250,16 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         self,
         model_config: ModelConfig[Qwen3NextConfig],
     ):
-        if self.prefill_kernels:
+        # The prefill and decode kernels were tuned on SM 10.0 / 10.3 only; the
+        # decode kernels also only in the layouts _decode_kernels_layout names.
+        if self.prefill_kernels and is_blackwell_datacenter():
             model_config.extra_attrs["qwen3_next_prefill_kernels"] = True
         if self.decode_kernels and is_blackwell_datacenter():
-            model_config.extra_attrs["qwen3_next_decode_kernels"] = True
+            if _decode_kernels_layout(model_config):
+                model_config.extra_attrs["qwen3_next_decode_kernels"] = True
+            else:
+                logger.info("Qwen3.5 decode kernels off: a TP layout "
+                            "without MNNVL (e.g. an HGX node)")
         decode_kernels = _uses_decode_kernels(model_config)
         if decode_kernels:
             # Its MNNVL all-reduces run the residual RMSNorm fusions on the CuTe DSL kernels.

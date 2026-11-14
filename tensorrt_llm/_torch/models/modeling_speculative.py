@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+import contextlib
 import copy
 import inspect
 import os
@@ -1762,11 +1763,46 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     return builder(model_config, draft_config, lm_head, model)
 
 
-# The step-loop hooks of a model with the one-engine speculative fast paths.
-_FAST_PATH_RUNTIME_HOOKS = RuntimeHooks(loop_on_execution_stream=True,
-                                        pack_spec_rng_uploads=True,
-                                        iteration_timing_one_event=True,
-                                        perf_metrics_timing_side_stream=True)
+def drafter_hidden_extra_attrs(model_cls: type, spec_config: object,
+                               draft_config: Optional[ModelConfig]) -> Tuple[str, ...]:
+    """The target's ``extra_attrs`` keys to hide while its drafter is built:
+    the model's ``target_only_extra_attrs`` when the drafter comes from
+    another checkpoint (an Eagle3 head, an external MTP or PARD /
+    draft-target drafter; its ``draft_config`` shares the target's
+    ``extra_attrs``), none for the target's own MTP layers (no
+    ``draft_config``, or replacement MTP heads of the same architecture).
+
+    Args:
+        model_cls: The target model class.
+        spec_config: The speculative config.
+        draft_config: The drafter's config, or None.
+
+    Returns:
+        The keys to hide (possibly empty).
+    """
+    if draft_config is None or spec_config.uses_replacement_heads:
+        return ()
+    return tuple(model_cls.target_only_extra_attrs)
+
+
+@contextlib.contextmanager
+def hidden_extra_attrs(extra_attrs: Dict, keys: Tuple[str,
+                                                      ...]) -> Iterator[None]:
+    """Remove ``keys`` from ``extra_attrs`` for the block and put back the
+    values they had (also when the block raises).
+
+    Args:
+        extra_attrs: A model config's ``extra_attrs``.
+        keys: The keys to hide; absent ones are skipped.
+
+    Yields:
+        None.
+    """
+    saved = {key: extra_attrs.pop(key) for key in keys if key in extra_attrs}
+    try:
+        yield
+    finally:
+        extra_attrs.update(saved)
 
 
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
@@ -1782,13 +1818,19 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
     # argmax splits rows by its row-split bounds (TPKeyExchange
     # argmax_row_split; same tokens, another launch shape).
     spec_decode_argmax_row_split: ClassVar[bool] = False
+    # Declared by the model: its step-loop hooks under the fast paths (None:
+    # the defaults).
+    spec_decode_fast_path_runtime_hooks: ClassVar[Optional[RuntimeHooks]] = None
+    # Declared by the model: ``extra_attrs`` keys its construction writes for
+    # its own modules, hidden while a drafter from another checkpoint is built
+    # (drafter_hidden_extra_attrs).
+    target_only_extra_attrs: ClassVar[Tuple[str, ...]] = ()
 
     @property
     def runtime_hooks(self) -> Optional[RuntimeHooks]:
-        """The fast paths run the overlap loop on the execution stream, stage
-        the sampler's Philox state with the step inputs and keep the timing
-        events off the current stream."""
-        return (_FAST_PATH_RUNTIME_HOOKS
+        """The model's ``spec_decode_fast_path_runtime_hooks`` under the fast
+        paths, else None."""
+        return (self.spec_decode_fast_path_runtime_hooks
                 if self.spec_decode_fast_paths else None)
 
     @classmethod
@@ -1917,9 +1959,15 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                     spec_config)
 
-                self.draft_model = get_draft_model(model_config,
-                                                   self.draft_config,
-                                                   self.lm_head, self.model)
+                # A drafter of another checkpoint shares extra_attrs: it must
+                # not build the target's declared decode kernels.
+                with hidden_extra_attrs(
+                        model_config.extra_attrs,
+                        drafter_hidden_extra_attrs(type(self), spec_config,
+                                                   self.draft_config)):
+                    self.draft_model = get_draft_model(model_config,
+                                                       self.draft_config,
+                                                       self.lm_head, self.model)
                 if spec_config.uses_replacement_heads:
                     self.draft_config = self.draft_model.model_config
                 if self.draft_model is not None:

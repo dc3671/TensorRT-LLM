@@ -516,10 +516,10 @@ class Runner:
                     )
                 else:
                     hidden_states = layer(position_ids, hidden_states, attn_metadata, **kwargs)
-            # As the model's own forward: join the side stream its layers fork (Qwen3.5's expert L2 prefetch).
-            expert_prefetch = getattr(model.model, "expert_prefetch", None)
-            if expert_prefetch is not None:
-                expert_prefetch.join()
+            # As the model's own forward: its hook after the last decoder layer (e.g. joining a side stream).
+            after_decoder_layers = getattr(model.model, "after_decoder_layers", None)
+            if after_decoder_layers is not None:
+                after_decoder_layers()
             return hidden_states, residual
 
         def forward_block_residual(

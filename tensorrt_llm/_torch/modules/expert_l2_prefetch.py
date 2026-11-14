@@ -203,9 +203,25 @@ class ExpertL2Prefetch:
             self._backends[layer_idx] = backend
             self._budget_ns[layer_idx] = issue_budget_ns
 
+    def unregister(self, layer_idx: int) -> None:
+        """Neither record nor prefetch for ``layer_idx`` any more: for a layer whose decode front never records
+        its experts, a prefetch would only launch on an empty or stale selection.
+
+        Args:
+            layer_idx: The layer registered with :meth:`register`.
+        """
+        self._backends.pop(layer_idx, None)
+        self._budget_ns.pop(layer_idx, None)
+
+    def registered(self, layer_idx: int) -> bool:
+        """Whether ``layer_idx`` records and prefetches (registered and not unregistered)."""
+        return layer_idx in self._backends
+
     def takes_rows(self, rows: int) -> bool:
-        # Side-stream forks and Triton launches: not under torch.compile.
-        return self.min_rows <= rows <= self.max_rows and not torch.compiler.is_compiling()
+        """Whether a forward of ``rows`` rows records and prefetches. Side-stream forks and Triton launches: not
+        under torch.compile, which is tested first so that a symbolic row count is not compared (dynamo would
+        guard on the row bounds and recompile when a count crosses one)."""
+        return not torch.compiler.is_compiling() and self.min_rows <= rows <= self.max_rows
 
     def budgeted(self, rows: int) -> bool:
         lo, hi = self.budget_rows

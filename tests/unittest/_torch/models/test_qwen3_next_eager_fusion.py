@@ -398,6 +398,8 @@ def test_decode_kernels_follow_the_model_declaration(monkeypatch, declared, blac
 
     monkeypatch.setattr(m, "Qwen3NextModel", stop)
     monkeypatch.setattr(m, "is_blackwell_datacenter", lambda: blackwell)
+    # A layout the decode kernels were tuned for (test_qwen3_next_decode_gates.py covers the layouts).
+    monkeypatch.setattr(m, "_decode_kernels_layout", lambda model_config: True)
     model_cls = type("_Declared", (Qwen3NextForCausalLM,), {"decode_kernels": declared})
     config = SimpleNamespace(
         pretrained_config=SimpleNamespace(model_type="qwen3_next"),
@@ -423,6 +425,7 @@ def test_decode_kernels_need_blackwell_datacenter(monkeypatch, sm) -> None:
 
     monkeypatch.setattr(utils, "get_sm_version", lambda: sm)
     monkeypatch.setattr(m, "Qwen3NextModel", stop)
+    monkeypatch.setattr(m, "_decode_kernels_layout", lambda model_config: True)
     model_cls = type("_Declared", (Qwen3NextForCausalLM,), {"decode_kernels": True})
     config = SimpleNamespace(
         pretrained_config=SimpleNamespace(model_type="qwen3_next"),
