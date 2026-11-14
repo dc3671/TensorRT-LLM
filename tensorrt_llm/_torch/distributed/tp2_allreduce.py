@@ -108,7 +108,9 @@ class Tp2AllReduceNorm:
             self._dummy_scale_view = None
             self._norm_weight_views = {}
             torch.cuda.synchronize()
-        except RuntimeError as e:  # e.g. out of memory or a CUDA error on this rank only
+        # Any failure on this rank only (a CUDA error, out of memory, a host allocation) enters the agreement
+        # below; an exception escaping before it would leave the peer waiting in the collective.
+        except Exception as e:  # noqa: BLE001 - re-raised on every rank below as RuntimeError
             error = e
         # Every rank's flags are zero before any rank can raise one; a failure on one rank fails all of them.
         causes = _setup_failures(comm, mapping.tp_rank, error)

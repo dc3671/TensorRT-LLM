@@ -710,10 +710,11 @@ def test_mnnvl_fused_allreduce_norm(case, mpi_pool_executor):
     assert all(results)
 
 
-def _tp2_setup_failure(tp):
+def _tp2_setup_failure(tp, error_type=RuntimeError):
     """A failure past the multicast buffer's collective handle exchange on one rank (its pointer-table init is not
-    collective) fails Tp2AllReduceNorm's construction on every rank, naming the failed rank's cause. Returns this
-    rank's outcome as text (exceptions stay in the worker)."""
+    collective) fails Tp2AllReduceNorm's construction on every rank with RuntimeError, naming the failed rank's
+    cause, whatever ``error_type`` that rank raised. Returns this rank's outcome as text (exceptions stay in the
+    worker)."""
     import importlib
 
     from tensorrt_llm._torch.distributed.tp2_allreduce import Tp2AllReduceNorm
@@ -729,7 +730,7 @@ def _tp2_setup_failure(tp):
     def make(*args, **kwargs):
         handle = real(*args, **kwargs)
         if rank == 1:
-            raise RuntimeError("injected pointer-table failure")
+            raise error_type("injected pointer-table failure")
         return handle
 
     allreduce_ops._make_mnnvl_mcast_buffer = make
@@ -747,9 +748,11 @@ def _tp2_setup_failure(tp):
 
 
 @pytest.mark.timeout(300)
+# MemoryError: a failure other than RuntimeError (e.g. a host allocation) must not leave the peer waiting.
+@pytest.mark.parametrize("error_type", [RuntimeError, MemoryError])
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_tp2_setup_failure_on_one_rank(mpi_pool_executor):
+def test_tp2_setup_failure_on_one_rank(mpi_pool_executor, error_type):
     if torch.cuda.device_count() < 2:
         pytest.skip("needs 2 GPUs")
-    outcomes = list(mpi_pool_executor.map(_tp2_setup_failure, [2] * 2))
+    outcomes = list(mpi_pool_executor.map(_tp2_setup_failure, [2] * 2, [error_type] * 2))
     assert all("rank 1: injected pointer-table failure" in o for o in outcomes), outcomes
