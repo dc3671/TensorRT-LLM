@@ -21,7 +21,12 @@ from typing import Callable, Optional
 from fastapi import HTTPException
 
 from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
-from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
+from tensorrt_llm.llmapi.disagg_utils import (
+    ConditionalDisaggConfig,
+    DisaggServerConfig,
+    ServerRole,
+    check_output_length_prediction_schedule,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicCountTokensRequest,
@@ -159,6 +164,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         client_factory: Callable[[Router, ServerRole], OpenAIClient],
         req_timeout_secs: int = 180,
     ):
+        # schedule_style may have been overridden (CLI -s, TLLM_DISAGG_SCHEDULE_STYLE) after parsing.
+        check_output_length_prediction_schedule(config)
         self._config = config
         # The service drives the coordinator's ctx/gen routers uniformly, so serving
         # is identical whether the router is the real one (single-process) or a

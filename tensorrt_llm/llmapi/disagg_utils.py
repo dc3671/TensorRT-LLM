@@ -552,13 +552,22 @@ def extract_disagg_cfg(
         config.output_length_prediction = (
             OutputLengthPredictionConfig.model_validate(
                 output_length_prediction))
-        if config.schedule_style == "generation_first":
-            # The prediction needs the context phase's prompt length; a
-            # generation_first request reaches its generation server without it.
-            raise ValueError("output_length_prediction requires schedule_style "
-                             "'context_first'")
+        check_output_length_prediction_schedule(config)
     _warn_if_subagent_affinity_inactive(config)
     return config
+
+
+def check_output_length_prediction_schedule(config: DisaggServerConfig) -> None:
+    """Refuse output_length_prediction with schedule_style generation_first.
+
+    Runs again in OpenAIDisaggregatedService, after the CLI / env override of schedule_style.
+    """
+    if (config.output_length_prediction is not None
+            and config.schedule_style == "generation_first"):
+        # The prediction needs the context phase's prompt length; a
+        # generation_first request reaches its generation server without it.
+        raise ValueError("output_length_prediction requires schedule_style "
+                         "'context_first'")
 
 
 def _warn_if_subagent_affinity_inactive(config: DisaggServerConfig) -> None:

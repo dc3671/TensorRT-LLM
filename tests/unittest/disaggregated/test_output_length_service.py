@@ -369,6 +369,15 @@ def test_prediction_requires_context_first():
     assert config.output_length_prediction.predictor == "ridge"
 
 
+def test_prediction_refuses_a_generation_first_override_after_parsing():
+    """`trtllm-serve disaggregated -s generation_first` sets schedule_style after the parse-time check."""
+    config = _config()
+    config.schedule_style = "generation_first"
+    coordinator = DisaggCoordinatorService(config, client_factory=_client_factory)
+    with pytest.raises(ValueError, match="context_first"):
+        OpenAIDisaggregatedService(config, coordinator, client_factory=_client_factory)
+
+
 @pytest.mark.asyncio
 async def test_request_without_a_context_phase_gets_the_prior_priority(monkeypatch):
     """Conditional disaggregation served locally: a client-sent priority never passes through."""
