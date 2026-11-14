@@ -117,20 +117,23 @@ def test_pool_ages_from_the_orchestrator_arrival():
 
 
 def test_pool_expires_at_the_kv_transfer_timeout():
-    """Every waiter gets the deadline, counted from its entry here (generation_first ones too)."""
+    """Every waiter gets the deadline, counted from its entry here (generation_first ones too).
+
+    It comes KV_DEADLINE_MARGIN early: the C++ transceiver counts the timeout from the KV send.
+    """
     clock = _Clock()
     pool = SeatPool(1, clock=clock, kv_transfer_timeout_s=60.0)
     pool.add(1, 0.5, None, None, orig_elapsed_s=10.0)
     clock.now = 10.0
     pool.add(2, 0.5, None, None)  # no context phase yet: generation_first
-    clock.now = 59.9
+    clock.now = 56.9
     assert pool.expire() == [] and pool.remaining_s(pool.waiter(1)) == pytest.approx(0.1)
-    clock.now = 60.0
+    clock.now = 57.0
     expired = pool.expire()
     assert [w.rid for w in expired] == [1] and pool.expired == 1
-    assert "KV transfer timeout (60 s" in pool.expiry_message(expired[0])
+    assert "KV transfer timeout (60 s less a 5% margin" in pool.expiry_message(expired[0])
     assert len(pool) == 1 and pool.remaining_s(pool.waiter(2)) == pytest.approx(10.0)
-    clock.now = 70.0
+    clock.now = 67.0
     assert [w.rid for w in pool.expire()] == [2] and len(pool) == 0
     # Without the timeout nothing expires on its own.
     plain = SeatPool(1, clock=clock)
@@ -172,9 +175,9 @@ def test_pool_pick_does_not_scan_every_waiter(monkeypatch):
         pool.remove(rid)
     live = len(pool)
     assert 0 < live == len(pool.waiters()) < 1990
-    clock.now = 59.0
+    clock.now = 56.0  # the deadline is KV_DEADLINE_MARGIN before the 60 s timeout
     assert pool.expire() == []
-    clock.now = 60.0
+    clock.now = 57.0
     assert len(pool.expire()) == live and len(pool) == 0 and pool.pick(["s"]) is None
 
 
@@ -525,7 +528,7 @@ async def test_seat_wait_bound_comes_from_the_context_servers():
     waiting = asyncio.create_task(gen.get_next_server_by_key({}, req_id=2))
     await _settle()
     assert gen._pool.kv_transfer_timeout_s == 60.0
-    assert gen._pool.waiter(2).deadline - gen._pool.waiter(2).entered == pytest.approx(60.0)
+    assert gen._pool.waiter(2).deadline - gen._pool.waiter(2).entered == pytest.approx(57.0)
     waiting.cancel()
 
 

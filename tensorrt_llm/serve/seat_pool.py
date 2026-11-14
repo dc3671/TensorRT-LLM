@@ -25,10 +25,12 @@ the order of the generation server's ``AgingPriorityWaitingQueue``).
 A request that comes from a finished context phase carries ``orig_elapsed_s``, its time since it
 reached the orchestrator: its wait counts from that arrival. With ``kv_transfer_timeout_s`` (the
 context servers' ``kv_transfer_timeout_ms``) every waiter fails once it has been in this queue
-that long. A C++-transceiver context server counts that timeout from its KV send, so it has
-dropped the transfer by then; a Python-transceiver one holds a send its generation peer has not
-asked for up to three timeouts from the send, so there this bound is conservative (with
-``generation_first`` the context server waits the same timeout for the generation side).
+that long, less ``KV_DEADLINE_MARGIN`` of it. A C++-transceiver context server counts that timeout
+from its KV send, a little before the request joins this queue, so it has dropped the transfer by
+then and the margin keeps a seat granted at the deadline from reaching a cancelled send; a
+Python-transceiver one holds a send its generation peer has not asked for up to three timeouts
+from the send, so there this bound is conservative (with ``generation_first`` the context server
+waits the same timeout for the generation side).
 
 Waiters sit in heaps per excluded server, so a placement costs O(E log W) for E distinct
 excluded servers and W waiters, and expiry pops a deadline heap.
@@ -46,6 +48,8 @@ from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.logger import logger
 
 STATS_LOG_PERIOD_S = 30.0
+# A waiter fails this fraction of the KV transfer timeout before it (see the module docstring).
+KV_DEADLINE_MARGIN = 0.05
 # A heap is rebuilt from its live waiters once its removed entries outnumber them by this much.
 _COMPACT_SLACK = 64
 
@@ -223,7 +227,7 @@ class SeatPool:
                 arrival = now - max(0.0, float(orig_elapsed_s))
         deadline = None
         if self.kv_transfer_timeout_s is not None:
-            deadline = now + self.kv_transfer_timeout_s
+            deadline = now + self.kv_transfer_timeout_s * (1.0 - KV_DEADLINE_MARGIN)
         waiter = Waiter(
             rid=rid,
             seq=next(self._seq),
@@ -287,7 +291,8 @@ class SeatPool:
     def expiry_message(self, waiter: Waiter) -> str:
         return (
             f"generation request {waiter.rid} found no free seat within the context servers' KV "
-            f"transfer timeout ({waiter.deadline - waiter.entered:g} s after it joined the queue; "
+            f"transfer timeout ({(waiter.deadline - waiter.entered) / (1.0 - KV_DEADLINE_MARGIN):g} s "
+            f"less a {KV_DEADLINE_MARGIN:.0%} margin, after it joined the queue; "
             f"{self._clock() - waiter.arrival:.1f} s since it arrived); a context server with the "
             f"C++ transceiver has dropped the KV cache transfer by then"
         )
