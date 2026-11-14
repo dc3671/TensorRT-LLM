@@ -232,9 +232,14 @@ def test_ridge_refits_on_boundaries_after_min_rows():
     predictor.predict("x", 1000, 2 * olp.RIDGE_REFIT_S)
     assert predictor.ridge_fits == 1 and predictor.ridge.fit_rows == olp.RIDGE_MIN_ROWS
     assert predictor.sources["ridge"] == 1
-    # Several boundaries passed at once fit once per boundary.
-    predictor.predict("x", 1000, 5 * olp.RIDGE_REFIT_S)
-    assert predictor.ridge_fits == 4
+    # Several boundaries passed at once (an idle coordinator) fit once, the same coefficients
+    # as a fit per boundary since no row arrived in between; the next boundary stays on the grid.
+    coef = list(predictor.ridge.coef)
+    predictor.predict("x", 1000, 5 * olp.RIDGE_REFIT_S + 1.0)
+    assert predictor.ridge_fits == 2 and predictor.ridge.coef == coef
+    assert predictor.next_ridge_fit == 6 * olp.RIDGE_REFIT_S
+    predictor.predict("x", 1000, 6 * olp.RIDGE_REFIT_S)
+    assert predictor.ridge_fits == 3
 
 
 def test_ridge_mode_never_fits_trees():

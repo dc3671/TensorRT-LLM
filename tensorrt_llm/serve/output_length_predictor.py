@@ -648,11 +648,14 @@ class OnlineLengthPredictor:
             if self.gbm_on:
                 self.next_gbm_fit = t + GBM_REFIT_S
             return
-        while t >= self.next_ridge_fit:
+        if t >= self.next_ridge_fit:
+            # One fit for every boundary passed: no rows arrive between them, so it is the same.
             if self.ridge.n >= RIDGE_MIN_ROWS:
                 self.ridge.fit()
                 self.ridge_fits += 1
-            self.next_ridge_fit += RIDGE_REFIT_S
+            self.next_ridge_fit += RIDGE_REFIT_S * (
+                1 + math.floor((t - self.next_ridge_fit) / RIDGE_REFIT_S)
+            )
         while t >= self.next_gbm_fit:
             rows = min(self.gbm_n, self.gbm_max_rows)
             if rows >= GBM_MIN_ROWS:
