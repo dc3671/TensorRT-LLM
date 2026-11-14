@@ -531,11 +531,13 @@ Two exposed accessors look like they might leak shared state and do not:
   state, the eviction lists, or the stats aggregates. Accessors that read only
   state fixed at construction are lock-free: `num_layers`, `layer_ids`,
   `tokens_per_block`, `cache_tier_list`, `all_buffer_ids`, `get_layer_group_id`,
-  `any_remote_level_failed` (atomic flags, see above),
   `get_life_cycle_pool_group_indices`,
   `get_page_stride`, `get_page_index_scale`, `get_page_index_converter`,
   `get_mem_pool_base_address`, `supports_index_mode`, `init_config`, and the
-  config flags. `get_page_index_upper_bound` resembles that group but reads a
+  config flags. `any_remote_level_failed` is lock-free too but reads runtime
+  state: each remote client's atomic `failed()` flag, walking `mRemoteClients`,
+  which `destroy()` clears; it is safe while no `shutdown()` runs concurrently.
+  `get_page_index_upper_bound` resembles that group but reads a
   pool's current `numSlots`, which `_adjustLevel()` changes, so it takes the
   shared lock. Anything added here that reads resize-mutable state must too.
 - `get_base_page_indices` returns a zero-copy numpy view, but into
