@@ -44,7 +44,7 @@ from ....modules.fla.op import gdc_wait_with_memory_clobber
 from ....modules.low_m_gemm import low_m_gemm_dispatcher
 from ....modules.low_m_mma_gemm import candidate_tactics
 from ....utils import Fp4QuantizedTensor
-from ..impl_contract import PreroutedRouting
+from ..impl_contract import EngineRouting, PreroutedRouting
 
 if TYPE_CHECKING:
     from ....modules.expert_l2_prefetch import ExpertL2Prefetch
@@ -1159,7 +1159,7 @@ class DecodeFront:
     ``engine_route`` (declared by the model): an un-finalized route front call whose rows the routing engine and
     its router GEMM epilogue take (``decode_moe.engine_routes``, ``RouteFrontRouterGemm``) runs the router GEMM with
     each token's per-tile candidates and NVFP4 x in its epilogue, and the engine routes
-    (``PreroutedRouting.candidates``).
+    (``EngineRouting.candidates``).
     """
 
     fused_only: bool = False
@@ -1386,7 +1386,11 @@ class DecodeFront:
             x_in,
             logits,
             output_dtype=x.dtype,
-            prerouted=PreroutedRouting(flat, tactic, ids, wts, candidates),
+            prerouted=(
+                PreroutedRouting(flat, tactic, ids, wts)
+                if candidates is None
+                else EngineRouting(flat, tactic, ids, wts, candidates)
+            ),
             **moe_kwargs,
         )
         if self._expert_prefetch is not None and not do_finalize:

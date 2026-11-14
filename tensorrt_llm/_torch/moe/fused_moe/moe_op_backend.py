@@ -36,7 +36,7 @@ import torch
 
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
-from .impl_contract import PreroutedRouting
+from .impl_contract import EngineRouting, PreroutedRouting
 
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
@@ -172,14 +172,14 @@ class MoEOpBackend:
         decode_engine_state: Optional[torch.Tensor] = None,
         lamport_fc2_out: Optional[torch.Tensor] = None,
         decode_early_release_rows: int = 0,
-        decode_shared_expert_rows: int = 0,
+        decode_spare_sms: int = 0,
     ) -> List[torch.Tensor]:
         """Run FP4 block scale MoE computation. ``prerouted``: routing the caller
         computed (native op backend only). ``decode_tuning``: the native NVFP4 op
         tunes for the model's decode steps and runs its decode kernels
         (``FP4BlockScaleMoERunner``); ``decode_engine_state`` /
         ``lamport_fc2_out`` / ``decode_early_release_rows`` /
-        ``decode_shared_expert_rows``: see ``fp4_block_scale_moe_decode_runner``."""
+        ``decode_spare_sms``: see ``fp4_block_scale_moe_decode_runner``."""
         raise NotImplementedError
 
     def run_bf16_moe(
@@ -354,7 +354,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         decode_engine_state=None,
         lamport_fc2_out=None,
         decode_early_release_rows=0,
-        decode_shared_expert_rows=0,
+        decode_spare_sms=0,
     ):
         # The native runners take the block scales as one flat linear-layout
         # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
@@ -434,16 +434,18 @@ class TRTLLMOpBackend(MoEOpBackend):
                     decode_tuning
                     or decode_engine_state is not None
                     or lamport_fc2_out is not None
-                    or (prerouted is not None and prerouted.candidates is not None)
+                    or isinstance(prerouted, EngineRouting)
                 )
                 if decode_call:
                     fp4_op = torch.ops.trtllm.fp4_block_scale_moe_decode_runner
                     decode_kwargs = dict(
-                        prerouted_candidates=None if prerouted is None else prerouted.candidates,
+                        prerouted_candidates=(
+                            prerouted.candidates if isinstance(prerouted, EngineRouting) else None
+                        ),
                         decode_engine_state=decode_engine_state,
                         lamport_fc2_out=lamport_fc2_out,
                         decode_early_release_rows=decode_early_release_rows,
-                        decode_shared_expert_rows=decode_shared_expert_rows,
+                        decode_spare_sms=decode_spare_sms,
                     )
                 else:
                     fp4_op = torch.ops.trtllm.fp4_block_scale_moe_runner

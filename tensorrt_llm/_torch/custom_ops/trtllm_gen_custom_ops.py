@@ -449,7 +449,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
     tuning_config = None
     decode_tuning = False
     decode_early_release_rows = 0
-    decode_shared_expert_rows = 0
+    decode_spare_sms = 0
 
     def __init__(self,
                  num_experts: int,
@@ -467,7 +467,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
                  use_dp: bool = False,
                  decode_tuning: bool = False,
                  decode_early_release_rows: int = 0,
-                 decode_shared_expert_rows: int = 0):
+                 decode_spare_sms: int = 0):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -481,11 +481,11 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.do_finalize = do_finalize
         self.act_type = act_type
         # Declared by the model (decode_moe.select): decode-step tuning and kernels; the engine releases its
-        # dependents after its own wait from decode_early_release_rows rows and leaves SMs to a shared expert
-        # beside it from decode_shared_expert_rows rows (0: never).
+        # dependents after its own wait from decode_early_release_rows rows (0: never) and leaves decode_spare_sms
+        # SMs of its persistent grid free (the backend's reserve_sms_for_concurrent_kernels for this call).
         self.decode_tuning = decode_tuning
         self.decode_early_release_rows = decode_early_release_rows
-        self.decode_shared_expert_rows = decode_shared_expert_rows
+        self.decode_spare_sms = decode_spare_sms
 
         self.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts,
@@ -607,11 +607,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
                 output=output,
                 intermediate_size=self.intermediate_size,
                 prerouted=prerouted is not None,
-                engine_state=engine_state,
-                # The C++ runner prefers its fine-grained-sync FC1 / FC2 pair
-                # (llm_args.use_fine_grained_sync); read per call, as there.
-                fine_grained_sync=os.environ.get("TLLM_USE_FINE_GRAINED_SYNC")
-                == "1")
+                engine_state=engine_state)
         if candidates is not None and kernel != decode_moe.DecodeKernel.ENGINE:
             raise ValueError(
                 "pre-routed candidates need the decode MoE engine, which this "
@@ -628,7 +624,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
                 engine_state,
                 lamport_out,
                 release_after_wait=0 < self.decode_early_release_rows <= m,
-                beside_shared_expert=0 < self.decode_shared_expert_rows <= m,
+                spare_sms=self.decode_spare_sms,
                 candidates=candidates,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
@@ -846,13 +842,13 @@ def _run_fp4_block_scale_moe(
         decode_engine_state: Optional[torch.Tensor] = None,
         lamport_fc2_out: Optional[torch.Tensor] = None,
         decode_early_release_rows: int = 0,
-        decode_shared_expert_rows: int = 0) -> List[torch.Tensor]:
+        decode_spare_sms: int = 0) -> List[torch.Tensor]:
     """``decode_tuning``: see ``FP4BlockScaleMoERunner.get_tuning_config``.
 
     ``decode_engine_state``: the calling backend's decode MoE engine state
     (``moe_persistent_engine.new_state``), which pre-routed calls need to take
     the engine; ``decode_early_release_rows`` /
-    ``decode_shared_expert_rows``: see ``FP4BlockScaleMoERunner``. ``lamport_fc2_out``: a ``decode_moe.LamportFc2Buffer`` tensor; with
+    ``decode_spare_sms``: see ``FP4BlockScaleMoERunner``. ``lamport_fc2_out``: a ``decode_moe.LamportFc2Buffer`` tensor; with
     ``do_finalize=False`` a call that takes ``ENGINE`` or ``CUTE_FC2`` writes
     its FC2 rows there and returns an empty tensor in their place (an output
     may not alias an input); a ``CUBIN`` call returns its own rows.
@@ -883,7 +879,7 @@ def _run_fp4_block_scale_moe(
         use_dp=use_dp,
         decode_tuning=decode_tuning,
         decode_early_release_rows=decode_early_release_rows,
-        decode_shared_expert_rows=decode_shared_expert_rows,
+        decode_spare_sms=decode_spare_sms,
     )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
@@ -1104,7 +1100,7 @@ def fp4_block_scale_moe_decode_runner(
         decode_engine_state: Optional[torch.Tensor] = None,
         lamport_fc2_out: Optional[torch.Tensor] = None,
         decode_early_release_rows: int = 0,
-        decode_shared_expert_rows: int = 0) -> List[torch.Tensor]:
+        decode_spare_sms: int = 0) -> List[torch.Tensor]:
     """``fp4_block_scale_moe_runner`` with the decode kernels a model declares (``decode_tuning``): the decode MoE
     engine writes its call state, the Lamport FC2 rows and, when it routes the call, the pre-routed tables, ids and
     weights. Under torch.compile it runs inside the opaque ``trtllm::moe_custom_op``."""
@@ -1150,7 +1146,7 @@ def fp4_block_scale_moe_decode_runner(
         decode_engine_state=decode_engine_state,
         lamport_fc2_out=lamport_fc2_out,
         decode_early_release_rows=decode_early_release_rows,
-        decode_shared_expert_rows=decode_shared_expert_rows)
+        decode_spare_sms=decode_spare_sms)
 
 
 def fp4_block_scale_fake_output_without_finalize(
@@ -1216,8 +1212,14 @@ def _fp4_block_scale_moe_fake(
         prerouted_ids: Optional[torch.Tensor] = None,
         prerouted_weights: Optional[torch.Tensor] = None,
         prerouted_tactic: Optional[List[int]] = None,
-        lamport_fc2_out: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
-    """The fake of both ops (the decode op's state arguments do not shape the outputs)."""
+        prerouted_candidates: Optional[torch.Tensor] = None,
+        decode_tuning: bool = False,
+        decode_engine_state: Optional[torch.Tensor] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
+        decode_early_release_rows: int = 0,
+        decode_spare_sms: int = 0) -> List[torch.Tensor]:
+    """The fake of both ops, registered for each with the decode op's parameters (their defaults are the plain op's);
+    the decode op's state arguments do not shape the outputs."""
     if lamport_fc2_out is not None:
         # Whether the rows come back in the buffer depends on the kernel the
         # host picks per call; the model hands the buffer in eager calls only.
@@ -1239,162 +1241,8 @@ def _fp4_block_scale_moe_fake(
     return outputs[:1] if prerouted_tables is not None else outputs
 
 
-@fp4_block_scale_moe_runner.register_fake
-def _(routing_logits: Optional[torch.Tensor],
-      routing_bias: Optional[torch.Tensor],
-      hidden_states: torch.Tensor,
-      hidden_states_scale: torch.Tensor,
-      gemm1_weights: torch.Tensor,
-      gemm1_weights_scale: torch.Tensor,
-      gemm1_bias: torch.Tensor,
-      gemm1_alpha: torch.Tensor,
-      gemm1_beta: torch.Tensor,
-      gemm1_clamp_limit: torch.Tensor,
-      gemm2_weights: torch.Tensor,
-      gemm2_weights_scale: torch.Tensor,
-      gemm2_bias: torch.Tensor,
-      output1_scale_scalar: torch.Tensor,
-      output1_scale_gate_scalar: torch.Tensor,
-      output2_scale_scalar: torch.Tensor,
-      num_experts: int,
-      top_k: int,
-      n_group: Optional[int],
-      topk_group: Optional[int],
-      intermediate_size: int,
-      local_expert_offset: int,
-      local_num_experts: int,
-      routed_scaling_factor: Optional[float],
-      routing_method_type: int,
-      do_finalize: bool,
-      act_type: int = ActType_TrtllmGen.SwiGlu.value,
-      topk_weights: Optional[torch.Tensor] = None,
-      topk_ids: Optional[torch.Tensor] = None,
-      output: Optional[torch.Tensor] = None,
-      tune_max_num_tokens: int = 8192,
-      use_dp: bool = False,
-      prerouted_tables: Optional[torch.Tensor] = None,
-      prerouted_ids: Optional[torch.Tensor] = None,
-      prerouted_weights: Optional[torch.Tensor] = None,
-      prerouted_tactic: Optional[List[int]] = None,
-      decode_tuning: bool = False) -> List[torch.Tensor]:
-    return _fp4_block_scale_moe_fake(routing_logits,
-                                     routing_bias,
-                                     hidden_states,
-                                     hidden_states_scale,
-                                     gemm1_weights,
-                                     gemm1_weights_scale,
-                                     gemm1_bias,
-                                     gemm1_alpha,
-                                     gemm1_beta,
-                                     gemm1_clamp_limit,
-                                     gemm2_weights,
-                                     gemm2_weights_scale,
-                                     gemm2_bias,
-                                     output1_scale_scalar,
-                                     output1_scale_gate_scalar,
-                                     output2_scale_scalar,
-                                     num_experts,
-                                     top_k,
-                                     n_group,
-                                     topk_group,
-                                     intermediate_size,
-                                     local_expert_offset,
-                                     local_num_experts,
-                                     routed_scaling_factor,
-                                     routing_method_type,
-                                     do_finalize,
-                                     act_type=act_type,
-                                     topk_weights=topk_weights,
-                                     topk_ids=topk_ids,
-                                     output=output,
-                                     tune_max_num_tokens=tune_max_num_tokens,
-                                     use_dp=use_dp,
-                                     prerouted_tables=prerouted_tables,
-                                     prerouted_ids=prerouted_ids,
-                                     prerouted_weights=prerouted_weights,
-                                     prerouted_tactic=prerouted_tactic)
-
-
-@fp4_block_scale_moe_decode_runner.register_fake
-def _(routing_logits: Optional[torch.Tensor],
-      routing_bias: Optional[torch.Tensor],
-      hidden_states: torch.Tensor,
-      hidden_states_scale: torch.Tensor,
-      gemm1_weights: torch.Tensor,
-      gemm1_weights_scale: torch.Tensor,
-      gemm1_bias: torch.Tensor,
-      gemm1_alpha: torch.Tensor,
-      gemm1_beta: torch.Tensor,
-      gemm1_clamp_limit: torch.Tensor,
-      gemm2_weights: torch.Tensor,
-      gemm2_weights_scale: torch.Tensor,
-      gemm2_bias: torch.Tensor,
-      output1_scale_scalar: torch.Tensor,
-      output1_scale_gate_scalar: torch.Tensor,
-      output2_scale_scalar: torch.Tensor,
-      num_experts: int,
-      top_k: int,
-      n_group: Optional[int],
-      topk_group: Optional[int],
-      intermediate_size: int,
-      local_expert_offset: int,
-      local_num_experts: int,
-      routed_scaling_factor: Optional[float],
-      routing_method_type: int,
-      do_finalize: bool,
-      act_type: int = ActType_TrtllmGen.SwiGlu.value,
-      topk_weights: Optional[torch.Tensor] = None,
-      topk_ids: Optional[torch.Tensor] = None,
-      output: Optional[torch.Tensor] = None,
-      tune_max_num_tokens: int = 8192,
-      use_dp: bool = False,
-      prerouted_tables: Optional[torch.Tensor] = None,
-      prerouted_ids: Optional[torch.Tensor] = None,
-      prerouted_weights: Optional[torch.Tensor] = None,
-      prerouted_tactic: Optional[List[int]] = None,
-      prerouted_candidates: Optional[torch.Tensor] = None,
-      decode_tuning: bool = False,
-      decode_engine_state: Optional[torch.Tensor] = None,
-      lamport_fc2_out: Optional[torch.Tensor] = None,
-      decode_early_release_rows: int = 0,
-      decode_shared_expert_rows: int = 0) -> List[torch.Tensor]:
-    return _fp4_block_scale_moe_fake(routing_logits,
-                                     routing_bias,
-                                     hidden_states,
-                                     hidden_states_scale,
-                                     gemm1_weights,
-                                     gemm1_weights_scale,
-                                     gemm1_bias,
-                                     gemm1_alpha,
-                                     gemm1_beta,
-                                     gemm1_clamp_limit,
-                                     gemm2_weights,
-                                     gemm2_weights_scale,
-                                     gemm2_bias,
-                                     output1_scale_scalar,
-                                     output1_scale_gate_scalar,
-                                     output2_scale_scalar,
-                                     num_experts,
-                                     top_k,
-                                     n_group,
-                                     topk_group,
-                                     intermediate_size,
-                                     local_expert_offset,
-                                     local_num_experts,
-                                     routed_scaling_factor,
-                                     routing_method_type,
-                                     do_finalize,
-                                     act_type=act_type,
-                                     topk_weights=topk_weights,
-                                     topk_ids=topk_ids,
-                                     output=output,
-                                     tune_max_num_tokens=tune_max_num_tokens,
-                                     use_dp=use_dp,
-                                     prerouted_tables=prerouted_tables,
-                                     prerouted_ids=prerouted_ids,
-                                     prerouted_weights=prerouted_weights,
-                                     prerouted_tactic=prerouted_tactic,
-                                     lamport_fc2_out=lamport_fc2_out)
+fp4_block_scale_moe_runner.register_fake(_fp4_block_scale_moe_fake)
+fp4_block_scale_moe_decode_runner.register_fake(_fp4_block_scale_moe_fake)
 
 
 @dataclass(frozen=True)

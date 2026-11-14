@@ -27,7 +27,6 @@ per-format, so they are settled here rather than branched on above.
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.utils import (
     ActivationType,
     ActType_TrtllmGen,
@@ -72,6 +71,10 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
     #: The decode MoE engine's call state where the model declares its decode kernels (``decode_tuning``),
     #: created with the weights (``cache_derived_state``).
     decode_engine_state: torch.Tensor | None = None
+
+    #: SMs the decode MoE engine's persistent grid leaves free on the next ``run_moe`` calls
+    #: (``reserve_sms_for_concurrent_kernels``).
+    _concurrent_sm_reserve: int = 0
 
     def _intermediate_size_padded(self) -> int:
         act_type = to_trtllm_gen_act_type(self.activation_type)
@@ -199,10 +202,23 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         self.act_alpha.data.copy_(params.alpha)
         self.act_beta.data.copy_(params.beta)
 
-    def _shared_expert_rows_beside(self) -> int:
-        """``decode_shared_expert_rows`` for this call: the shared expert runs beside the engine only on the model's
-        aux stream (multi-stream, i.e. CUDA-graph capture); in-order steps (0) leave the engine every SM."""
-        return self.decode_shared_expert_rows if do_multi_stream() else 0
+    def sm_reserve_ceiling(self) -> int:
+        """Where the model declares the decode kernels (``decode_tuning``) of a pre-routed native call, the decode MoE
+        engine (``decode_moe.ENGINE``) sizes a persistent grid it can shrink by up to
+        ``decode_moe.ENGINE_SPARE_SMS`` SMs; 0 otherwise (the cubins' grids are fixed)."""
+        if not (self.decode_tuning and self.supports_prerouted_routing):
+            return 0
+        from .decode_moe import ENGINE_SPARE_SMS
+
+        return ENGINE_SPARE_SMS
+
+    def reserve_sms_for_concurrent_kernels(self, num_sms: int) -> int:
+        """The decode MoE engine launches its persistent grid ``num_sms`` SMs short (at most
+        ``sm_reserve_ceiling()``) until the next call; other kernels of the op keep their grids."""
+        if num_sms < 0:
+            raise ValueError(f"num_sms must be non-negative, got {num_sms}")
+        self._concurrent_sm_reserve = min(num_sms, self.sm_reserve_ceiling())
+        return self._concurrent_sm_reserve
 
     def run_moe(
         self,
@@ -271,7 +287,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             decode_engine_state=self.decode_engine_state,
             lamport_fc2_out=ctx.lamport_fc2_out,
             decode_early_release_rows=self.decode_early_release_rows,
-            decode_shared_expert_rows=self._shared_expert_rows_beside(),
+            decode_spare_sms=self._concurrent_sm_reserve,
         )
 
         if not k.do_finalize:

@@ -8,7 +8,8 @@ produces the runner's gemm2 rows bit for bit and returns its ``do_finalize=False
   given the router GEMM's per-tile candidates it also routes the call (:func:`engine_routes`).
 * ``CUTE_FC2``: up to :data:`MAX_TOKENS` tokens whose FC2 cubin ``moe_lowm_fc2`` reproduces: the runner's FC1, then
   FC2 on ``moe_lowm_fc2`` (two smaller CTAs per SM).
-* ``CUBIN``: the runner's own FC1 and FC2 (also under its fine-grained-sync pair, which has no FC1-only entry).
+* ``CUBIN``: the runner's own FC1 and FC2 (also where it runs its fine-grained-sync pair, which has no FC1-only
+  entry: ``TLLM_USE_FINE_GRAINED_SYNC`` with such a cubin for the shape).
 
 Lamport FC2 (:class:`LamportFc2Buffer`): ``ENGINE`` / ``CUTE_FC2`` store nothing before their PDL wait, release their
 dependents only after it and write each word of a real row once (``cvt.rn.satfinite.bf16x2.f32``, never 0xFFFFFFFF),
@@ -16,10 +17,8 @@ so the MoE-output all-reduce can poll their rows instead of waiting for FC2.
 """
 
 import enum
-import functools
-import re
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -36,35 +35,39 @@ if TYPE_CHECKING:
 MAX_TOKENS = 128
 #: The runner's token tile whose FC2 cubins the CuTe FC2 reproduces.
 TILE_N = 8
-#: SMs ``ENGINE`` leaves free for a shared expert that runs beside it on a side stream, whose down-projection CTAs
-#: cannot share an SM with an engine CTA.
+#: Most SMs ``ENGINE``'s persistent grid leaves free for work another stream runs beside it
+#: (``TRTLLMGenFp4BlockScaleBase.sm_reserve_ceiling``): a shared expert's down-projection CTAs cannot share an SM with
+#: an engine CTA. Measured on GB300 with Qwen3.5-397B-A17B NVFP4 (hidden 4096, top-10) MTP decode steps at the GEN
+#: reference layouts; other GPUs and expert shapes are not measured.
 ENGINE_SPARE_SMS = 8
-#: Fewest rows of a call whose segments take MMA N 64 (a measured crossover: fewer rows take N 32).
+#: Fewest rows of a call whose segments take MMA N 64 (fewer rows take N 32): the crossover measured on GB300 with the
+#: same Qwen3.5-397B-A17B NVFP4 decode steps.
 N64_MIN_ROWS = 225
 
-#: Structure of a trtllm-gen batched-GEMM cubin name: output / A, B / accumulator dtypes, tile M x N (x K, optional
-#: 2x unrolled K loop), stages, epilogue tile, MMA M x N x K, cluster, raster, split-K, layouts.
-_GEMM_NAME = re.compile(
-    r"^bmm_(?P<out>[A-Za-z0-9]+)_(?P<ab>[A-Za-z0-9]+)_(?P<acc>[A-Za-z0-9]+)_Ab\d+_Bb\d+"
-    r"_t(?P<tile>\d+x\d+)x\d+(?:u2)?_s\d+_et\d+x\d+_m(?P<mma>\d+x\d+x\d+)_c(?P<cluster>\d+x\d+x\d+)"
-    r"_r[MN]_(?P<split>splitK\d+_)?TN_transOut_"
-)
+#: The FC2 cubin options ``moe_lowm_fc2`` reproduces bit for bit (``get_gemm2_kernel_options`` of the C++ runner):
+#: E2m1 x E2m1 -> FP32 -> BF16 in tiles of 128 x TILE_N with M128 N8 K64 MMAs over the whole K in order (one CTA per
+#: tile, no split-K). The tile K, stage count, unrolling and tile scheduler only change when those MMAs issue.
+_CUTE_FC2_OPTIONS = {
+    "dtypeA": "E2m1",
+    "dtypeB": "E2m1",
+    "dtypeAcc": "Fp32",
+    "dtypeC": "Bfloat16",
+    "tileM": "128",
+    "tileN": str(TILE_N),
+    "mmaM": "128",
+    "mmaN": str(TILE_N),
+    "mmaK": "64",
+    "clusterDimX": "1",
+    "clusterDimY": "1",
+    "clusterDimZ": "1",
+    "numSlicesForSplitK": "1",
+}
 
 
-@functools.lru_cache(maxsize=None)
-def cute_fc2_reproduces(gemm2_kernel_name: str) -> bool:
-    """Whether ``moe_lowm_fc2`` reproduces this FC2 cubin bit for bit: E2m1 x E2m1 -> FP32 -> BF16 in tiles of 128 x
-    TILE_N with M128 N8 K64 MMAs over the whole K in order (one CTA per tile, no split-K). The tile K, stage count,
-    unrolling and tile scheduler only change when those MMAs issue."""
-    m = _GEMM_NAME.match(gemm2_kernel_name)
-    return (
-        m is not None
-        and (m["out"], m["ab"], m["acc"]) == ("Bfloat16", "E2m1E2m1", "Fp32")
-        and m["tile"] == f"128x{TILE_N}"
-        and m["mma"] == f"128x{TILE_N}x64"
-        and m["cluster"] == "1x1x1"
-        and m["split"] is None
-    )
+def cute_fc2_reproduces(gemm2_kernel_options: Mapping[str, str]) -> bool:
+    """Whether ``moe_lowm_fc2`` reproduces the FC2 cubin of these options (the runner's
+    ``get_gemm2_kernel_options(tile, config)``) bit for bit."""
+    return all(gemm2_kernel_options.get(key) == value for key, value in _CUTE_FC2_OPTIONS.items())
 
 
 class DecodeKernel(enum.Enum):
@@ -73,20 +76,37 @@ class DecodeKernel(enum.Enum):
     ENGINE = 2
 
 
+#: (act type, tile, config) -> whether ``moe_lowm_fc2`` reproduces that tactic's FC2 cubin. The C++ runners are
+#: shared per act type (``FP4BlockScaleMoERunner.get_runner``), so the key names the cubin.
+_FC2_REPRODUCED: Dict[Tuple[int, int, int], bool] = {}
+
+
 def _cute_fc2_fits(
     kernel_runner: torch.ScriptObject,
+    act_type: int,
     tactic: List[int],
     args: "FP4BlockScaleMoEInputs",
+    top_k: int,
     intermediate_size: int,
 ) -> bool:
     if len(tactic) != 2 or tactic[0] != TILE_N or tactic[1] < 0:
         return False
-    w2, w2_sf = args.gemm2_weights, args.gemm2_weights_scale
-    if args.hidden_states.shape[0] > MAX_TOKENS or w2.dim() != 3 or w2_sf.dim() != 3:
+    x, w2, w2_sf = args.hidden_states, args.gemm2_weights, args.gemm2_weights_scale
+    if x.shape[0] > MAX_TOKENS or w2.dim() != 3 or w2_sf.dim() != 3:
         return False
     if w2.shape[2] * 2 != intermediate_size:
         return False
-    return cute_fc2_reproduces(kernel_runner.get_gemm2_kernel_name(int(tactic[0]), int(tactic[1])))
+    key = (int(act_type), int(tactic[0]), int(tactic[1]))
+    reproduced = _FC2_REPRODUCED.get(key)
+    if reproduced is None:
+        reproduced = _FC2_REPRODUCED[key] = cute_fc2_reproduces(
+            kernel_runner.get_gemm2_kernel_options(key[1], key[2])
+        )
+    # The CuTe FC2 stands in for the tuned tactic's FC2; the runner runs its fine-grained-sync pair instead (which
+    # has no FC1-only entry) only where TLLM_USE_FINE_GRAINED_SYNC is set and such a cubin exists for this shape.
+    return reproduced and not kernel_runner.uses_fine_grained_sync(
+        key[1], top_k, 2 * x.shape[1], intermediate_size, w2.shape[0], x.shape[0]
+    )
 
 
 def _engine_fits(args: "FP4BlockScaleMoEInputs", act_type: int, top_k: int) -> bool:
@@ -212,12 +232,10 @@ def select(
     intermediate_size: int,
     prerouted: bool,
     engine_state: Optional[torch.Tensor],
-    fine_grained_sync: bool,
 ) -> DecodeKernel:
     """The kernels of one op call where the model declares its decode kernels (``FP4BlockScaleMoERunner``;
     host-side checks only). ``engine_state``: the calling backend's engine state
-    (``moe_persistent_engine.new_state``), or None. ``fine_grained_sync``: the runner prefers its fine-grained-sync
-    FC1 / FC2 pair (``TLLM_USE_FINE_GRAINED_SYNC``)."""
+    (``moe_persistent_engine.new_state``), or None."""
     if takes_engine(
         args,
         act_type,
@@ -230,7 +248,7 @@ def select(
         return DecodeKernel.ENGINE
     if do_finalize or output is not None or args.gemm2_bias is not None:
         return DecodeKernel.CUBIN
-    if not fine_grained_sync and _cute_fc2_fits(kernel_runner, tactic, args, intermediate_size):
+    if _cute_fc2_fits(kernel_runner, act_type, tactic, args, top_k, intermediate_size):
         return DecodeKernel.CUTE_FC2
     return DecodeKernel.CUBIN
 
@@ -263,7 +281,7 @@ def run_engine(
     state: torch.Tensor,
     lamport_out: Optional[torch.Tensor],
     release_after_wait: bool,
-    beside_shared_expert: bool = False,
+    spare_sms: int = 0,
     candidates: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
@@ -272,7 +290,8 @@ def run_engine(
     """``ENGINE`` on the pre-routed ``tables`` (``prerouted_table_views`` for ``tile``); returns [gemm2 rows], as the
     runner's pre-routed un-finalized call. ``release_after_wait``: the engine's PDL release point (its dependency
     wait, else once its FC2 tickets are spent), the caller's choice for the kernel that follows.
-    ``beside_shared_expert``: leave :data:`ENGINE_SPARE_SMS` SMs to the shared expert (same rows).
+    ``spare_sms``: SMs the persistent grid leaves free for work another stream runs beside it (the backend's
+    ``reserve_sms_for_concurrent_kernels``; at most :data:`ENGINE_SPARE_SMS`).
     ``candidates`` (``PreroutedRouting.candidates``): the engine routes the call for the local experts from
     ``local_start`` and writes ``tables``, ``topk_ids`` and ``topk_weights`` itself (:func:`engine_routes`)."""
     from tensorrt_llm._torch.kernels.blackwell.moe_nvfp4_engine import moe_nvfp4_engine
@@ -287,7 +306,7 @@ def run_engine(
     h = torch.empty((cap, inter // 2), dtype=torch.uint8, device=dev)
     hsf = torch.empty((cap * inter // 16,), dtype=torch.uint8, device=dev)
     if lamport_out is not None:
-        out = _lamport_rows(lamport_out, cap, hidden)
+        out = _lamport_out_view(lamport_out, cap, hidden)
     else:
         out = torch.empty((cap, hidden), dtype=torch.bfloat16, device=dev)
     n_max = n_max_for(m)
@@ -313,7 +332,7 @@ def run_engine(
         n_max=n_max,
         tile_k=tile_k_for(n_max, hidden, inter),
         release_after_wait=release_after_wait,
-        spare_sms=ENGINE_SPARE_SMS if beside_shared_expert else 0,
+        spare_sms=spare_sms,
         candidates=candidates,
         topk_ids=topk_ids,
         topk_weights=topk_weights,
@@ -368,7 +387,7 @@ def run_cute_fc2(
     ) = fc1_outputs
     out = gemm2_output
     if lamport_out is not None:
-        out = _lamport_rows(lamport_out, gemm2_output.shape[0], gemm2_output.shape[1])
+        out = _lamport_out_view(lamport_out, gemm2_output.shape[0], gemm2_output.shape[1])
     moe_lowm_fc2(
         gemm1_output.view(torch.uint8),
         gemm1_output_scale.view(torch.uint8),
@@ -389,7 +408,8 @@ def rows_in_lamport(rows: torch.Tensor, lamport_out: Optional[torch.Tensor]) -> 
     return lamport_out is not None and rows.data_ptr() == lamport_out.data_ptr()
 
 
-def _lamport_rows(lamport_out: torch.Tensor, rows: int, hidden: int) -> torch.Tensor:
+def _lamport_out_view(lamport_out: torch.Tensor, rows: int, hidden: int) -> torch.Tensor:
+    """The first ``rows`` rows of the Lamport FC2 buffer, the FC2 output of a call of that many rows."""
     if lamport_out.shape[0] < rows or lamport_out.shape[1] != hidden:
         raise RuntimeError(
             f"Lamport FC2 buffer {tuple(lamport_out.shape)} cannot hold {rows} x {hidden}"
@@ -397,7 +417,7 @@ def _lamport_rows(lamport_out: torch.Tensor, rows: int, hidden: int) -> torch.Te
     return lamport_out[:rows]
 
 
-def lamport_rows(
+def lamport_buffer_rows(
     runner: torch.ScriptObject,
     max_rows: int,
     hidden: int,
@@ -435,14 +455,14 @@ class LamportFc2Buffer:
     def get(
         self, hidden: int, inter: int, top_k: int, local_experts: int, device: torch.device
     ) -> torch.Tensor:
-        """The buffer [>= lamport_rows(...), hidden] bf16 for the FP4 MoE layers of these shapes."""
+        """The buffer [>= lamport_buffer_rows(...), hidden] bf16 for the FP4 MoE layers of these shapes."""
         buf = self._buf
         if buf is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("allocate the Lamport FC2 buffer before CUDA graph capture")
 
             runner = torch.classes.trtllm.FP4BlockScaleMoERunner(int(ActType_TrtllmGen.SwiGlu))
-            rows = lamport_rows(runner, self.max_rows, hidden, inter, top_k, local_experts)
+            rows = lamport_buffer_rows(runner, self.max_rows, hidden, inter, top_k, local_experts)
             buf = torch.full((rows, hidden), -1, dtype=torch.int16, device=device).view(
                 torch.bfloat16
             )

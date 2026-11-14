@@ -23,7 +23,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.low_m_mma_gemm import default_tactic, low_m_mma_gemm
-from tensorrt_llm._torch.moe.fused_moe.impl_contract import PreroutedRouting
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import EngineRouting, PreroutedRouting
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_front as df
 
 E, K, H = 512, 10, 4096
@@ -1045,7 +1045,9 @@ def test_decode_front_engine_route_gate(
     out = front(Gate(), Moe(), x, do_finalize=finalize)
     assert out == "front" and calls == path, calls
     engine = path[0] == "engine_router"
-    assert (seen[0].candidates is cand) == engine and (seen[0].candidates is None) != engine
+    # The engine's hand-off is an EngineRouting carrying the candidates; otherwise a plain PreroutedRouting.
+    assert isinstance(seen[0], EngineRouting) == engine
+    assert not engine or seen[0].candidates is cand
 
 
 def test_engine_route_decision_is_kept_per_token_count(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -24,6 +24,7 @@
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 #include "tensorrt_llm/thop/thUtils.h"
+#include <map>
 #include <set>
 #include <string>
 
@@ -259,6 +260,9 @@ public:
 
     [[nodiscard]] std::string getKernelNameFromConfigIndex(int32_t configIndex) const;
 
+    // See TrtllmGenBatchedGemmRunner::getKernelOptionsFromConfigIndex.
+    [[nodiscard]] std::map<std::string, std::string> getKernelOptionsFromConfigIndex(int32_t configIndex) const;
+
     void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight, void* weightScale,
         float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* ptrNumNonExitingCtas,
@@ -436,6 +440,9 @@ public:
 
     // Kernel name of the FC2 (gemm2) cubin of MoE config configIndex.
     [[nodiscard]] std::string getGemm2KernelName(int64_t configIndex) const;
+
+    // Arithmetic options of the FC2 (gemm2) cubin of MoE config configIndex (getKernelOptionsFromConfigIndex).
+    [[nodiscard]] std::map<std::string, std::string> getGemm2KernelOptions(int64_t configIndex) const;
 
 private:
     void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, moe::dev::convertsf::Data& convertSfData,

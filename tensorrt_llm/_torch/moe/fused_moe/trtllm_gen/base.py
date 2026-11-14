@@ -114,7 +114,6 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
 
     decode_tuning: bool = False
     decode_early_release_rows: int = 0
-    decode_shared_expert_rows: int = 0
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         """Take the provider off the descriptor a leaf already publishes.
@@ -220,7 +219,6 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         decode = MoEDecodeOptions.of(model_config.extra_attrs)
         self.decode_tuning = decode.tuning
         self.decode_early_release_rows = decode.early_release_rows
-        self.decode_shared_expert_rows = decode.shared_expert_rows
 
         self.op_backend: MoEOpBackend = get_op_backend(self.provider)
 

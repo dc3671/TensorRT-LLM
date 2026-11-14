@@ -753,7 +753,57 @@ public:
         return getRunner(static_cast<int32_t>(tileN), /*useFineGrained=*/false).getGemm2KernelName(config);
     }
 
+    // Arithmetic options of the FC2 cubin a tactic [tileN, config] runs (non-FineGrained runner), as strings
+    // (TrtllmGenBatchedGemmRunner::getKernelOptionsFromConfigIndex).
+    [[nodiscard]] c10::Dict<std::string, std::string> getGemm2KernelOptions(int64_t tileN, int64_t config)
+    {
+        c10::Dict<std::string, std::string> result;
+        for (auto const& [key, value] :
+            getRunner(static_cast<int32_t>(tileN), /*useFineGrained=*/false).getGemm2KernelOptions(config))
+        {
+            result.insert(key, value);
+        }
+        return result;
+    }
+
+    // Whether a call of this shape on tile tileN runs the fine-grained-sync FC1 / FC2 pair instead of the tuned
+    // tactic: TLLM_USE_FINE_GRAINED_SYNC is set and a fine-grained cubin with a valid config exists for it.
+    [[nodiscard]] bool usesFineGrainedSync(int64_t tileN, int64_t topK, int64_t hiddenSize, int64_t intermediateSize,
+        int64_t numLocalExperts, int64_t numTokens)
+    {
+        int64_t config = -1;
+        return fineGrainedRunner(tileN, topK, hiddenSize, intermediateSize, numLocalExperts, numTokens, config)
+            != nullptr;
+    }
+
 private:
+    // The fine-grained-sync runner a call of this shape prefers on tile tileN, with its default config in
+    // configOut, or nullptr (TLLM_USE_FINE_GRAINED_SYNC unset, no fine-grained cubin for the tile, or none valid for
+    // the shape): the call then runs the tuned tactic on the non-fine-grained runner.
+    RunnerType* fineGrainedRunner(int64_t tileN, int64_t topK, int64_t hiddenSize, int64_t intermediateSize,
+        int64_t numLocalExperts, int64_t numTokens, int64_t& configOut)
+    {
+        if (!tensorrt_llm::common::getEnvUseFineGrainedSync())
+        {
+            return nullptr;
+        }
+        auto* runner = getRunnerOrNull(static_cast<int32_t>(tileN), /*useFineGrained=*/true);
+        if (runner == nullptr)
+        {
+            return nullptr;
+        }
+        try
+        {
+            configOut
+                = runner->getDefaultValidConfigIndex(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+            return runner;
+        }
+        catch (std::exception const&)
+        {
+            return nullptr; // no valid config for this shape
+        }
+    }
+
     [[nodiscard]] std::vector<torch::Tensor> runImpl(torch::optional<torch::Tensor> const& routing_logits,
         torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
         torch::Tensor const& hidden_states_scale, torch::Tensor const& gemm1_weights,
@@ -772,7 +822,6 @@ private:
     {
         int64_t tileN = moeConfigIndex[0];
         int64_t config = moeConfigIndex[1];
-        bool const useFineGrained = tensorrt_llm::common::getEnvUseFineGrainedSync();
 
         auto const num_tokens = hidden_states.sizes()[0];
         // 2x FP4 per byte element
@@ -792,27 +841,12 @@ private:
         // passes local expert counts, global expert ids and no logits).
         TORCH_CHECK(prerouted == nullptr || tileN == routing_tile_n, "pre-routed call built for tile ", routing_tile_n,
             " cannot run with tile ", tileN);
-        // Prefer the fine-grained runner for the tuned tile when it has a valid config for this shape.
-        RunnerType* runner = nullptr;
+        // Prefer the fine-grained runner for the tuned tile when it has a valid config for this shape; only that
+        // pair has no FC1-only entry (without a fine-grained cubin the call runs the tuned tactic).
         int64_t configToRun = config;
-        TORCH_CHECK(!fc1_only || !useFineGrained, "fc1_only does not support FineGrained sync.");
-        if (useFineGrained)
-        {
-            auto* fineGrainedRunner = getRunnerOrNull(tileN, /*useFineGrained=*/true);
-            if (fineGrainedRunner != nullptr)
-            {
-                try
-                {
-                    configToRun = fineGrainedRunner->getDefaultValidConfigIndex(
-                        top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
-                    runner = fineGrainedRunner;
-                }
-                catch (std::exception const&)
-                {
-                    runner = nullptr; // no valid config for this shape; fall back to the tuned tactic
-                }
-            }
-        }
+        RunnerType* runner = fineGrainedRunner(
+            tileN, top_k, hidden_size, intermediate_size, local_num_experts, num_tokens, configToRun);
+        TORCH_CHECK(!fc1_only || runner == nullptr, "fc1_only does not support FineGrained sync.");
         if (runner == nullptr)
         {
             runner = &getRunner(tileN, /*useFineGrained=*/false);
@@ -947,7 +981,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         .def("run_moe_prerouted", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::runPrerouted)
         .def("run_moe_fc1", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::runFc1)
         .def("run_moe_prerouted_fc1", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::runPreroutedFc1)
-        .def("get_gemm2_kernel_name", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::getGemm2KernelName);
+        .def("get_gemm2_kernel_name", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::getGemm2KernelName)
+        .def("get_gemm2_kernel_options", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::getGemm2KernelOptions)
+        .def("uses_fine_grained_sync", &tensorrt_llm::torch_ext::FP4BlockScaleMoeRunner::usesFineGrainedSync);
     m.class_<tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner>("FP8FP4BlockScaleMoERunner")
         .def(torch::init<int64_t>())
         .def("get_valid_configs", &tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner::getValidConfigs)

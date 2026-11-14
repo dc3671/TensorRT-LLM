@@ -7,6 +7,7 @@ One TEP8 rank's shapes: 128 local experts of 512, hidden 4096, intermediate 512 
 checkpoint-format NVFP4 experts through the loader's own shuffle; block scales over 2^-6..2^6 so FP32 sums round."""
 
 import functools
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -363,7 +364,7 @@ def _op_inputs(ex, xq, xsf):
     ]
 
 
-def _decode_runner(decode_tuning=True, decode_shared_expert_rows=0):
+def _decode_runner(decode_tuning=True, decode_spare_sms=0):
     from tensorrt_llm._torch.custom_ops import trtllm_gen_custom_ops as G
 
     return G.FP4BlockScaleMoERunner(
@@ -379,7 +380,7 @@ def _decode_runner(decode_tuning=True, decode_shared_expert_rows=0):
         False,
         G.ActType_TrtllmGen.SwiGlu.value,
         decode_tuning=decode_tuning,
-        decode_shared_expert_rows=decode_shared_expert_rows,
+        decode_spare_sms=decode_spare_sms,
     )
 
 
@@ -390,7 +391,7 @@ def _tile8_tactics(runner, m):
     cr = runner.get_runner()
     tactics = [list(map(int, t)) for t in cr.get_valid_configs(TOPK, H, INTER, E_LOCAL, m)]
     tile8 = [t for t in tactics if t[0] == 8]
-    bitwise = [t for t in tile8 if cute_fc2_reproduces(cr.get_gemm2_kernel_name(t[0], t[1]))]
+    bitwise = [t for t in tile8 if cute_fc2_reproduces(cr.get_gemm2_kernel_options(t[0], t[1]))]
     assert bitwise, [cr.get_gemm2_kernel_name(t[0], t[1]) for t in tile8]
     return tile8[0], bitwise[0]
 
@@ -457,9 +458,25 @@ def test_decode_kernels_select_the_engine_with_the_runner_abi(monkeypatch):
     assert not picked
 
 
-def test_engine_leaves_sms_to_the_shared_expert_from_the_declared_rows(monkeypatch):
-    """The runner hands the engine ``beside_shared_expert`` from its ``decode_shared_expert_rows`` rows on (0:
-    never); the rows stay the stock runner's."""
+@pytest.mark.parametrize(
+    "e_local,inter",
+    # Qwen3.5-397B-A17B experts (512, intermediate 1024, top-10) at EP4 / EP8, layouts that take the engine in
+    # production (TP4/EP4, TEP8); the 56-row comparison needs a tile-8 tactic, which 32 local experts do not offer.
+    [(128, 1024), (64, 1024)],
+)
+def test_engine_rows_match_the_runner_at_the_qwen35_layouts(monkeypatch, e_local, inter):
+    """The runner-ABI engine / CuTe FC2 / cubin comparison of
+    ``test_decode_kernels_select_the_engine_with_the_runner_abi`` at the production expert layouts, not only this
+    file's 128 x 512 one."""
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "E_LOCAL", e_local)
+    monkeypatch.setattr(module, "INTER", inter)
+    test_decode_kernels_select_the_engine_with_the_runner_abi(monkeypatch)
+
+
+def test_engine_leaves_the_reserved_sms_free(monkeypatch):
+    """The runner hands the engine its ``decode_spare_sms`` (the backend's reserve for this call); the rows stay the
+    stock runner's."""
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
     from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe
@@ -474,37 +491,66 @@ def test_engine_leaves_sms_to_the_shared_expert_from_the_declared_rows(monkeypat
     seen, orig = [], decode_moe.run_engine
 
     def spy(*args, **kwargs):
-        seen.append(kwargs["beside_shared_expert"])
+        seen.append(kwargs["spare_sms"])
         return orig(*args, **kwargs)
 
     monkeypatch.setattr(decode_moe, "run_engine", spy)
-    for rows, expect in ((0, False), (m + 1, False), (m, True)):
-        runner = _decode_runner(decode_shared_expert_rows=rows)
+    for spare in (0, decode_moe.ENGINE_SPARE_SMS):
+        runner = _decode_runner(decode_spare_sms=spare)
         any8, _ = _tile8_tactics(runner, m)
         seen.clear()
         out = runner.forward(
             _op_inputs(ex, xq, xsf), tactic=any8, prerouted=(views, ids, wts), engine_state=state
         )[0]
         torch.cuda.synchronize()
-        assert seen == [expect], (rows, seen)
+        assert seen == [spare], (spare, seen)
         got = out[e2p.flatten()[valid].long()]
-        assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), rows
+        assert torch.equal(got.view(torch.int16), ref.view(torch.int16)), spare
 
 
-def test_shared_expert_rows_reach_the_engine_only_beside_the_shared_expert():
-    """The NVFP4 leaf declares its shared-expert rows to the op only while the model runs the shared expert on its
-    aux stream (multi-stream: CUDA-graph capture); an in-order (eager) step leaves the engine every SM."""
-    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+def test_engine_reserve_is_the_moe_sm_reserve_hook():
+    """The NVFP4 TRTLLM-Gen leaf takes the shared expert's SMs through MoEImplBase's hooks: a ceiling of
+    ENGINE_SPARE_SMS only where the model declares the decode kernels of a pre-routed call, and the per-forward
+    reserve bounded by it (the model hands 0 for an in-order step)."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import ENGINE_SPARE_SMS
     from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.fp4_block_scale import (
         TRTLLMGenFp4BlockScaleBase,
     )
 
-    leaf = SimpleNamespace(decode_shared_expert_rows=64)
-    rows = functools.partial(TRTLLMGenFp4BlockScaleBase._shared_expert_rows_beside, leaf)
-    with with_multi_stream(False):
-        assert rows() == 0
-    with with_multi_stream(True):
-        assert rows() == 64
+    def leaf(decode_tuning, prerouted):
+        obj = SimpleNamespace(decode_tuning=decode_tuning, supports_prerouted_routing=prerouted)
+        obj.sm_reserve_ceiling = functools.partial(
+            TRTLLMGenFp4BlockScaleBase.sm_reserve_ceiling, obj
+        )
+        obj.reserve = functools.partial(
+            TRTLLMGenFp4BlockScaleBase.reserve_sms_for_concurrent_kernels, obj
+        )
+        return obj
+
+    declared = leaf(True, True)
+    assert declared.sm_reserve_ceiling() == ENGINE_SPARE_SMS
+    assert declared.reserve(ENGINE_SPARE_SMS) == ENGINE_SPARE_SMS
+    assert declared._concurrent_sm_reserve == ENGINE_SPARE_SMS
+    assert declared.reserve(4 * ENGINE_SPARE_SMS) == ENGINE_SPARE_SMS
+    assert declared.reserve(0) == 0 and declared._concurrent_sm_reserve == 0
+    with pytest.raises(ValueError):
+        declared.reserve(-1)
+    for decode_tuning, prerouted in ((False, True), (True, False)):
+        other = leaf(decode_tuning, prerouted)
+        assert other.sm_reserve_ceiling() == 0
+        assert other.reserve(ENGINE_SPARE_SMS) == 0
+
+
+def test_engine_grid_leaves_the_global_sm_reserve(monkeypatch):
+    """The persistent MoE grids also keep out the SMs ``cute_dsl_utils.sm_reserve()`` reserves (DWDP), on top of
+    the per-call spare SMs."""
+    import tensorrt_llm._torch.cute_dsl_utils as cdu
+    from tensorrt_llm._torch.kernels.blackwell import moe_lowm_fc2
+
+    sms = torch.cuda.get_device_properties(torch.device("cuda")).multi_processor_count
+    assert moe_lowm_fc2.num_sms(torch.device("cuda")) == sms
+    monkeypatch.setattr(cdu, "_sm_reserve", 4)
+    assert moe_lowm_fc2.num_sms(torch.device("cuda")) == sms - 4
 
 
 def test_lamport_out_takes_the_decode_kernels_rows(monkeypatch):
@@ -623,7 +669,7 @@ def test_lamport_buffer_holds_every_tile_the_runner_can_tune():
         tiles = {int(t[0]) for t in runner.get_valid_configs(TOPK, H, INTER, E_LOCAL, m)}
         assert tiles
         calls += [max(max_num_tiles(m, TOPK, E_LOCAL, t) * t, 128 * 1024 // (H * 2)) for t in tiles]
-    rows = dm.lamport_rows(runner, LAMPORT_MAX_ROWS, H, INTER, TOPK, E_LOCAL)
+    rows = dm.lamport_buffer_rows(runner, LAMPORT_MAX_ROWS, H, INTER, TOPK, E_LOCAL)
     assert max(calls) <= rows
     dev = torch.device("cuda", torch.cuda.current_device())
     owner = dm.LamportFc2Buffer(LAMPORT_MAX_ROWS)
@@ -718,13 +764,25 @@ def test_engine_gate_bounds_the_segment_table(m, top_k, fits):
 
 
 def test_fine_grained_sync_keeps_the_runner_fc2():
-    """With the runner's fine-grained-sync pair preferred, a call keeps its own FC2: the FC1-only entry points
-    refuse fine-grained sync."""
+    """A call keeps the runner's FC2 only where the runner runs its fine-grained-sync pair (the FC1-only entry points
+    refuse it), as the runner reports for the call's tile and shape; the FC2 cubin's options are asked once per
+    (act type, tactic)."""
     from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe as dm
     from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
-    name = "bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_t128x8x256_s4_et128x8_m128x8x64_c1x1x1_rM_TN_transOut_dynB"
-    runner = SimpleNamespace(get_gemm2_kernel_name=lambda tile, config: name)
+    options = dict(dm._CUTE_FC2_OPTIONS, tileK="256")
+    asked, fg_calls = [], []
+
+    def runner(fine_grained):
+        def uses_fine_grained_sync(*shape):
+            fg_calls.append(shape)
+            return fine_grained
+
+        return SimpleNamespace(
+            get_gemm2_kernel_options=lambda tile, config: asked.append((tile, config)) or options,
+            uses_fine_grained_sync=uses_fine_grained_sync,
+        )
+
     args = SimpleNamespace(
         hidden_states=torch.empty((7, H // 2), dtype=torch.uint8, device="meta"),
         gemm2_weights=torch.empty((E_LOCAL, H, INTER // 2), dtype=torch.uint8, device="meta"),
@@ -742,14 +800,40 @@ def test_fine_grained_sync_keeps_the_runner_fc2():
         engine_state=None,
     )
     act = int(ActType_TrtllmGen.SwiGlu)
-    assert dm.cute_fc2_reproduces(name)
-    assert (
-        dm.select(runner, act, [8, 0], args, fine_grained_sync=False, **kw)
-        == dm.DecodeKernel.CUTE_FC2
-    )
-    assert (
-        dm.select(runner, act, [8, 0], args, fine_grained_sync=True, **kw) == dm.DecodeKernel.CUBIN
-    )
+    dm._FC2_REPRODUCED.clear()
+    assert dm.cute_fc2_reproduces(options)
+    assert dm.select(runner(False), act, [8, 0], args, **kw) == dm.DecodeKernel.CUTE_FC2
+    assert dm.select(runner(True), act, [8, 0], args, **kw) == dm.DecodeKernel.CUBIN
+    assert dm.select(runner(False), act, [8, 0], args, **kw) == dm.DecodeKernel.CUTE_FC2
+    assert asked == [(8, 0)]
+    # (tile, top_k, hidden, intermediate, local experts, tokens), as the runner's own call resolves it.
+    assert fg_calls == [(8, TOPK, H, INTER, E_LOCAL, 7)] * 3
+
+
+def test_fine_grained_sync_without_its_cubins_keeps_the_cute_fc2(monkeypatch):
+    """TLLM_USE_FINE_GRAINED_SYNC=1 on SM 10.0 / 10.3, which ship no fine-grained cubins: the runner runs the tuned
+    tactic, so the CuTe FC2 still stands in for its FC2 (and the FC1-only entry runs), bit for bit the stock rows."""
+    import tensorrt_llm  # noqa: F401
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import DecodeKernel
+
+    monkeypatch.setenv("TLLM_USE_FINE_GRAINED_SYNC", "1")
+    ex = _experts()
+    m = 56
+    xq, xsf, ids, wts = _inputs(m, ex, seed=19)
+    ref, valid = _stock(ex, xq, xsf, ids, wts)
+    runner = _decode_runner()
+    _, bitwise8 = _tile8_tactics(runner, m)
+    assert not runner.get_runner().uses_fine_grained_sync(8, TOPK, H, INTER, E_LOCAL, m)
+    views, _ = _tables(ids, 8)
+    e2p = views[0].view(m, TOPK)
+    picked = _spy_select(monkeypatch)
+    out = runner.forward(
+        _op_inputs(ex, xq, xsf), tactic=bitwise8, prerouted=(views, ids, wts), engine_state=None
+    )[0]
+    torch.cuda.synchronize()
+    assert picked == [DecodeKernel.CUTE_FC2], picked
+    got = out[e2p.flatten()[valid].long()]
+    assert torch.equal(got.view(torch.int16), ref.view(torch.int16))
 
 
 def _router_inputs(m, ex, seed, dup=False):
@@ -1072,11 +1156,11 @@ def test_engine_route_bounds():
 
 def test_runner_routes_in_the_engine(monkeypatch):
     """A pre-routed un-finalized call with ``candidates`` takes the engine, which writes the routing today's chain
-    would, also through the op backend (``PreroutedRouting.candidates``); a call that would not take the engine
+    would, also through the op backend (``EngineRouting``); a call that would not take the engine
     refuses them."""
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
-    from tensorrt_llm._torch.moe.fused_moe.impl_contract import PreroutedRouting
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import EngineRouting
     from tensorrt_llm._torch.moe.fused_moe.moe_op_backend import TRTLLMOpBackend
     from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_front import (
         RouteFrontRouterGemm,
@@ -1134,7 +1218,7 @@ def test_runner_routes_in_the_engine(monkeypatch):
         topk_weights=None,
         topk_ids=None,
         gated_act_type=int(ActType_TrtllmGen.SwiGlu),
-        prerouted=PreroutedRouting(flat, any8, ids, wts, cand),
+        prerouted=EngineRouting(flat, any8, ids, wts, cand),
         decode_tuning=True,
         decode_engine_state=state,
     )

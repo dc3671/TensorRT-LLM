@@ -666,6 +666,11 @@ std::string Runner::getKernelNameFromConfigIndex(int32_t configIndex) const
     return mRunner.getKernelNameFromConfigIndex(configIndex);
 }
 
+std::map<std::string, std::string> Runner::getKernelOptionsFromConfigIndex(int32_t configIndex) const
+{
+    return mRunner.getKernelOptionsFromConfigIndex(configIndex);
+}
+
 } // namespace Gemm2
 
 namespace MoE
@@ -830,6 +835,13 @@ std::string Runner::getGemm2KernelName(int64_t configIndex) const
     TLLM_CHECK_WITH_INFO(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
         "Invalid MoE config index %ld.", static_cast<long>(configIndex));
     return mGemm2.getKernelNameFromConfigIndex(static_cast<int32_t>(mPassingConfigs[configIndex].gemm2Config));
+}
+
+std::map<std::string, std::string> Runner::getGemm2KernelOptions(int64_t configIndex) const
+{
+    TLLM_CHECK_WITH_INFO(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+        "Invalid MoE config index %ld.", static_cast<long>(configIndex));
+    return mGemm2.getKernelOptionsFromConfigIndex(static_cast<int32_t>(mPassingConfigs[configIndex].gemm2Config));
 }
 
 void Runner::run(

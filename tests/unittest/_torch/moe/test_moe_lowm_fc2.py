@@ -130,7 +130,7 @@ def _bitwise_tactics(runner, m, shape):
     tactics = [
         t
         for t in cfg
-        if t[0] == _TILE and cute_fc2_reproduces(runner.get_gemm2_kernel_name(t[0], t[1]))
+        if t[0] == _TILE and cute_fc2_reproduces(runner.get_gemm2_kernel_options(t[0], t[1]))
     ]
     assert tactics, "no tile-8 tactic whose FC2 cubin the CuTe FC2 reproduces"
     return tactics
@@ -138,22 +138,87 @@ def _bitwise_tactics(runner, m, shape):
 
 def test_fc2_cubin_selection_is_structural():
     """The CuTe FC2 takes the tile-8 FC2 cubins with M128 N8 K64 MMAs on one CTA per tile, whatever their tile K,
-    stages, unrolling or scheduler, and no split-K or other MMA shape."""
+    stages, unrolling or scheduler, and no split-K or other MMA shape or dtype; decided from the cubin's options as
+    the C++ runner reports them, not from its name."""
     from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import cute_fc2_reproduces
 
-    base = "bmm_Bfloat16_E2m1E2m1_Fp32_Ab16_Bb16_{t}_et128x8_{mma}_{c}_rM_{sk}TN_transOut_{sch}_biasFp32M_bN_rgTma"
-    tail = "_clmp_dynB_sm100f"
+    def options(**over):
+        base = dict(
+            dtypeA="E2m1",
+            dtypeB="E2m1",
+            dtypeC="Bfloat16",
+            dtypeAcc="Fp32",
+            tileM="128",
+            tileN="8",
+            tileK="256",
+            mmaM="128",
+            mmaN="8",
+            mmaK="64",
+            clusterDimX="1",
+            clusterDimY="1",
+            clusterDimZ="1",
+            numSlicesForSplitK="1",
+        )
+        return {**base, **over}
 
-    def name(t="t128x8x256_s9", mma="m128x8x64", c="c1x1x1", sk="", sch="schedS"):
-        return base.format(t=t, mma=mma, c=c, sk=sk, sch=sch) + tail
+    assert cute_fc2_reproduces(options())
+    assert cute_fc2_reproduces(options(tileK="512"))
+    assert not cute_fc2_reproduces(options(clusterDimZ="2", numSlicesForSplitK="2"))
+    assert not cute_fc2_reproduces(options(numSlicesForSplitK="2"))
+    assert not cute_fc2_reproduces(options(mmaK="128"))
+    assert not cute_fc2_reproduces(options(tileN="16", mmaN="16"))
+    assert not cute_fc2_reproduces(options(dtypeA="E4m3"))
+    assert not cute_fc2_reproduces({})
 
-    assert cute_fc2_reproduces(name())
-    assert cute_fc2_reproduces(name(t="t128x8x512u2_s5", sch="schPd2x1x2x3"))
-    assert cute_fc2_reproduces(name(t="t128x8x256u2_s9"))
-    assert not cute_fc2_reproduces(name(c="c1x1x2", sk="splitK2_", sch="schPdx3"))
-    assert not cute_fc2_reproduces(name(mma="m128x8x128"))
-    assert not cute_fc2_reproduces(name(t="t128x16x256_s9", mma="m128x16x64"))
-    assert not cute_fc2_reproduces(name().replace("E2m1E2m1", "E4m3E2m1"))
+
+def test_fc2_cubin_options_match_the_cubin_names():
+    """Every FC2 cubin the runner offers reports the options its name encodes (tile, MMA shape, cluster, split-K,
+    dtypes), so the options-based selection takes exactly the tile-8 M128 N8 K64 single-CTA cubins."""
+    import re
+
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.decode_moe import cute_fc2_reproduces
+    from tensorrt_llm._torch.utils import ActType_TrtllmGen
+
+    old_name = re.compile(
+        r"^bmm_(?P<out>[A-Za-z0-9]+)_(?P<ab>[A-Za-z0-9]+)_(?P<acc>[A-Za-z0-9]+)_Ab\d+_Bb\d+"
+        r"_t(?P<tile>\d+x\d+)x\d+(?:u2)?_s\d+_et\d+x\d+_m(?P<mma>\d+x\d+x\d+)_c(?P<cluster>\d+x\d+x\d+)"
+        r"_r[MN]_(?P<split>splitK\d+_)?TN_transOut_"
+    )
+    runner = torch.classes.trtllm.FP4BlockScaleMoERunner(int(ActType_TrtllmGen.SwiGlu))
+    picked = 0
+    # (local experts, intermediate): this file's EP shape and Qwen3.5-397B's TEP8 / TEP16 experts (hidden 4096, top-10).
+    for local, inter in ((_EP_LOCAL.local, _EP_LOCAL.inter), (64, 1024), (32, 1024)):
+        for m in (1, 8, 32, 128):
+            configs = runner.get_valid_configs(_EP_LOCAL.top_k, _EP_LOCAL.hidden, inter, local, m)
+            for tile, config in configs:
+                opts = runner.get_gemm2_kernel_options(tile, config)
+                name = runner.get_gemm2_kernel_name(tile, config)
+                assert f"_t{opts['tileM']}x{opts['tileN']}x{opts['tileK']}" in name, (name, opts)
+                assert f"_m{opts['mmaM']}x{opts['mmaN']}x{opts['mmaK']}_" in name, (name, opts)
+                cluster = f"_c{opts['clusterDimX']}x{opts['clusterDimY']}x{opts['clusterDimZ']}_"
+                assert cluster in name, (name, opts)
+                split = re.search(r"_splitK(\d+)_", name)
+                assert opts["numSlicesForSplitK"] == (split.group(1) if split else "1"), (
+                    name,
+                    opts,
+                )
+                assert name.startswith(
+                    f"bmm_{opts['dtypeC']}_{opts['dtypeA']}{opts['dtypeB']}_{opts['dtypeAcc']}_"
+                )
+                picked += cute_fc2_reproduces(opts)
+                # The name-parsing selection this replaced (d7b87c20fc) picks the same cubins.
+                m_old = old_name.match(name)
+                by_name = (
+                    m_old is not None
+                    and (m_old["out"], m_old["ab"], m_old["acc"])
+                    == ("Bfloat16", "E2m1E2m1", "Fp32")
+                    and m_old["tile"] == "128x8"
+                    and m_old["mma"] == "128x8x64"
+                    and m_old["cluster"] == "1x1x1"
+                    and m_old["split"] is None
+                )
+                assert cute_fc2_reproduces(opts) == by_name, (name, opts)
+    assert picked
 
 
 @pytest.mark.parametrize("kind", ["random", "signed_zeros", "full_sf"])
@@ -291,3 +356,38 @@ def test_fp4_moe_fake_refuses_the_lamport_output():
     assert (
         len(_fp4_block_scale_moe_fake(**kwargs)) == 3
     )  # rows, top-k weights, expanded -> permuted
+
+
+def test_both_fp4_ops_trace_through_the_one_fake():
+    """The plain and the decode FP4 MoE ops register the one fake, which takes each op's own arguments (the decode
+    op's state arguments included) and shapes the finalized output from the hidden states."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    from tensorrt_llm._torch.custom_ops import trtllm_gen_custom_ops as G
+
+    decode_only = {"decode_spare_sms": 8, "decode_early_release_rows": 4, "decode_tuning": True}
+    for op, extra in (
+        (torch.ops.trtllm.fp4_block_scale_moe_runner, {}),
+        (torch.ops.trtllm.fp4_block_scale_moe_decode_runner, decode_only),
+    ):
+        with FakeTensorMode():
+            kwargs = {}
+            for arg in op.default._schema.arguments:
+                text = str(arg.type)
+                if text == "Tensor":
+                    kwargs[arg.name] = torch.empty((1,), dtype=torch.uint8, device="cuda")
+                elif text in ("int", "bool"):
+                    kwargs[arg.name] = 1 if text == "int" else False
+                elif arg.has_default_value():
+                    continue
+                else:
+                    kwargs[arg.name] = None
+            kwargs.update(
+                hidden_states=torch.empty((4, 64), dtype=torch.uint8, device="cuda"),
+                do_finalize=True,
+                **extra,
+            )
+            (out,) = op(**kwargs)
+        assert out.shape == (4, 128) and out.dtype == torch.bfloat16, op
+    assert G.fp4_block_scale_moe_runner._abstract_fn is G._fp4_block_scale_moe_fake
+    assert G.fp4_block_scale_moe_decode_runner._abstract_fn is G._fp4_block_scale_moe_fake

@@ -54,7 +54,7 @@ class TrtllmTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
     BF16 activations times BF16 weights on the ``Bmm_Bfloat16_Bfloat16Bfloat16``
     cubins, through ``trtllm::bf16_moe_runner``. The weights are stored in the
     shuffled BlockMajorK layout ``BF16TRTLLMGenFusedMoEMethod`` produces. A
-    model that declares ``MoEDecodeOptions.bf16_logits_routing`` also runs its
+    model that declares ``MoEDecodeOptions.bf16_decode_engine`` also runs its
     small un-finalized logits-routed calls on the BF16 decode MoE engine.
     """
 
@@ -64,12 +64,12 @@ class TrtllmTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         "TRTLLM-Gen batched-GEMM cubins, BF16 activations and weights, SM100 family.",
     )
 
-    #: Declared by the model (``MoEDecodeOptions.bf16_logits_routing``), for every BF16 MoE layer it builds:
+    #: Declared by the model (``MoEDecodeOptions.bf16_decode_engine``), for every BF16 MoE layer it builds:
     #: un-finalized logits-routed SwiGLU runs of up to 32 rows take the one-launch BF16 decode MoE engine
     #: (decode_moe_bf16.py) instead of ``bf16_moe_runner``.
-    routes_from_logits: bool = False
+    uses_decode_engine: bool = False
     #: The BF16 decode MoE engine's call state, created with the weights (``cache_derived_state``) where
-    #: ``routes_from_logits`` holds.
+    #: ``uses_decode_engine`` holds.
     _decode_engine_state: torch.Tensor | None = None
 
     #: The gemm1 epilogues the BF16 cubins ship: gated SwiGLU and non-gated
@@ -87,10 +87,10 @@ class TrtllmTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
     _MAX_ROUTING_EXPERTS = 2048
     _MAX_ROUTING_TOP_K = 32
 
-    def __init__(self, *, model_config: ModelConfig = ModelConfig(), **kwargs):
+    def __init__(self, *, model_config: ModelConfig = ModelConfig(), **kwargs: object) -> None:
         super().__init__(model_config=model_config, **kwargs)
         decode = MoEDecodeOptions.of(model_config.extra_attrs)
-        self.routes_from_logits = decode.bf16_logits_routing
+        self.uses_decode_engine = decode.bf16_decode_engine
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
@@ -128,7 +128,7 @@ class TrtllmTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         """Also create the BF16 decode MoE engine's call state once storage is bound (before any CUDA-graph
         capture)."""
         super().cache_derived_state()
-        if self.routes_from_logits and self._decode_engine_state is None:
+        if self.uses_decode_engine and self._decode_engine_state is None:
             from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
 
             self._decode_engine_state = new_state(self.w3_w1_weight.device)

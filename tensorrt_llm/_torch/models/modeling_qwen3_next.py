@@ -539,6 +539,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     # Whether a context-sized input is quantized once for both expert paths
     # (_moe_input_dual_quant); decided in cache_derived_state.
     _dual_quant_input = False
+    # Decode kernels with MTP: rows from which the shared expert running beside
+    # the routed experts takes the SMs their persistent grid can leave free
+    # (_reserve_sms_for_shared_expert); 0: never.
+    _shared_expert_reserve_rows = 0
 
     def __init__(
         self,
@@ -570,6 +574,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                                    dtype=config.torch_dtype)
 
         self.aux_stream = aux_stream
+        if self.decode_kernels:
+            self._shared_expert_reserve_rows = _large_step_rows(model_config)
 
         self.gate = Qwen3NextGate(
             hidden_size=self.hidden_dim,
@@ -732,6 +738,26 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                  (experts.comm is None and experts.layer_load_balancer is None))
                 and not experts.routing_method.requires_separated_routing
                 and not FORCE_SEPARATED_ROUTING)
+
+    def _reserve_sms_for_shared_expert(self, num_rows: int) -> None:
+        """Ask the routed experts' backend to keep SMs free of its persistent
+        grid for the shared expert on this forward
+        (``MoEImplBase.reserve_sms_for_concurrent_kernels``, up to its
+        ``sm_reserve_ceiling()``): only where the shared expert runs beside them
+        (multi-stream on the aux stream) on a decode step of at least
+        ``_shared_expert_reserve_rows`` rows; otherwise 0, so the grid keeps
+        every SM. Re-asked per forward: a captured graph bakes the launch's
+        reserve in."""
+        from ..moe.fused_moe.configurable_moe import ConfigurableMoE
+        if (not self._shared_expert_reserve_rows
+                or not isinstance(self.experts, ConfigurableMoE)
+                or torch.compiler.is_compiling()):
+            return
+        backend = self.experts.backend
+        beside = (do_multi_stream() and self.aux_stream is not None
+                  and num_rows >= self._shared_expert_reserve_rows)
+        backend.reserve_sms_for_concurrent_kernels(
+            backend.sm_reserve_ceiling() if beside else 0)
 
     def _experts_take_lamport(self) -> bool:
         """Experts that take ``lamport_fc2`` (``takes_lamport_fc2_out``): an
@@ -1014,6 +1040,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 self._lamport_fence.zero_()
                 return outputs
 
+        self._reserve_sms_for_shared_expert(hidden_states.shape[0])
         (final_hidden_states,
          shared_expert_outputs) = maybe_execute_in_parallel(
              _compute_routed_output,
@@ -2028,15 +2055,16 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
             model_config.extra_attrs["allreduce_tp2_fused_norm"] = True
             # FP4 MoE: decode tuning; the engine releases the MoE-output all-reduce after its own wait from its
             # two-shot rows; CuTe DSL decode steps (every attention-DP rank's rows) stream FC2 weights evict-first.
-            # Without attention DP the BF16 MTP draft experts route from the logits on the draft MoE engine.
+            # Without attention DP its BF16 TRTLLM-Gen MoE layers (the MTP draft experts) take the BF16 decode MoE
+            # engine for small logits-routed calls. The SMs the engine leaves to the shared expert are asked per
+            # forward (Qwen3NextSparseMoeBlock._reserve_sms_for_shared_expert).
             no_adp = not model_config.mapping.enable_attention_dp
             model_config.extra_attrs[MOE_DECODE_OPTIONS] = MoEDecodeOptions(
                 tuning=True,
                 early_release_rows=TWO_SHOT_ROWS,
-                shared_expert_rows=_large_step_rows(model_config),
                 fc2_weights_evict_first_rows=_decode_step_rows(model_config) *
                 model_config.mapping.dp_size,
-                bf16_logits_routing=no_adp)
+                bf16_decode_engine=no_adp)
             if no_adp:
                 # Its temperature verify steps sample and accept in one launch where that launch takes the step.
                 model_config.extra_attrs["spec_fused_sample_accept"] = True

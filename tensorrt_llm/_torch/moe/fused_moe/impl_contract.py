@@ -80,12 +80,10 @@ class MoEDecodeOptions:
     tuning: bool = False
     # Rows from which the decode engine releases its dependents right after its own wait (0: never).
     early_release_rows: int = 0
-    # Rows from which the decode engine leaves SMs to a shared expert running beside it (0: never).
-    shared_expert_rows: int = 0
     # CuTe DSL NVFP4 calls of up to this many rows load the FC2 weights evict-first (0: none).
     fc2_weights_evict_first_rows: int = 0
     # TRTLLM-Gen BF16: logits-routed un-finalized SwiGLU runs of up to 32 rows take the BF16 decode MoE engine.
-    bf16_logits_routing: bool = False
+    bf16_decode_engine: bool = False
 
     @classmethod
     def of(cls, extra_attrs: Dict) -> "MoEDecodeOptions":
@@ -730,25 +728,34 @@ class MoECommPlan:
 
 @dataclass(frozen=True)
 class PreroutedRouting:
-    """Routing for one ``run_moe`` of an impl that declares
-    ``supports_prerouted_routing``, done by the caller or (with ``candidates``)
-    by the decode MoE engine before it reads it: the routing tables of the kernels' tile
+    """Routing the caller computed for one ``run_moe`` of an impl that declares
+    ``supports_prerouted_routing``: the routing tables of the kernels' tile
     (flat int32, layout of ``trtllm_gen.decode_front.prerouted_table_views``),
     the [tile, config] tactic they are built for, and the [num_tokens, top_k]
     expert ids (int32) and BF16 weights. The impl runs that tactic and skips
-    its routing kernel.
-
-    ``candidates`` ([num_tokens, num_experts / 128, top_k] int32, the router
-    GEMM's per-tile top-k keys): the routing is still to be done, by the
-    decode MoE engine, which writes ``tables``, ``topk_ids`` and
-    ``topk_weights`` before it reads them
-    (``trtllm_gen.decode_moe.engine_routes``)."""
+    its routing kernel."""
 
     tables: torch.Tensor
     tactic: List[int]
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
+
+
+@dataclass(frozen=True)
+class EngineRouting(PreroutedRouting):
+    """Routing still to be done, by the decode MoE engine (``trtllm_gen.decode_moe``
+    ``ENGINE``, under ``engine_routes``): ``candidates`` ([num_tokens,
+    num_experts / 128, top_k] int32, the router GEMM's per-tile top-k keys).
+    ``tables``, ``topk_ids`` and ``topk_weights`` are buffers the engine writes
+    before it reads them: only the ENGINE path consumes this hand-off (the FP4
+    op raises for any other kernel), and nothing may read those buffers before
+    the op returns."""
+
     candidates: Optional[torch.Tensor] = None
+
+    def __post_init__(self) -> None:
+        if self.candidates is None:
+            raise ValueError("EngineRouting needs the router GEMM's candidates")
 
 
 @dataclass(frozen=True)
@@ -836,9 +843,10 @@ class MoERunContext:
     all_rank_num_tokens: Optional[List[int]] = None
     # produced by the comm strategy, one object per forward
     comm_plan: Optional[MoECommPlan] = None
-    # produced by a decode front end: the routing it computed, or (with
-    # candidates) left to the decode MoE engine, which writes it before it
-    # reads it; single chunk, no communication (see PreroutedRouting)
+    # produced by a decode front end: the routing it computed
+    # (PreroutedRouting), or, as an EngineRouting, left to the decode MoE
+    # engine, which writes it before it reads it; single chunk, no
+    # communication
     prerouted: Optional[PreroutedRouting] = None
     # produced by a caller whose all-reduce polls the un-finalized FC2 rows
     # (trtllm_gen.decode_moe.LamportFc2Buffer); one un-finalized chunk of a
