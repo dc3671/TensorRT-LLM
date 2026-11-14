@@ -72,7 +72,7 @@ class TestPopulate(unittest.TestCase):
         self.assertEqual(_resident_bytes(address, _SIZE), 0)
         # A kernel without MADV_POPULATE_WRITE (EINVAL) takes the zero-fill path.
         with mock.patch.object(
-            remote_donor, "madvise_range", side_effect=OSError(errno.EINVAL, "EINVAL")
+            host_memory, "madvise_range", side_effect=OSError(errno.EINVAL, "EINVAL")
         ):
             host_memory.populate(region, address, _SIZE)
         self.assertEqual(_resident_bytes(address, _SIZE), _SIZE)

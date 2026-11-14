@@ -602,7 +602,7 @@ class TestPopulate(unittest.TestCase):
     def _populate_with(self, error):
         region = mmap.mmap(-1, 1 << 20, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
         try:
-            with mock.patch.object(remote_donor, "madvise_range", side_effect=error):
+            with mock.patch.object(host_memory, "madvise_range", side_effect=error):
                 host_memory.populate(region, 0, 1 << 20)
         finally:
             region.close()
