@@ -463,24 +463,123 @@ def test_fmha_paged_context_fp8_needs_a_fixed_stage():
         )
 
 
-def test_stage_kv_cubins_match_the_kernel_params_they_were_built_against():
-    """The stage-KV cubins are compiled against the trtllm-gen KernelParams headers; a changed header needs a
-    regeneration (scripts/trtllm_gen_fmha_stage_kv/gen_stage_kv_cubins.py), which records its hash per SM."""
-    import hashlib
-    import re
+def _stage_kv_generator():
+    """scripts/trtllm_gen_fmha_stage_kv/gen_stage_kv_cubins.py as a module (stdlib imports only at module level)."""
+    import importlib.util
     from pathlib import Path
 
-    fmha = Path(__file__).resolve().parents[4] / "cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha"
-    if not fmha.is_dir():
-        pytest.skip("needs the C++ sources")
-    h = hashlib.sha256()
-    for name in ("KernelParams.h", "KernelParamsDecl.h"):
-        h.update((fmha / "trtllmGen_fmha_export" / name).read_bytes())
-    recorded = re.findall(
-        r"// KernelParams sha256: ([0-9a-f]{64})",
-        (fmha / "cubin/kernelMetaInfoStageKv.h").read_text(),
+    path = (
+        Path(__file__).resolve().parents[4]
+        / "scripts/trtllm_gen_fmha_stage_kv/gen_stage_kv_cubins.py"
     )
-    assert recorded and set(recorded) == {h.hexdigest()}
+    if not path.is_file():
+        pytest.skip("needs the repository sources")
+    spec = importlib.util.spec_from_file_location("gen_stage_kv_cubins", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_stage_kv_cubins_match_the_kernel_inputs_they_were_built_against():
+    """The stage-KV cubins are compiled against the trtllm-gen kernel headers and launched with parameters the
+    runner sets up from KernelParams / KernelTraits / FmhaOptions: a change to any of them needs a regeneration
+    (scripts/trtllm_gen_fmha_stage_kv/gen_stage_kv_cubins.py), which records their hash in every header block."""
+    import re
+
+    gen = _stage_kv_generator()
+    names = {p.relative_to(gen.EXPORT_DIR).as_posix() for p in gen.kernel_input_files()}
+    assert {"KernelParams.h", "KernelParamsDecl.h", "KernelTraits.h", "FmhaOptions.h"} <= names
+    assert any(name.startswith("trtllm/dev/") for name in names)
+    recorded = re.findall(r"// Kernel inputs sha256: ([0-9a-f]{64})", gen.META_HEADER.read_text())
+    assert recorded and set(recorded) == {gen.kernel_inputs_sha256()}
+
+
+@pytest.mark.parametrize("touched", ["KernelTraits.h", "FmhaOptions.h", "trtllm/dev/Utils.h"])
+def test_stage_kv_kernel_inputs_hash_covers_the_parameter_setup(tmp_path, touched):
+    """Editing KernelTraits.h, FmhaOptions.h or a device header changes the recorded hash (not only KernelParams)."""
+    import shutil
+
+    gen = _stage_kv_generator()
+    export = tmp_path / "export"
+    for path in gen.kernel_input_files():
+        dst = export / path.relative_to(gen.EXPORT_DIR)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, dst)
+    before = gen.kernel_inputs_sha256(export)
+    assert before == gen.kernel_inputs_sha256()
+    with open(export / touched, "a") as f:
+        f.write("\n")
+    assert gen.kernel_inputs_sha256(export) != before
+
+
+def test_stage_kv_regeneration_keeps_other_page_sizes_and_drops_stale_archives(
+    tmp_path, monkeypatch
+):
+    """A regeneration for one page size replaces only that configuration's header blocks of its SM, and deletes
+    the SM's archives no entry references any more (CMake links every archive in cubin/)."""
+    gen = _stage_kv_generator()
+    cubin = tmp_path / "cubin"
+    cubin.mkdir()
+    monkeypatch.setattr(gen, "CUBIN_DIR", cubin)
+    monkeypatch.setattr(gen, "META_HEADER", cubin / "kernelMetaInfoStageKv.h")
+    monkeypatch.setattr(gen, "kernel_inputs_sha256", lambda: "0" * 64)
+
+    def kernel(sm, page, sched):
+        stem = (
+            f"FmhaSm{sm}aKernel_QkvE4m3OBfloat16H256PagedKvCausalP{page}{sched}ContextStageKv256E4"
+        )
+        (cubin / f"{stem}.cubin.tar.zst").write_bytes(b"x")
+        decl = f"extern unsigned char const {stem}_cubin[];\nextern unsigned int const {stem}_cubin_len;\n"
+        return stem, decl, f"{{ 256, {{ /* {stem} */ }} }},\n"
+
+    p64 = gen.config_key(256, 64, 256)
+    p32 = gen.config_key(256, 32, 256)
+    persistent64, d1, e1 = kernel(103, 64, "Persistent")
+    static64, d2, e2 = kernel(103, 64, "Static")
+    gen.write_header(103, p64, d1 + d2, e1 + e2)
+    other_sm, d3, e3 = kernel(100, 64, "Static")
+    gen.write_header(100, p64, d3, e3)
+    static32, d4, e4 = kernel(103, 32, "Static")
+    keep = gen.write_header(103, p32, d4, e4)
+    assert keep == {persistent64, static64, static32}
+    assert gen.remove_stale_archives(103, keep) == []
+    text = gen.META_HEADER.read_text()
+    for stem in (persistent64, static64, static32, other_sm):
+        assert f"{stem}_cubin[]" in text and f"/* {stem} */" in text
+
+    # Regenerate page size 64 on SM103: only the persistent kernel is selected now.
+    keep = gen.write_header(103, p64, d1, e1)
+    assert keep == {persistent64, static32}
+    assert gen.remove_stale_archives(103, keep) == [cubin / f"{static64}.cubin.tar.zst"]
+    text = gen.META_HEADER.read_text()
+    assert static64 not in text and static32 in text and other_sm in text
+    assert sorted(p.name for p in cubin.glob("*.tar.zst")) == sorted(
+        f"{s}.cubin.tar.zst" for s in (persistent64, static32, other_sm)
+    )
+
+
+def test_fmha_paged_context_fp8_rejects_a_pool_without_kv_heads():
+    """The Q / KV head ratio check runs after the KV-head count check (no integer division by zero)."""
+    q, pool, block_tables, seq_lens, cu_q, cu_kv, scale_bmm1, _ = _make_case([1], [130], 16, 1)
+    empty_pool = torch.empty(
+        (pool.shape[0], 0, pool.shape[2], pool.shape[3]), dtype=pool.dtype, device="cuda"
+    )
+    out = torch.empty(1, 16 * _HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="kv_pool must have KV heads"):
+        torch.ops.trtllm.fmha_paged_context_fp8(
+            q,
+            empty_pool,
+            block_tables,
+            seq_lens,
+            cu_q,
+            cu_kv,
+            out,
+            scale_bmm1,
+            torch.ones(1, dtype=torch.float32, device="cuda"),
+            1,
+            130,
+            _HEAD_DIM,
+        )
 
 
 def test_fmha_paged_context_fp8_fake_declines():

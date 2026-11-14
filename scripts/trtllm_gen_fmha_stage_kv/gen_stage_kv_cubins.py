@@ -52,11 +52,20 @@ REPO = Path(__file__).resolve().parents[2]
 FMHA_DIR = REPO / "cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha"
 CUBIN_DIR = FMHA_DIR / "cubin"
 META_HEADER = CUBIN_DIR / "kernelMetaInfoStageKv.h"
-# The kernel parameter block the cubins are compiled against; its hash is recorded per SM in META_HEADER and checked by
-# tests/unittest/_torch/attention/test_fmha_paged_context_fp8.py, so a changed layout forces a regeneration.
-KERNEL_PARAMS_HEADERS = [
-    FMHA_DIR / "trtllmGen_fmha_export" / name for name in ("KernelParams.h", "KernelParamsDecl.h")
-]
+EXPORT_DIR = FMHA_DIR / "trtllmGen_fmha_export"
+# What the cubins are built against and the runner sets their parameters with: the kernel parameter block and its
+# host-side setup (KernelParams.h takes FmhaOptions and KernelTraits), and the device headers the generated source
+# compiles with (trtllm/). Their hash is recorded per block in META_HEADER and checked by
+# tests/unittest/_torch/attention/test_fmha_paged_context_fp8.py, so a change to any of them forces a regeneration.
+KERNEL_INPUT_HEADERS = (
+    "KernelParams.h",
+    "KernelParamsDecl.h",
+    "KernelTraits.h",
+    "KernelConfigBase.h",
+    "FmhaOptions.h",
+    "Dsv4Constants.h",
+)
+STAGE_KV_ARCHIVE_GLOB = "FmhaSm{sm}*StageKv*E4.cubin.tar.zst"
 
 # Context-warmup grid of fmhaKernels.h (kContextWarmup* / kDefaultWarmupSeqLenKvCandidates), up to 128k tokens.
 BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256]
@@ -223,10 +232,20 @@ def log(*args: object) -> None:
     print("[gen_stage_kv]", *args, flush=True)
 
 
-def kernel_params_sha256() -> str:
+def kernel_input_files(export_dir: Path = EXPORT_DIR) -> list[Path]:
+    """The files kernel_inputs_sha256 covers, in hashing order."""
+    files = [export_dir / name for name in KERNEL_INPUT_HEADERS]
+    files += sorted(p for p in (export_dir / "trtllm").rglob("*") if p.is_file())
+    return files
+
+
+def kernel_inputs_sha256(export_dir: Path = EXPORT_DIR) -> str:
+    """sha256 over the path (relative to export_dir) and bytes of every kernel_input_files entry."""
     h = hashlib.sha256()
-    for path in KERNEL_PARAMS_HEADERS:
-        h.update(path.read_bytes())
+    for path in kernel_input_files(export_dir):
+        rel = path.relative_to(export_dir).as_posix().encode()
+        data = path.read_bytes()
+        h.update(len(rel).to_bytes(8, "little") + rel + len(data).to_bytes(8, "little") + data)
     return h.hexdigest()
 
 
@@ -606,30 +625,58 @@ def meta_entry(sm: int, stem: str, func: str, ident: dict[str, object], smem: in
     )
 
 
-def write_header(sm: int, decls: str, entries: str) -> None:
-    """Replace this SM's blocks in the header, keeping the other SMs' blocks."""
+_BLOCK_RE = r"// BEGIN %s sm(\d+) (\S+)\n#ifndef EXCLUDE_SM_\d+\n(.*?)#endif\n// END %s sm\1 \2\n"
+_STEM_RE = r"extern unsigned char const (\w+)_cubin\[\];"
+
+
+def config_key(head_dim: int, tokens_per_page: int, stage: int) -> str:
+    """Header block key of one generator configuration (the kernels of other page sizes / stages live apart)."""
+    return f"h{head_dim}p{tokens_per_page}s{stage}"
+
+
+def write_header(sm: int, config: str, decls: str, entries: str) -> set[str]:
+    """Replace this SM's blocks of this configuration in the header; keep the other SMs' and configurations'.
+
+    Returns the cubin stems the header references for this SM afterwards.
+    """
     blocks = {"decls": {}, "entries": {}}
     text = META_HEADER.read_text() if META_HEADER.exists() else ""
     for kind in blocks:
-        for m in re.finditer(
-            r"// BEGIN %s sm(\d+)\n#ifndef EXCLUDE_SM_\d+\n(.*?)#endif\n// END %s sm\1\n"
-            % (kind, kind),
-            text,
-            re.S,
-        ):
-            blocks[kind][int(m.group(1))] = m.group(2)
-    blocks["decls"][sm] = f"// KernelParams sha256: {kernel_params_sha256()}\n" + decls
-    blocks["entries"][sm] = entries
+        for m in re.finditer(_BLOCK_RE % (kind, kind), text, re.S):
+            blocks[kind][(int(m.group(1)), m.group(2))] = m.group(3)
+    blocks["decls"][(sm, config)] = f"// Kernel inputs sha256: {kernel_inputs_sha256()}\n" + decls
+    blocks["entries"][(sm, config)] = entries
     render = {
         kind: "".join(
-            f"// BEGIN {kind} sm{s}\n#ifndef EXCLUDE_SM_{s}\n{body}#endif\n// END {kind} sm{s}\n"
-            for s, body in sorted(blocks[kind].items())
+            f"// BEGIN {kind} sm{s} {c}\n#ifndef EXCLUDE_SM_{s}\n{body}#endif\n// END {kind} sm{s} {c}\n"
+            for (s, c), body in sorted(blocks[kind].items())
         )
         for kind in blocks
     }
     META_HEADER.write_text(
         HEADER_TEMPLATE.replace("@DECLS@", render["decls"]).replace("@ENTRIES@", render["entries"])
     )
+    return {
+        stem
+        for (s, _), body in blocks["decls"].items()
+        if s == sm
+        for stem in re.findall(_STEM_RE, body)
+    }
+
+
+def remove_stale_archives(sm: int, keep: set[str]) -> list[Path]:
+    """Delete this SM's stage-KV archives in cubin/ that no header entry references; return their paths.
+
+    Those are kernels a regeneration no longer selects, which CMake would still link (it globs the directory).
+    """
+    stale = [
+        path
+        for path in sorted(CUBIN_DIR.glob(STAGE_KV_ARCHIVE_GLOB.format(sm=sm)))
+        if path.name[: -len(".cubin.tar.zst")] not in keep
+    ]
+    for path in stale:
+        path.unlink()
+    return stale
 
 
 def parse_heads(text: str) -> list[tuple[int, int]]:
@@ -749,10 +796,13 @@ def main() -> None:
             write_archive(stem, e4)
 
     if not a.dry_run:
-        write_header(sm, decls, entries)
+        config = config_key(a.head_dim, a.tokens_per_page, a.stage)
+        keep = write_header(sm, config, decls, entries)
         log(
-            f"wrote {len(kernels)} archive(s) to {CUBIN_DIR} and the SM{sm} entries of {META_HEADER}"
+            f"wrote {len(kernels)} archive(s) to {CUBIN_DIR} and the SM{sm} {config} entries of {META_HEADER}"
         )
+        for path in remove_stale_archives(sm, keep):
+            log(f"removed {path.name}: no header entry references it")
 
 
 if __name__ == "__main__":

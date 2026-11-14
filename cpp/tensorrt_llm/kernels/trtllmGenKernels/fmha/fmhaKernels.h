@@ -365,29 +365,8 @@ public:
             return std::make_pair(false, "Empty batch or zero sequence length");
         }
 
-        // The selectKernelParams that might be updated.
-        SelectKernelParams selectKernelParams{params};
-
-        int32_t ctaDim = 512;
-        FmhaOptions options;
-        FmhaOptionsFromArgs optionsFromArgs;
-        parseOptionsFromRunnerParams(params, options);
-        applyCallerOptions(params, options, optionsFromArgs);
-        options.mCudaArch = intToCudaArch(mSM);
-
-        std::tie(options, optionsFromArgs, ctaDim)
-            = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
-        applyCallerOptions(params, options, optionsFromArgs);
-
-        // Check if the options are valid or not.
-        checkFmhaOptions(options, optionsFromArgs);
-        // Update the options if needed.
-        updateFmhaOptions(options, optionsFromArgs);
-        checkTrtllmSkipCorrThreshold(options, params.mSkipCorrThreshold);
-
-        // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
-        // dimension.
-        computeNumCtas(options, params.mMultiProcessorCount);
+        // The options run() selects (its CTA counts included), so the check answers for the kernel it dispatches.
+        auto const [options, ctaDim, grid] = selectOptions(params);
 
         if (usesNvrtc(params, options))
         {
@@ -471,8 +450,8 @@ private:
         return candidateSizes;
     }
 
-    // The options, CTA size and grid run() selects for these params.
-    std::tuple<FmhaOptions, int32_t, tg::CudaRunner::Grid> selectOptions(RunnerParams const& params) const
+    // The options and CTA size run() selects for these params, before computeNumCtas.
+    std::pair<FmhaOptions, int32_t> selectKernelOptions(RunnerParams const& params) const
     {
         int32_t ctaDim = 512;
         FmhaOptions options;
@@ -484,7 +463,8 @@ private:
         std::tie(options, optionsFromArgs, ctaDim)
             = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
         applyCallerOptions(params, options, optionsFromArgs);
-        // Same override as run(), so the selected config matches the dispatched one.
+        // Overwrite AutoTuner decision: SageAttention with SfsPV is known to cause regression to persistent scheduler.
+        // Remove this overwritten once we refresh the cubin kernels that containing the related fix.
         if (mNumEltsPerSageAttnBlkP + mNumEltsPerSageAttnBlkV > 0)
         {
             options.mTileScheduler = TileScheduler::Static;
@@ -493,9 +473,16 @@ private:
         checkFmhaOptions(options, optionsFromArgs);
         updateFmhaOptions(options, optionsFromArgs);
         checkTrtllmSkipCorrThreshold(options, params.mSkipCorrThreshold);
+        return {options, ctaDim};
+    }
 
+    // The options, CTA size and grid run() selects for these params.
+    std::tuple<FmhaOptions, int32_t, tg::CudaRunner::Grid> selectOptions(RunnerParams const& params) const
+    {
+        auto selected = selectKernelOptions(params);
+        FmhaOptions& options = selected.first;
         auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
-        return {options, ctaDim, tg::CudaRunner::Grid{numCtasX, numCtasY, numCtasZ}};
+        return {options, selected.second, tg::CudaRunner::Grid{numCtasX, numCtasY, numCtasZ}};
     }
 
     void warmupOneKernel(RunnerParams const& params)
@@ -679,29 +666,9 @@ public:
         }
         runJITWarmupGridIfRequested(params);
 
-        int32_t ctaDim = 512;
-        FmhaOptions options;
-        FmhaOptionsFromArgs optionsFromArgs;
-        parseOptionsFromRunnerParams(params, options);
-        applyCallerOptions(params, options, optionsFromArgs);
-        options.mCudaArch = intToCudaArch(mSM);
-
-        std::tie(options, optionsFromArgs, ctaDim)
-            = selectKernelAutotuned(options, optionsFromArgs, params.mMultiProcessorCount);
-        applyCallerOptions(params, options, optionsFromArgs);
-
-        // Overwrite AutoTuner decision: SageAttention with SfsPV is known to cause regression to persistent scheduler.
-        // Remove this overwritten once we refresh the cubin kernels that containing the related fix.
-        if (mNumEltsPerSageAttnBlkP + mNumEltsPerSageAttnBlkV > 0)
-        {
-            options.mTileScheduler = TileScheduler::Static;
-        }
-
-        // Check if the options are valid or not.
-        checkFmhaOptions(options, optionsFromArgs);
-        // Update the options if needed.
-        updateFmhaOptions(options, optionsFromArgs);
-        checkTrtllmSkipCorrThreshold(options, params.mSkipCorrThreshold);
+        auto selected = selectKernelOptions(params);
+        FmhaOptions& options = selected.first;
+        int32_t const ctaDim = selected.second;
 
         // Any caller that selects MultiCtasKvMode must supply the partial-reduction scratch pool
         // and per-CTA counter; fail fast here instead of silently falling back to Disabled.
