@@ -26,6 +26,7 @@ import errno
 import gc
 import mmap
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -507,6 +508,41 @@ class TestRendezvousPermissions(unittest.TestCase):
         os.symlink(target, link)
         with self.assertRaises(PermissionError):
             remote_donor.ensure_rendezvous_directory(link)
+
+    def test_a_symlinked_directory_with_a_trailing_slash_is_refused(self):
+        """A path ending in a separator follows the link in lstat and in the C++ client's O_NOFOLLOW open."""
+        target = os.path.join(self.dir, "target")
+        os.mkdir(target, 0o700)
+        link = os.path.join(self.dir, "rendezvous")
+        os.symlink(target, link)
+        with self.assertRaises(PermissionError):
+            remote_donor.ensure_rendezvous_directory(link + "/")
+        self.assertEqual(remote_donor.resolve_rendezvous_directory(link + "//"), link)
+
+    def test_missing_parents_are_private_too(self):
+        path = os.path.join(self.dir, "a", "b", "rendezvous")
+        remote_donor.ensure_rendezvous_directory(path)
+        for d in (os.path.join(self.dir, "a"), os.path.join(self.dir, "a", "b"), path):
+            self.assertEqual(os.stat(d).st_mode & 0o077, 0, d)
+
+    def test_an_unset_variable_in_the_directory_is_refused(self):
+        """An unset variable would leave one literal directory that every run without it shares."""
+        with mock.patch.dict(os.environ, {"KVCM2_TEST_JOB": "7"}):
+            os.environ.pop("KVCM2_TEST_UNSET", None)
+            self.assertEqual(
+                remote_donor.resolve_rendezvous_directory(f"{self.dir}/${{KVCM2_TEST_JOB}}/"),
+                f"{self.dir}/7",
+            )
+            for unset in ("${KVCM2_TEST_UNSET}", "$KVCM2_TEST_UNSET"):
+                with self.assertRaisesRegex(ValueError, re.escape(unset)):
+                    remote_donor.resolve_rendezvous_directory(f"{self.dir}/{unset}/x")
+
+    def test_the_compaction_lock_is_not_opened_through_a_link(self):
+        victim = os.path.join(self.dir, "victim")
+        open(victim, "w").close()
+        os.symlink(victim, os.path.join(self.dir, "compact.h.node0.lock"))
+        with remote_donor._node_compaction_lock(self.dir, "h", 0) as held:
+            self.assertFalse(held)
 
     def test_a_planted_tmp_link_is_not_written_through(self):
         """Files are written through fresh exclusive temporaries, never through a file or link already there."""

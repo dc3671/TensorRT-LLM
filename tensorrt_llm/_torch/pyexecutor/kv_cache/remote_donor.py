@@ -45,6 +45,7 @@ import errno
 import fcntl
 import mmap
 import os
+import re
 import socket
 import stat
 import threading
@@ -144,10 +145,35 @@ def _log(message: str) -> None:
     logger.info(f"KVCM2 remote donor: {message}")
 
 
+_ENV_REFERENCE = re.compile(r"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)")
+
+
+def resolve_rendezvous_directory(configured: str) -> str:
+    """``remote_cache_config.directory`` with ``~`` and environment variables expanded and trailing separators
+    stripped (a path ending in one follows a symlink). A variable left unset raises: the path would otherwise be one
+    literal directory shared by every run without it, whose leftover donor files would count as live donors."""
+    directory = os.path.expandvars(os.path.expanduser(configured))
+    unset = sorted({m.group(0) for m in _ENV_REFERENCE.finditer(directory)})
+    if unset:
+        raise ValueError(
+            f"remote_cache_config.directory {configured!r} names unset environment variable(s) {', '.join(unset)}"
+        )
+    return directory.rstrip(os.sep) or os.sep
+
+
 def ensure_rendezvous_directory(directory: str) -> None:
-    """Create `directory` as 0700, or accept an existing one only if it is a directory (not a symlink to one) that this
-    user owns and nobody else can write. Clients pin the directory they checked (C++ ``RemoteMemClient``)."""
-    os.makedirs(directory, mode=0o700, exist_ok=True)
+    """Create `directory` and its missing parents as 0700, or accept an existing one only if it is a directory (not a
+    symlink to one) that this user owns and nobody else can write. Clients pin the directory they checked (C++
+    ``RemoteMemClient``)."""
+    directory = directory.rstrip(os.sep) or os.sep
+    missing = []
+    parent = directory
+    while parent and not os.path.lexists(parent):
+        missing.append(parent)
+        parent = os.path.dirname(parent)
+    for path in reversed(missing):
+        with contextlib.suppress(FileExistsError):  # another rank made it first
+            os.mkdir(path, 0o700)
     st = os.lstat(directory)
     if not stat.S_ISDIR(st.st_mode):
         raise PermissionError(
@@ -377,7 +403,7 @@ def _node_compaction_lock(directory: str, host: str, node: int) -> Iterator[bool
     file system refuses it (no pass may then run on the node)."""
     path = os.path.join(directory, f"compact.{host}.node{node}.lock")
     try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     except OSError as error:
         _log(f"cannot open {path} ({error}); no reclaim-and-compact pass on node {node}")
         yield False
@@ -1179,7 +1205,7 @@ def make_donor(
 
 def _donor_for(remote_config: "RemoteCacheConfig", device: Optional[int]) -> RemoteMemDonor:
     return make_donor(
-        os.path.expandvars(os.path.expanduser(remote_config.directory)),
+        resolve_rendezvous_directory(remote_config.directory),
         remote_config.donate_size,
         remote_config.transport,
         device=device,

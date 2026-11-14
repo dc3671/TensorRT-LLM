@@ -8770,11 +8770,12 @@ class KVCacheManagerV2(BaseResourceManager):
             check_remote_capacity,
             ensure_rendezvous_directory,
             nixl_ucx_backend_params,
+            resolve_rendezvous_directory,
             resolve_ucx_devices,
             start_donation,
         )
 
-        remote_dir = os.path.expandvars(os.path.expanduser(remote_config.directory))
+        remote_dir = resolve_rendezvous_directory(remote_config.directory)
         ensure_rendezvous_directory(remote_dir)
         agent_backend_params = nixl_ucx_backend_params(
             resolve_ucx_devices(remote_config.ucx_devices)

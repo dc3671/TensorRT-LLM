@@ -403,12 +403,14 @@ The Slurm launcher in `examples/disaggregated/slurm/benchmark` fills in `directo
 (when unset) and the two expected-donor fields from the job's layout.
 
 **Rendezvous directory.** `directory` must be on a file system that every rank of
-the job sees; environment variables in it are expanded. Use a new directory for
-each job. Donor files hold NIXL memory registration keys or fabric handles, so the
-directory is created with mode 0700, every file in it is 0600, and a rank refuses
-a directory that another user owns, that group or others can write, or that is a
-symlink. A claimant opens the directory once, checks it, and reads every donor
-file through that handle, only from files the job's user owns. Put the directory
+the job sees; environment variables in it are expanded, and one that is not set
+is an error (every run without it would share one directory). Use a new
+directory for each job. Donor files hold NIXL memory registration keys or fabric
+handles, so the directory and its missing parents are created with mode 0700,
+every file in it is 0600, and a rank refuses a directory that another user owns,
+that group or others can write, or that is a symlink (also when the path ends in
+`/`). A claimant opens the directory once, checks it, and reads every donor file
+through that handle, only from files the job's user owns. Put the directory
 where only users you trust can rename or replace it: a user who can write one of
 its parent directories can move it aside before a rank opens it.
 
