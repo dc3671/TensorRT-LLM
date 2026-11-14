@@ -1154,10 +1154,14 @@ class ConversationAwareADPRouter(ADPRouter):
     _home_wait_rounds: Optional[int] = None
     # Home-wait state; __init__ gives each instance its own (see there).
     _home_wait_age: Dict[int, int] | Mapping[int, int] = MappingProxyType({})
+    # Request id -> home ranks of requests the last pop_requests round held for an earlier admission group: an
+    # unplanned request may not take them in route_requests either.
+    _route_avoid: Dict[int, frozenset] | Mapping[int, frozenset] = MappingProxyType({})
     # The first window one home-wait round peeks; it doubles while no request in it stopped the round.
     HOME_WAIT_WINDOW = 256
-    # Requests one home-wait round may pass over (held, or unbound without room) before it stops: bounds the round's
-    # work by this plus its admission budget, however deep the queue of held requests.
+    # Requests one home-wait round may hold for their home rank before it stops: bounds the round's work by this plus
+    # its admission budget, however deep the queue of held requests. Unbound requests without room are set aside
+    # uncounted, as by the base pop.
     HOME_WAIT_MAX_PASSED = 256
 
     def __init__(
@@ -1273,13 +1277,14 @@ class ConversationAwareADPRouter(ADPRouter):
         """Pop the requests to admit and, under home-wait, plan their home ranks (request id -> rank).
 
         Home-wait admits a returning conversation only to its home rank until it was held ``home_wait_rounds``
-        rounds while another rank had room; then it is admitted unplanned and overflows in ``route_requests``.
+        rounds while another rank had a free slot; then it is admitted unplanned and overflows in ``route_requests``.
         Other requests are admitted as without home-wait. Later requests of a held request's admission group
         may pass it; a later group may too, except into its home rank, so that each rank still admits in group
-        (priority) order. Held requests stay in order. A round passes over at most ``HOME_WAIT_MAX_PASSED`` requests.
+        (priority) order. Held requests stay in order. A round holds at most ``HOME_WAIT_MAX_PASSED`` requests.
         A request no single rank can take (1 + children > ``max_num_active_requests``) is never held, and with
         ``kv_balance`` False (warmup, benchmark fill phase) the base FIFO pop runs.
         """
+        self._route_avoid = {}
         if (
             self._home_wait_rounds is None
             or not kv_balance
@@ -1304,6 +1309,9 @@ class ConversationAwareADPRouter(ADPRouter):
         # Admission group of the request last examined, and the home ranks of the requests held in it.
         group = None
         held_homes: set = set()
+        # Home ranks of requests held in earlier groups, and what unplanned admissions must avoid in route_requests.
+        blocked: set = set()
+        avoid: Dict[int, frozenset] = {}
         passed = 0
         window: List["RequestQueueItem"] = []
         size = self.HOME_WAIT_WINDOW
@@ -1322,6 +1330,7 @@ class ConversationAwareADPRouter(ADPRouter):
                     if held_homes:
                         for rank in held_homes:
                             num_active[rank] = max(num_active[rank], max_num_active_requests)
+                        blocked |= held_homes
                         held_homes.clear()
                         if all(n >= max_num_active_requests for n in num_active):
                             stopped = True
@@ -1333,22 +1342,22 @@ class ConversationAwareADPRouter(ADPRouter):
                 conv_id = self._conversation_id(item)
                 home = None if conv_id is None else self._conv_to_rank.get(conv_id)
                 if home is None:
-                    # Not bound: admitted as without home-wait (an explicit strict rank needs room).
+                    # Not bound: admitted as without home-wait (an explicit strict rank needs room; without it, set
+                    # aside as by the base pop).
                     if can_process_attention_dp_request(item, num_active, max_num_active_requests):
                         budget -= need
                         chosen_idx.append(idx)
-                    else:
-                        passed += 1
+                        if blocked:
+                            avoid[item.id] = frozenset(blocked)
                 elif num_active[home] + need <= max_num_active_requests:
                     num_active[home] += need
                     budget -= need
                     placement[item.id] = home
                     chosen_idx.append(idx)
                 else:
+                    # Room as route_requests overflows a request: one slot on another rank, whatever its children.
                     other_room = any(
-                        num_active[r] + need <= max_num_active_requests
-                        for r in range(tp_size)
-                        if r != home
+                        num_active[r] < max_num_active_requests for r in range(tp_size) if r != home
                     )
                     # A request that no rank can take whole (1 + children over the per-rank cap) is never planned:
                     # its home would never have room, so it is admitted unplanned at once, as without home-wait.
@@ -1357,6 +1366,8 @@ class ConversationAwareADPRouter(ADPRouter):
                     ):
                         budget -= need
                         chosen_idx.append(idx)
+                        if blocked:
+                            avoid[item.id] = frozenset(blocked)
                     else:
                         if other_room:
                             ages[item.id] = ages.get(item.id, 0) + 1
@@ -1378,6 +1389,7 @@ class ConversationAwareADPRouter(ADPRouter):
         }
         if not chosen_idx:
             return [], {}
+        self._route_avoid = avoid
         chosen = [window[i] for i in chosen_idx]
         popped = [waiting_queue.pop_request() for _ in range(chosen_idx[-1] + 1)]
         waiting_queue.prepend_requests(item for item in popped if item.id not in chosen_ids)
@@ -1438,6 +1450,7 @@ class ConversationAwareADPRouter(ADPRouter):
             if (
                 target_dp_rank is not None
                 and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
+                and target_dp_rank not in self._route_avoid.get(req_item.id, ())
             ):
                 all_ranks_num_active_requests[target_dp_rank] += 1
                 self._publish_uncached_estimate(req_item, target_dp_rank, None)
@@ -1516,6 +1529,8 @@ class ConversationAwareADPRouter(ADPRouter):
             conv_id = self._conversation_id(req_item)
             rank = None
             home_rank = None if conv_id is None else self._conv_to_rank.get(conv_id)
+            # Ranks held for a request of an earlier admission group count as full (pop_requests).
+            avoid = self._route_avoid.get(req_item.id, ())
 
             if conv_id is not None and conv_id in self._conv_to_rank:
                 target_rank = self._conv_to_rank[conv_id]
@@ -1524,7 +1539,10 @@ class ConversationAwareADPRouter(ADPRouter):
                 # soft fair-share `expected`. Stickiness wins over balance so a
                 # conversation's KV prefix stays resident on one rank instead of
                 # migrating when the rank gets moderately busy.
-                if all_ranks_num_active_requests[target_rank] < max_num_active_requests:
+                if (
+                    all_ranks_num_active_requests[target_rank] < max_num_active_requests
+                    and target_rank not in avoid
+                ):
                     rank = target_rank
                     self._record_target_rank(conv_id, target_rank)  # LRU touch
                 # else: target saturated this batch -> fall through to overflow
@@ -1534,9 +1552,13 @@ class ConversationAwareADPRouter(ADPRouter):
                 # First turn of a new conversation, sticky-overflow, or no
                 # conversation_id -> spread under the soft cap using the
                 # configured count- or token-based placement strategy.
-                rank = self._pick_rank(
-                    all_ranks_num_active_requests, token_load, expected_num_active_requests
-                )
+                counts = all_ranks_num_active_requests
+                if avoid:
+                    counts = [
+                        max(n, max_num_active_requests) if r in avoid else n
+                        for r, n in enumerate(counts)
+                    ]
+                rank = self._pick_rank(counts, token_load, expected_num_active_requests)
                 if conv_id is not None and conv_id not in self._conv_to_rank:
                     # Bind this new conversation to its first-turn rank.
                     self._record_target_rank(conv_id, rank)

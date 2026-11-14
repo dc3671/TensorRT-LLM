@@ -300,6 +300,22 @@ def test_continuous_priorities_do_not_block_other_ranks():
     assert [x.id for x in queue] == [4]
 
 
+def test_an_aged_lower_priority_request_does_not_take_a_held_requests_home():
+    """Once aged, a lower-priority request is admitted unplanned; route_requests must still keep it off the home rank
+    of a higher-priority request held in the same round, so each rank admits in priority order."""
+    router = _router(tp_size=2, rounds=2)
+    _bind(router, {"A": 0, "E": 0}, tp_size=2, cap=2)
+    queue = PriorityWaitingQueue()
+    queue.add_request(_item(2, "E", priority=0.5))
+    for _ in range(2):
+        assert _round(router, queue, [2, 1], 2) == {}  # E held while rank 1 has room
+    queue.add_request(_item(1, "A", priority=0.9, children=1))  # needs both slots of rank 0
+    pos = _round(router, queue, [1, 1], 2)
+    assert pos == {2: 1}, pos
+    assert [x.id for x in queue] == [1]
+    assert router._conv_to_rank["E"] == 0
+
+
 def test_round_passes_over_a_bounded_number_of_requests():
     """A deep queue of held requests costs a round at most HOME_WAIT_MAX_PASSED requests, not the whole queue."""
     router = _router(rounds=10_000)
@@ -326,6 +342,38 @@ def test_children_need_their_slots_on_one_rank():
     queue.add_request(_item(1, "A", children=2))
     assert _round(router, queue, [6, 0, 0, 0], 8) == {}  # home has 2 free, needs 3
     assert _round(router, queue, [5, 0, 0, 0], 8) == {1: 0}
+
+
+def test_a_held_request_with_children_ages_while_another_rank_has_a_slot():
+    """An n > 1 turn ages whenever another rank has a free slot (where route_requests overflows it), not only when one
+    rank has all of its slots free, so a steady single-slot stream cannot hold it past home_wait_rounds."""
+    router = _router(tp_size=2, rounds=4)
+    _bind(router, {"A": 0}, tp_size=2, cap=4)
+    queue = FCFSWaitingQueue()
+    queue.add_request(_item(1, "A", children=1))  # needs 2 slots
+    admitted_at = None
+    for i in range(20):
+        queue.add_request(_item(100 + i, f"s{i}"))
+        pos = _round(router, queue, [3, 3], 4, max_new=2)
+        if 1 in pos:
+            admitted_at = i
+            break
+    assert admitted_at == 4, (admitted_at, router._home_wait_age)
+
+
+def test_unbound_strict_requests_without_room_do_not_stop_the_round():
+    """Strict-rank requests whose rank is full are set aside as by the base pop, not counted against the round's
+    limit on held requests, so a relaxed request behind any number of them is still admitted."""
+    router = _router(rounds=4)
+    queue = FCFSWaitingQueue()
+    queue.add_requests(
+        [_item(i, None, target=0, relax=False) for i in range(1, router.HOME_WAIT_MAX_PASSED + 45)]
+    )
+    queue.add_request(_item(5000, None))
+    pos = _round(router, queue, [8, 2, 2, 2], 8)
+    assert list(pos) == [5000] and pos[5000] != 0
+    assert len(queue) == router.HOME_WAIT_MAX_PASSED + 44
+    assert router._home_wait_age == {}
 
 
 def test_a_request_no_rank_can_take_whole_is_admitted_at_once():
