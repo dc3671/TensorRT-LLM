@@ -483,6 +483,104 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             base.take_poison()
             shutil.rmtree(directory, ignore_errors=True)
 
+    def _attention_layers(self, window: "int | None" = None) -> list:
+        """Two attention layers; with `window`, the second one slides over that many tokens."""
+        return [
+            AttentionLayerConfig(
+                layer_id=LayerId(lid),
+                buffers=[
+                    BufferConfig(role=DataRole("key"), size=self.buf_size),
+                    BufferConfig(role=DataRole("value"), size=self.buf_size),
+                ],
+                sliding_window_size=window if lid == 1 else None,
+            )
+            for lid in range(2)
+        ]
+
+    def test_rebase_leaves_the_remote_copies_of_stale_sliding_window_blocks_unread(self) -> None:
+        """A stale sliding-window block's page is held only to be committed: rebasing it onto the tree's remote copy
+        drops it instead of reading that copy back, which with the donor gone would fail the commit."""
+        if self.transport == "fabric":
+            self.skipTest(_NIXL_DEATH_ONLY)
+        directory = tempfile.mkdtemp(prefix="kvcm2_swa_")
+        donor = _Donor(directory, 1 << 30, self.transport)
+        try:
+            cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=10_000)
+            # All-reusable commits: the sliding layer's stale blocks keep their pages (held) until committed.
+            self.cfg = replace(
+                cfg, layers=self._attention_layers(window=self.tokens_per_block), commit_min_snapshot=False
+            )
+            self.manager = KVCacheManager(self.cfg)
+            self.engine = FakeEngine(self.cfg)
+            stream_holder = base.CachedCudaStream()
+            stream = cast(CudaStream, stream_holder.handle)
+            prompt = self._prompt(4 * self.tokens_per_block)
+
+            def compute(tokens: list, stop_donor: bool = False) -> None:
+                kv = self.manager.create_kv_cache()
+                self.assertTrue(kv.resume(stream))
+                kv.capacity = len(tokens)
+                if stop_donor:
+                    _sync_device()
+                    donor.stop()
+                self.engine.execute([Step(kv, tokens, [])], stream)
+                # The window moves past the sliding layer's first blocks: their pages are held for the commit only.
+                kv.history_length = len(tokens)
+                kv.commit(tokens)
+                kv.stop_committing()
+                kv.close()
+
+            # The suite's prefill sets the history before computing, which a sliding window cannot take.
+            self._prefill = lambda tokens, _stream: compute(tokens)
+            compute(prompt)
+            self._push_to_last_level(prompt, stream)
+            compute(prompt, stop_donor=True)
+            self.assertIsNone(base.poison_reason())
+        finally:
+            donor.stop()
+            if hasattr(self, "manager"):
+                with contextlib.suppress(Exception):
+                    self.manager.shutdown()
+                del self.manager
+            gc.collect()
+            base.take_poison()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_a_page_that_supersedes_a_remote_copy_keeps_its_retention(self) -> None:
+        """The committed page takes the superseded copy's retention priority, as reusing that copy would keep it."""
+        cfg = self._config(with_host=True)
+        self.cfg = replace(cfg, layers=self._attention_layers())
+        self.manager = KVCacheManager(self.cfg)
+        self.engine = FakeEngine(self.cfg)
+        stream_holder = base.CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = self._prompt(4 * self.tokens_per_block)
+        # Below the default (35) and above the cold-tier offload threshold (30), so that it reaches the remote level.
+        retention = base.KvCacheRetentionConfig(
+            [base.KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, 31, None)]
+        )
+        kv = self.manager.create_kv_cache(
+            expected_prompt_length=len(prompt), kv_cache_retention_config=retention
+        )
+        self.assertTrue(kv.resume(stream))
+        kv.capacity = len(prompt)
+        kv.history_length = len(prompt)
+        self.engine.execute([Step(kv, prompt, [])], stream)
+        kv.commit(prompt)
+        kv.stop_committing()
+        kv.close()
+        self._push_to_last_level(prompt, stream)
+        # A default-priority request computes the same prompt and supersedes the remote copies with its pages.
+        kv = self.manager.create_kv_cache()
+        self.assertTrue(kv.resume(stream))
+        kv.capacity = len(prompt)
+        kv.history_length = len(prompt)
+        self.engine.execute([Step(kv, prompt, [])], stream)
+        kv.commit(prompt)
+        self.assertEqual(kv.get_page_priorities(0), [31] * 4)
+        kv.stop_committing()
+        kv.close()
+
     def test_dead_donor_fails_the_promotion_instead_of_reusing(self) -> None:
         """The promotion itself raises."""
         if self.transport == "fabric":

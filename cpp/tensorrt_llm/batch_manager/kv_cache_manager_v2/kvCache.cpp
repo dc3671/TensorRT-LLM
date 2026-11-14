@@ -2417,13 +2417,16 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                         CacheLevel const coldLevel = existingPage->cacheLevel;
                         auto* superseded = newBlock->unlinkPage(lc, existingPage);
                         existingPage = nullptr;
+                        // Kept until ours took over its retention, as reusing it would have kept it.
+                        SharedPtr<Page> const supersededPage
+                            = superseded != nullptr ? superseded->sharedFromThis() : SharedPtr<Page>{};
                         if (superseded != nullptr && superseded->scheduledForEviction())
                         {
-                            // May drop the eviction list's last reference and destroy the page.
                             superseded->manager->excludeFromEviction(*superseded);
                         }
                         bp = std::monostate{};
-                        auto committed = up->convertToCommitted(newBlock, finishEvent(), numTokens);
+                        auto committed
+                            = up->convertToCommitted(newBlock, finishEvent(), numTokens, supersededPage.get());
                         if (newBlock->eventSink)
                         {
                             newBlock->eventSink->addCacheLevelUpdated(newBlock->key, coldLevel, kHotLevel, lc);
@@ -2431,6 +2434,13 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                         bp = BlockPage{committed->lock(*this, kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc)};
                         continue;
                     }
+                }
+                else if (_getStaleRange(mHistoryLength, mManager->lifeCycles()[lc]).contains(BlockOrdinal{ord}))
+                {
+                    // A stale block's page is held only to be committed, and the tree has a copy: ours is dropped.
+                    // Locking that copy would read it back, a transfer the stale clear below then throws away.
+                    bp = std::monostate{};
+                    continue;
                 }
             }
             if (existingPage == nullptr)
