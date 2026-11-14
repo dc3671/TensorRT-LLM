@@ -17,6 +17,7 @@ all ranks' inputs: the slot (one-shot) and two-shot launches, the shared-expert 
 without the in-kernel MoE finalize), the FP8 output, the FP8 GEMM + all-reduce + norm launches (one-shot and
 two-shot), and the TP2 large-message all-reduce + norm (Tp2AllReduceNorm)."""
 
+import operator
 import os
 import pickle
 import sys
@@ -72,6 +73,49 @@ def _check(got, ref, tag, rtol=2e-2):
     )
 
 
+def _library(ar, x, params):
+    """The library op's outputs for this call (MNNVLAllReduce with its CuTe kernels set aside)."""
+    fused = ar.fused_norm
+    ar.fused_norm = None
+    try:
+        out = ar(x, all_reduce_params=params)
+    finally:
+        ar.fused_norm = fused
+    return out if isinstance(out, tuple) else (out,)
+
+
+def _assert_bitwise(got, ref, tag, norm_ulps=0):
+    """Outputs equal bit for bit (BF16 / E4M3 compared as integers); with ``norm_ulps``, all but the last (the
+    residual, still bit for bit) within that many ulps / E4M3 codes."""
+    assert len(got) == len(ref), tag
+    for i, (g, r) in enumerate(zip(got, ref)):
+        assert g.dtype == r.dtype and g.shape == r.shape, (tag, i)
+        as_int = torch.int16 if g.element_size() == 2 else torch.uint8
+        if norm_ulps and i < len(got) - 1:
+            ulps = (g.view(as_int).int() - r.view(as_int).int()).abs().max().item()
+            assert ulps <= norm_ulps, (tag, i, ulps)
+        else:
+            assert torch.equal(g.view(as_int), r.view(as_int)), (tag, i)
+
+
+def _library_arithmetic(m, tp, hidden=H):
+    """Which arithmetic the library op runs for ``m`` rows ("one-shot" up to its message size, else "two-shot"),
+    the one the CuTe kernels run for ``m`` rows (the two-shot's from TWO_SHOT_ROWS), and whether the norm's
+    reduction tree is the library's too: always for the two-shot (it replays the library's launch shape), for the
+    slot kernel's one-shot only where the library's one-shot norm takes its SLOT_CTAS CTAs per token (else the FP32
+    sum of squares is added in another order and the norm may differ by an ulp)."""
+    from tensorrt_llm._torch.distributed.mnnvl_fused_allreduce import TWO_SHOT_ROWS, lib_norm_tree
+    from tensorrt_llm._torch.distributed.ops import _MNNVL_ONE_SHOT_THRESHOLD_BYTES as one_shot
+
+    lib = "one-shot" if m * hidden * tp * 2 <= one_shot else "two-shot"
+    cute = "two-shot" if m >= TWO_SHOT_ROWS else "one-shot"
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    same_tree = (
+        cute == "two-shot" or lib_norm_tree(m, hidden, sms)[1] == MnnvlAllReduceNorm.SLOT_CTAS
+    )
+    return lib, cute, same_tree
+
+
 def _mnnvl(tp, hidden=H, max_num_tokens=max(ROWS)):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -123,6 +167,30 @@ def _norm_cases(tp):
         _check(norm, ref_norm, ("norm with fp8", m))
         # E4M3 holds 3 mantissa bits: half an ulp is 6.25 % relative.
         _check(fp8.float() * scale, ref_norm.clamp(-448 * 0.05, 448 * 0.05), ("fp8", m), rtol=7e-2)
+        # Bit for bit the library op wherever it runs the arithmetic the kernels run for m rows.
+        # Elsewhere (the one-shot rows whose library norm takes fewer CTAs per token) the norm within an ulp.
+        lib, cute, same_tree = _library_arithmetic(m, tp)
+        ulps = 0 if same_tree else 1
+        if lib == cute:
+            _assert_bitwise(
+                ar.fused_norm(residual, norm_weight, EPS, x=xs[rank]),
+                _library(ar, xs[rank], params),
+                ("library", lib, m),
+                ulps,
+            )
+            fp8_params = AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8,
+                residual=residual,
+                norm_weight=norm_weight,
+                eps=EPS,
+                scale=scale,
+            )
+            _assert_bitwise(
+                ar.fused_norm(residual, norm_weight, EPS, x=xs[rank], scale=scale, norm_out=True),
+                _library(ar, xs[rank], fp8_params),
+                ("library fp8", lib, m),
+                ulps,
+            )
     # Exercise two and 14 tokens per CTA, including a partially filled final CTA. From 15 tokens an SM holds
     # one of these CTAs instead of two, and the dispatch declines.
     wave = 2 * torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
@@ -444,6 +512,25 @@ def _gemm_twoshot_cases(
             norm, res = out
             _check(norm, ref_norm, ("gemm two-shot norm", m, inp.dtype))
             _check(res, ref_res, ("gemm two-shot residual", m, inp.dtype))
+        # Bit for bit the unfused calls: the projection on cuBLAS (as FP8QDQLinearMethod.apply), then the library
+        # op, which runs two-shot at every row count the kernel takes.
+        # Looked up by name: cloudpickle pickles this module by value and cannot pickle the torch.ops module that an
+        # attribute access (or import) of ``ops`` here would make it carry along.
+        cublas_scaled_mm = operator.attrgetter("ops.trtllm.cublas_scaled_mm")(torch)
+        partial = cublas_scaled_mm(
+            xq,
+            w.t(),
+            scale_a=input_scale,
+            scale_b=weight_scale,
+            bias=None,
+            out_dtype=torch.bfloat16,
+        )
+        assert _library_arithmetic(m, tp)[0] == "two-shot", m
+        _assert_bitwise(
+            ar.gemm_twoshot_allreduce_norm(xq, w, weight_scale, input_scale, params),
+            _library(ar, partial, params),
+            ("gemm two-shot vs cuBLAS + library", m),
+        )
         # The kernel exchanges BF16: an E4M3-payload call stays on the library two-shot.
         params = AllReduceParams(
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -478,6 +565,53 @@ def _gemm_twoshot_large_workspace_cases(tp, k=1024):
         return
     rows = (fits[0], fits[len(fits) // 2], fits[-1])
     _gemm_twoshot_cases(tp, k, max_num_tokens=131072, rows=rows, required=True)
+
+
+def _shifted(t, offset):
+    """A copy of contiguous ``t`` at ``offset`` bytes past a 128-byte boundary."""
+    buf = torch.empty(t.numel() * t.element_size() + 128, dtype=torch.uint8, device="cuda")
+    assert buf.data_ptr() % 128 == 0
+    view = buf[offset : offset + t.numel() * t.element_size()].view(t.dtype).view(t.shape)
+    view.copy_(t)
+    return view
+
+
+def _gemm_twoshot_alignment_cases(tp, k=1024):
+    """The GEMM + two-shot launch takes an E4M3 x and W at any 16-byte aligned address (their TMA descriptors'
+    requirement) with the aligned call's outputs bit for bit, and declines (before any launch, on every rank) an x or
+    W that is not 16-byte aligned."""
+    ar, rank = _mnnvl(tp)
+    assert ar.gemm_twoshot is not None, "GEMM + two-shot all-reduce + norm kernel not built"
+    probe = torch.empty((H, k), dtype=torch.float8_e4m3fn, device="cuda")
+    fits = [m for m in range(1, max(ROWS) + 1) if ar.gemm_twoshot.takes(m, probe)]
+    if not fits:  # TP2: no row takes the kernel
+        return
+    m = fits[0]
+    norm_weight = _rand((H,), 5, 0.1) + 1
+    weight_scale = torch.tensor([0.02], dtype=torch.float32, device="cuda")
+    input_scale = torch.tensor([4.0 / 448], dtype=torch.float32, device="cuda")
+    xq = (_rand((m, k), 91 * m + rank).float() / input_scale).clamp(-448, 448)
+    xq = xq.to(torch.float8_e4m3fn)
+    w = _rand((H, k), 6000 + rank, 4.0).to(torch.float8_e4m3fn)
+    residual = _rand((m, H), 13 * m)
+    params = AllReduceParams(
+        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+        residual=residual,
+        norm_weight=norm_weight,
+        eps=EPS,
+    )
+    ref = ar.gemm_twoshot_allreduce_norm(xq, w, weight_scale, input_scale, params)
+    assert ref is not None, m
+    for x_off, w_off in ((16, 0), (0, 16), (48, 80)):
+        got = ar.gemm_twoshot_allreduce_norm(
+            _shifted(xq, x_off), _shifted(w, w_off), weight_scale, input_scale, params
+        )
+        assert got is not None, ("16-byte aligned operands declined", m, x_off, w_off)
+        _assert_bitwise(got, ref, ("16-byte aligned operands", x_off, w_off))
+    for x_off, w_off in ((8, 0), (0, 8)):
+        x8, w8 = _shifted(xq, x_off), _shifted(w, w_off)
+        assert not ar.gemm_twoshot.supports(x8, w8), (x_off, w_off)
+        assert ar.gemm_twoshot_allreduce_norm(x8, w8, weight_scale, input_scale, params) is None
 
 
 def test_gemm_twoshot_rows() -> None:
@@ -694,6 +828,7 @@ CASES = {
     "gemm_norm": _gemm_norm_cases,
     "gemm_twoshot": _gemm_twoshot_cases,
     "gemm_twoshot_large_workspace": _gemm_twoshot_large_workspace_cases,
+    "gemm_twoshot_alignment": _gemm_twoshot_alignment_cases,
     "tp2": _tp2_cases,
     "meta_init": _meta_init_cases,
     "opt_in": _opt_in_cases,
