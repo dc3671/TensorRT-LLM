@@ -344,7 +344,7 @@ class RequestBroadcaster:
         self.hang_detector = hang_detector
         self.send_requests_handler = None
         # sync_clock: rank 0's time.monotonic() and ``aux`` (>= 0) ride along
-        # with the request count (or in the single-round envelope), read on
+        # with the request count (or in the single-round header), read on
         # every rank as ``rank0_now`` and ``rank0_aux``. Must be the same on
         # all ranks: it changes the length.
         self.sync_clock = sync_clock
@@ -426,9 +426,9 @@ class RequestBroadcaster:
         here for rank 0 exactly as they did in the probe. The hang-detector
         pause covers both the non-root wait and the root's bounded fence.
 
-        With ``sync_clock`` rank 0 always sends ``(clock, aux, requests or
-        None)``: two collectives per iteration, as the clock-carrying count
-        probe alone costs on this transport, and no second round for requests.
+        With ``sync_clock`` rank 0's clock and aux ride in a fixed-size header
+        next to the size word (``broadcast_or_none_with_header``), so the
+        collective counts stay one (empty) and two (requests).
         """
         payloads = None
         is_root = self.dist.rank == 0
@@ -437,12 +437,14 @@ class RequestBroadcaster:
         if self.sync_clock:
             # Same microsecond encoding as the probe (_broadcast_request_count), so the clock never steps back
             # when consecutive iterations take different routes.
-            envelope = None
+            header = [0, -1]
             if is_root:
                 aux_us = int(self.aux * 1e6) if self.aux is not None else -1
-                envelope = (int(time.monotonic() * 1e6), aux_us, payloads)
+                header = [int(time.monotonic() * 1e6), aux_us]
             with self.hang_detector.pause():
-                now_us, aux_us, received = self.dist.broadcast_or_none(envelope, root=0)
+                (now_us, aux_us), received = self.dist.broadcast_or_none_with_header(
+                    payloads, header, root=0
+                )
             self.rank0_now = now_us / 1e6
             self.rank0_aux = None if aux_us < 0 else aux_us / 1e6
         else:
