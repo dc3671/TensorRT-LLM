@@ -1027,9 +1027,9 @@ class KvCacheCreator:
     # This rank's donation (remote_cache_config.donate_size), started before the
     # estimation so that clients do not wait out the warmup; the final target
     # manager takes it over.
-    _remote_donor = None
+    _remote_donor: Optional["RemoteMemDonor"] = None
     # The donation handed to the final target manager (close_remote_donor).
-    _handed_remote_donor = None
+    _handed_remote_donor: Optional["RemoteMemDonor"] = None
 
     def __init__(
         self,
@@ -2249,7 +2249,7 @@ class KvCacheCreator:
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
         cold_page_codec_provider: Optional[object] = None,
-        remote_donor=None,
+        remote_donor: Optional["RemoteMemDonor"] = None,
     ) -> KVCacheManager:
         mapping = self._mapping
         assert self._model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
@@ -2917,7 +2917,7 @@ class KvCacheCreator:
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
         cold_page_codec_provider: Optional[object] = None,
-        remote_donor=None,
+        remote_donor: Optional["RemoteMemDonor"] = None,
     ) -> Optional[KVCacheManager]:
         """
         Create a KV cache manager for draft model layers in one-model mode
@@ -4007,7 +4007,7 @@ def _create_kv_cache_manager(
         max_cuda_graph_batch_size: Optional[int] = None,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         shared_draft_block_width: Optional[int] = None,
-        remote_donor=None,
+        remote_donor: Optional["RemoteMemDonor"] = None,
         gen_preemption_headroom: int = 0) -> KVCacheManager:
     """
     Returns:

@@ -131,7 +131,8 @@ def save_mooncake_worker_config(worker_config, log_dir, role, instance_id):
 REMOTE_CACHE_DIR_NAME = 'kvcm2_remote'
 
 
-def resolve_remote_cache(worker_config, num_ranks, directory):
+def resolve_remote_cache(worker_config: Dict[str, Any], num_ranks: Dict[str, int],
+                         directory: str) -> None:
     """Fill the job-wide fields of the KV cache remote level from the layout.
 
     Each role's kv_cache_config.remote_cache_config gets the job's rendezvous
