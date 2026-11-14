@@ -99,7 +99,7 @@ class _OwnTensorWorker(_Worker):
 
 
 class _ThreeArgWorker(_Worker):
-    """An override with main's three-argument signature (out-of-tree subclasses)."""
+    """An override without the ``tokens_out`` parameter (out-of-tree subclasses)."""
 
     def greedy_sample_draft_with_tp_gather(
         self, logits, spec_metadata=None, mapping_lm_head_tp=None

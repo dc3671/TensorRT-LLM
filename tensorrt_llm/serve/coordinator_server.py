@@ -57,6 +57,8 @@ TIMEOUT_KEEP_ALIVE = 10  # seconds
 # /select, and a connect to a full queue fails with ENOTCONN on its first send.
 # The kernel caps the value at net.core.somaxconn.
 COORDINATOR_UDS_BACKLOG = 16384
+# uvicorn's default accept queue: a cap at or above it is only logged, not warned about.
+UVICORN_DEFAULT_BACKLOG = 2048
 MSGPACK_MEDIA_TYPE = "application/msgpack"
 # How often serving checks whether a uvicorn server began its shutdown (uvicorn's own tick).
 SHUTDOWN_POLL_S = 0.1
@@ -325,7 +327,8 @@ class CoordinatorServer:
             await self._coordinator.start()
             backlog = _effective_uds_backlog()
             if backlog < COORDINATOR_UDS_BACKLOG:
-                logger.warning(
+                log = logger.warning if backlog < UVICORN_DEFAULT_BACKLOG else logger.info
+                log(
                     f"Coordinator UNIX socket accept queue is {backlog}, capped by "
                     f"net.core.somaxconn (requested {COORDINATOR_UDS_BACKLOG}); raise the "
                     "sysctl if routers report coordinator connect failures under bursts."

@@ -992,6 +992,7 @@ def test_coordinator_session_gives_up_idle_connections_before_the_server():
         assert connector.call_args.kwargs["keepalive_timeout"] == dc.COORDINATOR_KEEPALIVE_TIMEOUT_S
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("somaxconn", "expected"), [("4096\n", 4096), ("65535\n", 16384), (None, 16384)]
 )
