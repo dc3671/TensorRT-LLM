@@ -46,12 +46,33 @@ public:
         bool concluded = false;
     };
 
-    AgentTransferAttempt(std::string opName, size_t bytes, std::vector<Request> requests, std::string submitFault)
+    //! Room for `numRequests` requests and a fault message, so that add() and failSubmit() do not allocate.
+    AgentTransferAttempt(std::string opName, size_t bytes, size_t numRequests)
         : mOpName(std::move(opName))
         , mBytes(bytes)
-        , mRequests(std::move(requests))
-        , mFault(std::move(submitFault))
     {
+        mRequests.reserve(numRequests);
+        mFault.reserve(kFaultCapacity);
+    }
+
+    //! Take a posted request; never throws, within the reserved room.
+    void add(std::string donor, size_t pages, std::unique_ptr<kvc::TransferStatus> status) noexcept
+    {
+        TLLM_CHECK_DEBUG(mRequests.size() < mRequests.capacity());
+        mRequests.push_back(Request{std::move(donor), pages, std::move(status), /*concluded=*/false});
+    }
+
+    //! Posting the request to `donor` failed; nothing more is posted. Never throws.
+    void failSubmit(std::string const& donor, char const* what) noexcept
+    {
+        try
+        {
+            mFault = "KVCM2 remote level: " + mOpName + " donor " + donor + ": submitting failed: " + what;
+        }
+        catch (...)
+        {
+            mFault.assign("KVCM2 remote level: submitting a transfer failed"); // within the reserved capacity
+        }
     }
 
     ~AgentTransferAttempt() override
@@ -83,6 +104,8 @@ public:
         return outcome();
     }
 
+    //! A request that ended in kFAILURE counts as concluded, its access to the staging range ended: NIXL reports
+    //! no state after it, and keeping its lease out of use would leak the claims and staging of every dead donor.
     bool quiesced() override
     {
         advance();
@@ -151,6 +174,8 @@ private:
     size_t mBytes;
     std::vector<Request> mRequests;
     std::string mFault; // the first failure: the submission's, else a request's
+
+    static constexpr size_t kFaultCapacity = 512;
 };
 
 } // namespace
@@ -244,9 +269,16 @@ std::unique_ptr<RemoteTransferAttempt> AgentTransferBackend::submit(bool write, 
         TLLM_CHECK_DEBUG(ios[i].donor < donors.size());
         byDonor[ios[i].donor].push_back(i);
     }
-    std::string opName = write ? "WRITE to" : "READ from";
-    std::vector<AgentTransferAttempt::Request> requests;
-    std::string submitFault;
+    // Everything that allocates is made before the first request is posted: from then on submit must return the
+    // attempt that owns the requests in flight, never throw (dropping a status does not stop its request).
+    struct Pending
+    {
+        std::string donor; // "<name> (<host>)"
+        size_t pages;
+        kvc::TransferRequest request;
+    };
+
+    std::vector<Pending> pending;
     for (uint32_t donorIdx = 0; donorIdx < byDonor.size(); ++donorIdx)
     {
         auto const& entries = byDonor[donorIdx];
@@ -265,24 +297,28 @@ std::unique_ptr<RemoteTransferAttempt> AgentTransferBackend::submit(bool write, 
         }
         auto const& donor = donors[donorIdx];
         // The request names the local descriptors first and the remote ones second, whichever way data flows.
-        kvc::TransferRequest request(write ? kvc::TransferOp::kWRITE : kvc::TransferOp::kREAD,
-            kvc::MemoryDescs(kvc::MemoryType::kDRAM, std::move(local)),
-            kvc::MemoryDescs(kvc::MemoryType::kDRAM, std::move(remote)), donor.name);
+        pending.push_back(Pending{donor.name + " (" + donor.host + ")", entries.size(),
+            kvc::TransferRequest(write ? kvc::TransferOp::kWRITE : kvc::TransferOp::kREAD,
+                kvc::MemoryDescs(kvc::MemoryType::kDRAM, std::move(local)),
+                kvc::MemoryDescs(kvc::MemoryType::kDRAM, std::move(remote)), donor.name)});
+    }
+    auto attempt = std::make_unique<AgentTransferAttempt>(write ? "WRITE to" : "READ from", bytes, pending.size());
+    for (auto& entry : pending)
+    {
+        std::unique_ptr<kvc::TransferStatus> status;
         try
         {
-            requests.push_back({donor.name + " (" + donor.host + ")", entries.size(),
-                mTransferAgent->submitTransferRequests(request), /*concluded=*/false});
+            status = mTransferAgent->submitTransferRequests(entry.request);
         }
         catch (std::exception const& e)
         {
             // Nothing more is submitted; the requests already in flight conclude before the attempt does.
-            submitFault = "KVCM2 remote level: " + opName + " donor " + donor.name + " (" + donor.host
-                + "): submitting failed: " + e.what();
+            attempt->failSubmit(entry.donor, e.what());
             break;
         }
+        attempt->add(std::move(entry.donor), entry.pages, std::move(status));
     }
-    return std::make_unique<AgentTransferAttempt>(
-        std::move(opName), bytes, std::move(requests), std::move(submitFault));
+    return attempt;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
