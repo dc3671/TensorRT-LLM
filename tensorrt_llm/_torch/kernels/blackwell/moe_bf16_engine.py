@@ -4,9 +4,13 @@
 in one persistent launch, returning what ``trtllm::bf16_moe_runner`` returns un-finalized (per (token, k) a gemm2 row
 and the BF16 top-k weight; the local picks' rows packed).
 
-Every CTA routes the step's rows in its prologue (as FlashInfer's routing kernels under -use_fast_math), then runs
-FC1 -> SwiGLU -> FC2 with ``kind::f16`` MMAs over the whole K in order on the BlockMajorK weights in place.
-Scheduling: ``moe_persistent_engine``.
+Every CTA routes the step's rows in its prologue, then runs FC1 -> SwiGLU -> FC2 with ``kind::f16`` MMAs over the
+whole K in order on the BlockMajorK weights in place. Scheduling: ``moe_persistent_engine``.
+
+Parity with ``bf16_moe_runner``: the same picks and gemm2 rows bit for bit; the BF16 top-k weights within 1 ulp. The
+prologue's softmax is the fast-math sequence (``ex2.approx``, ``rcp.approx``) while the runner's routing
+(RoutingKernel.cuh, built without fast math) uses ``expf`` and an IEEE divide, so a weight can round to the
+neighbouring BF16 value.
 """
 
 from __future__ import annotations
@@ -33,8 +37,8 @@ from cutlass.pipeline import (
 if TYPE_CHECKING:
     import torch
 
+from ...cute_dsl_utils import gmem_ptr
 from .moe_decode_front import (
-    _add,
     _below,
     _bit,
     _bitonic_pairs,
@@ -62,6 +66,11 @@ from .moe_persistent_engine import (
     THREADS,
     TILE_M,
     PersistentMoeEngine,
+    launch,
+    new_state,
+    ring_smem_bytes,
+)
+from .ptx_helpers import (
     _add_rn,
     _cp_async_16,
     _cp_async_arrive_noinc,
@@ -74,10 +83,7 @@ from .moe_persistent_engine import (
     _rcp,
     _st_global_b32,
     _st_global_b32_hint,
-    gmem_ptr,
-    launch,
-    new_state,
-    ring_smem_bytes,
+    sum_tree,
 )
 
 TILE_K = 128  # bf16 elements per ring stage (256 bytes per row)
@@ -136,8 +142,8 @@ def supports_local_experts(num_experts: int, num_local: int) -> bool:
 
 
 def _butterfly_sum(top_k: int):
-    """FlashInfer's softmax sum over the top-k values held by lanes 0 .. top_k - 1 (the others hold 0): the warp
-    butterfly (xor 16, 8, 4, 2, 1) as lane 0 sees it, as nested pairs of value indices (adding 0 is exact)."""
+    """The routing kernels' softmax sum over the top-k values held by lanes 0 .. top_k - 1 (the others hold 0): the
+    warp butterfly (xor 16, 8, 4, 2, 1) as lane 0 sees it, as nested pairs of value indices (adding 0 is exact)."""
     lanes = [i if i < top_k else None for i in range(32)]
     for off in (16, 8, 4, 2, 1):
         lanes = [
@@ -407,7 +413,8 @@ class MoeBf16Engine(PersistentMoeEngine):
             s_mask[i] = Int32(0)
         gen = self.wait_dependency(state_addr)
         cute.arch.barrier()  # the masks are zero before any warp sets bits in them
-        # ---- routing: every CTA routes all m rows (warp w: rows w, w + 12, ...), bitwise trtllm-gen Renormalize
+        # ---- routing: every CTA routes all m rows (warp w: rows w, w + 12, ...), trtllm-gen Renormalize (same picks,
+        # weights within 1 BF16 ulp)
         self.route(lg_addr, m, local_start, wts_addr, s_mask, s_pick, warp_idx, lane, bidx)
         cute.arch.barrier()
         # ---- segments (warp 0): per local expert its rows (token bits), first permuted row, segments of <= n_max
@@ -498,7 +505,8 @@ class MoeBf16Engine(PersistentMoeEngine):
     def route(self, lg_addr, m, local_start, wts_addr, s_mask, s_pick, warp_idx, lane, bidx):
         """Top-k Renormalize of the BF16 router logits [m, E], MoeDecodeFront's selection: lane l holds experts
         E/32 l .. E/32 (l + 1) - 1, bitonic-sorted per lane, the warp max popped top_k times (keys unique); the
-        softmax as FlashInfer's routing kernels compute it under -use_fast_math, its sum tree their warp butterfly.
+        softmax in fast math (ex2.approx, rcp.approx: within 1 BF16 ulp of the runner's expf / IEEE divide), its sum
+        tree the routing kernels' warp butterfly.
         Lane k < top_k records pick k: the token bit in its local expert's mask, its local expert (or -1), and in CTA
         0 its BF16 weight."""
         NLOC = self.num_local
@@ -542,9 +550,9 @@ class MoeBf16Engine(PersistentMoeEngine):
             vmax = val[0]
             ex = cute.make_rmem_tensor(cute.make_layout((TOPK,)), cutlass.Float32)
             for k in cutlass.range_constexpr(TOPK):
-                # FlashInfer's routing under -use_fast_math: FADD.FTZ, FMUL.FTZ by log2e, MUFU.EX2
+                # fast-math exp: FADD.FTZ, FMUL.FTZ by log2e, MUFU.EX2 (the runner: expf)
                 ex[k] = _ex2(_mul_rn_ftz(_sub_rn_ftz(val[k], vmax), cutlass.Float32(LOG2E)))
-            ssum = self._sum_tree(ex, _butterfly_sum(TOPK))
+            ssum = sum_tree(ex, _butterfly_sum(TOPK))
             my_sel = sel[0]
             my_e = ex[0]
             for k in cutlass.range_constexpr(TOPK - 1):
@@ -553,7 +561,7 @@ class MoeBf16Engine(PersistentMoeEngine):
             if lane < TOPK:
                 o = Int64(row) * Int64(TOPK) + Int64(lane)
                 if bidx == 0:
-                    # FlashInfer's: MUFU.RCP of the sum, FMUL.FTZ, F2FP.BF16 (round to nearest even)
+                    # MUFU.RCP of the sum, FMUL.FTZ, F2FP.BF16 (round to nearest even); the runner: IEEE divide
                     q = _mul_rn_ftz(my_e, _rcp(ssum))
                     _st_b16(wts_addr + o * Int64(2), _pack_bf16x2_rn(q, q) & Int32(65535))
                 lid = my_sel - local_start
@@ -561,11 +569,6 @@ class MoeBf16Engine(PersistentMoeEngine):
                 if pick >= Int32(0):
                     _red_or_shared(mask_addr + pick * 4, _bit(row))
                 s_pick[row * TOPK + lane] = pick
-
-    def _sum_tree(self, ex, tree):
-        if isinstance(tree, int):
-            return ex[tree]
-        return _add(self._sum_tree(ex, tree[0]), self._sum_tree(ex, tree[1]))
 
     @cute.jit
     def segments(self, s_mask, s_eoff, s_seg_e, s_seg_r0, s_seg_n, s_nseg, lane):
@@ -900,7 +903,8 @@ class MoeBf16Engine(PersistentMoeEngine):
                         # u * (g * sigmoid(g)), sigmoid = rcp.approx(ex2.approx(-g log2e) + 1)
                         sgm = _rcp(
                             _add_rn(
-                                _ex2(-_mul_rn(gate, cutlass.Float32(LOG2E))), cutlass.Float32(1.0)
+                                _ex2(-_mul_rn(gate, cutlass.Float32(LOG2E))),
+                                cutlass.Float32(1.0),
                             )
                         )
                         hv = _mul_rn(xv, _mul_rn(gate, sgm))
@@ -1000,9 +1004,9 @@ def moe_bf16_engine(
     n_max = N_MAX[0] if m <= N_MAX[0] else N_MAX[1]
     num_stages = stages_for(n_max, ring_smem_bytes(x.device))
     args = (
-        gmem_ptr(cutlass.BFloat16, w31, 128),
-        gmem_ptr(cutlass.BFloat16, w2, 128),
-        gmem_ptr(cutlass.BFloat16, w2, 128),
+        gmem_ptr(w31, cutlass.BFloat16, 128),
+        gmem_ptr(w2, cutlass.BFloat16, 128),
+        gmem_ptr(w2, cutlass.BFloat16, 128),
         Int64(x.data_ptr()),
         Int64(x.stride(0) * 2),
         Int64(logits.data_ptr()),

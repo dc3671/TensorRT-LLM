@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The persistent unit scheduler of the decode MoE engines (``moe_nvfp4_engine``, ``moe_bf16_engine``) and the PTX
-helpers they share.
+"""The persistent unit scheduler of the decode MoE engines (``moe_nvfp4_engine``, ``moe_bf16_engine``); the PTX
+helpers they share are in ``ptx_helpers``.
 
 An engine runs one call's routed experts FC1 -> activation -> FC2 in one persistent launch. A unit is one 128-row
 weight tile of a segment (at most ``n_max`` rows of one expert): 2I / 128 FC1 and H / 128 FC2 units per segment share
@@ -17,7 +17,6 @@ advances gen. Calls on one state must be stream-ordered.
 from __future__ import annotations
 
 import enum
-import functools
 from typing import Callable
 
 import cuda.bindings.driver as cuda
@@ -26,6 +25,16 @@ import cutlass.cute as cute
 import torch
 from cutlass import Int32, Int64
 from cutlass.cute.nvgpu import tcgen05
+
+from .ptx_helpers import (
+    _atom_add_acq_rel,
+    _atom_add_relaxed,
+    _bar_sync,
+    _ld_acquire_u32,
+    _ld_relaxed_u32,
+    _red_release_add,
+    _st_relaxed_u32,
+)
 
 TILE_M = 128
 NUM_ACC = 2  # TMEM accumulator buffers (unit k uses buffer k % NUM_ACC)
@@ -41,147 +50,6 @@ LOG2E = 1.4426950216293334961
 _CNT_OFFSET = 64
 # Upper bound of an engine's shared memory outside its operand ring (tables, barriers, routing scratch, alignment)
 NON_RING_SMEM = 27 * 1024
-
-
-# ----------------------------------------------------------------------------------------------------------------
-# PTX helpers
-# ----------------------------------------------------------------------------------------------------------------
-def _ld_s32(addr: Int64):
-    return cute.arch.inline_ptx(
-        "ld.global.s32 {$w0}, [{$r0}];", write_only_types=[Int32], read_only_args=[addr]
-    )
-
-
-def _ld_relaxed_u32(addr: Int64):
-    return cute.arch.inline_ptx(
-        "ld.relaxed.gpu.global.u32 {$w0}, [{$r0}];", write_only_types=[Int32], read_only_args=[addr]
-    )
-
-
-def _ld_acquire_u32(addr: Int64):
-    return cute.arch.inline_ptx(
-        "ld.acquire.gpu.global.u32 {$w0}, [{$r0}];", write_only_types=[Int32], read_only_args=[addr]
-    )
-
-
-def _st_relaxed_u32(addr: Int64, v) -> None:
-    cute.arch.inline_ptx("st.relaxed.gpu.global.u32 [{$r0}], {$r1};", read_only_args=[addr, v])
-
-
-def _st_global_b32(addr: Int64, v) -> None:
-    cute.arch.inline_ptx("st.global.b32 [{$r0}], {$r1};", read_only_args=[addr, v])
-
-
-def _red_release_add(addr: Int64, v) -> None:
-    cute.arch.inline_ptx("red.release.gpu.global.add.u32 [{$r0}], {$r1};", read_only_args=[addr, v])
-
-
-def _atom_add_acq_rel(addr: Int64, v):
-    return cute.arch.inline_ptx(
-        "atom.acq_rel.gpu.global.add.u32 {$w0}, [{$r0}], {$r1};",
-        write_only_types=[Int32],
-        read_only_args=[addr, v],
-    )
-
-
-def _atom_add_relaxed(addr: Int64, v):
-    return cute.arch.inline_ptx(
-        "atom.relaxed.gpu.global.add.u32 {$w0}, [{$r0}], {$r1};",
-        write_only_types=[Int32],
-        read_only_args=[addr, v],
-    )
-
-
-def _policy_evict_first():
-    """An L2 cache policy: evict first (createpolicy.fractional, fraction 1.0)."""
-    return cute.arch.inline_ptx(
-        "createpolicy.fractional.L2::evict_first.b64 {$w0}, 1.0;", write_only_types=[Int64]
-    )
-
-
-def _policy_evict_last():
-    """An L2 cache policy: evict last (createpolicy.fractional, fraction 1.0)."""
-    return cute.arch.inline_ptx(
-        "createpolicy.fractional.L2::evict_last.b64 {$w0}, 1.0;", write_only_types=[Int64]
-    )
-
-
-def _st_global_b32_hint(addr: Int64, v, pol) -> None:
-    cute.arch.inline_ptx(
-        "st.global.L2::cache_hint.b32 [{$r0}], {$r1}, {$r2};", read_only_args=[addr, v, pol]
-    )
-
-
-def _cp_async_16(dst: Int32, src: Int64) -> None:
-    cute.arch.inline_ptx(
-        "cp.async.cg.shared.global [{$r0}], [{$r1}], 16;", read_only_args=[dst, src]
-    )
-
-
-def _cp_async_arrive_noinc(bar: Int32) -> None:
-    """Arrive on bar once this thread's earlier cp.async copies complete (the barrier's count includes it)."""
-    cute.arch.inline_ptx(
-        "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [{$r0}];", read_only_args=[bar]
-    )
-
-
-def _cp_async_commit() -> None:
-    cute.arch.inline_ptx("cp.async.commit_group;")
-
-
-def _bar_sync(bar_id, n: int) -> None:
-    """Named barrier bar_id (a register) over n threads."""
-    cute.arch.inline_ptx(f"bar.sync {{$r0}}, {n};", read_only_args=[bar_id])
-
-
-def _ld_nc_f32(addr: Int64):
-    return cute.arch.inline_ptx(
-        "ld.global.nc.f32 {$w0}, [{$r0}];",
-        write_only_types=[cutlass.Float32],
-        read_only_args=[addr],
-    )
-
-
-def _pack_bf16x2_rn(lo, hi):
-    """{bf16(hi), bf16(lo)} by cvt.rn.bf16x2.f32 (no saturation)."""
-    return cute.arch.inline_ptx(
-        "cvt.rn.bf16x2.f32 {$w0}, {$r1}, {$r0};", write_only_types=[Int32], read_only_args=[lo, hi]
-    )
-
-
-def _mul_rn(a, b):
-    return cute.arch.inline_ptx(
-        "mul.rn.f32 {$w0}, {$r0}, {$r1};", write_only_types=[cutlass.Float32], read_only_args=[a, b]
-    )
-
-
-def _add_rn(a, b):
-    return cute.arch.inline_ptx(
-        "add.rn.f32 {$w0}, {$r0}, {$r1};", write_only_types=[cutlass.Float32], read_only_args=[a, b]
-    )
-
-
-def _rcp(a):
-    return cute.arch.inline_ptx(
-        "rcp.approx.ftz.f32 {$w0}, {$r0};", write_only_types=[cutlass.Float32], read_only_args=[a]
-    )
-
-
-def _ex2(a):
-    return cute.arch.inline_ptx(
-        "ex2.approx.ftz.f32 {$w0}, {$r0};", write_only_types=[cutlass.Float32], read_only_args=[a]
-    )
-
-
-def _scale_pack_bf16x2(lo, hi, s):
-    """{bf16_sat(hi * s), bf16_sat(lo * s)}: one IEEE mul.rn.f32 each, then cvt.rn.satfinite.bf16x2.f32 (the
-    trtllm-gen FC2 cubins' FMUL2 + F2FP.SATFINITE.BF16.F32.PACK_AB)."""
-    return cute.arch.inline_ptx(
-        "{ .reg .f32 a, b; mul.rn.f32 a, {$r0}, {$r2}; mul.rn.f32 b, {$r1}, {$r2};"
-        " cvt.rn.satfinite.bf16x2.f32 {$w0}, b, a; }",
-        write_only_types=[Int32],
-        read_only_args=[lo, hi, s],
-    )
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -420,21 +288,16 @@ class PersistentMoeEngine:
 
 
 # ----------------------------------------------------------------------------------------------------------------
-@functools.lru_cache(maxsize=None)
 def ring_smem_bytes(device: torch.device) -> int:
     """Shared memory an engine's operand ring may take on ``device``: a block's opt-in maximum but NON_RING_SMEM."""
-    return torch.cuda.get_device_properties(device).shared_memory_per_block_optin - NON_RING_SMEM
+    from ...cute_dsl_utils import smem_optin_bytes
+
+    return smem_optin_bytes(device) - NON_RING_SMEM
 
 
 def new_state(device: torch.device) -> torch.Tensor:
     """An engine's call state, zero-initialized; it must exist before CUDA-graph capture."""
     return torch.zeros(_CNT_OFFSET // 4 + 2 * CNT_CAP, dtype=torch.int32, device=device)
-
-
-def gmem_ptr(dtype: type, t: torch.Tensor, align: int) -> cute.Pointer:
-    from cutlass.cute.runtime import make_ptr
-
-    return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
 
 
 def launch(
@@ -446,14 +309,18 @@ def launch(
     tail_args: tuple = (),
 ) -> None:
     """Compile ``make_engine()`` once per ``key`` (the engine class and its compile-time configuration) and the PDL
-    setting, and launch it with ``args`` on the current stream, one CTA per SM of ``device`` but ``spare_sms`` (the
-    grid size is a launch argument; the units balance over any grid). ``tail_args`` follow the stream (an engine
-    option's parameters). The first call of a key must precede CUDA graph capture."""
+    setting, and launch it with ``args`` on the current stream, one CTA per SM of ``device`` but ``spare_sms`` and the
+    SMs ``cute_dsl_utils.sm_reserve()`` keeps out of every persistent grid (the grid size is a launch argument; the
+    units balance over any grid). ``tail_args`` follow the stream (an engine option's parameters). The first call of a
+    key must precede CUDA graph capture."""
+    from ...cute_dsl_utils import sm_reserve
     from ...flashinfer_utils import get_env_enable_pdl
 
     use_pdl = get_env_enable_pdl()
     key = (*key, use_pdl)
-    grid_ctas = Int32(torch.cuda.get_device_properties(device).multi_processor_count - spare_sms)
+    grid_ctas = Int32(
+        torch.cuda.get_device_properties(device).multi_processor_count - spare_sms - sm_reserve()
+    )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn = _COMPILED.get(key)
     if fn is None:

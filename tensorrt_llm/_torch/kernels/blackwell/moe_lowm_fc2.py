@@ -39,12 +39,13 @@ from cutlass.pipeline import (
     pipeline_init_wait,
 )
 
+from ...cute_dsl_utils import gmem_ptr
 from ...flashinfer_utils import get_env_enable_pdl
 
 if TYPE_CHECKING:
     import torch
 from .moe_decode_front import _st_shared
-from .moe_persistent_engine import _ld_nc_f32, _ld_s32, _scale_pack_bf16x2, _st_global_b32
+from .ptx_helpers import _ld_nc_f32, _ld_s32, _scale_pack_bf16x2, _st_global_b32, s2t_copy
 
 TILE_M = 128
 TILE_N = 8
@@ -639,17 +640,6 @@ class MoeLowMFc2Nvfp4:
                         cute.arch.mbarrier_arrive(ab_full + st.index)
                     st.advance()
 
-    def _s2t(self, sSF: cute.Tensor, tSF: cute.Tensor):
-        tCsSF_compact = cute.filter_zeros(sSF)
-        tCtSF_compact = cute.filter_zeros(tSF)
-        copy_atom_s2t = cute.make_copy_atom(tcgen05.Cp4x32x128bOp(self.cta_group), self.sf_dtype)
-        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSF_compact)
-        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
-        tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact)
-        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(tiled_copy_s2t, tCsSF_compact_s2t_)
-        tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
-        return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
-
     @cute.jit
     def mma(
         self,
@@ -698,8 +688,8 @@ class MoeLowMFc2Nvfp4:
         tCtSFB = cute.make_tensor(
             cute.recast_ptr(tmem_ptr + sfb_col, dtype=self.sf_dtype), tCtSFB_layout
         )
-        copy_sfa, tCsSFA_s2t, tCtSFA_s2t = self._s2t(sSFA, tCtSFA)
-        copy_sfb, tCsSFB_s2t, tCtSFB_s2t = self._s2t(sSFB, tCtSFB)
+        copy_sfa, tCsSFA_s2t, tCtSFA_s2t = s2t_copy(sSFA, tCtSFA, self.cta_group, self.sf_dtype)
+        copy_sfb, tCsSFB_s2t, tCtSFB_s2t = s2t_copy(sSFB, tCtSFB, self.cta_group, self.sf_dtype)
         num_kphases = cute.size(tCrA, mode=[2])
         ab_st = make_pipeline_state(PipelineUserType.Consumer, self.num_stages)
         acc_st = make_pipeline_state(PipelineUserType.Producer, NUM_ACC)
@@ -812,16 +802,13 @@ class MoeLowMFc2Nvfp4:
 _COMPILED = {}
 
 
-def _ptr(dtype, t, align):
-    from cutlass.cute.runtime import make_ptr
-
-    return make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
-
-
 def num_sms(device: Optional[torch.device] = None) -> int:
+    """SMs of ``device`` the persistent grid spans: all but those ``cute_dsl_utils.sm_reserve()`` keeps out."""
     import torch
 
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    from ...cute_dsl_utils import sm_reserve
+
+    return torch.cuda.get_device_properties(device).multi_processor_count - sm_reserve()
 
 
 def moe_lowm_fc2(
@@ -855,9 +842,9 @@ def moe_lowm_fc2(
         raise ValueError("out must be a contiguous bf16 [padded rows, H] tensor")
     grid_ctas = num_sms(act.device) * CTAS_PER_SM
     ptrs = (
-        _ptr(cutlass.Float4E2M1FN, w2, 32),
-        _ptr(cutlass.Float8E4M3FN, w2_sf, 16),
-        _ptr(cutlass.Float4E2M1FN, act, 32),
+        gmem_ptr(w2, cutlass.Float4E2M1FN, 32),
+        gmem_ptr(w2_sf, cutlass.Float8E4M3FN, 16),
+        gmem_ptr(act, cutlass.Float4E2M1FN, 32),
     )
     addrs = (
         Int64(act_sf.data_ptr()),

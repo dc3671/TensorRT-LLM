@@ -35,9 +35,9 @@ from cutlass.pipeline import (
     pipeline_init_wait,
 )
 
+from ...cute_dsl_utils import gmem_ptr
 from .moe_bf16_engine import _butterfly_sum
 from .moe_decode_front import (
-    _add,
     _bit,
     _div_bf16,
     _exp_tr,
@@ -65,6 +65,11 @@ from .moe_persistent_engine import (
     TILE_M,
     PersistentMoeEngine,
     Release,
+    launch,
+    new_state,
+    ring_smem_bytes,
+)
+from .ptx_helpers import (
     _add_rn,
     _bar_sync,
     _cp_async_16,
@@ -80,10 +85,8 @@ from .moe_persistent_engine import (
     _scale_pack_bf16x2,
     _st_global_b32,
     _st_global_b32_hint,
-    gmem_ptr,
-    launch,
-    new_state,
-    ring_smem_bytes,
+    s2t_copy,
+    sum_tree,
 )
 
 SF_VEC = 16
@@ -227,13 +230,6 @@ def _max_tree(keys: list):
         return keys[0]
     half = (len(keys) + 1) // 2
     return _max_u32(_max_tree(keys[:half]), _max_tree(keys[half:]))
-
-
-def _sum_tree(vals: list, tree):
-    """``vals`` summed in the order of ``tree`` (nested pairs of indices, ``moe_bf16_engine._butterfly_sum``)."""
-    if isinstance(tree, int):
-        return vals[tree]
-    return _add(_sum_tree(vals, tree[0]), _sum_tree(vals, tree[1]))
 
 
 def _fence_cta_after(dep) -> None:
@@ -1125,7 +1121,7 @@ class MoeNvfp4Engine(PersistentMoeEngine):
             ex = []
             for k in cutlass.range_constexpr(TK):
                 ex.append(_exp_tr(_sub(val[k], val[0])))
-            ssum = _sum_tree(ex, _butterfly_sum(TK))
+            ssum = sum_tree(ex, _butterfly_sum(TK))
             for k in cutlass.range_constexpr(TK):
                 o = Int64(t) * Int64(TK) + Int64(k)
                 _st_b16(wts_addr + o * Int64(2), _div_bf16(ex[k], ssum))
@@ -1366,17 +1362,6 @@ class MoeNvfp4Engine(PersistentMoeEngine):
             k = k + 1
             g, slot = self.unit(s_q, q_full, k)
 
-    def _s2t(self, sSF: cute.Tensor, tSF: cute.Tensor):
-        tCsSF_compact = cute.filter_zeros(sSF)
-        tCtSF_compact = cute.filter_zeros(tSF)
-        copy_atom_s2t = cute.make_copy_atom(tcgen05.Cp4x32x128bOp(self.cta_group), self.sf_dtype)
-        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSF_compact)
-        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
-        tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact)
-        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(tiled_copy_s2t, tCsSF_compact_s2t_)
-        tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
-        return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t
-
     @cute.jit
     def mma(
         self,
@@ -1425,8 +1410,8 @@ class MoeNvfp4Engine(PersistentMoeEngine):
         tCtSFB = cute.make_tensor(
             cute.recast_ptr(tmem_ptr + sfb_col, dtype=self.sf_dtype), tCtSFB_layout
         )
-        copy_sfa, tCsSFA_s2t, tCtSFA_s2t = self._s2t(sSFA, tCtSFA)
-        copy_sfb, tCsSFB_s2t, tCtSFB_s2t = self._s2t(sSFB, tCtSFB)
+        copy_sfa, tCsSFA_s2t, tCtSFA_s2t = s2t_copy(sSFA, tCtSFA, self.cta_group, self.sf_dtype)
+        copy_sfb, tCsSFB_s2t, tCtSFB_s2t = s2t_copy(sSFB, tCtSFB, self.cta_group, self.sf_dtype)
         num_kphases = cute.size(tCrA, mode=[2])
         ab_st = make_pipeline_state(PipelineUserType.Consumer, self.num_stages)
         acc_st = make_pipeline_state(PipelineUserType.Producer, NUM_ACC)
@@ -1636,11 +1621,11 @@ def moe_nvfp4_engine(
     per_stage = (128 + n_max) * tile_k // 2 + 2 * 128 * tile_k // SF_VEC
     num_stages = min(10, ring_smem_bytes(xq.device) // per_stage)
     args = (
-        gmem_ptr(cutlass.Float4E2M1FN, w31, 32),
-        gmem_ptr(cutlass.Float8E4M3FN, w31_sf, 16),
-        gmem_ptr(cutlass.Float4E2M1FN, w2, 32),
-        gmem_ptr(cutlass.Float8E4M3FN, w2_sf, 16),
-        gmem_ptr(cutlass.Float4E2M1FN, w2, 32),
+        gmem_ptr(w31, cutlass.Float4E2M1FN, 32),
+        gmem_ptr(w31_sf, cutlass.Float8E4M3FN, 16),
+        gmem_ptr(w2, cutlass.Float4E2M1FN, 32),
+        gmem_ptr(w2_sf, cutlass.Float8E4M3FN, 16),
+        gmem_ptr(w2, cutlass.Float4E2M1FN, 32),
         Int64(xq.data_ptr()),
         Int64(xsf.data_ptr()),
         Int64(p2t.data_ptr()),

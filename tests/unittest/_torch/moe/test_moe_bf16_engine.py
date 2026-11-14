@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """The BF16 decode MoE engine (kernels/blackwell/moe_bf16_engine.py) against trtllm::bf16_moe_runner routed from
-the router logits, un-finalized: per (token, k) the same gemm2 row and BF16 top-k weight, bit for bit, through each
-op's own expanded -> permuted index (the engine packs the local picks' rows), at the Qwen3.5 MTP draft layer's shapes
-(512 experts, top-10, hidden 4096, intermediate 512 per rank, 128 / 64 local experts) and at 256 experts, top-8."""
+the router logits, un-finalized: per (token, k) the same pick and gemm2 row bit for bit and the BF16 top-k weight
+within 1 ulp (the engine's softmax is ex2.approx / rcp.approx, the runner's expf / IEEE divide), through each op's own
+expanded -> permuted index (the engine packs the local picks' rows), at the Qwen3.5 MTP draft layer's shapes (512
+experts, top-10, hidden 4096, intermediate 512 per rank, 128 / 64 local experts) and at 256 experts, top-8."""
 
 from types import SimpleNamespace
 
@@ -15,6 +16,13 @@ from tensorrt_llm._utils import is_blackwell_datacenter
 pytestmark = pytest.mark.skipif(not is_blackwell_datacenter(), reason="needs SM 10.0 / 10.3")
 
 H, E, TOPK, INTER = 4096, 512, 10, 512
+
+
+def _assert_within_one_ulp(got: torch.Tensor, ref: torch.Tensor) -> None:
+    """Positive BF16 weights at most one ulp apart (as int16 bit patterns, adjacent values differ by 1)."""
+    assert (got > 0).all() and (ref > 0).all()
+    ulps = (got.view(torch.int16).int() - ref.view(torch.int16).int()).abs()
+    assert int(ulps.max()) <= 1, f"top-k weights {int(ulps.max())} ulp apart"
 
 
 def _gen(seed):
@@ -96,7 +104,7 @@ def test_engine_matches_bf16_moe_runner(m, num_experts, top_k, e_local):
         ref = _reference(x, lg, w31, w2, top_k, local_start, e_local)
         torch.cuda.synchronize()
         r_rows, r_wts, r_e2p = ref[0], ref[1], ref[2].reshape(m, top_k)
-        assert torch.equal(wts.view(torch.int16), r_wts.view(torch.int16)), "top-k weights"
+        _assert_within_one_ulp(wts, r_wts)
         valid = e2p >= 0
         assert torch.equal(valid, r_e2p >= 0), "local picks"
         rows = torch.sort(e2p[valid]).values
@@ -212,7 +220,7 @@ def test_decode_moe_bf16_run_matches_bf16_moe_runner(m):
     )
     torch.cuda.synchronize()
     r_rows, r_wts, r_e2p = ref[0], ref[1], ref[2].reshape(m, TOPK)
-    assert torch.equal(wts.view(torch.int16), r_wts.view(torch.int16))
+    _assert_within_one_ulp(wts, r_wts)
     valid = e2p >= 0
     assert torch.equal(valid, r_e2p >= 0) and int(valid.sum()) > 0
     assert torch.equal(

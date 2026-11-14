@@ -912,7 +912,7 @@ def _pdl_table_reader():
         _ld_relaxed_s32,
         _ld_relaxed_u16,
     )
-    from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import _st_global_b32
+    from tensorrt_llm._torch.kernels.blackwell.ptx_helpers import _st_global_b32
 
     class Reader:
         @cute.jit
