@@ -83,10 +83,10 @@ def _good_fit(**extra):
 
 
 def test_priority_is_strictly_decreasing_in_tokens():
-    values = [olp.priority_of(t) for t in (0, 1, 100, 375.77, 1024, 1e6)]
+    values = [olp.priority_of(t) for t in (0, 1, 100, 400, 1024, 1e6)]
     assert values[0] == 1.0
     assert all(a > b for a, b in zip(values, values[1:]))
-    assert values[3] == pytest.approx(0.7315, abs=1e-4)
+    assert values[3] == pytest.approx(0.7191, abs=1e-4)
     assert olp.priority_of(-5) == 1.0
 
 

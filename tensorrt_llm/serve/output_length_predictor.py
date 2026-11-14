@@ -86,10 +86,9 @@ PREDICTORS = get_args(PredictorName)
 
 # priority = 1 / (1 + tokens / scale); the admission order does not depend on the scale.
 PRIORITY_SCALE_TOKENS = 1024.0
-# The prediction before any reply was learned, and for a request the coordinator could not predict:
-# the median reply length (375.767 tokens) of the AgentX trace the Qwen3.5 reference recipes replay.
-# It is fixed; it does not follow the learned median.
-PRIOR_TOKENS = 375.77
+# Neutral starting value: the prediction before any reply is learned (the learned median replaces it
+# after the first reply) and for a request the coordinator could not predict.
+PRIOR_TOKENS = 400.0
 PREDICT_TIMEOUT_S = 1.0
 RECORD_TIMEOUT_S = 5.0
 STATS_LOG_PERIOD_S = 30.0
