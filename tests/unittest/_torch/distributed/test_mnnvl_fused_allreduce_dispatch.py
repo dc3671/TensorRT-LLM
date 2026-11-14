@@ -77,3 +77,38 @@ def test_two_cta_residency(
 @pytest.mark.parametrize("rows", [0, -1])
 def test_nonpositive_rows(fused_norm: MnnvlAllReduceNorm, rows: int) -> None:
     assert not fused_norm.supports_rows(rows)
+
+
+# (m, hidden, sms, access group) -> (block, cluster, loads per thread) of twoshotAllreduceFusionOp's rmsNormLamport
+# launch, from mnnvlAllreduceKernels.cu's adjustGridConfig<true> / <false> compiled on the host (getMultiProcessorCount
+# replaced by sms): every step of it (cluster shrink and regrowth, the SM cap, the non-CGA fallback, loads > 1).
+_LIB_NORM_LAUNCHES = [
+    ((1, 4096, 148, 1), (64, 8, 1)),
+    ((18, 4096, 148, 1), (64, 8, 1)),
+    ((19, 4096, 148, 1), (128, 4, 1)),
+    ((64, 4096, 148, 1), (256, 2, 1)),
+    ((75, 4096, 148, 1), (512, 1, 1)),
+    ((200, 4096, 148, 1), (512, 1, 1)),
+    ((128, 16384, 148, 1), (1024, 2, 1)),
+    ((128, 65536, 148, 1), (1024, 8, 1)),
+    ((1, 2560, 148, 1), (80, 4, 1)),
+    ((40, 2560, 148, 1), (160, 2, 1)),
+    ((1, 131072, 148, 1), (2048, 1, 8)),
+    ((1, 6144, 132, 2), (96, 8, 1)),
+    ((17, 7168, 132, 2), (224, 4, 1)),
+    ((1, 1000, 160, 1), (125, 1, 1)),
+]
+
+
+@pytest.mark.parametrize(("args", "launch"), _LIB_NORM_LAUNCHES)
+def test_lib_norm_tree_matches_the_library_launch(
+    args: tuple[int, int, int, int], launch: tuple[int, int, int]
+) -> None:
+    """The one Python port of the library's norm launch shape, which both the slot / two-shot all-reduce kernels
+    (``_ctas_per_token``) and the GEMM + two-shot kernel replay."""
+    from tensorrt_llm._torch.distributed.mnnvl_fused_allreduce import _ctas_per_token, lib_norm_tree
+
+    m, hidden, sms, group = args
+    assert lib_norm_tree(m, hidden, sms, group=group) == launch
+    if group == 1:
+        assert _ctas_per_token(m, hidden, sms) == launch[1]

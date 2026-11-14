@@ -53,6 +53,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.experimental import primitives as prims
 
+from ...distributed.mnnvl_fused_allreduce import lib_norm_tree
 from .mnnvl_allreduce_norm import (
     _NEG_ZERO,
     _add,
@@ -89,55 +90,6 @@ MAX_ROWS = 128
 NORM_BAR = 1  # named barrier of the four epilogue warps
 OWN_WARPS = 2  # warps 0-1 (TMA, MMA) take the spread owner items
 GATE_BAR = 3  # named barrier of the row gate over all THREADS (0 = CTA, 1 = NORM_BAR)
-
-
-def lib_norm_tree(
-    m: int, hidden: int, sms: int, elts: int = 8, group: int = 1
-) -> Tuple[int, int, int]:
-    """(block, cluster, loads per thread) of the library's rmsNormLamport launch for ``m`` tokens on ``sms`` SMs:
-    ``adjustGridConfig<true>``, or the non-CGA ``adjustGridConfig<false>`` that ``twoshotAllreduceFusionOp`` takes
-    unless that gives a cluster > 1 with one load per thread (mnnvlAllreduceKernels.cu)."""
-
-    def div_up(a, b):
-        return -(-a // b)
-
-    def adjust(use_cluster):
-        cluster = 8 if use_cluster else 1
-        need = div_up(hidden, elts)
-        loads = 1
-        block = div_up(need, cluster)
-        if use_cluster:
-            while (need % cluster != 0 or div_up(need, cluster) % group != 0) and cluster > 1:
-                cluster //= 2
-            max_div = cluster
-            block = div_up(need, cluster)
-            while block < 128 and cluster >= 2:
-                block, cluster = block * 2, cluster // 2
-            while m * cluster > sms and cluster > 1 and block <= 512:
-                block, cluster = block * 2, cluster // 2
-            while cluster < max_div:
-                cc = cluster * 2
-                cb = div_up(need, cc)
-                if cb < 64 or cb % group != 0 or m * cc > sms:
-                    break
-                cluster, block = cc, cb
-        while block > 1024:
-            if use_cluster and cluster < 8:
-                cluster <<= 1
-            elif loads < 8:
-                loads += 1
-            else:
-                break
-            block = div_up(need, cluster * loads)
-        while block % group != 0 and loads < 8:
-            loads += 1
-            block = div_up(need, cluster * loads)
-        return block, cluster, loads
-
-    block, cluster, loads = adjust(True)
-    if not (cluster > 1 and loads == 1):
-        block, cluster, loads = adjust(False)
-    return block, cluster, loads
 
 
 def _replayable(m: int, hidden: int, sms: int) -> bool:
@@ -759,10 +711,11 @@ def _compile(
     assert _replayable(m, hidden, sms), (m, hidden, sms, block, cluster, loads)
     mk = cute.runtime.make_fake_compact_tensor
     u8 = cutlass.Uint8
+    # x and W only feed the host-built TMA descriptors, whose global address needs 16 bytes (``supports``).
     return cute.compile(
         _launch,
-        mk(u8, (m, k), stride_order=(1, 0), assumed_align=128),
-        mk(u8, (hidden, k), stride_order=(1, 0), assumed_align=128),
+        mk(u8, (m, k), stride_order=(1, 0), assumed_align=16),
+        mk(u8, (hidden, k), stride_order=(1, 0), assumed_align=16),
         mk(cutlass.Float32, (1,), assumed_align=4),
         mk(cutlass.Float32, (1,), assumed_align=4),
         mk(cutlass.BFloat16, (m, hidden), stride_order=(1, 0), assumed_align=16),
@@ -834,12 +787,14 @@ def supports_rows(m: int, hidden: int, nranks: int, sms: int, min_rows: int) -> 
 def supports_problem(
     m: int, weight: torch.Tensor, hidden: int, nranks: int, sms: int, min_rows: int
 ) -> bool:
-    """Whether a call of ``m`` rows with this E4M3 weight [H, K] fits (the activation not looked at)."""
+    """Whether a call of ``m`` rows with this E4M3 weight [H, K] fits (the activation not looked at); the weight's
+    address is 16-byte aligned, as its TMA descriptor needs."""
     k = weight.shape[-1]
     return (
         weight.dtype == torch.float8_e4m3fn
         and weight.shape == (hidden, k)
         and weight.is_contiguous()
+        and weight.data_ptr() % 16 == 0
         and k % MMA_K == 0
         and k // MMA_K <= 8
         and supports_hidden(hidden, nranks, sms)
@@ -850,6 +805,8 @@ def supports_problem(
 def supports(
     x: torch.Tensor, weight: torch.Tensor, hidden: int, nranks: int, sms: int, min_rows: int
 ) -> bool:
+    """Whether the launch takes this E4M3 activation and weight: ``supports_problem``, and x contiguous at a 16-byte
+    aligned address (the compiled kernel's assumption for both)."""
     return (
         x.dim() == 2
         and x.dtype == torch.float8_e4m3fn

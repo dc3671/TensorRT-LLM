@@ -18,8 +18,12 @@
   ``routed + sigmoid(gate) * shared`` computed in-kernel (``routed`` finalized, or finalized in-kernel from
   the fc2 rows). Calls of up to ``SLOT_MAX_ROWS`` rows run the
   slot kernel on its own multicast workspace, larger ones the two-shot kernel on the library's Lamport
-  workspace and flags. Both produce the library op's outputs. Calls of ``TWO_SHOT_ROWS`` to ``SLOT_MAX_ROWS``
-  rows run the slot transport with the two-shot kernel's arithmetic, so their outputs are the two-shot's.
+  workspace and flags. Both produce the library op's outputs: bit for bit where the norm's reduction tree is the
+  library's (the two-shot arithmetic replays the library's launch shape; the slot kernel's one-shot sums over
+  ``SLOT_CTAS`` CTAs per token, the library one-shot's for few rows, e.g. up to 18 at H 4096 on 148 SMs), otherwise
+  the residual bit for bit and the norm within one BF16 ulp (the FP32 sum of squares added in another order).
+  Calls of ``TWO_SHOT_ROWS`` to ``SLOT_MAX_ROWS`` rows run the slot transport with the two-shot kernel's
+  arithmetic, so their outputs are the two-shot's.
 * ``GemmAllReduceNorm``: FP8 per-tensor row-parallel GEMM (low-M warp MMA) + one-shot all-reduce + residual +
   RMSNorm in one launch, on the library's Lamport workspace.
 * ``GemmTwoShotAllReduceNorm``: the same for 17-128 rows with an E4M3 input: tcgen05 GEMM + two-shot all-reduce
@@ -51,19 +55,61 @@ TWO_SHOT_ROWS = 64
 SLOT_MAX_ROWS = 128
 
 
+@functools.lru_cache(maxsize=None)
+def lib_norm_tree(
+    m: int, hidden: int, sms: int, elts: int = 8, group: int = 1
+) -> Tuple[int, int, int]:
+    """(block, cluster, loads per thread) of the library's rmsNormLamport launch for ``m`` tokens on ``sms`` SMs:
+    ``adjustGridConfig<true>``, or the non-CGA ``adjustGridConfig<false>`` that ``twoshotAllreduceFusionOp`` takes
+    unless that gives a cluster > 1 with one load per thread (mnnvlAllreduceKernels.cu). The one port of it: the
+    CuTe kernels' norm reduction trees (and outputs) match the library's bit for bit only for its launch shape."""
+
+    def div_up(a: int, b: int) -> int:
+        return -(-a // b)
+
+    def adjust(use_cluster: bool) -> Tuple[int, int, int]:
+        cluster = 8 if use_cluster else 1
+        need = div_up(hidden, elts)
+        loads = 1
+        block = div_up(need, cluster)
+        if use_cluster:
+            while (need % cluster != 0 or div_up(need, cluster) % group != 0) and cluster > 1:
+                cluster //= 2
+            max_div = cluster
+            block = div_up(need, cluster)
+            while block < 128 and cluster >= 2:
+                block, cluster = block * 2, cluster // 2
+            while m * cluster > sms and cluster > 1 and block <= 512:
+                block, cluster = block * 2, cluster // 2
+            while cluster < max_div:
+                cc = cluster * 2
+                cb = div_up(need, cc)
+                if cb < 64 or cb % group != 0 or m * cc > sms:
+                    break
+                cluster, block = cc, cb
+        while block > 1024:
+            if use_cluster and cluster < 8:
+                cluster <<= 1
+            elif loads < 8:
+                loads += 1
+            else:
+                break
+            block = div_up(need, cluster * loads)
+        while block % group != 0 and loads < 8:
+            loads += 1
+            block = div_up(need, cluster * loads)
+        return block, cluster, loads
+
+    block, cluster, loads = adjust(True)
+    if not (cluster > 1 and loads == 1):
+        block, cluster, loads = adjust(False)
+    return block, cluster, loads
+
+
 def _ctas_per_token(rows: int, hidden: int, sms: int) -> int:
-    """CTAs per token, as the library one-shot's ``adjustGridConfig`` picks them, so the norm's reduction
-    tree (and output) match the library bit for bit: the CTA count shrinks for the grid to fit the SMs only while a
-    CTA stays within 1024 threads."""
-    threads = hidden // 8
-    ctas = 8
-    while ctas > 1 and (
-        threads // ctas < 64
-        or (threads // ctas) % 32
-        or (rows * ctas > sms and threads // ctas <= 512)
-    ):
-        ctas //= 2
-    return ctas
+    """CTAs per token of the library's norm launch for ``rows`` tokens (:func:`lib_norm_tree`'s cluster), so the
+    norm's reduction tree (and output) match the library bit for bit."""
+    return lib_norm_tree(rows, hidden, sms)[1]
 
 
 def _tokens_per_cta(rows: int, ctas: int, sms: int) -> int:
