@@ -403,6 +403,25 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertEqual(len(names), 64)
 
 
+@pytest.mark.cpu_only
+class TestBindingDefaults(unittest.TestCase):
+    def test_the_binding_timeouts_default_to_remote_cache_config(self):
+        """The C++ defaults (config.h) and RemoteCacheConfig's are kept apart; a launcher that omits a field gets one."""
+        from tensorrt_llm.llmapi.llm_args import RemoteCacheConfig
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+            RemoteCacheTierConfig,
+            RemoteTransferConfig,
+            RemoteTransport,
+        )
+
+        defaults = {name: field.default for name, field in RemoteCacheConfig.model_fields.items()}
+        transfer = RemoteTransferConfig()
+        self.assertEqual(transfer.timeout_ms, defaults["transfer_timeout_s"] * 1000)
+        self.assertEqual(transfer.transport, RemoteTransport[defaults["transport"].upper()])
+        tier = RemoteCacheTierConfig(quota=0, path="")
+        self.assertEqual(tier.wait_timeout_ms, defaults["donor_wait_timeout_s"] * 1000)
+
+
 def _capture_mode():
     """The calling thread's stream-capture mode."""
     from cuda.bindings import driver as drv

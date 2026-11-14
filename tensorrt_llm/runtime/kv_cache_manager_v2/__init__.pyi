@@ -292,14 +292,14 @@ class RemoteTransferConfig:
     """How a remote tier's pages move, apart from the memory it declares."""
 
     transport: RemoteTransport = RemoteTransport.NIXL
-    timeout_ms: int = 30_000  # how long one batch may take before the level fails
+    timeout_ms: int = ...  # how long one batch may take before the level fails
     backend_params: dict[str, str] = ...  # NIXL only: e.g. {"device_list": "mlx5_0"}
 
 @dataclass(slots=True)
 class RemoteCacheTierConfig:
     quota: int
     path: str  # the rendezvous directory
-    wait_timeout_ms: int = 900_000
+    wait_timeout_ms: int = ...
     expected_donors: int = 0  # 0: unknown
     pool_ratio: list[float] = ...  # empty: the hot level's split
     transfer: RemoteTransferConfig = ...
