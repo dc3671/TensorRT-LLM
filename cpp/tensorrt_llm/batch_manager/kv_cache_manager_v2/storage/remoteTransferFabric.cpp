@@ -24,6 +24,7 @@
 
 #include <cstring>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -200,8 +201,11 @@ uint64_t FabricTransferBackend::attachChunk(RemoteDonor& donor, size_t chunk)
     if (result != CUDA_SUCCESS)
     {
         cuMemRelease(handle);
-        throw RemoteMemError("KVCM2 remote level: mapping chunk " + std::to_string(chunk) + " (" + std::to_string(bytes)
-            + " B) of donor " + donor.name + " (" + donor.host + ") failed: " + cuErrorName(result));
+        // A local failure (e.g. out of GPU address space or memory), not the donor's: it fails the claim instead of
+        // passing over a live donor.
+        throw std::runtime_error("KVCM2 remote level: mapping chunk " + std::to_string(chunk) + " ("
+            + std::to_string(bytes) + " B) of donor " + donor.name + " (" + donor.host
+            + ") into this GPU failed: " + cuErrorName(result));
     }
     mMappings.push_back(FabricMapping{address, bytes, handle});
     mMappingEnd.emplace(address, address + bytes);
