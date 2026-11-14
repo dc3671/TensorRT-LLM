@@ -105,11 +105,11 @@ l0_gb300:
   - unittest/_torch/modules/test_q35_mtp_glue.py
   - unittest/_torch/pyexecutor/test_steady_spec_prepare.py
   # KV cache manager v2 remote cache level: only the fabric transport cases (Grace host memory), which no other
-  # stage can run. The NIXL and host-only cases run with the whole unittest/kv_cache_manager_v2_tests directory in
-  # l0_a10 and l0_b200 (pre-merge) and l0_h100 (post-merge).
+  # stage can run. The NIXL cases run with the whole unittest/kv_cache_manager_v2_tests directory in l0_a10 and
+  # l0_b200 (pre-merge) and l0_h100 (post-merge); the host-only (cpu_only) cases run in l0_cpu.
   - unittest/kv_cache_manager_v2_tests/test_remote_fabric_available.py
   - unittest/kv_cache_manager_v2_tests/test_remote_level.py -k "fabric"
-  - unittest/kv_cache_manager_v2_tests/test_remote_capacity.py::TestFabricPlacement
+  - unittest/kv_cache_manager_v2_tests/test_remote_capacity.py -k "fabric"
   # Muse Spark Open decoder fast paths on one GPU: the fused Triton kernels and the
   # GB300 cluster boundary kernel, against their reference compositions.
   - unittest/_torch/modeling/test_musespark_open_router_projection.py
