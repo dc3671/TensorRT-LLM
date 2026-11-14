@@ -177,20 +177,37 @@ def _write_atomically(path: str, data: bytes) -> None:
         raise
 
 
+class _DonorFiles:
+    """The rendezvous files a donor published, shared with its finalizer. Once withdrawn, nothing more is published:
+    at exit the finalizer may run while a background start is still publishing (daemon threads keep running)."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.paths: list[str] = []
+        self.withdrawn = False
+
+    def withdraw(self, failed: Optional[tuple[str, bytes]] = None) -> None:
+        """Unlink the published files and refuse later ones; with `failed` (path, text), leave that marker too."""
+        with self.lock:
+            self.withdrawn = True
+            for path in reversed(self.paths):
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+            self.paths.clear()
+            if failed is not None:
+                with contextlib.suppress(OSError):
+                    _write_atomically(*failed)
+
+
 def _withdraw_unowned(
-    published: list, failed_path: str, marker: bytes, transport: "DonorTransport"
+    files: _DonorFiles, failed_path: str, marker: bytes, transport: "DonorTransport"
 ) -> None:
     """Finalizer of a donor nobody closed: withdraw its files, leave the failure marker and free its memory.
 
     It holds the transport, not the donor: e.g. a fabric donation's pinned chunks and retained primary context
     otherwise stay until the process exits, though the donor is gone (a failed startup in a process that lives on).
     """
-    for path in reversed(published):
-        with contextlib.suppress(OSError):
-            os.unlink(path)
-    published.clear()
-    with contextlib.suppress(OSError):
-        _write_atomically(failed_path, marker)
+    files.withdraw((failed_path, marker))
     transport.release_unowned()
 
 
@@ -685,7 +702,7 @@ class RemoteMemDonor:
     device: Optional[int] = None
     name: str = ""
     host: str = ""
-    _published: Optional[list] = None  # paths written, withdrawn by close()
+    _files: Optional[_DonorFiles] = None  # files written, withdrawn by close() or the finalizer
     # start_in_background()'s thread, joined by close().
     _start_thread: Optional[threading.Thread] = None
     # Serializes close(): a failed background start closes on its own thread.
@@ -717,7 +734,7 @@ class RemoteMemDonor:
         # Unique per donor, also within one process: clients never take claims from a withdrawn name again.
         self.name = name or f"kvcm2-donor-{host}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
         self.host = host
-        self._published = []
+        self._files = _DonorFiles()
         self._start_thread = None
         self._close_lock = threading.Lock()
         self._finalizer = None
@@ -740,13 +757,12 @@ class RemoteMemDonor:
                 "",
             ]
         ).encode()
-        for suffix, data in extra_files:
-            _write_atomically(self._path(suffix), data)
-            self._published.append(self._path(suffix))
-        _write_atomically(self._path("meta"), meta)
-        self._published.append(self._path("meta"))
-        _write_atomically(self._path("ready"), b"")
-        self._published.append(self._path("ready"))
+        with self._files.lock:
+            if self._files.withdrawn:
+                raise RuntimeError(f"{self.name} was withdrawn before it published")
+            for suffix, data in [*extra_files, ("meta", meta), ("ready", b"")]:
+                _write_atomically(self._path(suffix), data)
+                self._files.paths.append(self._path(suffix))
         _log(
             f"{self.name} donates {self.nbytes / (1 << 30):.2f} GiB in {self.nbytes // self.chunk_bytes} chunk(s) "
             f"of {self.chunk_bytes / (1 << 30):.2f} GiB via {self.directory} ({timing})"
@@ -780,7 +796,7 @@ class RemoteMemDonor:
             self._finalizer = weakref.finalize(
                 self,
                 _withdraw_unowned,
-                self._published,
+                self._files,
                 self._path("failed"),
                 self._failure_text(RuntimeError("the donor's owner exited without closing it")),
                 self.transport,
@@ -829,13 +845,8 @@ class RemoteMemDonor:
             self._start_thread = None
 
     def _withdraw(self) -> None:
-        for path in reversed(self._published):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        self._published.clear()
-        self.transport.release(self)
+        self._files.withdraw()
+        self.transport.release_unowned()
 
 
 def _make_nixl_agent(name: str, backend_params: dict) -> "NixlTransferAgent":

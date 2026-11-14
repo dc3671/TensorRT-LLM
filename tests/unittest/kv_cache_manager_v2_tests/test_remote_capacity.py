@@ -351,6 +351,32 @@ class TestCapacityCheck(unittest.TestCase):
         _, failed = scan_donors(self.dir)
         self.assertEqual([f["name"] for f in failed], ["orphan"])
 
+    def test_a_start_still_running_when_the_finalizer_withdraws_publishes_nothing(self):
+        """At exit the finalizer runs while a daemon start thread may still be past its registration: once it withdrew
+        the donor and left the failure marker, the start must not publish .ready for memory it released."""
+        registered, finalized = threading.Event(), threading.Event()
+
+        class _Racing(remote_donor.DonorTransport):
+            kind = "fabric"
+
+            def start(self, donor):
+                registered.set()
+                finalized.wait(10)
+                donor._publish([], ["segment 0 1"], "test")
+
+        donor = remote_donor.RemoteMemDonor(
+            self.dir, 4 * _GIB, _Racing(), chunk_bytes=_GIB, name="exiting"
+        )
+        donor.start_in_background()
+        self.assertTrue(registered.wait(10))
+        donor._finalizer()  # what atexit runs for a donor nobody closed
+        finalized.set()
+        donor.wait_started()
+        published, failed = scan_donors(self.dir)
+        self.assertEqual(published, [])
+        self.assertEqual([f["name"] for f in failed], ["exiting"])
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "donor.exiting.meta")))
+
     def test_a_closed_donor_leaves_no_marker(self):
         donor = self._started("done")
         donor.close()
