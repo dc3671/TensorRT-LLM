@@ -74,7 +74,11 @@ def _reference(x, lg, w31, w2, top_k, local_start, e_local):
     )
 
 
-@pytest.mark.parametrize("num_experts,top_k,e_local", [(E, TOPK, 128), (E, TOPK, 64), (256, 8, 64)])
+# 512 / 256 local experts: the draft experts with no or 2-way expert parallelism.
+@pytest.mark.parametrize(
+    "num_experts,top_k,e_local",
+    [(E, TOPK, 512), (E, TOPK, 256), (E, TOPK, 128), (E, TOPK, 64), (256, 8, 64)],
+)
 @pytest.mark.parametrize("m", [1, 2, 7, 14, 16, 17, 32])
 def test_engine_matches_bf16_moe_runner(m, num_experts, top_k, e_local):
     from tensorrt_llm._torch.kernels.blackwell import moe_bf16_engine as eng
