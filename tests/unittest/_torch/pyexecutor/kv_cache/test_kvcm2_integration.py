@@ -2081,6 +2081,34 @@ class TestRemoteTierInitStatus:
         assert str(donor.close.call_args.args[0]) == "state pool too small"
 
     @pytest.mark.cpu_only
+    def test_an_undecorated_subclass_that_fails_after_the_base_init_is_guarded_too(
+        self, tmp_path
+    ) -> None:
+        """E.g. DSACacheManagerV2, which raises after super().__init__(): every subclass's __init__ is guarded."""
+        donor, add_remote_level = self._starting_donor()
+
+        class RaisesAfterTheBaseInit(KVCacheManagerV2):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                raise ValueError("indexer cache too small")
+
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ),
+            pytest.raises(ValueError, match="indexer cache too small"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, donate_size=1 << 30),
+                [Mock()],
+                manager_cls=RaisesAfterTheBaseInit,
+            )
+        donor.close.assert_called_once()
+        assert str(donor.close.call_args.args[0]) == "indexer cache too small"
+
+    @pytest.mark.cpu_only
     def test_a_failed_construction_closes_its_open_caches_before_the_shutdown(
         self, tmp_path
     ) -> None:

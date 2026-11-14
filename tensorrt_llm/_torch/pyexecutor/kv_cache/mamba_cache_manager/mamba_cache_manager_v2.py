@@ -52,7 +52,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     Role,
     _compute_index_mapper_capacity,
     _read_guard_page_setting,
-    _withdraws_remote_donation_on_error,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     AllocationUnit,
@@ -253,7 +252,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Construction and cache configuration
 
     @override
-    @_withdraws_remote_donation_on_error
     def __init__(
         self,
         # mamba cache parameters

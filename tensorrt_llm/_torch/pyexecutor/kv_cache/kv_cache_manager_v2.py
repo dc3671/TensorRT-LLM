@@ -2032,8 +2032,9 @@ _InitT = TypeVar("_InitT", bound=Callable[..., None])
 def _withdraws_remote_donation_on_error(init: _InitT) -> _InitT:
     """Wrap ``__init__`` so a construction that raises undoes what it set up (``_abandon_construction``).
 
-    A subclass wraps its ``__init__`` too, so that its own finalization after ``super().__init__()`` is guarded; the
-    outermost wrapper does the cleanup, and ``shutdown()`` inside it leaves the donation to that cleanup.
+    Every subclass's ``__init__`` is wrapped too (``KVCacheManagerV2.__init_subclass__``), so that its own finalization
+    after ``super().__init__()`` is guarded; the outermost wrapper does the cleanup, and ``shutdown()`` inside it leaves
+    the donation to that cleanup.
     """
 
     @functools.wraps(init)
@@ -2180,6 +2181,12 @@ class KVCacheManagerV2(BaseResourceManager):
     # The manager config offload is sized from, built once with a placeholder
     # device quota; None until offload sizing first asks for it.
     _offload_sizing_config: Optional[KVCacheManagerConfigPy] = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        init = cls.__dict__.get("__init__")
+        if init is not None:
+            cls.__init__ = _withdraws_remote_donation_on_error(init)
 
     @_withdraws_remote_donation_on_error
     def __init__(
