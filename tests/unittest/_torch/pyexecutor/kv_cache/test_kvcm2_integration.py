@@ -1924,6 +1924,24 @@ class TestRemoteTierInitStatus:
         return donor, add_remote_level
 
     @pytest.mark.cpu_only
+    def test_the_manager_waits_for_its_donation_once_its_claims_are_done(self, tmp_path) -> None:
+        """Without the estimation the target starts the donation itself: it is placed before warmup and capture."""
+        donor, add_remote_level = self._starting_donor()
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ),
+        ):
+            manager, _ = _make_manager_for_cache_tier_test(
+                self._config(tmp_path, donor={"size": 1 << 30}), [Mock()]
+            )
+        donor.wait_started.assert_called_once_with()
+        donor.close.assert_not_called()
+        assert manager.remote_donor is donor
+
+    @pytest.mark.cpu_only
     def test_local_failure_aborts_every_rank_and_closes_the_donor(self, tmp_path) -> None:
         donor, add_remote_level = self._starting_donor(RuntimeError("capacity check failed"))
         with (

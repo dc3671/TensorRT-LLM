@@ -3107,6 +3107,10 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self.kv_cache_manager_py_config = config
         self.impl = candidate
+        if self._remote_donor is not None:
+            # This rank's claims are done: place the donation now (a no-op once placed, as after the estimation), so
+            # it does not fault in and register beside warmup, CUDA-graph capture and the first serving steps.
+            self._remote_donor.wait_started()
         self._can_evict = len(config.cache_tiers) > 1
         self._only_remote_below_gpu = self._can_evict and all(
             isinstance(tier, RemoteCacheTierConfig) for tier in config.cache_tiers[1:]
