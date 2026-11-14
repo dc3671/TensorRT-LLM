@@ -386,3 +386,39 @@ def test_split_kernels_compile_once_for_every_batch():
         triton_num_compiled(gdn_inforward_split._split_state_rows_kernel),
         triton_num_compiled(gdn_inforward_split._tail_scatter_kernel),
     ) == before
+
+
+def test_conv_state_and_tail_gather_kernels_compile_once_for_every_batch():
+    """The conv-state split and the tail-token gather take their counts as grid sizes and their strides from the
+    model's fixed widths: the variant compiled for the first split batch (the startup warmup's) serves every later
+    split count, so serving compiles none of the four split kernels."""
+    from _torch.helpers import triton_num_compiled
+
+    cuda = torch.device("cuda")
+    q, k, v, g, beta = _inputs(64, seed=3)
+
+    def run(num_splits, num_tail):
+        split = types.SimpleNamespace(
+            k=num_splits,
+            tail_slots=torch.arange(num_splits, dtype=torch.long, device=cuda) % NUM_SLOTS,
+            stage_rows=torch.arange(num_splits, dtype=torch.long, device=cuda),
+            conv_win=torch.arange(num_splits * (D_CONV - 1), dtype=torch.long, device=cuda) % 64,
+            tail_tok=torch.arange(num_tail, dtype=torch.long, device=cuda),
+        )
+        mixed_qkv = torch.randn(64, CONV_DIM, device=cuda).to(torch.bfloat16)
+        conv_states = torch.randn(NUM_SLOTS, CONV_DIM, D_CONV - 1, device=cuda).to(torch.bfloat16)
+        stage = torch.zeros(NUM_SLOTS, CONV_DIM, D_CONV - 1, dtype=torch.bfloat16, device=cuda)
+        gdn_inforward_split.split_conv_states(conv_states, mixed_qkv, split, stage)
+        outs = gdn_inforward_split.gather_tail_tokens(q, k, v, g, beta, split)
+        for x, o in zip((q, k, v, g, beta), outs):
+            assert torch.equal(o, x.index_select(1, split.tail_tok))
+
+    kernels = (
+        gdn_inforward_split._split_conv_state_kernel,
+        gdn_inforward_split._tail_token_gather_kernel,
+    )
+    run(2, 4)
+    before = tuple(triton_num_compiled(kernel) for kernel in kernels)
+    for num_splits, num_tail in ((1, 1), (3, 17), (8, 64), (5, 2)):
+        run(num_splits, num_tail)
+    assert tuple(triton_num_compiled(kernel) for kernel in kernels) == before
