@@ -780,6 +780,64 @@ async def test_delegating_router_finishes_a_timed_out_select():
     await _with_fake_coordinator(fake, body)
 
 
+class _LossyCoordinatorHttp(_FakeCoordinatorHttp):
+    """A coordinator that takes the first /select but whose reply never arrives.
+
+    ``disconnect``: attempt 1 parks (its connection drops) and every retry's connection drops too.
+    ``refused``: attempt 1 parks (its connection drops) and attempt 2 gets an error status.
+    ``truncated``: attempt 1 is granted, but its 200 reply is cut short.
+    """
+
+    def __init__(self, failure):
+        super().__init__()
+        self.failure = failure
+        self.selects = 0
+
+    async def select(self, request):
+        from aiohttp import web
+
+        body = msgpack.unpackb(await request.read(), raw=False)
+        self.selects += 1
+        if self.failure == "truncated":
+            response = web.StreamResponse(
+                headers={"Content-Type": "application/msgpack", "Content-Length": "1000"}
+            )
+            await response.prepare(request)
+            await response.write(b"\x83")
+            request.transport.close()
+            return response
+        if self.failure == "refused" and self.selects > 1:
+            return web.Response(
+                status=500,
+                body=msgpack.packb({"error": "refused"}),
+                content_type="application/msgpack",
+            )
+        request.transport.close()
+        if self.selects == 1:
+            # Parked: the coordinator still waits for a seat for this request.
+            await self._finish_events.setdefault(body["req_id"], asyncio.Event()).wait()
+        return web.Response(body=msgpack.packb({}), content_type="application/msgpack")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["disconnect", "refused", "truncated"])
+async def test_delegating_router_finishes_a_select_whose_reply_is_lost(monkeypatch, failure):
+    """A select the coordinator took is ended by /finish when the worker gets no reply."""
+    import aiohttp
+
+    monkeypatch.setattr("tensorrt_llm.serve.router.COORDINATOR_SELECT_RETRY_DELAY_S", 0.001)
+    fake = _LossyCoordinatorHttp(failure)
+
+    async def body(router):
+        with pytest.raises((aiohttp.ClientError, ValueError)):
+            await asyncio.wait_for(router.get_next_server(_gen_request(11)), timeout=10)
+        await asyncio.wait_for(router._finish_queue.join(), timeout=5)
+        assert fake.finished == [11]
+        assert fake.selects == {"disconnect": 4, "refused": 2, "truncated": 1}[failure]
+
+    await _with_fake_coordinator(fake, body)
+
+
 class _FlakyCoordinatorFinish:
     """A coordinator /finish that fails its first ``failures`` calls, then reaches ``coordinator``."""
 

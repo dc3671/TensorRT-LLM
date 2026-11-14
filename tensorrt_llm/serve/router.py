@@ -2491,6 +2491,15 @@ class CoordinatorDelegatingRouter(Router):
                                       success=False,
                                       req_id=payload["req_id"])
             raise
+        except Exception:
+            if self.pooled:
+                # A select the coordinator took may still wait there, or hold a
+                # seat whose reply was lost (a transport error, or a refused
+                # retry); /finish ends either.
+                await self.finish_request(request,
+                                          success=False,
+                                          req_id=payload["req_id"])
+            raise
         self._select_lat.record(time.monotonic() - _t0)
         if body["server"] is None:
             raise ValueError(f"coordinator /select placed no {self._role} "
