@@ -855,12 +855,16 @@ def completion_tokens_in(data: bytes) -> Tuple[Optional[int], bool]:
 
 
 class _Ticket:
-    __slots__ = ("conv_id", "isl", "key", "recorded", "via_select", "strip_usage")
+    __slots__ = ("conv_id", "isl", "key", "sequences", "recorded", "via_select", "strip_usage")
 
-    def __init__(self, conv_id: Optional[str], isl: float, key: Optional[int]) -> None:
+    def __init__(
+        self, conv_id: Optional[str], isl: float, key: Optional[int], sequences: int = 1
+    ) -> None:
         self.conv_id = conv_id
         self.isl = isl
         self.key = key
+        # Returned sequences (``n``): the reply's usage sums their lengths.
+        self.sequences = sequences
         self.recorded = False
         # The prediction comes with the generation placement (/select).
         self.via_select = False
@@ -934,7 +938,9 @@ class OutputLengthPriority:
         if isl is None:
             self._miss(gen_req, "no prompt tokens")
             return None
-        ticket = _Ticket(conv_id, isl, None)
+        n = getattr(gen_req, "n", None)
+        sequences = n if isinstance(n, int) and not isinstance(n, bool) and n > 1 else 1
+        ticket = _Ticket(conv_id, isl, None, sequences)
         self._request_usage(gen_req, ticket)
         if self.via_select and placed_later:
             ticket.via_select = True
@@ -1001,7 +1007,8 @@ class OutputLengthPriority:
             self.no_usage += 1
             return
         self.recorded += 1
-        self._batch.append((ticket.conv_id, ticket.isl, float(out), ticket.key))
+        # Learn the length of one sequence.
+        self._batch.append((ticket.conv_id, ticket.isl, float(out) / ticket.sequences, ticket.key))
         if len(self._batch) >= RECORD_BATCH_MAX:
             self._send(self._take_batch())
         elif self._flush_task is None:

@@ -497,6 +497,34 @@ async def test_track_non_streaming_response():
     assert frontend.track(response, None) is response
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["complete", "streamed"])
+@pytest.mark.parametrize("cls", [CompletionRequest, ChatCompletionRequest])
+async def test_reply_with_n_sequences_is_learned_per_sequence(stream, cls):
+    """usage.completion_tokens sums the n sequences; the predictor learns one sequence's length."""
+    coordinator = _FakeCoordinator()
+    frontend = olp.OutputLengthPriority(coordinator, "ridge")
+    request = _gen_request("c1", 2000, cls=cls)
+    request.n = 4
+    request.stream = stream
+    ticket = await frontend.assign(request)
+    if stream:
+
+        async def reply():
+            yield _sse({"choices": [{"text": "a"}]})
+            yield _sse({"choices": [], "usage": {"completion_tokens": 1200}})
+
+        assert [chunk async for chunk in frontend.track(reply(), ticket)]
+    else:
+
+        class Response:
+            usage = UsageInfo(prompt_tokens=2000, completion_tokens=1200)
+
+        frontend.track(Response(), ticket)
+    await asyncio.sleep(0.01)
+    assert coordinator.recorded == [("c1", 2000.0, 300.0, 7)]
+
+
 # ------------------------------------------------------ input validation, bounded state and streams
 
 
