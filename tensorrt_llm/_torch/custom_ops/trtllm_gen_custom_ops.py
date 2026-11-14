@@ -511,15 +511,17 @@ class FP4BlockScaleMoERunner(TunableRunner):
         return FP4BlockScaleMoERunner.runner_dict[instance_key]
 
     def forward(
-        self,
-        inputs: List[torch.Tensor],
-        tactic: List[int] = [-1, -1],
-        output: Optional[torch.Tensor] = None,
-        prerouted: Optional[Tuple[List[torch.Tensor], torch.Tensor,
-                                  torch.Tensor]] = None,
-        engine_state: Optional[torch.Tensor] = None,
-        lamport_out: Optional[torch.Tensor] = None,
-        candidates: Optional[torch.Tensor] = None,
+            self,
+            inputs: List[torch.Tensor],
+            tactic: List[int] = [-1, -1],
+            output: Optional[torch.Tensor] = None,
+            prerouted: Optional[Tuple[List[torch.Tensor], torch.Tensor,
+                                      torch.Tensor]] = None,
+            engine_state: Optional[torch.Tensor] = None,
+            lamport_out: Optional[torch.Tensor] = None,
+            candidates: Optional[torch.Tensor] = None,
+            routing_tables: Optional[torch.Tensor] = None,
+            routing_tiles: Tuple[int, ...] = (),
     ) -> torch.Tensor:
         """``prerouted``: (routing tables for ``tactic``'s tile, top-k ids, BF16
         top-k weights); the tables number this rank's experts from 0 (-1:
@@ -530,7 +532,10 @@ class FP4BlockScaleMoERunner(TunableRunner):
         rows in ``lamport_out`` (and returns that view), a ``CUBIN`` call
         returns its own rows and leaves ``lamport_out`` untouched.
         ``candidates``: ``PreroutedRouting.candidates``; the call must take
-        ``ENGINE``, which fills ``prerouted`` from them."""
+        ``ENGINE``, which fills ``prerouted`` from them. ``routing_tables``
+        ([tiles, 5, width], one per tile of ``routing_tiles``) replace the
+        routing kernel for tactics of those tiles; other tiles route in the
+        runner (the decode kernels do not take them)."""
         assert isinstance(tactic, list)
 
         args = FP4BlockScaleMoEInputs(*inputs)
@@ -554,6 +559,14 @@ class FP4BlockScaleMoERunner(TunableRunner):
                 topk_weights, topk_ids, output, *tables, tactic[0])
             run = kernel_runner.run_moe_prerouted
         else:
+            num_experts, local_expert_offset = self.num_experts, self.local_expert_offset
+            if routing_tables is not None and self.local_num_experts != self.num_experts:
+                if tactic[0] in routing_tiles:
+                    # Tables number this rank's experts from 0: to the runner they are all its experts.
+                    num_experts, local_expert_offset = self.local_num_experts, 0
+                else:
+                    # Routing in the runner needs the global numbering.
+                    routing_tables = None
             run_args = (args.routing_logits, args.routing_bias,
                         args.hidden_states, args.hidden_states_scale,
                         args.gemm1_weights, args.gemm1_weights_scale,
@@ -562,13 +575,19 @@ class FP4BlockScaleMoERunner(TunableRunner):
                         args.gemm2_weights_scale, args.gemm2_bias,
                         args.output1_scale_scalar,
                         args.output1_scale_gate_scalar,
-                        args.output2_scale_scalar, self.num_experts, self.top_k,
+                        args.output2_scale_scalar, num_experts, self.top_k,
                         self.n_group, self.topk_group, self.intermediate_size,
-                        self.local_expert_offset, self.local_num_experts,
+                        local_expert_offset, self.local_num_experts,
                         self.routed_scaling_factor, self.routing_method_type,
                         self.do_finalize, tactic, args.topk_weights,
                         args.topk_ids, output)
             run = kernel_runner.run_moe
+            if routing_tables is not None:
+                if self.decode_tuning or candidates is not None:
+                    raise ValueError(
+                        "routing tables do not combine with the decode kernels")
+                return kernel_runner.run_moe_routing_tables(
+                    *run_args, routing_tables, list(routing_tiles))
         if not self.decode_tuning and candidates is None:
             # Every model's call (no decode kernels declared): the runner's
             # own kernels; a Lamport buffer only goes to ENGINE / CUTE_FC2.
@@ -799,49 +818,51 @@ class FP4BlockScaleMoERunner(TunableRunner):
         return [int(tactic[0]), int(tactic[1])]
 
 
-def _run_fp4_block_scale_moe(routing_logits: Optional[torch.Tensor],
-                             routing_bias: Optional[torch.Tensor],
-                             hidden_states: torch.Tensor,
-                             hidden_states_scale: torch.Tensor,
-                             gemm1_weights: torch.Tensor,
-                             gemm1_weights_scale: torch.Tensor,
-                             gemm1_bias: torch.Tensor,
-                             gemm1_alpha: torch.Tensor,
-                             gemm1_beta: torch.Tensor,
-                             gemm1_clamp_limit: torch.Tensor,
-                             gemm2_weights: torch.Tensor,
-                             gemm2_weights_scale: torch.Tensor,
-                             gemm2_bias: torch.Tensor,
-                             output1_scale_scalar: torch.Tensor,
-                             output1_scale_gate_scalar: torch.Tensor,
-                             output2_scale_scalar: torch.Tensor,
-                             num_experts: int,
-                             top_k: int,
-                             n_group: Optional[int],
-                             topk_group: Optional[int],
-                             intermediate_size: int,
-                             local_expert_offset: int,
-                             local_num_experts: int,
-                             routed_scaling_factor: Optional[float],
-                             routing_method_type: int,
-                             do_finalize: bool,
-                             act_type: int = ActType_TrtllmGen.SwiGlu.value,
-                             topk_weights: Optional[torch.Tensor] = None,
-                             topk_ids: Optional[torch.Tensor] = None,
-                             output: Optional[torch.Tensor] = None,
-                             tune_max_num_tokens: int = 8192,
-                             use_dp: bool = False,
-                             prerouted_tables: Optional[torch.Tensor] = None,
-                             prerouted_ids: Optional[torch.Tensor] = None,
-                             prerouted_weights: Optional[torch.Tensor] = None,
-                             prerouted_tactic: Optional[List[int]] = None,
-                             prerouted_candidates: Optional[
-                                 torch.Tensor] = None,
-                             decode_tuning: bool = False,
-                             decode_engine_state: Optional[torch.Tensor] = None,
-                             lamport_fc2_out: Optional[torch.Tensor] = None,
-                             decode_early_release_rows: int = 0,
-                             decode_spare_sms: int = 0) -> List[torch.Tensor]:
+def _run_fp4_block_scale_moe(
+        routing_logits: Optional[torch.Tensor],
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm1_bias: torch.Tensor,
+        gemm1_alpha: torch.Tensor,
+        gemm1_beta: torch.Tensor,
+        gemm1_clamp_limit: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        gemm2_bias: torch.Tensor,
+        output1_scale_scalar: torch.Tensor,
+        output1_scale_gate_scalar: torch.Tensor,
+        output2_scale_scalar: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        do_finalize: bool,
+        act_type: int = ActType_TrtllmGen.SwiGlu.value,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
+        tune_max_num_tokens: int = 8192,
+        use_dp: bool = False,
+        prerouted_tables: Optional[torch.Tensor] = None,
+        prerouted_ids: Optional[torch.Tensor] = None,
+        prerouted_weights: Optional[torch.Tensor] = None,
+        prerouted_tactic: Optional[List[int]] = None,
+        prerouted_candidates: Optional[torch.Tensor] = None,
+        decode_tuning: bool = False,
+        decode_engine_state: Optional[torch.Tensor] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
+        decode_early_release_rows: int = 0,
+        decode_spare_sms: int = 0,
+        routing_tables: Optional[torch.Tensor] = None,
+        routing_tiles: Optional[List[int]] = None) -> List[torch.Tensor]:
     """``decode_tuning``: see ``FP4BlockScaleMoERunner.get_tuning_config``.
 
     ``decode_engine_state``: the calling backend's decode MoE engine state
@@ -859,7 +880,11 @@ def _run_fp4_block_scale_moe(routing_logits: Optional[torch.Tensor],
     it then returns the FC2 rows only (the top-k weights and the expanded ->
     permuted index are the caller's tensors). ``prerouted_candidates``
     (``PreroutedRouting.candidates``): the decode MoE engine writes those
-    tables, ids and weights itself."""
+    tables, ids and weights itself.
+
+    ``routing_tables`` replace the routing kernel for tactics of the tiles in
+    ``routing_tiles``. Unfinalized, a run on them returns an empty ``[0, tile]``
+    permutation: the permutation is row 0 of that tile's table."""
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -952,11 +977,16 @@ def _run_fp4_block_scale_moe(routing_logits: Optional[torch.Tensor],
             tuning_config_with_hook,
             input_tensors_for_tuner,
         )
+        table_kwargs = {}
+        if routing_tables is not None:
+            table_kwargs = dict(routing_tables=routing_tables,
+                                routing_tiles=tuple(routing_tiles or ()))
         result = kernel_runner(
             input_tensors,
             tactic=[-1, -1] if best_tactic == -1 else best_tactic,
             output=output,
-            lamport_out=lamport_fc2_out)
+            lamport_out=lamport_fc2_out,
+            **table_kwargs)
     # Rows written into the Lamport buffer come back as the empty placeholder
     # (an output may not alias an input; moe_op_backend hands the buffer on).
     if lamport_fc2_out is not None and not do_finalize:
@@ -1010,7 +1040,9 @@ def fp4_block_scale_moe_runner(
         prerouted_ids: Optional[torch.Tensor] = None,
         prerouted_weights: Optional[torch.Tensor] = None,
         prerouted_tactic: Optional[List[int]] = None,
-        decode_tuning: bool = False) -> List[torch.Tensor]:
+        decode_tuning: bool = False,
+        routing_tables: Optional[torch.Tensor] = None,
+        routing_tiles: Optional[List[int]] = None) -> List[torch.Tensor]:
     """The TRTLLM-Gen NVFP4 MoE runner (see ``_run_fp4_block_scale_moe``); functional: it writes no argument
     except ``output``, as on every model's path. The decode kernels that write state run in
     ``fp4_block_scale_moe_decode_runner``."""
@@ -1050,7 +1082,9 @@ def fp4_block_scale_moe_runner(
                                     prerouted_ids=prerouted_ids,
                                     prerouted_weights=prerouted_weights,
                                     prerouted_tactic=prerouted_tactic,
-                                    decode_tuning=decode_tuning)
+                                    decode_tuning=decode_tuning,
+                                    routing_tables=routing_tables,
+                                    routing_tiles=routing_tiles)
 
 
 @torch.library.custom_op("trtllm::fp4_block_scale_moe_decode_runner",
@@ -1216,7 +1250,9 @@ def _fp4_block_scale_moe_fake(
         decode_engine_state: Optional[torch.Tensor] = None,
         lamport_fc2_out: Optional[torch.Tensor] = None,
         decode_early_release_rows: int = 0,
-        decode_spare_sms: int = 0) -> List[torch.Tensor]:
+        decode_spare_sms: int = 0,
+        routing_tables: Optional[torch.Tensor] = None,
+        routing_tiles: Optional[List[int]] = None) -> List[torch.Tensor]:
     """The fake of both ops, registered for each with the decode op's parameters (their defaults are the plain op's);
     the decode op's state arguments do not shape the outputs."""
     if lamport_fc2_out is not None:
@@ -1237,7 +1273,15 @@ def _fp4_block_scale_moe_fake(
         top_k,
         routing_bias,
     )
-    return outputs[:1] if prerouted_tables is not None else outputs
+    if prerouted_tables is not None:
+        return outputs[:1]
+    if routing_tables is not None and routing_tiles:
+        # The tactic picked at run time decides: [num_tokens, top_k], or an
+        # empty [0, tile] when its tile ran on a routing table.
+        ctx = torch.library.get_ctx()
+        outputs[2] = outputs[2].new_empty(
+            (ctx.new_dynamic_size(), ctx.new_dynamic_size()))
+    return outputs
 
 
 fp4_block_scale_moe_runner.register_fake(_fp4_block_scale_moe_fake)

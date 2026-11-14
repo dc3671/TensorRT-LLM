@@ -69,7 +69,9 @@ add_th_common_family(
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
   pagedFp8ContextFmhaOp.cpp
-  trtllmGenQKVProcessOp.cpp)
+  trtllmGenQKVProcessOp.cpp
+  csa2SparseContextOp.cpp
+  csa2SparseDecodeOp.cpp)
 target_include_directories(th_common_attention
                            PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
 # pagedFp8ContextFmhaOp.cpp includes the trtllm-gen FMHA runner headers (see

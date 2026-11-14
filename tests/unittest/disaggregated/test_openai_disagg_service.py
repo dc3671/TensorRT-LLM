@@ -558,6 +558,7 @@ async def test_subagent_affinity_http_worker_adp_placement(
             scheduling = kwargs["scheduling_params"]
             item = SimpleNamespace(
                 id=len(observed[role]),
+                num_input_tokens=3,
                 request=SimpleNamespace(
                     py_conversation_params=conversation,
                     py_scheduling_params=scheduling,

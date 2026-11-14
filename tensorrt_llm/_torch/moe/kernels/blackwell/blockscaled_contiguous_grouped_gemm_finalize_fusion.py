@@ -35,9 +35,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch.kernels.blackwell.utils import (
     TRTLLM_ENABLE_PDL,
@@ -48,6 +46,9 @@ from tensorrt_llm._torch.kernels.blackwell.utils import (
     griddepcontrol_wait,
     is_power_of_2,
 )
+
+# TMA cache hint (CUTLASS copy_sm90_desc.hpp): L2 evict-first.
+_TMA_L2_EVICT_FIRST = 0x12F0000000000000
 
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM (C = alpha * (SFA * A) * (SFB * B)) example for
@@ -157,24 +158,6 @@ CUDA Graph Support:
 """
 
 
-@dsl_user_op
-def _l2_evict_first_policy(*, loc=None, ip=None) -> cutlass.Int64:
-    """An L2 evict_first cache policy (fraction 1.0) for TMA loads."""
-    return cutlass.Int64(
-        llvm.inline_asm(
-            T.i64(),
-            [],
-            "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
-            "=l",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
 class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
     """This class implements batched matrix multiplication (C = A x SFA x B x SFB) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
@@ -226,7 +209,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         raster_along_m: bool = False,
         use_expert_counts: bool = False,
         num_local_experts: int = 0,
-        weights_evict_first: bool = False,
+        weight_evict_first: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -244,19 +227,20 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param raster_along_m: Boolean, True to use raster along M.
         :type raster_along_m: bool
-        :param weights_evict_first: Boolean, True to load B / SFB (the expert weights) with an L2 evict_first policy,
+        :param weight_evict_first: Boolean, True to load B / SFB (the expert weights) with the L2 evict-first hint,
             so that weights each tile reads once do not evict A and the output rows the epilogue adds into.
-        :type weights_evict_first: bool
+        :type weight_evict_first: bool
         """
 
         self.sf_vec_size = sf_vec_size
-        self.weights_evict_first = weights_evict_first
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
         self.use_expert_counts = use_expert_counts
         self.num_local_experts = num_local_experts
+        # Expert weights (B, SFB) are loaded with the L2 evict-first hint.
+        self.weight_evict_first = weight_evict_first
         self.num_tile_info_fields = 6 if self.use_expert_counts else 5
         if self.use_expert_counts:
             assert self.num_local_experts > 0
@@ -1470,17 +1454,17 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     )
                     tBgB_slice = tBgB_0[(None, mma_tile_coord_mnl[1], None, expert_idx)]
                     tBgSFB_slice = tBgSFB_0[(None, slice_n, None, expert_idx)]
-                    # cute.copy treats cache_policy=None as no policy.
-                    b_policy = None
-                    if cutlass.const_expr(self.weights_evict_first):
-                        b_policy = _l2_evict_first_policy()
                     cute.copy(
                         tma_atoms_b[0],
                         tBgB_slice[(None, ab_producer_state.count)],
                         tBsB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=b_full_mcast_mask,
-                        cache_policy=b_policy,
+                        **(
+                            {"cache_policy": cutlass.Int64(_TMA_L2_EVICT_FIRST)}
+                            if cutlass.const_expr(self.weight_evict_first)
+                            else {}
+                        ),
                     )
                     cute.copy(
                         tma_atoms_sfb[0],
@@ -1488,7 +1472,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         tBsSFB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=sfb_full_mcast_mask,
-                        cache_policy=b_policy,
+                        **(
+                            {"cache_policy": cutlass.Int64(_TMA_L2_EVICT_FIRST)}
+                            if cutlass.const_expr(self.weight_evict_first)
+                            else {}
+                        ),
                     )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1

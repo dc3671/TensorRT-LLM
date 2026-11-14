@@ -191,6 +191,8 @@ public:
 
 private:
     void scrubEvents();
+    // Takes one free slot, preferring ready recycled ones; the caller has scanned readiness.
+    Slot takeFreeSlot();
     [[nodiscard]] bool check() const noexcept;
 
     SlotCount mCapacity;

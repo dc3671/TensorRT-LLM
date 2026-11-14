@@ -611,8 +611,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         auto* gpuPhysMemAllocator
             = cacheTierOf(config.cacheTiers[level]) == CacheTier::GPU_MEM ? mGpuPhysMemAllocator.get() : nullptr;
         mLevels.emplace_back(lifeCycleGrouping(level), level, config.cacheTiers[level], slotDescList(level), slotCounts,
-            gpuPhysMemAllocator, tierBackingOptions(config.cacheTiers[level], gpuGranularity), std::nullopt,
-            remoteClientFor(config.cacheTiers[level]));
+            gpuPhysMemAllocator, tierBackingOptions(config.cacheTiers[level], gpuGranularity, config.hostMemBacking),
+            std::nullopt, remoteClientFor(config.cacheTiers[level]));
     }
 
     for (CacheLevel level{0}; level < mLevels.size(); ++level)
@@ -2802,12 +2802,15 @@ size_t StorageManager::tierCommitUnit(CacheTierConfig const& tierConfig, size_t 
         : tierAllocationGranularity(cacheTierOf(tierConfig), cacheTierQuota(tierConfig));
 }
 
-HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& tierConfig, size_t gpuPhysMemSize)
+HostMemBackingOptions StorageManager::tierBackingOptions(
+    CacheTierConfig const& tierConfig, size_t gpuPhysMemSize, HostMemBackingConfig const& backing)
 {
     HostMemBackingOptions options;
     if (auto const* host = std::get_if<HostCacheTierConfig>(&tierConfig))
     {
-        options.allowRemoteNumaFallback = host->allowRemoteNumaFallback;
+        // The tier's deprecated flag can only make the placement stricter.
+        options.allowRemoteNumaFallback = backing.allowRemoteNumaFallback && host->allowRemoteNumaFallback;
+        options.numaNode = backing.numaNode;
     }
     return options;
 }

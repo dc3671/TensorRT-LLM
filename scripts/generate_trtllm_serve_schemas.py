@@ -254,11 +254,19 @@ def _cross_field_rules(definitions: dict) -> None:
         ]
     )
     # AttentionDpConfig.validate_attention_dp_config().
-    definitions["AttentionDpConfig"].setdefault("allOf", []).append(
-        when(
-            _is_set_to("kv_cache_routing_home_wait_rounds", {"type": "integer"}),
-            _is_set_to("kv_cache_routing_conversation_affinity", {"const": True}),
-        )
+    home_wait = _is_set_to("kv_cache_routing_home_wait_rounds", {"type": "integer"})
+    definitions["AttentionDpConfig"].setdefault("allOf", []).extend(
+        [
+            when(home_wait, _is_set_to("kv_cache_routing_conversation_affinity", {"const": True})),
+            when(
+                home_wait,
+                {
+                    "properties": {
+                        "kv_cache_routing_strict_conversation_affinity": {"not": {"const": True}}
+                    }
+                },
+            ),
+        ]
     )
     # SchedulerConfig.validate_waiting_queue_max_wait_s().
     definitions["SchedulerConfig"].setdefault("allOf", []).append(

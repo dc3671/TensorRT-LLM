@@ -36,7 +36,7 @@ import torch
 
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
-from .impl_contract import EngineRouting, PreroutedRouting
+from .impl_contract import EngineRouting, MoERoutingTables, PreroutedRouting
 
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
@@ -173,13 +173,17 @@ class MoEOpBackend:
         lamport_fc2_out: Optional[torch.Tensor] = None,
         decode_early_release_rows: int = 0,
         decode_spare_sms: int = 0,
+        routing_tables: Optional[MoERoutingTables] = None,
     ) -> List[torch.Tensor]:
         """Run FP4 block scale MoE computation. ``prerouted``: routing the caller
         computed (native op backend only). ``decode_tuning``: the native NVFP4 op
         tunes for the model's decode steps and runs its decode kernels
         (``FP4BlockScaleMoERunner``); ``decode_engine_state`` /
         ``lamport_fc2_out`` / ``decode_early_release_rows`` /
-        ``decode_spare_sms``: see ``fp4_block_scale_moe_decode_runner``."""
+        ``decode_spare_sms``: see ``fp4_block_scale_moe_decode_runner``.
+        ``routing_tables`` replace the kernel's routing pass for tactics of their tiles
+        (calls without the decode kernels only).
+        """
         raise NotImplementedError
 
     def run_bf16_moe(
@@ -355,6 +359,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         lamport_fc2_out=None,
         decode_early_release_rows=0,
         decode_spare_sms=0,
+        routing_tables=None,
     ):
         # The native runners take the block scales as one flat linear-layout
         # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
@@ -437,8 +442,10 @@ class TRTLLMOpBackend(MoEOpBackend):
                     or isinstance(prerouted, EngineRouting)
                 )
                 if decode_call:
+                    if routing_tables is not None:
+                        raise ValueError("routing tables do not combine with the decode kernels")
                     fp4_op = torch.ops.trtllm.fp4_block_scale_moe_decode_runner
-                    decode_kwargs = dict(
+                    op_kwargs = dict(
                         prerouted_candidates=(
                             prerouted.candidates if isinstance(prerouted, EngineRouting) else None
                         ),
@@ -449,7 +456,12 @@ class TRTLLMOpBackend(MoEOpBackend):
                     )
                 else:
                     fp4_op = torch.ops.trtllm.fp4_block_scale_moe_runner
-                    decode_kwargs = {}
+                    op_kwargs = dict(
+                        routing_tables=None if routing_tables is None else routing_tables.tables,
+                        routing_tiles=None
+                        if routing_tables is None
+                        else list(routing_tables.tiles),
+                    )
                 outputs = fp4_op(
                     router_logits,
                     routing_bias,
@@ -490,7 +502,7 @@ class TRTLLMOpBackend(MoEOpBackend):
                     prerouted_weights=None if prerouted is None else prerouted.topk_weights,
                     prerouted_tactic=None if prerouted is None else prerouted.tactic,
                     decode_tuning=decode_tuning,
-                    **decode_kwargs,
+                    **op_kwargs,
                 )
                 if not do_finalize:
                     if lamport_fc2_out is not None and outputs[0].numel() == 0:
