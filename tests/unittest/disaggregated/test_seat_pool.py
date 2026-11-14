@@ -626,6 +626,71 @@ async def test_coordinator_shutdown_answers_parked_selects_at_once(tmp_path, mon
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("uds", [False, True], ids=["tcp", "uds"])
+async def test_parked_select_of_a_disconnected_client_takes_no_seat(tmp_path, monkeypatch, uds):
+    """A worker that dies while its /select waits for a seat leaves no waiter and no seat behind."""
+    import socket
+
+    coordinator = _coordinator()
+    coordinator.start = AsyncMock()  # no servers to prepare or wait for
+    router = coordinator.gen_router
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    monkeypatch.chdir(tmp_path)  # a relative path keeps the socket under AF_UNIX's 108-byte limit
+    uds_path = "coordinator.sock" if uds else None
+    server = CoordinatorServer(coordinator)
+    serving = asyncio.create_task(server("127.0.0.1", port, uds=uds_path, sockets=[sock]))
+
+    async def post_select(rid):
+        """Send a /select over a raw socket; return its reader and writer."""
+        for _ in range(200):
+            try:
+                if uds:
+                    reader, writer = await asyncio.open_unix_connection(uds_path)
+                else:
+                    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+                break
+            except OSError:
+                await asyncio.sleep(0.05)
+        body = msgpack.packb({"role": "generation", "routing_key": {}, "req_id": rid})
+        writer.write(
+            b"POST /select HTTP/1.1\r\nHost: c\r\nContent-Type: application/msgpack\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        await writer.drain()
+        return reader, writer
+
+    try:
+        reader, writer = await post_select(1)  # takes the only seat
+        assert b" 200 " in await asyncio.wait_for(reader.readline(), timeout=10)
+        writer.close()
+        _, parked = await post_select(2)
+        for _ in range(100):
+            if router._pool.waiter(2) is not None:
+                break
+            await asyncio.sleep(0.02)
+        assert router._pool.waiter(2) is not None
+        parked.close()  # the worker dies: its socket closes
+        for _ in range(100):
+            if len(router._pool) == 0:
+                break
+            await asyncio.sleep(0.02)
+        assert len(router._pool) == 0
+        await coordinator.finish("generation", 1)
+        await _settle()
+        assert router._get_server_load("g:1") == 0 and router._req_routing_table == {}
+        assert ("generation", 2) not in coordinator._reservation_tasks
+    finally:
+        for uvicorn_server in server.servers:
+            uvicorn_server.should_exit = True
+        await asyncio.wait_for(serving, timeout=10)
+        await coordinator.stop()
+
+
+@pytest.mark.asyncio
 async def test_finish_before_select_refuses_the_late_select(monkeypatch):
     """A cancelled request's /finish can overtake its /select; that select must not queue."""
     coordinator = _coordinator()

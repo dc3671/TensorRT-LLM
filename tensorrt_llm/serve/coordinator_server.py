@@ -37,7 +37,7 @@ the ZMQ ingest bind for centralized mode.
 import asyncio
 import socket
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Awaitable, Optional, TypeVar
 
 import msgpack
 import uvicorn
@@ -60,6 +60,40 @@ COORDINATOR_UDS_BACKLOG = 16384
 MSGPACK_MEDIA_TYPE = "application/msgpack"
 # How often serving checks whether a uvicorn server began its shutdown (uvicorn's own tick).
 SHUTDOWN_POLL_S = 0.1
+_T = TypeVar("_T")
+
+
+class _ClientDisconnected(Exception):
+    """The client of a waiting request closed its connection."""
+
+
+async def _wait_for_disconnect(raw_req: Request) -> None:
+    """Return once the client of ``raw_req``, whose body was read, closes its connection."""
+    while (await raw_req.receive())["type"] != "http.disconnect":
+        pass
+
+
+async def _until_disconnect(raw_req: Request, selection: Awaitable[_T]) -> _T:
+    """Await ``selection``; cancel it and raise ``_ClientDisconnected`` if the client leaves first.
+
+    uvicorn does not cancel a handler whose client disconnected, so a pooled select of a fleet
+    worker that died would otherwise keep its place in the seat queue and later take a seat.
+    """
+    selecting = asyncio.ensure_future(selection)
+    watching = asyncio.ensure_future(_wait_for_disconnect(raw_req))
+    try:
+        await asyncio.wait((selecting, watching), return_when=asyncio.FIRST_COMPLETED)
+        if not selecting.done() and not watching.cancelled() and watching.exception() is None:
+            selecting.cancel()
+            try:
+                return await selecting
+            except asyncio.CancelledError:
+                raise _ClientDisconnected() from None
+        return await selecting
+    finally:
+        watching.cancel()
+        # Also when this handler itself is cancelled.
+        selecting.cancel()
 
 
 def _effective_uds_backlog() -> int:
@@ -129,10 +163,15 @@ class CoordinatorServer:
         exclude_server = body.get("exclude_server")
         if exclude_server is not None and not isinstance(exclude_server, str):
             return self._response({"error": "exclude_server must be a string"}, status_code=400)
+        selection = self._coordinator.select(role, body["routing_key"], req_id, exclude_server)
         try:
-            server, info, req_id = await self._coordinator.select(
-                role, body["routing_key"], req_id, exclude_server
-            )
+            if self._pooled(role):
+                server, info, req_id = await _until_disconnect(raw_req, selection)
+            else:
+                server, info, req_id = await selection
+        except _ClientDisconnected:
+            # Nobody reads this reply; the cancelled wait gave its place or seat back.
+            return self._response({"error": "client disconnected"}, status_code=503)
         except NoGenerationSeatError as e:
             # Overload, not a fault: the frontend answers its client 503 too.
             return self._response({"error": str(e), "no_generation_seat": True}, status_code=503)
@@ -142,6 +181,12 @@ class CoordinatorServer:
             logger.error(f"CoordinatorServer.select failed: {e}")
             return self._response({"error": str(e)}, status_code=500)
         return self._response({"server": server, "info": info, "req_id": req_id})
+
+    def _pooled(self, role: str) -> bool:
+        """Whether a select for ``role`` may wait for a seat (a pooled router)."""
+        if role in ("context", "ctx"):
+            return self._coordinator.ctx_router.pooled
+        return self._coordinator.gen_router.pooled
 
     async def finish(self, raw_req: Request) -> Response:
         try:

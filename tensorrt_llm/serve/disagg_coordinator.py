@@ -352,23 +352,26 @@ class DisaggCoordinatorService(DisaggCoordinator):
     ) -> Tuple[Optional[str], dict, Optional[int]]:
         """Select through a pooled router, which may wait for a free seat.
 
-        The wait happens before the striped reservation lock is taken: ``finish`` takes
-        that lock to free seats, so a waiter holding it could block the finish its seat
-        depends on. A repeated select for the same ``req_id`` gets the same seat from the
-        router and only renews the reservation's expiry, which is ``POOLED_RESERVATION_TIMEOUT_S``:
-        the seat must not be handed on while its generation still streams.
+        The wait does not take the striped reservation lock: ``finish`` takes that lock to
+        free seats, so a waiter holding it could block the finish its seat depends on. A
+        repeated select for the same ``req_id`` gets the same seat from the router and only
+        renews the reservation's expiry, which is ``POOLED_RESERVATION_TIMEOUT_S``: the seat
+        must not be handed on while its generation still streams.
+
+        Nothing is awaited between the seat grant and its reservation, so a caller cancelled
+        while it waits (its client left) either gives its place or seat back in the router's
+        wait, or returns with the reservation armed.
         """
         reservation_key = (self._normalize_role(role), req_id)
         server, info, request_id = await router.get_next_server_by_key(
             routing_key, req_id=req_id, exclude_server=exclude_server
         )
-        async with self._reservation_lock(reservation_key):
-            previous = self._reservation_tasks.pop(reservation_key, None)
-            if previous is not None:
-                previous.cancel()
-            self._reservation_tasks[reservation_key] = asyncio.create_task(
-                self._expire_reservation(reservation_key, router)
-            )
+        previous = self._reservation_tasks.pop(reservation_key, None)
+        if previous is not None:
+            previous.cancel()
+        self._reservation_tasks[reservation_key] = asyncio.create_task(
+            self._expire_reservation(reservation_key, router)
+        )
         self._api_lat(f"select[{role}]").record(time.monotonic() - t0)
         return server, self._compact_route_info(info), request_id
 
