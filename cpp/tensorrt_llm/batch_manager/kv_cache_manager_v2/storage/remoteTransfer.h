@@ -66,6 +66,9 @@ struct RemoteDonor
     bool withdrawn = false; // its .ready file is gone: no new claims from it
     size_t nextClaim = 0;   // chunks before it were claimed (by anyone) when last probed: claims start here
     bool full = false;      // a probe found every chunk claimed; skipped until a claim finds no donor at all
+    //! Per chunk: its claim file was in the last directory listing, or a create since found it taken. Such a chunk is
+    //! not probed again until the next listing shows it free.
+    std::vector<uint8_t> claimed;
 };
 
 //! One page to move: `bytes` between local memory at `local` and donor `donor` at `remoteAddr`.
@@ -119,7 +122,8 @@ public:
     //! Whether `donor`'s payload fits its chunks; logs why not.
     [[nodiscard]] virtual bool acceptPayload(RemoteDonor const& donor) const = 0;
     //! Make the newly claimed chunk `chunk` of `donor` reachable; returns the address transfers name it by. Throws
-    //! RemoteMemError when the donor cannot be reached, which passes over that donor.
+    //! RemoteMemError when the donor cannot be reached, which passes over that donor; any other exception (a local
+    //! failure, such as mapping the chunk) fails the claim.
     virtual uint64_t attachChunk(RemoteDonor& donor, size_t chunk) = 0;
 
     //! Whether transfers are enqueued on the caller's stream. Then the stream orders everything that touches the

@@ -1074,6 +1074,69 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             base.take_poison()
             shutil.rmtree(directory, ignore_errors=True)
 
+    def test_a_donor_reported_twice_counts_once(self) -> None:
+        """A listing that sees a donor's .ready and its .failed (it exits between the two) counts one donor, so a
+        claim keeps waiting for the other expected donor instead of failing as if all had reported."""
+        directory = tempfile.mkdtemp(prefix="kvcm2_twice_")
+        try:
+            meta = f"version 1\nname x\nhost h\npid 1\nchunk_bytes {_CHUNK_BYTES}\ntransport {self.transport}\n"
+            for suffix, text in (
+                ("meta", meta + f"segment 4096 {4 * _CHUNK_BYTES}\n"),
+                ("ready", ""),
+                ("failed", f"version 1\nname x\ntransport {self.transport}\n"),
+            ):
+                with open(os.path.join(directory, f"donor.x.{suffix}"), "w") as f:
+                    f.write(text)
+            self.cfg = self._config(
+                with_host=False, directory=directory, wait_timeout_ms=1_500, expected_donors=2
+            )
+            start = time.monotonic()
+            with self.assertRaisesRegex(Exception, "after 1500 ms"):
+                self.manager = KVCacheManager(self.cfg)
+            self.assertGreaterEqual(time.monotonic() - start, 1.0)
+        finally:
+            gc.collect()
+            base.take_poison()
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def test_a_donor_found_full_earlier_is_probed_again_before_a_claim_fails(self) -> None:
+        """A donor found full while a claim was served elsewhere is probed again before a claim fails at once (every
+        expected donor reported): a peer may have returned its chunks since, e.g. an abandoned construction."""
+        directory = tempfile.mkdtemp(prefix="kvcm2_refull_")
+        donors = [_Donor(directory, _CHUNK_BYTES, self.transport) for _ in range(2)]
+        peer_claim = os.path.join(directory, f"claim.{donors[0].name}.0")
+        last = cast(CacheLevel, CacheLevel(1))
+        try:
+            cfg = self._config(
+                with_host=False,
+                directory=directory,
+                remote_quota=_CHUNK_BYTES,
+                wait_timeout_ms=600_000,
+                expected_donors=2,
+            )
+            self.cfg = replace(cfg, layers=self._attention_layers())
+            # Whether the first claim passes over the full donor depends on where this client starts probing, which
+            # its random name decides: repeat with new clients.
+            for attempt in range(8):
+                with open(peer_claim, "w") as f:
+                    f.write("peer\n")
+                self.manager = KVCacheManager(self.cfg)
+                os.unlink(peer_claim)  # the peer lets go of its chunk
+                self.assertTrue(self.manager.resize(last, 2 * _CHUNK_BYTES), f"attempt {attempt}")
+                self.manager.shutdown()
+                del self.manager
+                gc.collect()
+        finally:
+            for donor in donors:
+                donor.stop()
+            if hasattr(self, "manager"):
+                with contextlib.suppress(Exception):
+                    self.manager.shutdown()
+                del self.manager
+            gc.collect()
+            base.take_poison()
+            shutil.rmtree(directory, ignore_errors=True)
+
     def test_crashed_donor_is_passed_over(self) -> None:
         """A donor that died without withdrawing (its files stay) gets no claims; the next donor serves them."""
         if self.transport != "fabric":

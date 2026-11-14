@@ -26,6 +26,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstring>
 #include <dirent.h>
@@ -38,6 +39,8 @@
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -81,6 +84,7 @@ constexpr uint64_t kMaxChunksPerDonor = 1ULL << 20;
 constexpr std::string_view kDonorPrefix = "donor.";
 constexpr std::string_view kReadySuffix = ".ready";
 constexpr std::string_view kFailedSuffix = ".failed";
+constexpr std::string_view kClaimPrefix = "claim.";
 constexpr mode_t kOthersWrite = S_IWGRP | S_IWOTH;
 
 } // namespace
@@ -208,6 +212,8 @@ void RemoteMemClient::refreshDonors()
 {
     std::vector<std::string> ready;
     std::vector<std::string> failedFiles;
+    // claim.<donor>.<chunk> files: chunks some client holds.
+    std::unordered_map<std::string, std::vector<uint64_t>> claimedChunks;
     {
         // A fresh open of the checked directory: its own read position, closed by closedir.
         int const listFd = ::openat(mDirectory.get(), ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -248,15 +254,35 @@ void RemoteMemClient::refreshDonors()
             {
                 failedFiles.emplace_back(file);
             }
+            else if (file.starts_with(kClaimPrefix))
+            {
+                auto const dot = file.rfind('.');
+                if (dot > kClaimPrefix.size() && dot + 1 < file.size())
+                {
+                    uint64_t chunk = 0;
+                    auto const digits = file.substr(dot + 1);
+                    auto const [end, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), chunk);
+                    if (ec == std::errc() && end == digits.data() + digits.size())
+                    {
+                        claimedChunks[std::string(file.substr(kClaimPrefix.size(), dot - kClaimPrefix.size()))]
+                            .push_back(chunk);
+                    }
+                }
+            }
         }
     }
-    size_t failed = 0;
+    // Each donor counts once: a listing taken while a donor exits can show its .ready and its .failed.
+    std::unordered_set<std::string> reported;
     for (auto const& file : failedFiles)
     {
         // A failed donor of another transport is not one of the donors this client counts on.
         auto const text = readDonorFile(file);
         auto const transport = text ? failedDonorTransport(*text) : std::nullopt;
-        failed += transport && *transport == mBackend->kind() ? 1 : 0;
+        if (transport && *transport == mBackend->kind())
+        {
+            reported.emplace(
+                file.substr(kDonorPrefix.size(), file.size() - kDonorPrefix.size() - kFailedSuffix.size()));
+        }
     }
     std::sort(ready.begin(), ready.end());
     for (auto& donor : mDonors)
@@ -369,9 +395,29 @@ void RemoteMemClient::refreshDonors()
         mDonors.push_back(std::move(donor));
     }
     // Counted once the new ready donors are parsed: a donor of another transport is not reported to this client.
-    mReportedDonors = failed
-        + static_cast<size_t>(std::count_if(
-            ready.begin(), ready.end(), [this](std::string const& name) { return mForeignDonors.count(name) == 0; }));
+    for (auto const& name : ready)
+    {
+        if (mForeignDonors.count(name) == 0)
+        {
+            reported.insert(name);
+        }
+    }
+    mReportedDonors = reported.size();
+    for (auto& donor : mDonors)
+    {
+        donor.claimed.assign(donor.chunks.size(), 0);
+        auto const it = claimedChunks.find(donor.name);
+        if (it != claimedChunks.end())
+        {
+            for (auto const chunk : it->second)
+            {
+                if (chunk < donor.claimed.size())
+                {
+                    donor.claimed[chunk] = 1;
+                }
+            }
+        }
+    }
 }
 
 bool RemoteMemClient::stillPublished(RemoteDonor& donor)
@@ -432,13 +478,18 @@ bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
         {
             continue;
         }
-        // Chunks are probed from the last one this client claimed or found taken, wrapping around once: claims
-        // last as long as their client, so earlier chunks rarely free up, and the shared file system sees one
-        // exclusive create per chunk per client instead of one per claim.
+        // Chunks are probed from the last one this client claimed or found taken, wrapping around once, skipping
+        // those the last listing showed claimed: claims last as long as their client, so the shared file system sees
+        // about one exclusive create per free chunk per client, also while the client waits for capacity.
         size_t const numChunks = donor.chunks.size();
+        donor.claimed.resize(numChunks, 0);
         for (size_t probe = 0; probe < numChunks; ++probe)
         {
             size_t const chunk = (donor.nextClaim + probe) % numChunks;
+            if (donor.claimed[chunk] != 0)
+            {
+                continue;
+            }
             auto const claim = "claim." + donor.name + "." + std::to_string(chunk);
             auto const path = mOptions.directory + "/" + claim; // for messages; files go through mDirectory
             int const fd = ::openat(mDirectory.get(), claim.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
@@ -446,6 +497,7 @@ bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
             {
                 if (errno == EEXIST)
                 {
+                    donor.claimed[chunk] = 1;
                     continue;
                 }
                 throw RemoteMemError(
@@ -479,6 +531,7 @@ bool RemoteMemClient::tryClaim(size_t minBytes, RemoteChunk& out)
                 throw;
             }
             out = RemoteChunk{index, address, donor.chunks[chunk].second};
+            donor.claimed[chunk] = 1;
             donor.nextClaim = chunk + 1;
             mClaims.push_back(claim);
             mClaimedBytes += out.bytes;
@@ -520,6 +573,14 @@ RemoteChunk RemoteMemClient::acquireChunk(size_t minBytes)
         bool const allReported = mOptions.expectedDonors > 0 && mReportedDonors >= mOptions.expectedDonors;
         if (allReported || std::chrono::steady_clock::now() >= deadline)
         {
+            // The failed pass skipped donors found full while an earlier claim was served elsewhere, and chunks an
+            // older listing showed claimed: one more pass over a fresh listing probes them, as a peer that gave up
+            // (an abandoned construction) returns its chunks.
+            refreshDonors();
+            if (tryClaim(minBytes, chunk))
+            {
+                return chunk;
+            }
             throw RemoteMemError("KVCM2 remote level: no donor in " + mOptions.directory + " has a free chunk of "
                 + std::to_string(minBytes) + " B or more "
                 + (allReported ? "and all " + std::to_string(mOptions.expectedDonors)
