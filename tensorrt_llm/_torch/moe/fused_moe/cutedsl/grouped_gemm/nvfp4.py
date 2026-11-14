@@ -617,6 +617,9 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 finalize_inplace_kwargs["weights_evict_first"] = (
                     token_selected_experts.size(0) <= self.fc2_weights_evict_first_rows
                 )
+                finalize_inplace_kwargs["weights_evict_first_max_tokens"] = (
+                    self.fc2_weights_evict_first_rows
+                )
 
             finalize_inplace_op(**finalize_inplace_kwargs)
         else:
