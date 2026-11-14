@@ -11,18 +11,17 @@ keys of each 128-expert tile, the NVFP4 quantization of x, and the PDL release r
 
 from __future__ import annotations
 
-import functools
 from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
-import torch
 from cutlass import BFloat16, Float32, Int32, Int64, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from ...cute_dsl_utils import smem_optin_bytes
 from .moe_decode_front import (
     _add,
     _asm,
@@ -43,7 +42,6 @@ from .moe_decode_front import (
     _struct,
     _unpack,
 )
-from .moe_persistent_engine import _pack_bf16x2_rn
 from .moe_route_front import (
     _bulk_commit,
     _bulk_push,
@@ -52,6 +50,7 @@ from .moe_route_front import (
     _cluster_wait_acquire,
     _keys2,
 )
+from .ptx_helpers import _pack_bf16x2_rn
 
 EXPERT_TILE = 128  # UMMA M (cta_group 1): TMEM lane = expert
 K_TILE = 64  # one 128-byte swizzle atom of BF16 per row
@@ -61,14 +60,6 @@ TOKEN_TILES = (32, 64)  # UMMA N
 # this many rows of its token tile (threads / 16 lanes per row).
 ROUTE_MAX_TOP_K = 32
 QUANT_ROWS_PER_TILE = 8
-
-
-@functools.lru_cache(maxsize=None)
-def _smem_limit() -> int:
-    """A CTA's opt-in shared memory on the current device."""
-    return torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).shared_memory_per_block_optin
 
 
 @dsl_user_op
@@ -162,7 +153,7 @@ class MoeRouterGemmKernel:
         if k_extent // SPLITS // K_TILE < 4:
             return "the staging tile reuses the x buffers: at least 4 K tiles per split"
         smem_bytes = (k_extent // SPLITS // K_TILE) * (EXPERT_TILE + token_tile) * K_TILE * 2
-        if smem_bytes + token_tile * EXPERT_TILE * 4 + 2048 > _smem_limit():
+        if smem_bytes + token_tile * EXPERT_TILE * 4 + 2048 > smem_optin_bytes():
             return "shared memory over budget"
         if route_top_k and not 0 < route_top_k <= ROUTE_MAX_TOP_K:
             return f"route_top_k must be in 1..{ROUTE_MAX_TOP_K}"
@@ -174,8 +165,9 @@ class MoeRouterGemmKernel:
         return None
 
     @classmethod
-    def supports(cls, **shape) -> bool:
-        """Whether the constructor takes these shape arguments."""
+    def supports(cls, **shape: int) -> bool:
+        """Whether the constructor takes these shape arguments (the integer keyword arguments of ``__init__`` other
+        than ``use_pdl``)."""
         return cls._shape_error(**shape) is None
 
     def __init__(

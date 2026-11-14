@@ -15,7 +15,7 @@ builds the same tables with a cheaper count exchange and releases its dependent 
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -297,8 +297,9 @@ class MoeRouteFrontKernel:
     ``griddepcontrol.wait`` still waits for this grid's completion."""
 
     @staticmethod
-    def supports(**kw) -> bool:
-        """Whether the constructor takes these keyword arguments (``use_pdl`` aside)."""
+    def supports(**kw: Union[int, bool]) -> bool:
+        """Whether the constructor takes these keyword arguments (``use_pdl`` aside): ``__init__``'s integer shape
+        arguments and its ``lean`` / ``use_pdl`` flags."""
         kw.pop("use_pdl", None)
         return _shape_error(**kw) is None
 
