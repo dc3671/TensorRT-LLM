@@ -298,6 +298,7 @@ def test_executor_loop_overlap_flushes_deferred_closes(monkeypatch) -> None:
 
     idle_pass = _SCHEDULE_HEAD + [
         ("flush_deferred_closes",),
+        ("start_deferred_gen_receives", "wait_all=False"),
         ("flush_pending_transfer_responses",),
         ("flush_deferred_closes",),
         ("handle_timeouts_synced",),
