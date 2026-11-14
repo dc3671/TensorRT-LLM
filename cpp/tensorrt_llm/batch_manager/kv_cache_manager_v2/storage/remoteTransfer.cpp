@@ -30,7 +30,7 @@ std::unique_ptr<RemoteTransferBackend> makeRemoteTransferBackend(
 {
     switch (config.transport)
     {
-    case RemoteTransport::NIXL:
+    case RemoteTransport::kNixl:
     {
         executor::kv_cache::BaseAgentConfig agentConfig{};
         agentConfig.mName = name;
@@ -44,7 +44,7 @@ std::unique_ptr<RemoteTransferBackend> makeRemoteTransferBackend(
         return std::make_unique<AgentTransferBackend>(
             executor::kv_cache::makeTransferAgent("nixl", &agentConfig), "nixl");
     }
-    case RemoteTransport::FABRIC: return std::make_unique<FabricTransferBackend>();
+    case RemoteTransport::kFabric: return std::make_unique<FabricTransferBackend>();
     }
     TLLM_THROW("KVCM2 remote level: unknown transport %d", static_cast<int>(config.transport));
 }

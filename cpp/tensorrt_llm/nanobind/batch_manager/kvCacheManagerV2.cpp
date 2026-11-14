@@ -1005,8 +1005,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .export_values();
 
     nb::enum_<kv::RemoteTransport>(m, "RemoteTransport")
-        .value("NIXL", kv::RemoteTransport::NIXL)
-        .value("FABRIC", kv::RemoteTransport::FABRIC);
+        .value("NIXL", kv::RemoteTransport::kNixl)
+        .value("FABRIC", kv::RemoteTransport::kFabric);
 
     // ---- KvCache::Status enum (also accessible as _KVCache.Status) ---------
     auto kvCacheStatus = nb::enum_<kv::KvCache::Status>(m, "KvCacheStatus")
@@ -1770,7 +1770,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     nb::class_<kv::RemoteTransferConfig>(m, "RemoteTransferConfig")
         .def(nb::init<kv::RemoteTransport, int64_t, std::map<std::string, std::string>>(),
-            nb::arg("transport") = kv::RemoteTransport::NIXL,
+            nb::arg("transport") = kv::RemoteTransport::kNixl,
             nb::arg("timeout_ms") = kv::RemoteTransferConfig{}.timeoutMs,
             nb::arg("backend_params") = std::map<std::string, std::string>{})
         .def_rw("transport", &kv::RemoteTransferConfig::transport)

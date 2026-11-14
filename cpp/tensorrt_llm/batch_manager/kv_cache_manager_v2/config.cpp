@@ -163,7 +163,7 @@ void RemoteCacheTierConfig::validate() const
         "RemoteCacheTierConfig: wait_timeout_ms (donor_wait_timeout_s) must be in (0, %lld], got %lld",
         static_cast<long long>(kMaxRemoteTimeoutMs), static_cast<long long>(waitTimeoutMs));
     // The fabric transport's copies are stream-ordered and never timed.
-    TLLM_CHECK_WITH_INFO(transfer.transport != RemoteTransport::NIXL
+    TLLM_CHECK_WITH_INFO(transfer.transport != RemoteTransport::kNixl
             || (0 < transfer.timeoutMs && transfer.timeoutMs <= kMaxRemoteTimeoutMs),
         "RemoteCacheTierConfig: the NIXL transfer timeout_ms (transfer_timeout_s) must be in (0, %lld], got %lld",
         static_cast<long long>(kMaxRemoteTimeoutMs), static_cast<long long>(transfer.timeoutMs));

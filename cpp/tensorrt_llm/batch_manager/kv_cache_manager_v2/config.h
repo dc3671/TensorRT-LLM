@@ -113,9 +113,9 @@ struct DiskCacheTierConfig
 enum class RemoteTransport : int
 {
     //! A NIXL transfer agent (executor::kv_cache::BaseTransferAgent): one-sided RDMA, concluded on the host.
-    NIXL = 0,
+    kNixl = 0,
     //! NVLink fabric memory mapped into this process, copied on the caller's stream.
-    FABRIC = 1,
+    kFabric = 1,
 };
 
 //! Upper bound of the remote tier's timeouts: 1e6 s, as RemoteCacheConfig allows.
@@ -124,7 +124,7 @@ inline constexpr int64_t kMaxRemoteTimeoutMs = 1'000'000'000;
 //! How a remote tier's pages move, apart from what memory it declares (RemoteCacheTierConfig).
 struct RemoteTransferConfig
 {
-    RemoteTransport transport = RemoteTransport::NIXL;
+    RemoteTransport transport = RemoteTransport::kNixl;
     //! NIXL: how long one batch of transfers may take before the level fails (transfer_timeout_s), in (0,
     //! kMaxRemoteTimeoutMs]. Unused by FABRIC, whose copies run on the stream.
     int64_t timeoutMs = 30'000;
