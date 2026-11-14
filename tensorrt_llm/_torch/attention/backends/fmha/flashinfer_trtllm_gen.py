@@ -39,8 +39,9 @@ Example:
 """
 
 import math
+import re
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
@@ -224,6 +225,56 @@ def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
     return bmm1_scale.narrow(0, 1, 1)
 
 
+# The typed signature of FlashInfer's private trtllm-gen decode op that trtllm_gen_paged_decode's positional call is
+# written for (FlashInfer 0.7), as the op's TVM-FFI wrapper reports it.
+_PAGED_DECODE_SIGNATURE = (
+    "trtllm_paged_attention_decode(0: DLTensor*, 1: Optional<DLTensor*>, 2: DLTensor*, 3: DLTensor*, 4: DLTensor*, "
+    "5: DLTensor*, 6: DLTensor*, 7: DLTensor*, 8: DLTensor*, 9: int, 10: int, 11: Variant<float, ffi.Tensor>, "
+    "12: Variant<float, ffi.Tensor>, 13: float, 14: int, 15: int, 16: int, 17: int, 18: int, 19: int, 20: bool, "
+    "21: int, 22: Optional<DLTensor*>, 23: Optional<DLTensor*>, 24: Optional<DLTensor*>, 25: Optional<DLTensor*>, "
+    "26: Optional<float>, 27: Optional<bool>, 28: Optional<DLTensor*>, 29: float, 30: int, 31: int, 32: bool, "
+    "33: Optional<DLTensor*>, 34: int, 35: Optional<bool>) -> void"
+)
+
+
+@lru_cache(maxsize=1)
+def trtllm_gen_paged_decode_supported() -> bool:
+    """Whether FlashInfer's private positional ``trtllm_paged_attention_decode`` has the signature
+    trtllm_gen_paged_decode passes its arguments for; callers decline otherwise (FlashInfer's public decode runs).
+
+    Probed once by calling the op without arguments: its TVM-FFI wrapper checks the argument count before running
+    anything and names its typed signature in the TypeError. Another signature, another error, or a module that
+    does not load all decline.
+    """
+    if not IS_FLASHINFER_AVAILABLE:
+        return False
+    try:
+        op = flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
+    except (AttributeError, ImportError, OSError, RuntimeError) as e:
+        logger.warning(
+            f"FlashInfer's trtllm-gen decode op is unavailable ({e}); its direct calls are declined"
+        )
+        return False
+    try:
+        op()
+    except TypeError as e:
+        found = re.search(r"`([^`]*)`", str(e))
+        if found is not None and found.group(1) == _PAGED_DECODE_SIGNATURE:
+            return True
+        logger.warning(
+            "FlashInfer's trtllm_paged_attention_decode does not have the signature trtllm_gen_paged_decode was "
+            f"written for ({e}); its direct calls are declined"
+        )
+        return False
+    except (RuntimeError, ValueError) as e:
+        logger.warning(
+            f"FlashInfer's trtllm_paged_attention_decode did not report its signature ({e}); its direct calls are "
+            "declined"
+        )
+        return False
+    return False
+
+
 def trtllm_gen_paged_decode(
     out: torch.Tensor,
     query: torch.Tensor,
@@ -234,8 +285,8 @@ def trtllm_gen_paged_decode(
     seq_lens: torch.Tensor,
     max_q_len: int,
     max_kv_len: int,
-    bmm1_scale,
-    bmm2_scale,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
     batch_size: int,
     window_left: int,
     sm_count: int,
@@ -246,7 +297,8 @@ def trtllm_gen_paged_decode(
 ) -> None:
     """FlashInfer's trtllm-gen paged decode op (behind ``trtllm_batch_decode_with_kv_cache``) with an explicit SM count,
     from which the kernel derives its KV split. Query and KV of one dtype, HND pool, a [requests, 2, pages] page table;
-    bmm1_scale a float or the [raw, raw * log2e] tensor; lse (base 2) optional."""
+    bmm1_scale a float or the [raw, raw * log2e] tensor; lse (base 2) optional. Callers check
+    trtllm_gen_paged_decode_supported() first."""
     flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode(
         out,
         None,  # out_scale_factor

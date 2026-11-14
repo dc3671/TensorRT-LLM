@@ -32,6 +32,7 @@ from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
     _get_generation_workspace_layout,
     trtllm_gen_paged_decode,
+    trtllm_gen_paged_decode_supported,
 )
 from tensorrt_llm._torch.attention.backends.fmha.gqa_decode import (
     FoldInputs,
@@ -42,6 +43,7 @@ from tensorrt_llm._torch.attention.backends.fmha.gqa_decode import (
     GqaSegmentedFmha,
     GqaSplitKvFmha,
     KvAppendPlan,
+    min_kv_split_scratch_bytes,
 )
 from tensorrt_llm._torch.attention.backends.fmha.gqa_kv_replica import kv_replica_partial_merge_free
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
@@ -943,7 +945,12 @@ def test_min_kv_split_decode_is_flashinfer_decode_at_that_sm_count(
     q = torch.randn(b * q_len, hq, HEAD_DIM, device="cuda", generator=g).to(torch.float8_e4m3fn)
     sm_count = splits * hkv * b
     assert sm_count > torch.cuda.get_device_properties(0).multi_processor_count
-    workspace = torch.zeros(sm_count * 128 * (8 + 4 * HEAD_DIM), dtype=torch.uint8, device="cuda")
+    assert trtllm_gen_paged_decode_supported()
+    # The library's scratch size, checked by the kernel's writes rather than by restating its formula: the scratch
+    # is the front of a buffer whose tail is a canary that must come back untouched.
+    nbytes = min_kv_split_scratch_bytes(sm_count, HEAD_DIM)
+    guarded = torch.full((nbytes + (4 << 20),), 0xA5, dtype=torch.uint8, device="cuda")
+    workspace = guarded[:nbytes]
     counter = torch.zeros(max(b * hq, sm_count) * 4, dtype=torch.uint8, device="cuda")
     max_kv_len = int(lens.max())
 
@@ -975,6 +982,9 @@ def test_min_kv_split_decode_is_flashinfer_decode_at_that_sm_count(
         )
         return ref
 
+    torch.cuda.synchronize()
+    assert bool((guarded[nbytes:] == 0xA5).all()), "the forced-split decode wrote past its scratch"
+    assert bool((workspace != 0xA5).any()), "the forced split must keep its partials in the scratch"
     assert torch.equal(out, public(sm_count))
     # The device's own SM count splits less, which only reorders the FP32 sums.
     heuristic = public(torch.cuda.get_device_properties(0).multi_processor_count)
@@ -1143,3 +1153,76 @@ def test_rope_gather_is_armed_only_where_the_fused_library_is_selected(
     assert (got.rope_gather == "gather") is armed
     # The library's selection (_is_supported) at this call's cell agrees.
     assert lib._takes(*generation_cell_bound(batch, q_len), metadata) is armed
+
+
+def test_trtllm_gen_paged_decode_checks_flashinfers_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direct call of FlashInfer's private positional decode op is taken only while the op has the signature it
+    was written for: another signature, another error, or a module that does not load decline."""
+    import flashinfer
+
+    from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen as fi
+
+    fi.trtllm_gen_paged_decode_supported.cache_clear()
+    try:
+        assert fi.trtllm_gen_paged_decode_supported()
+
+        def module_with(error: Exception):
+            def op(*args):
+                raise error
+
+            return lambda: SimpleNamespace(trtllm_paged_attention_decode=op)
+
+        other = fi._PAGED_DECODE_SIGNATURE.replace(
+            "35: Optional<bool>", "35: Optional<bool>, 36: int"
+        )
+        for loader in (
+            module_with(
+                TypeError(f"Mismatched number of arguments when calling: `{other}`. Expected 37")
+            ),
+            module_with(TypeError("missing 36 required positional arguments")),
+            module_with(RuntimeError("no such kernel")),
+        ):
+            monkeypatch.setattr(flashinfer.decode, "get_trtllm_gen_fmha_module", loader)
+            fi.trtllm_gen_paged_decode_supported.cache_clear()
+            assert not fi.trtllm_gen_paged_decode_supported()
+
+        def broken():
+            raise RuntimeError("JIT build failed")
+
+        monkeypatch.setattr(flashinfer.decode, "get_trtllm_gen_fmha_module", broken)
+        fi.trtllm_gen_paged_decode_supported.cache_clear()
+        assert not fi.trtllm_gen_paged_decode_supported()
+    finally:
+        monkeypatch.undo()
+        fi.trtllm_gen_paged_decode_supported.cache_clear()
+
+
+def test_direct_decode_callers_decline_on_another_flashinfer_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the signature check failing, the forced-split decode returns False before any launch (the stock
+    FlashInfer call runs) and the segmented KV-replica library takes no call."""
+    monkeypatch.setattr(gqa_decode, "trtllm_gen_paged_decode_supported", lambda: False)
+    q_len, kv_heads, sms = 7, 2, 148
+    fmha = SimpleNamespace(
+        _min_kv_splits=8,
+        _multi_processor_count=sms,
+        _min_kv_split_batch=16,
+        attn=SimpleNamespace(num_kv_heads=kv_heads),
+    )
+    batch = 16
+    assert 8 * kv_heads * batch > sms
+    q = torch.empty(batch * q_len, 32, HEAD_DIM, dtype=torch.float8_e4m3fn)
+    kv_pool = torch.empty(1, kv_heads, PAGE, HEAD_DIM, dtype=torch.float8_e4m3fn)
+    assert not GqaDecodeFmha._run_min_kv_split(
+        fmha, None, q, kv_pool, None, 0, -1, q_len, None, None, 1.0, 1.0
+    )
+    library = SimpleNamespace(
+        _kv_replicas=4,
+        attn=SimpleNamespace(num_heads=4),
+        _largest_segment_rows=GqaKvReplicaFmha._largest_segment_rows,
+        _counter_slots=GqaKvReplicaFmha._counter_slots,
+    )
+    assert not GqaKvReplicaFmha._takes(library, 2, 7, SimpleNamespace(max_num_requests=512))

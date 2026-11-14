@@ -30,7 +30,7 @@ decode kernel for a call whose runtime layout their kernel does not take.
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -49,6 +49,7 @@ from .flashinfer_trtllm_gen import (
     _get_generation_workspace_layout,
     _get_generation_workspace_size,
     trtllm_gen_paged_decode,
+    trtllm_gen_paged_decode_supported,
 )
 from .gqa_kv_replica import (
     ROPE_GATHER_CHANNEL,
@@ -97,6 +98,12 @@ _MIN_MERGE_ROWS = 2048
 _ATTENTION_DP_MIN_KV_SPLITS = 8
 # Largest Q tile of trtllm-gen's generation kernels; a split CTA keeps one tile of partials (FP32 O + softmax stats).
 _MAX_GEN_TILE_ROWS = 128
+
+
+def min_kv_split_scratch_bytes(max_sm_count: int, head_dim: int) -> int:
+    """Scratch bytes of a forced-split trtllm-gen decode launched with up to max_sm_count CTAs: per CTA one Q tile of
+    at most _MAX_GEN_TILE_ROWS rows of FP32 partial O and an FP32 (max, sum) softmax-stats pair."""
+    return max_sm_count * _MAX_GEN_TILE_ROWS * (8 + 4 * head_dim)
 
 
 @dataclass(frozen=True)
@@ -371,8 +378,8 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
         q_len_per_req: Optional[int],
         max_q_len: Optional[int],
         cu_seqlens: Optional[torch.Tensor],
-        bmm1_scale,
-        bmm2_scale,
+        bmm1_scale: Union[float, torch.Tensor],
+        bmm2_scale: Union[float, torch.Tensor],
     ) -> bool:
         """trtllm-gen decode with _min_kv_splits KV splits per sequence where the device's SM count gives fewer: the
         same kernel launched with the SM count that gives them, and a scratch for their partials. False: the stock
@@ -390,11 +397,13 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
         sm_count = splits * attn.num_kv_heads * batch
         if sm_count <= self._multi_processor_count or batch > self._min_kv_split_batch:
             return False
+        if not trtllm_gen_paged_decode_supported():
+            return False
         # Split CTAs <= sm_count, one Q tile of partials each; sized for the largest batch, so every call and captured
         # graph shares one block.
         max_sm_count = splits * attn.num_kv_heads * self._min_kv_split_batch
         scratch = get_memory_buffers().get_buffer(
-            [max_sm_count * _MAX_GEN_TILE_ROWS * (8 + 4 * attn.head_dim)],
+            [min_kv_split_scratch_bytes(max_sm_count, attn.head_dim)],
             torch.uint8,
             buffer_name="trtllm_gen_min_kv_split_scratch",
             reserve_buffer=True,
@@ -1177,6 +1186,9 @@ class GqaKvReplicaFmha(_GqaKvReplicaFmha):
         )
 
     def _takes(self, batch: int, q_len: int, metadata: "TrtllmAttentionMetadata") -> bool:
+        # The segment attention calls FlashInfer's decode op directly (trtllm_gen_paged_decode).
+        if not trtllm_gen_paged_decode_supported():
+            return False
         # One counter per (FMHA request, folded head) of the segment attention, at the largest call of this cell.
         group_heads = self._kv_replicas * self.attn.num_heads
         max_num_requests = metadata.max_num_requests
@@ -1448,6 +1460,9 @@ class GqaSegmentedFmha(GqaDecodeFmha):
     ) -> bool:
         cell = self._decode_cell(q, metadata, forward_args, phase, generation_only=False)
         if cell is None or metadata.num_generations > _SEGMENTED_MAX_BATCH:
+            return False
+        # The segment attention calls FlashInfer's decode op directly (trtllm_gen_paged_decode).
+        if not trtllm_gen_paged_decode_supported():
             return False
         batch, q_len = cell
         attn = self.attn
