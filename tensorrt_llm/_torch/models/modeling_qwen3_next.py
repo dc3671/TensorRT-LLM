@@ -185,6 +185,8 @@ def _resident_min_rows(model_config: ModelConfig) -> int:
     if not _uses_tp_decode_kernels(model_config):
         return 0
     return _RESIDENT_MIN_REQUESTS * _rows_per_request(model_config)
+
+
 # The routed experts' cross-step L2 prefetch (ExpertL2Prefetch) runs from 2
 # requests below the all-reduces' two-shot rows: beside their slot transport at
 # more rows, its burst slows the layer chain more than the experts gain.
@@ -387,8 +389,7 @@ def _takes_resident_band(layer: nn.Module, projection: Optional[Linear],
         return False
     n, k = projection.weight.shape
     return all(
-        plan(rows, k, n) is not None
-        for rows in range(min_rows, max_rows + 1))
+        plan(rows, k, n) is not None for rows in range(min_rows, max_rows + 1))
 
 
 def _post_moe_allreduce(layer: nn.Module, mlp_output, residual: torch.Tensor):
@@ -2107,11 +2108,11 @@ class Qwen3NextModel(DecoderModel):
                 continue
             # The MoE block's own cache_derived_state (can_defer_finalize) may
             # run after this one: ask the experts directly.
-            records = (layer.fusion_config.POST_MOE_FUSION
-                       and mlp.has_shared_expert
-                       and mlp._experts_defer_finalize() and any(
-                           layer.allreduce.supports_moe_fold(
-                               r, layer.hidden_size) for r in rows))
+            records = (
+                layer.fusion_config.POST_MOE_FUSION and mlp.has_shared_expert
+                and mlp._experts_defer_finalize() and any(
+                    layer.allreduce.supports_moe_fold(r, layer.hidden_size)
+                    for r in rows))
             if not records:
                 prefetch.unregister(layer.layer_idx)
 

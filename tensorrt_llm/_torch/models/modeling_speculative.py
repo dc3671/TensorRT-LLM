@@ -1763,8 +1763,9 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     return builder(model_config, draft_config, lm_head, model)
 
 
-def drafter_hidden_extra_attrs(model_cls: type, spec_config: object,
-                               draft_config: Optional[ModelConfig]) -> Tuple[str, ...]:
+def drafter_hidden_extra_attrs(
+        model_cls: type, spec_config: object,
+        draft_config: Optional[ModelConfig]) -> Tuple[str, ...]:
     """The target's ``extra_attrs`` keys to hide while its drafter is built:
     the model's ``target_only_extra_attrs`` when the drafter comes from
     another checkpoint (an Eagle3 head, an external MTP or PARD /

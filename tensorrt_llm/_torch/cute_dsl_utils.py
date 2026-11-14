@@ -112,7 +112,8 @@ def _smem_optin_bytes(device_index: int) -> int:
         device_index).shared_memory_per_block_optin
 
 
-def smem_optin_bytes(device: Optional[Union[int, "torch.device"]] = None) -> int:
+def smem_optin_bytes(
+        device: Optional[Union[int, "torch.device"]] = None) -> int:
     """A CTA's opt-in shared memory limit on ``device`` (default: the current CUDA device)."""
     import torch
 
