@@ -617,6 +617,7 @@ def check_remote_capacity(
     need = need_bytes
     expected = num_donors
     deadline = time.monotonic() + timeout_s
+    warned: set[str] = set()
     while True:
         malformed: list[str] = []
         published, failed = scan_donors(directory, malformed)
@@ -672,12 +673,9 @@ class DonorTransport:
         """Allocate and register `donor`'s memory, then publish it (``donor._publish``)."""
         raise NotImplementedError
 
-    def release(self, donor: "RemoteMemDonor") -> None:
-        """Free what ``start`` made; teardown keeps going past errors."""
-        self.release_unowned()
-
     def release_unowned(self) -> None:
-        """``release`` without the donor, for the finalizer of a donor nobody closed."""
+        """Free what ``start`` made, without the donor (also the finalizer of a donor nobody closed); teardown keeps
+        going past errors."""
 
 
 @contextlib.contextmanager
@@ -939,10 +937,6 @@ class AgentDonorTransport(DonorTransport):
     @classmethod
     def options_from(cls, remote_config: "RemoteCacheConfig") -> dict:
         return {"ucx_devices": remote_config.ucx_devices}
-
-    @property
-    def address(self) -> int:
-        return self._address
 
     def start(self, donor: "RemoteMemDonor") -> None:
         from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
