@@ -375,22 +375,28 @@ class OpenAIDisaggregatedService(OpenAIService):
                 self._output_length_priority.assign_prior(gen_req)
         self._strip_gen_subagent_affinity(gen_req)
         if ctx_response is None or self._need_gen(ctx_response):
-            if not gen_server:
-                if ctx_response is not None:
-                    # A pooled generation router ages the request from its arrival and
-                    # bounds its wait by the context servers' KV transfer timeout, which
-                    # runs from here. Stamped again below to include this wait.
-                    self._stamp_orig_elapsed(gen_req, arrival_time)
-                gen_server, gen_route_info = await self._gen_router.get_next_server(
-                    gen_req, exclude_server=ctx_server, req_id=disagg_request_id
+            try:
+                if not gen_server:
+                    if ctx_response is not None:
+                        # A pooled generation router ages the request from its arrival and
+                        # bounds its wait by the context servers' KV transfer timeout, which
+                        # runs from here. Stamped again below to include this wait.
+                        self._stamp_orig_elapsed(gen_req, arrival_time)
+                    gen_server, gen_route_info = await self._gen_router.get_next_server(
+                        gen_req, exclude_server=ctx_server, req_id=disagg_request_id
+                    )
+                    gen_reservation_id = disagg_request_id
+                    if length_ticket is not None:
+                        self._output_length_priority.placed(length_ticket, gen_req, gen_route_info)
+                self._stamp_orig_elapsed(gen_req, arrival_time)
+                gen_response = await self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
                 )
-                gen_reservation_id = disagg_request_id
+            except BaseException:
                 if length_ticket is not None:
-                    self._output_length_priority.placed(length_ticket, gen_req, gen_route_info)
-            self._stamp_orig_elapsed(gen_req, arrival_time)
-            gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
-            )
+                    # No reply will come: the coordinator drops the request's prediction row.
+                    self._output_length_priority.abandon(length_ticket)
+                raise
             if length_ticket is not None:
                 gen_response = self._output_length_priority.track(gen_response, length_ticket)
             return gen_response

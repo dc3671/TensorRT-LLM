@@ -108,8 +108,11 @@ SKIP_MAX_OUT = 2.0
 MAX_CONVERSATIONS = 50000
 # A longer conversation id is keyed by its digest, which bounds the table's memory.
 MAX_CONVERSATION_ID_CHARS = 128
-# Features of predicted requests whose reply has not been learned yet (the oldest are dropped).
+# Features of predicted requests whose reply has not been learned yet. A row leaves when its reply
+# is learned or reported failed, when it is older than PENDING_MAX_AGE_S (the coordinator's pooled
+# seat expiry: no generation runs longer), or, past this many rows, oldest first.
 MAX_PENDING_ROWS = 200000
+PENDING_MAX_AGE_S = 6 * 3600.0
 # The median prior covers the last this many learned replies.
 MEDIAN_WINDOW = 10000
 
@@ -636,9 +639,11 @@ class OnlineLengthPredictor:
         self.t0: Optional[float] = None
         self.next_ridge_fit = math.inf
         self.next_gbm_fit = math.inf
-        self._pending: OrderedDict[int, list] = OrderedDict()
+        # Prediction key -> (time of the prediction, features), oldest first.
+        self._pending: OrderedDict[int, Tuple[float, list]] = OrderedDict()
         self._next_key = 0
         self.unmatched = 0
+        self.dropped = 0
         self.learned = 0
         self.without_conversation = 0
         self.invalid = 0
@@ -705,10 +710,14 @@ class OnlineLengthPredictor:
             f"iterations, fit {result['fit_s']:.2f} s, export check {diff:.1e}"
         )
 
-    def predict(self, conv_id: Optional[str], isl: float, t: float) -> Tuple[float, int]:
+    def predict(
+        self, conv_id: Optional[str], isl: float, t: float, key: Optional[int] = None
+    ) -> Tuple[float, int]:
         """(predicted output tokens, key): the key goes back with the reply, so its features can be learned.
 
-        Raises ValueError unless ``isl`` is a finite number in [0, ``MAX_TOKENS``].
+        A ``key`` still pending (the same request predicted again, e.g. a repeated ``/select``) is
+        reused, so the request keeps one row. Raises ValueError unless ``isl`` is a finite number
+        in [0, ``MAX_TOKENS``].
         """
         if not is_token_count(isl):
             raise ValueError(
@@ -729,26 +738,42 @@ class OnlineLengthPredictor:
         if not math.isfinite(tokens):
             tokens, source = PRIOR_TOKENS, "prior"
         self.sources[source] += 1
-        key = self._next_key
-        self._next_key += 1
-        self._pending[key] = x
-        if len(self._pending) > MAX_PENDING_ROWS:
-            self._pending.popitem(last=False)
+        if key is None or key not in self._pending:
+            key = self._next_key
+            self._next_key += 1
+        self._pending[key] = (t, x)
+        self._pending.move_to_end(key)
+        pending = self._pending
+        while pending and (
+            len(pending) > MAX_PENDING_ROWS
+            or t - next(iter(pending.values()))[0] > PENDING_MAX_AGE_S
+        ):
+            pending.popitem(last=False)
         self._maybe_log_stats()
         return tokens, key
 
     def record(
-        self, conv_id: Optional[str], isl: float, out: float, key: Optional[int], t: float
+        self,
+        conv_id: Optional[str],
+        isl: float,
+        out: Optional[float],
+        key: Optional[int],
+        t: float,
     ) -> bool:
         """Learn a finished reply of ``out`` tokens; returns whether it was learned.
 
-        Not learned: an ``isl`` / ``out`` outside [0, ``MAX_TOKENS``] (or NaN), and a reply of at most
-        ``SKIP_MAX_OUT`` tokens (a cache primer). A reply without a conversation id trains the
-        global models only.
+        ``out`` None reports a request that ended without a reply length (failed, interrupted):
+        its row is dropped, nothing is learned. Not learned either: an ``isl`` / ``out`` outside
+        [0, ``MAX_TOKENS``] (or NaN), and a reply of at most ``SKIP_MAX_OUT`` tokens (a cache
+        primer). A reply without a conversation id trains the global models only.
         """
         self._tick(t)
+        row = self._pending.pop(key, None) if key is not None else None
+        if out is None:
+            self.dropped += row is not None
+            return False
         self.reported += 1
-        x = self._pending.pop(key, None) if key is not None else None
+        x = row[1] if row is not None else None
         if not (is_token_count(isl) and is_token_count(out)):
             self.invalid += 1
             return self._learned(False)
@@ -795,7 +820,8 @@ class OnlineLengthPredictor:
             line += f"; tree fits {self.gbm_fits}, errors {self.gbm_errors}, busy skips {self.gbm_busy_skips}"
         return (
             line
-            + f"; pending {len(self._pending)}, replies without their features {self.unmatched}"
+            + f"; pending {len(self._pending)}, replies without their features {self.unmatched}, "
+            f"failed requests dropped {self.dropped}"
         )
 
     def _maybe_log_stats(self) -> None:
@@ -910,7 +936,7 @@ class OutputLengthPriority:
         self.record_flush_s = record_flush_s
         self.prior_priority = priority_of(PRIOR_TOKENS)
         self._tasks: set = set()
-        self._batch: List[Tuple[Optional[str], float, float, Optional[int]]] = []
+        self._batch: List[Tuple[Optional[str], float, Optional[float], Optional[int]]] = []
         self._flush_task: Optional[asyncio.Task] = None
         self.assigned = 0
         self.missing = 0
@@ -1009,16 +1035,27 @@ class OutputLengthPriority:
         if throttled(self.missing):
             logger.warning(f"[output_length] no prediction #{self.missing}, prior used: {reason}")
 
+    def abandon(self, ticket: Optional[_Ticket]) -> None:
+        """The request failed before its reply: the coordinator drops its row unlearned."""
+        if ticket is not None:
+            self._record(ticket, None)
+
     def _record(self, ticket: _Ticket, out: Optional[int]) -> None:
         if ticket.recorded:
             return
         ticket.recorded = True
         if out is None:
             self.no_usage += 1
-            return
-        self.recorded += 1
-        # Learn the length of one sequence.
-        self._batch.append((ticket.conv_id, ticket.isl, float(out) / ticket.sequences, ticket.key))
+            if ticket.key is None:
+                return
+            # No length to learn: report it, so the coordinator drops its row.
+            self._batch.append((ticket.conv_id, ticket.isl, None, ticket.key))
+        else:
+            self.recorded += 1
+            # Learn the length of one sequence.
+            self._batch.append(
+                (ticket.conv_id, ticket.isl, float(out) / ticket.sequences, ticket.key)
+            )
         if len(self._batch) >= RECORD_BATCH_MAX:
             self._send(self._take_batch())
         elif self._flush_task is None:

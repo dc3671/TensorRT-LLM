@@ -39,6 +39,7 @@ import asyncio
 import os
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import aiohttp
@@ -63,6 +64,7 @@ from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerI
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.output_length_predictor import (
+    MAX_PENDING_ROWS,
     OUTPUT_LENGTH_KEY,
     PRIOR_TOKENS,
     OnlineLengthPredictor,
@@ -164,10 +166,11 @@ class DisaggCoordinator(ABC):
         raise NotImplementedError("output_length_prediction is not configured")
 
     async def record_output_lengths(
-        self, records: Sequence[Tuple[Optional[str], float, float, Optional[int]]]
+        self, records: Sequence[Tuple[Optional[str], float, Optional[float], Optional[int]]]
     ) -> int:
         """Learn finished replies, each ``(conv_id, prompt_tokens, output_tokens, key)``.
 
+        ``output_tokens`` None reports a request that failed: its prediction row is dropped.
         Returns how many were learned.
         """
         raise NotImplementedError("output_length_prediction is not configured")
@@ -241,6 +244,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
         # One predictor for every frontend, so that it learns from all replies.
         self._output_length_predictor: Optional[OnlineLengthPredictor] = None
         self._output_length_errors = 0
+        # The prediction key of each generation request predicted in /select, until its /finish:
+        # a repeated select reuses it, and a failed one drops its row.
+        self._prediction_keys: OrderedDict[int, int] = OrderedDict()
         if config.output_length_prediction is not None:
             self._output_length_predictor = OnlineLengthPredictor(
                 config.output_length_prediction.predictor
@@ -285,12 +291,33 @@ class DisaggCoordinatorService(DisaggCoordinator):
         normalized_role = self._normalize_role(role)
         router = self._router_for_role(normalized_role)
         reservation_key = (normalized_role, req_id)
-        prediction = self._predict_in_select(normalized_role, routing_key)
-        if router.pooled:
-            server, info, request_id = await self._select_pooled(
-                router, role, routing_key, req_id, exclude_server, _t0
+        prediction = self._predict_in_select(normalized_role, routing_key, req_id)
+        try:
+            if router.pooled:
+                server, info, request_id = await self._select_pooled(
+                    router, role, routing_key, req_id, exclude_server, _t0
+                )
+                return server, self._with_prediction(info, prediction), request_id
+            server, info, request_id = await self._select_reserved(
+                router, routing_key, req_id, exclude_server, reservation_key
             )
-            return server, self._with_prediction(info, prediction), request_id
+        except BaseException:
+            if prediction is not None:
+                # No placement (no seat, a disconnected client): the request will not report.
+                self._drop_prediction(req_id)
+            raise
+        self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
+        return server, self._with_prediction(self._compact_route_info(info), prediction), request_id
+
+    async def _select_reserved(
+        self,
+        router: Router,
+        routing_key: Any,
+        req_id: int,
+        exclude_server: Optional[str],
+        reservation_key: Tuple[str, int],
+    ) -> Tuple[Optional[str], dict, Optional[int]]:
+        """Select through a non-pooled router under the reservation lock, and reserve the server."""
         async with self._reservation_lock(reservation_key):
             previous = self._reservation_tasks.pop(reservation_key, None)
             if previous is not None:
@@ -305,10 +332,14 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 self._reservation_tasks[reservation_key] = asyncio.create_task(
                     self._expire_reservation(reservation_key, router)
                 )
-        self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
-        return server, self._with_prediction(self._compact_route_info(info), prediction), request_id
+        return server, info, request_id
 
-    def _predict_in_select(self, role: str, routing_key: Any) -> Optional[dict]:
+    def _drop_prediction(self, req_id: int) -> None:
+        key = self._prediction_keys.pop(req_id, None)
+        if key is not None and self._output_length_predictor is not None:
+            self._output_length_predictor.record(None, 0.0, None, key, time.monotonic())
+
+    def _predict_in_select(self, role: str, routing_key: Any, req_id: int) -> Optional[dict]:
         """Predict a generation request's output length from its routing key's ``OUTPUT_LENGTH_KEY``.
 
         The prediction's priority replaces the key's ``priority``, so a pooled router orders by it. A predictor
@@ -328,7 +359,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
         if (conv is not None and not isinstance(conv, str)) or not is_token_count(isl):
             return None
         try:
-            tokens, key = self._output_length_predictor.predict(conv, float(isl), time.monotonic())
+            tokens, key = self._output_length_predictor.predict(
+                conv, float(isl), time.monotonic(), self._prediction_keys.get(req_id)
+            )
         except Exception as e:  # noqa: BLE001  (an admission hint is never worth failing a placement)
             self._output_length_errors += 1
             if throttled(self._output_length_errors):
@@ -338,6 +371,11 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 )
             routing_key["priority"] = priority_of(PRIOR_TOKENS)
             return None
+        keys = self._prediction_keys
+        keys[req_id] = key
+        keys.move_to_end(req_id)
+        if len(keys) > MAX_PENDING_ROWS:
+            keys.popitem(last=False)
         priority = priority_of(tokens)
         routing_key["priority"] = priority
         return {"tokens": tokens, "key": key, "priority": priority}
@@ -413,7 +451,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         return self._length_predictor().predict(conv_id, float(prompt_tokens), time.monotonic())
 
     async def record_output_lengths(
-        self, records: Sequence[Tuple[Optional[str], float, float, Optional[int]]]
+        self, records: Sequence[Tuple[Optional[str], float, Optional[float], Optional[int]]]
     ) -> int:
         predictor = self._length_predictor()
         now = time.monotonic()
@@ -423,6 +461,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
         _t0 = time.monotonic()
         normalized_role = self._normalize_role(role)
         reservation_key = (normalized_role, req_id)
+        if normalized_role == "generation":
+            # Its frontend reports the reply (or the failure) by the key itself.
+            self._prediction_keys.pop(req_id, None)
         async with self._reservation_lock(reservation_key):
             reservation = self._reservation_tasks.pop(reservation_key, None)
             if reservation is not None:
@@ -849,12 +890,15 @@ class CoordinatorClient(DisaggCoordinator):
         return float(reply["tokens"]), int(reply["key"])
 
     async def record_output_lengths(
-        self, records: Sequence[Tuple[Optional[str], float, float, Optional[int]]]
+        self, records: Sequence[Tuple[Optional[str], float, Optional[float], Optional[int]]]
     ) -> int:
         reply = await self._output_length_call(
             {
                 "op": "record",
-                "records": [[conv, float(isl), float(out), key] for conv, isl, out, key in records],
+                "records": [
+                    [conv, float(isl), None if out is None else float(out), key]
+                    for conv, isl, out, key in records
+                ],
             }
         )
         return int(reply["learned"])

@@ -220,17 +220,20 @@ class CoordinatorServer:
             return "conv must be a string or null"
         if not is_token_count(isl):
             return f"isl must be a finite number in [0, {MAX_TOKENS:.0f}]"
-        if not is_token_count(out):
-            return f"out must be a finite number in [0, {MAX_TOKENS:.0f}]"
         if key is not None and (not isinstance(key, int) or isinstance(key, bool)):
             return "key must be an integer or null"
+        if out is None and key is not None:
+            return None  # a failed request: its prediction row is dropped
+        if not is_token_count(out):
+            return f"out must be a finite number in [0, {MAX_TOKENS:.0f}], or null with a key"
         return None
 
     async def output_length(self, raw_req: Request) -> Response:
         """Output-length prediction (``output_length_prediction``) for frontends.
 
         POST {"op": "predict", "conv", "isl"} -> {"tokens", "key"}, and
-        POST {"op": "record", "records": [[conv, isl, out, key], ...]} -> {"learned"}.
+        POST {"op": "record", "records": [[conv, isl, out, key], ...]} -> {"learned"} (``out``
+        null with a ``key``: the request failed, its prediction row is dropped).
         """
         try:
             body = msgpack.unpackb(await raw_req.body(), raw=False)
@@ -261,7 +264,10 @@ class CoordinatorServer:
                 if error:
                     return self._response({"error": error}, status_code=400)
             learned = await self._coordinator.record_output_lengths(
-                [(conv, float(isl), float(out), key) for conv, isl, out, key in records]
+                [
+                    (conv, float(isl), None if out is None else float(out), key)
+                    for conv, isl, out, key in records
+                ]
             )
             return self._response({"learned": learned})
         except ValueError as e:

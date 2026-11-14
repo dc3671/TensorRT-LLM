@@ -467,3 +467,63 @@ async def test_responses_request_waits_for_a_seat_at_the_prior(fleet):
         completion.cancel()
         await asyncio.gather(completion, return_exceptions=True)
     await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_select_keeps_one_row_per_request_and_drops_it_on_failure():
+    """A repeated /select reuses its prediction key; a select that gets no seat drops its row."""
+    from tensorrt_llm.llmapi.disagg_utils import CtxGenServerConfig, RouterConfig, ServerRole
+    from tensorrt_llm.serve.seat_pool import NoGenerationSeatError
+
+    config = _config()
+    config.server_configs = [CtxGenServerConfig(type="gen", hostname="g", port=1)]
+    config.ctx_router_config = RouterConfig(type="round_robin", server_role=ServerRole.CONTEXT)
+    config.gen_router_config = RouterConfig(
+        type="load_balancing",
+        server_role=ServerRole.GENERATION,
+        args={"max_requests_per_server": 1},
+    )
+    coordinator = DisaggCoordinatorService(config, client_factory=_client_factory)
+    predictor = coordinator._output_length_predictor
+
+    def key_of(rid):
+        return {olp.OUTPUT_LENGTH_KEY: {"conv": "c", "isl": 1000.0}}
+
+    _, info, _ = await coordinator.select("generation", key_of(1), 1, None)
+    _, again, _ = await coordinator.select("generation", key_of(1), 1, None)
+    assert again[olp.OUTPUT_LENGTH_KEY]["key"] == info[olp.OUTPUT_LENGTH_KEY]["key"]
+    assert len(predictor._pending) == 1
+    parked = asyncio.create_task(coordinator.select("generation", key_of(2), 2, None))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert len(predictor._pending) == 2
+    await coordinator.stop()  # fails the parked select: no seat, so no reply will come
+    with pytest.raises(NoGenerationSeatError):
+        await parked
+    assert len(predictor._pending) == 1 and predictor.dropped == 1
+    await coordinator.finish("generation", 1)
+    assert coordinator._prediction_keys == {}
+
+
+@pytest.mark.asyncio
+async def test_failed_generation_drops_the_prediction_row(monkeypatch):
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    config = _config()
+    coordinator = DisaggCoordinatorService(config, client_factory=_client_factory)
+    coordinator._ctx_router = AsyncMock(spec=Router)
+    coordinator._gen_router = AsyncMock(spec=Router)
+    coordinator._ctx_router.get_next_server.return_value = ("ctx:1", {})
+    coordinator._gen_router.get_next_server.return_value = ("gen:1", {})
+    service = OpenAIDisaggregatedService(config, coordinator, client_factory=_client_factory)
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_client.send_request.return_value = _ctx_response(5000)
+    service._gen_client.send_request.side_effect = ConnectionResetError("generation server died")
+    request = CompletionRequest(
+        model="m", prompt="hi", conversation_params=ConversationParams(conversation_id="c")
+    )
+    with pytest.raises(ConnectionResetError):
+        await service._send_disagg_request_ctx_first(request)
+    await asyncio.sleep(0.01)  # the record task
+    predictor = coordinator._output_length_predictor
+    assert len(predictor._pending) == 0 and predictor.dropped == 1 and predictor.learned == 0

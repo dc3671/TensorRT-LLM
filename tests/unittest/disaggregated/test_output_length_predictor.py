@@ -763,7 +763,9 @@ async def test_interrupted_stream_is_not_learned():
         async for _ in frontend.track(stream(), ticket):
             pass
     await asyncio.sleep(0.01)
-    assert coordinator.recorded == [] and frontend.no_usage == 1
+    # Not learned: the coordinator only drops its row (out None).
+    assert coordinator.recorded == [("c1", 2000.0, None, 7)] and frontend.no_usage == 1
+    assert frontend.recorded == 0
 
 
 @pytest.mark.asyncio
@@ -826,3 +828,35 @@ def test_generated_subagent_ids_stay_out_of_the_conversation_table():
     # The context request's copy keeps the mark; a client-sent id with that prefix is a conversation.
     assert ConversationParams.for_one_request("x").model_copy().generated_for_one_request
     assert olp.request_inputs(_gen_request("subagent:mine", 1000))[0] == "subagent:mine"
+
+
+def test_pending_rows_leave_on_failure_reuse_and_age():
+    """A row leaves when its request fails, a repeated prediction keeps one row, old rows expire."""
+    predictor = olp.OnlineLengthPredictor("ridge")
+    _, key = predictor.predict("c", 1000, 0.0)
+    # The same request predicted again (a repeated /select) keeps its key and its one row.
+    assert predictor.predict("c", 1000, 1.0, key)[1] == key and len(predictor._pending) == 1
+    # A failed request is reported with out None: its row goes, nothing is learned.
+    assert not predictor.record("c", 1000, None, key, 2.0)
+    assert len(predictor._pending) == 0 and predictor.dropped == 1
+    assert predictor.reported == 0 and predictor.learned == 0
+    # An unknown (already dropped) key gets a new one.
+    _, new_key = predictor.predict("c", 1000, 3.0, key)
+    assert new_key != key
+    # A row older than PENDING_MAX_AGE_S leaves although the count cap is far away.
+    _, recent = predictor.predict("d", 1000, olp.PENDING_MAX_AGE_S)
+    predictor.predict("e", 1000, olp.PENDING_MAX_AGE_S + 3.5)
+    assert new_key not in predictor._pending and recent in predictor._pending
+
+
+@pytest.mark.asyncio
+async def test_abandoned_request_drops_its_row():
+    coordinator = _FakeCoordinator()
+    frontend = olp.OutputLengthPriority(coordinator, "ridge")
+    ticket = olp._Ticket("c1", 2000.0, 7)
+    frontend.abandon(ticket)
+    frontend.abandon(ticket)  # once only
+    frontend.abandon(olp._Ticket("c2", 10.0, None))  # nothing to drop without a key
+    frontend.abandon(None)
+    await asyncio.sleep(0.01)
+    assert coordinator.recorded == [("c1", 2000.0, None, 7)] and frontend.recorded == 0
