@@ -370,7 +370,8 @@ Each rank takes one or both of two roles:
 
 - **Donor** (`donate_size > 0`): at startup, before the KV cache estimation, the
   rank allocates and registers `donate_size` bytes of host memory in whole 1 GiB
-  chunks and publishes it in the rendezvous directory. The memory stays donated
+  chunks (a remainder below one chunk is not donated; the rank logs the size it
+  donates) and publishes it in the rendezvous directory. The memory stays donated
   for the lifetime of the process. The donor does no work after publishing; the
   claiming ranks move pages themselves.
 - **Claimant** (`cache_size > 0`): the rank gets a remote cache level of

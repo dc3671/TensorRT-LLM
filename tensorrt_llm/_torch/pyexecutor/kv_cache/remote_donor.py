@@ -1219,8 +1219,13 @@ def start_donation(remote_config: "RemoteCacheConfig", device: int) -> RemoteMem
     donor = _donor_for(remote_config, device)
     directory = donor.directory
     donor.start_in_background()
+    if donor.nbytes != remote_config.donate_size:
+        logger.warning(
+            f"remote_cache_config.donate_size {remote_config.donate_size} is not a whole number of "
+            f"{donor.chunk_bytes}-byte chunks; {donor.nbytes} bytes are donated"
+        )
     logger.info(
-        f"KV cache manager v2 donates {remote_config.donate_size / _GIB:.2f}GiB of host memory "
+        f"KV cache manager v2 donates {donor.nbytes / _GIB:.2f}GiB of host memory "
         f"to remote cache levels via {directory} ({remote_config.transport})"
     )
     return donor
