@@ -477,38 +477,46 @@ def child_sys_path() -> List[str]:
     ]
 
 
-# Startup check of the fit process: a tiny fit read through the same fitted-model attributes as
-# _GBM_FIT_SCRIPT (scikit-learn has no public tree export), so a scikit-learn that lacks them
-# fails here rather than at every refit.
-_GBM_CHECK_SCRIPT = r"""
-import json, sys
-sys.path[:0] = json.loads(sys.argv[1])
-import numpy as np
-from sklearn.ensemble import HistGradientBoostingRegressor
-X = np.arange(64.0).reshape(32, 2)
-model = HistGradientBoostingRegressor(max_iter=2, min_samples_leaf=4).fit(X, X[:, 0])
-nodes = model._predictors[0][0].nodes
-for field in ("is_leaf", "value", "feature_idx", "num_threshold", "missing_go_to_left", "left",
-              "right", "is_categorical"):
-    nodes[field]
-float(np.asarray(model._baseline_prediction).ravel()[0])
-"""
+# Rows of the startup check, enough for trees with splits under GBM_PARAMS' min_samples_leaf.
+GBM_CHECK_ROWS = 1000
+GBM_CHECK_TIMEOUT_S = 120.0
+
+
+def _gbm_check_rows(n: int) -> array:
+    """``n`` deterministic synthetic training rows: the features (some missing), then the target."""
+    rows = array("d")
+    for i in range(n):
+        rows.extend(
+            NAN if (i + j) % 7 == 0 else float((i * (j + 3)) % 97) for j in range(len(FEATURES))
+        )
+        rows.append(math.log1p(float((i * 37) % 2000)))
+    return rows
+
+
+def _gbm_fit_problem(result: dict) -> Optional[str]:
+    """Why a tree fit's result cannot go live (a failed fit, or a tree walk unlike predict), or None."""
+    if "error" in result:
+        return str(result["error"])
+    diff = result.get("export_max_abs_diff")
+    if diff is None or not diff <= GBM_EXPORT_TOL:
+        return f"export check {diff}"
+    return None
 
 
 def check_gbm_dependencies(python: Optional[str] = None) -> None:
-    """Raise ImportError unless the fit process can fit and export trees with scikit-learn."""
-    python = python or sys.executable
-    result = subprocess.run(
-        [python, "-I", "-c", _GBM_CHECK_SCRIPT, json.dumps(child_sys_path())],
-        capture_output=True,
-        timeout=120,
-        check=False,
-    )
-    if result.returncode != 0:
+    """Raise ImportError unless the fit process can fit and export trees with scikit-learn.
+
+    Runs the refit itself (:class:`SubprocessGbmFitter`) once on synthetic rows and applies the
+    checks that put a refit live, so what passes here also passes at every refit.
+    """
+    fitter = SubprocessGbmFitter(timeout_s=GBM_CHECK_TIMEOUT_S, python=python, sync=True)
+    fitter.start(_gbm_check_rows(GBM_CHECK_ROWS), GBM_CHECK_ROWS, {})
+    problem = _gbm_fit_problem(fitter.poll() or {"error": "no result"})
+    if problem is not None:
         raise ImportError(
             "output_length_prediction.predictor='ridge_gbm' fits its trees with numpy and "
             "scikit-learn and reads them from HistGradientBoostingRegressor's fitted predictors, "
-            f"which {python} cannot do ({result.stderr.decode(errors='replace').strip()[-300:]}); "
+            f"which {fitter.python} cannot do ({problem.strip()[-300:]}); "
             "install a scikit-learn that provides them or use predictor='ridge'"
         )
 
@@ -681,14 +689,15 @@ class OnlineLengthPredictor:
         self.gbm_n += 1
 
     def _install_gbm(self, result: dict) -> None:
-        diff = result.get("export_max_abs_diff")
-        if "error" in result or diff is None or not diff <= GBM_EXPORT_TOL:
+        problem = _gbm_fit_problem(result)
+        if problem is not None:
             self.gbm_errors += 1
             logger.warning(
                 f"[output_length] tree fit on {result.get('rows')} replies failed, the current model "
-                f"stays: {result.get('error') or f'export check {diff}'}"
+                f"stays: {problem}"
             )
             return
+        diff = result["export_max_abs_diff"]
         self.gbm = TreeEnsemble(result["baseline"], result["trees"])
         self.gbm_fits += 1
         logger.info(

@@ -385,6 +385,32 @@ def test_sklearn_without_the_fitted_trees_fails_at_start(tmp_path, monkeypatch):
         olp.check_gbm_dependencies()
 
 
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"error": "exit 1: SystemExit: unsupported tree"},
+        {"baseline": 0.0, "trees": [], "export_max_abs_diff": 1.0},
+        {"baseline": 0.0, "trees": []},
+    ],
+    ids=["unsupported_tree", "walk_differs", "no_export_check"],
+)
+def test_startup_check_applies_the_refit_install_rules(monkeypatch, result):
+    """The startup check runs the refit and its install checks, so a refit cannot fail where it passed."""
+    started = []
+
+    def run(self, header, rows):
+        started.append((header["n"], len(rows)))
+        return dict(result)
+
+    monkeypatch.setattr(olp.SubprocessGbmFitter, "_run", run)
+    with pytest.raises(ImportError, match="scikit-learn"):
+        olp.check_gbm_dependencies()
+    assert started == [(olp.GBM_CHECK_ROWS, olp.GBM_CHECK_ROWS * (len(olp.FEATURES) + 1))]
+    predictor = olp.OnlineLengthPredictor("ridge")
+    predictor._install_gbm(dict(result, rows=1))
+    assert predictor.gbm is None and predictor.gbm_errors == 1
+
+
 # ---------------------------------------------------------------------------------- frontend
 
 
@@ -656,9 +682,12 @@ def test_fit_children_get_the_server_import_path(tmp_path, monkeypatch):
         f"json.dump(sys.argv[1:], open({str(argv_file)!r}, 'w'))\n"
     )
     fake_python.chmod(0o755)
-    olp.check_gbm_dependencies(str(fake_python))
+    with pytest.raises(ImportError, match="unreadable fit output"):
+        olp.check_gbm_dependencies(str(fake_python))  # it runs the fit script, which wrote nothing
     argv = json.loads(argv_file.read_text())
-    assert argv[0] == "-I" and str(extra) in json.loads(argv[-1])
+    header = json.loads(argv[-1])
+    assert argv[0] == "-I" and header["n"] == olp.GBM_CHECK_ROWS
+    assert str(extra) in header["sys_path"]
     fitter = olp.SubprocessGbmFitter(python=str(fake_python), sync=True)
     fitter.start(olp.array("d", [0.0] * len(olp.FEATURES) + [1.0]), 1, {"rows": 1})
     argv = json.loads(argv_file.read_text())
