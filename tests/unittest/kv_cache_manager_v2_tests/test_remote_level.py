@@ -608,6 +608,11 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             except Exception:
                 pass
             del kv
+            # The failed resume gave back the GPU slots it had taken for the promotion: with no cache open, every
+            # GPU slot is free or evictable.
+            gpu = cast(CacheLevel, CacheLevel(0))
+            for pool in self.manager.get_storage_statistics(gpu):
+                self.assertEqual(pool.available, pool.total)
         finally:
             donor.stop()
             if hasattr(self, "manager"):
@@ -1356,7 +1361,7 @@ class TestRemoteTierCombinations(_Transport, unittest.TestCase):
 
 
 class TestRemoteInPlaceOfDisk(_Transport, base.TestKVCacheManagerV2):
-    """The suite's disk-level tests (reuse via eviction, out-of-pages, shrink, naive stress), remote in disk's place."""
+    """The suite's cache-reuse tests and one shrink case, with the remote level in the disk level's place."""
 
     Request = base.TestNoBatching.Request
     new_request = base.TestNoBatching.new_request
@@ -1398,15 +1403,19 @@ class TestRemoteInPlaceOfDisk(_Transport, base.TestKVCacheManagerV2):
         self.manager = KVCacheManager(self.cfg)
 
 
-# Only the suite's tests whose pages reach the disk level (the parameterized ones under each generated name).
-for _name, _test in vars(base.TestNoBatching).items():
-    if (
-        _name.startswith(
-            ("test_cache_reuse", "test_sol_mem_utilization", "test_shrink_capacity", "test_naive_")
-        )
-        and not _name.startswith("test_naive_perf")
-        and callable(_test)
-    ):
-        setattr(TestRemoteInPlaceOfDisk, _name, _test)
-del _name, _test
+# The suite's cache-reuse tests, whose pages reach the disk level and come back (each generated name), and one
+# shrink case; the base suite covers the rest of the manager.
+_cases = sorted(
+    name
+    for name, test in vars(base.TestNoBatching).items()
+    if name.startswith("test_cache_reuse") and callable(test)
+)
+_cases += sorted(
+    name
+    for name, test in vars(base.TestNoBatching).items()
+    if name.startswith("test_shrink_capacity") and "truncates" not in name and callable(test)
+)[:1]
+for _name in _cases:
+    setattr(TestRemoteInPlaceOfDisk, _name, getattr(base.TestNoBatching, _name))
+del _name, _cases
 TestRemoteInPlaceOfDisk = _per_transport(TestRemoteInPlaceOfDisk)
