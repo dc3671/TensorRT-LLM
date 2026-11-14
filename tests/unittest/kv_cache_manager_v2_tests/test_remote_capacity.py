@@ -38,7 +38,7 @@ from unittest import mock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
+from tensorrt_llm._torch.pyexecutor.kv_cache import host_memory, remote_donor
 from tensorrt_llm._torch.pyexecutor.kv_cache.remote_donor import (
     FabricDonorTransport,
     check_remote_capacity,
@@ -117,11 +117,16 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertEqual(failed, [])
         # The capacity check warns once per malformed file and names them, instead of blaming a missing donor.
         with mock.patch.object(remote_donor.logger, "warning") as warning:
-            with self.assertRaisesRegex(RuntimeError, "malformed.*donor.bare.meta, donor.lost.failed"):
+            with self.assertRaisesRegex(
+                RuntimeError, "malformed.*donor.bare.meta, donor.lost.failed"
+            ):
                 check_remote_capacity(
                     self.dir, 3, 20 * _GIB, timeout_s=0.3, poll_s=0.05, log=lambda _: None
                 )
-        self.assertEqual(sorted(c.args[0].split()[4] for c in warning.call_args_list), ["donor.bare.meta", "donor.lost.failed"])
+        self.assertEqual(
+            sorted(c.args[0].split()[4] for c in warning.call_args_list),
+            ["donor.bare.meta", "donor.lost.failed"],
+        )
 
     def test_every_donor_names_its_transport(self):
         for kind in remote_donor.TRANSPORTS:
@@ -150,7 +155,7 @@ class TestCapacityCheck(unittest.TestCase):
                 log=lambda _: None,
             )
         self.assertIn("1 of 2 planned donors published 40 GiB", str(ctx.exception))
-        self.assertIn("donate_size", str(ctx.exception))
+        self.assertIn("donor.size", str(ctx.exception))
 
     def test_passes_when_offer_covers_need(self):
         for i in range(8):
@@ -360,8 +365,11 @@ class TestCapacityCheck(unittest.TestCase):
         self.assertEqual([f["name"] for f in failed], ["orphan"])
 
     def test_a_start_still_running_when_the_finalizer_withdraws_publishes_nothing(self):
-        """At exit the finalizer runs while a daemon start thread may still be past its registration: once it withdrew
-        the donor and left the failure marker, the start must not publish .ready for memory it released."""
+        """A start still running when the finalizer withdrew the donor publishes nothing.
+
+        At exit the finalizer runs while a daemon start thread may still be past its registration: once it withdrew
+        the donor and left the failure marker, the start must not publish .ready for memory it released.
+        """
         registered, finalized = threading.Event(), threading.Event()
 
         class _Racing(remote_donor.DonorTransport):
@@ -406,7 +414,7 @@ class TestCapacityCheck(unittest.TestCase):
 @pytest.mark.cpu_only
 class TestBindingDefaults(unittest.TestCase):
     def test_the_binding_timeouts_default_to_remote_cache_config(self):
-        """The C++ defaults (config.h) and RemoteCacheConfig's are kept apart; a launcher that omits a field gets one."""
+        """The C++ defaults (config.h) match RemoteCacheConfig's; a launcher that omits a field gets one."""
         from tensorrt_llm.llmapi.llm_args import RemoteCacheConfig
         from tensorrt_llm.runtime.kv_cache_manager_v2 import (
             RemoteCacheTierConfig,
@@ -414,12 +422,12 @@ class TestBindingDefaults(unittest.TestCase):
             RemoteTransport,
         )
 
-        defaults = {name: field.default for name, field in RemoteCacheConfig.model_fields.items()}
+        defaults = RemoteCacheConfig(directory="d", level={"size": 1})
         transfer = RemoteTransferConfig()
-        self.assertEqual(transfer.timeout_ms, defaults["transfer_timeout_s"] * 1000)
-        self.assertEqual(transfer.transport, RemoteTransport[defaults["transport"].upper()])
+        self.assertEqual(transfer.timeout_ms, defaults.transport.transfer_timeout_s * 1000)
+        self.assertEqual(transfer.transport, RemoteTransport[defaults.transport.kind.upper()])
         tier = RemoteCacheTierConfig(quota=0, path="")
-        self.assertEqual(tier.wait_timeout_ms, defaults["donor_wait_timeout_s"] * 1000)
+        self.assertEqual(tier.wait_timeout_ms, defaults.level.donor_wait_timeout_s * 1000)
 
 
 def _capture_mode():
@@ -567,7 +575,7 @@ class TestRendezvousPermissions(unittest.TestCase):
         victim = os.path.join(self.dir, "victim")
         open(victim, "w").close()
         os.symlink(victim, os.path.join(self.dir, "compact.h.node0.lock"))
-        with remote_donor._node_compaction_lock(self.dir, "h", 0) as held:
+        with host_memory.node_compaction_lock(self.dir, "h", 0) as held:
             self.assertFalse(held)
 
     def test_a_planted_tmp_link_is_not_written_through(self):
@@ -595,7 +603,7 @@ class TestPopulate(unittest.TestCase):
         region = mmap.mmap(-1, 1 << 20, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
         try:
             with mock.patch.object(remote_donor, "madvise_range", side_effect=error):
-                remote_donor._populate(region, 0, 1 << 20)
+                host_memory.populate(region, 0, 1 << 20)
         finally:
             region.close()
 
@@ -654,7 +662,7 @@ class TestPlaceChunks(unittest.TestCase):
             node_lock=self._node_lock,
         )
         args.update(overrides)
-        return remote_donor._place_chunks(n_chunks, [0, 1], create, **args)
+        return host_memory.place_chunks(n_chunks, [0, 1], create, **args)
 
     def _allocator(self, refuse):
         """create(node) refuses when refuse(node, call number) says so; an accepted chunk takes 1 GiB of the node."""
@@ -671,6 +679,14 @@ class TestPlaceChunks(unittest.TestCase):
 
     def _passes_on(self, node):
         return [gib for n, gib in self.passes if n == node]
+
+    def test_without_compaction_passes_a_refused_chunk_moves_on_after_its_retries(self):
+        """compact_host_memory off (the default): no pass and no node lock; what fits is placed."""
+        create, _ = self._allocator(lambda node, call: node == 0)
+        handles, placement = self._place(4, create, compact_passes=False)
+        self.assertEqual(self.passes, [])
+        self.assertEqual(placement, {0: 0, 1: 4})
+        self.assertEqual(len(handles), 4)
 
     def test_all_accepted(self):
         create, calls = self._allocator(lambda node, i: False)
@@ -718,7 +734,7 @@ class TestPlaceChunks(unittest.TestCase):
         handles, placement = self._place(10, create)
         self.assertEqual(len(handles), 3)
         self.assertEqual(placement, {0: 3, 1: 0})
-        self.assertEqual(len(self._passes_on(0)), remote_donor._MAX_PASSES_PER_REFUSAL)
+        self.assertEqual(len(self._passes_on(0)), host_memory._MAX_PASSES_PER_REFUSAL)
 
     def test_a_failing_pass_stops_passes_on_the_node(self):
         attempts = []
@@ -776,7 +792,7 @@ class TestPlaceChunks(unittest.TestCase):
         create, _ = self._allocator(lambda node, i: node == 0 and contiguous(0) < 1.0)
         handles, placement = self._place(8, create, contiguous=contiguous)
         self.assertEqual(placement, {0: 4, 1: 4})
-        self.assertEqual(len(self._passes_on(0)), remote_donor._MAX_PASSES_PER_REFUSAL)
+        self.assertEqual(len(self._passes_on(0)), host_memory._MAX_PASSES_PER_REFUSAL)
 
     def test_the_sweep_runs_once(self):
         # Nodes that look recovered but refuse every chunk: the donation ends short after one sweep, without looping.
@@ -829,12 +845,12 @@ class TestNodeCompactionLock(unittest.TestCase):
 
         def second():
             holding.wait(10)
-            with remote_donor._node_compaction_lock(self.dir, "hostA", 0) as locked:
+            with host_memory.node_compaction_lock(self.dir, "hostA", 0) as locked:
                 order.append(("second", locked))
 
         thread = threading.Thread(target=second)
         thread.start()
-        with remote_donor._node_compaction_lock(self.dir, "hostA", 0) as locked:
+        with host_memory.node_compaction_lock(self.dir, "hostA", 0) as locked:
             holding.set()
             thread.join(0.3)
             self.assertTrue(thread.is_alive(), "the second donor passed a held lock")
@@ -843,15 +859,15 @@ class TestNodeCompactionLock(unittest.TestCase):
         self.assertEqual(order, [("first", True), ("second", True)])
 
     def test_other_nodes_and_hosts_do_not_wait(self):
-        with remote_donor._node_compaction_lock(self.dir, "hostA", 0) as locked:
+        with host_memory.node_compaction_lock(self.dir, "hostA", 0) as locked:
             self.assertTrue(locked)
             for host, node in (("hostA", 1), ("hostB", 0)):
-                with remote_donor._node_compaction_lock(self.dir, host, node) as other:
+                with host_memory.node_compaction_lock(self.dir, host, node) as other:
                     self.assertTrue(other)
 
     def test_unusable_directory_refuses_the_lock(self):
         missing = os.path.join(self.dir, "missing")
-        with remote_donor._node_compaction_lock(missing, "hostA", 0) as locked:
+        with host_memory.node_compaction_lock(missing, "hostA", 0) as locked:
             self.assertFalse(locked)
 
 
@@ -863,7 +879,7 @@ class TestBuddyInfo(unittest.TestCase):
     )
 
     def test_free_memory_in_blocks_of_2_mib_or_more(self):
-        f = remote_donor._contiguous_free_gib
+        f = host_memory.contiguous_free_gib
         # 4 KiB pages: order 9 is 2 MiB, order 10 is 4 MiB: 4 x 2 + 2 x 4 = 16 MiB on node 0, none on node 1.
         self.assertAlmostEqual(f(0, text=self.TEXT, page=4096), 16 / 1024)
         self.assertEqual(f(1, text=self.TEXT, page=4096), 0.0)
@@ -874,7 +890,7 @@ class TestBuddyInfo(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    len(remote_donor._host_numa_nodes()) >= 2 and fabric_available(),
+    len(host_memory.host_numa_nodes()) >= 2 and fabric_available(),
     "needs the fabric transport (a Grace GPU with an IMEX channel) and two NUMA nodes with memory",
 )
 class TestFabricPlacement(unittest.TestCase):
@@ -888,7 +904,7 @@ class TestFabricPlacement(unittest.TestCase):
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="kvcm2_fabric_placement_")
-        self.real = remote_donor._node_meminfo
+        self.real = host_memory.node_meminfo
 
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -909,7 +925,7 @@ class TestFabricPlacement(unittest.TestCase):
             device=0,
         )
         fake = lambda n: self._full(n) if n == 0 else self.real(n)  # noqa: E731
-        with mock.patch.object(remote_donor, "_node_meminfo", fake):
+        with mock.patch.object(host_memory, "node_meminfo", fake):
             donor.start()
         try:
             fields = self._meta(donor)
@@ -935,7 +951,7 @@ class TestFabricPlacement(unittest.TestCase):
         def fake(n):
             return self._full(n) if n == 0 or len(donor.transport._fabric) >= 2 else self.real(n)
 
-        with mock.patch.object(remote_donor, "_node_meminfo", fake):
+        with mock.patch.object(host_memory, "node_meminfo", fake):
             donor.start()
         try:
             fields = self._meta(donor)
@@ -966,7 +982,7 @@ class TestFabricPlacement(unittest.TestCase):
         )
         with (
             mock.patch.object(FabricDonorTransport, "_try_create", flaky),
-            mock.patch.object(remote_donor, "_FABRIC_RETRY_S", 0.5),
+            mock.patch.object(host_memory, "_REFUSAL_RETRY_S", 0.5),
         ):
             donor.start()
         try:
@@ -980,7 +996,7 @@ class TestFabricPlacement(unittest.TestCase):
         # Refuse until one real reclaim-and-compact pass (64 chunks of 16 MiB, libnuma-bound, huge pages) has run on
         # node 0.
         real_create = FabricDonorTransport._try_create
-        real_compact = remote_donor._compact_node
+        real_compact = host_memory.compact_node
         passes = []
 
         def counted(node, gib):
@@ -997,11 +1013,12 @@ class TestFabricPlacement(unittest.TestCase):
             chunk_bytes=self.CHUNK,
             numa_node=0,
             device=0,
+            compact_host_memory=True,
         )
         with (
             mock.patch.object(FabricDonorTransport, "_try_create", refusing),
-            mock.patch.object(remote_donor, "_compact_node", counted),
-            mock.patch.object(remote_donor, "_FABRIC_RETRY_S", 0.2),
+            mock.patch.object(host_memory, "compact_node", counted),
+            mock.patch.object(host_memory, "_REFUSAL_RETRY_S", 0.2),
         ):
             donor.start()
         try:
@@ -1013,7 +1030,7 @@ class TestFabricPlacement(unittest.TestCase):
 
     def test_no_room_anywhere_leaves_a_failure_marker(self):
         donor = make_donor(self.dir, 4 * self.CHUNK, "fabric", chunk_bytes=self.CHUNK)
-        with mock.patch.object(remote_donor, "_node_meminfo", self._full):
+        with mock.patch.object(host_memory, "node_meminfo", self._full):
             donor.start_or_report()
         self.assertFalse(os.path.exists(os.path.join(self.dir, f"donor.{donor.name}.ready")))
         published, failed = scan_donors(self.dir)

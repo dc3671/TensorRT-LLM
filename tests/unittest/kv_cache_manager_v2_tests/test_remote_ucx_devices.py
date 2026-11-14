@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""remote_cache_config.ucx_devices: the {GPU} token and the NIXL backend parameter. No GPU needed."""
+"""remote_cache_config.transport.ucx_devices: the {GPU} token and the NIXL backend parameter. No GPU needed."""
 
 import os
 import shutil
@@ -156,7 +156,9 @@ class TestNixlUcxBackendParams(unittest.TestCase):
             tiers = []
             manager._add_remote_level(
                 RemoteCacheConfig(
-                    directory=directory, cache_size=1 << 30, ucx_devices="mlx5_0:1,mlx5_3:1"
+                    directory=directory,
+                    level={"size": 1 << 30},
+                    transport={"kind": "nixl", "ucx_devices": "mlx5_0:1,mlx5_3:1"},
                 ),
                 tiers,
             )

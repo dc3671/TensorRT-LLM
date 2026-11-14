@@ -19,7 +19,7 @@ A donor publishes host memory in a rendezvous directory on a shared file system;
 whole chunks of it with O_EXCL claim files and moves cold pages itself, so the donor does no work after publishing.
 
 ``RemoteMemDonor`` declares the donation (size, chunks, the files, the failure marker, start and close) and does not
-pick how it is reached: its ``DonorTransport``, chosen apart (``make_donor``, ``RemoteCacheConfig.transport``),
+pick how it is reached: its ``DonorTransport``, chosen apart (``make_donor``, ``RemoteCacheConfig.transport.kind``),
 allocates and registers the memory:
 
 * ``AgentDonorTransport``: anonymous memory registered with the donor's own transfer agent through the
@@ -27,11 +27,11 @@ allocates and registers the memory:
 * ``FabricDonorTransport``: Grace DRAM allocated with cuMemCreate (``CU_MEM_LOCATION_TYPE_HOST_NUMA``), one
   allocation per chunk because an imported fabric allocation maps only whole; ``donor.<name>.fabric`` holds one
   64-byte handle per chunk. Chunks fill the GPU's host NUMA node first, then the other nodes; a donation that only
-  partly fits is published with ``short_bytes``. Donors on one host take turns at reclaim-and-compact passes per NUMA
-  node by flock on ``compact.<host>.node<N>.lock``.
+  partly fits is published with ``short_bytes``. Placement, and the optional reclaim-and-compact passes, are
+  ``host_memory``'s.
 
 A donor that cannot start, or whose owner fails, leaves ``donor.<name>.failed``, which clients ignore and capacity
-checks count. In a serving process ``start_donation`` starts the donation (``remote_cache_config.donate_size``)
+checks count. In a serving process ``start_donation`` starts the donation (``remote_cache_config.donor``)
 before the KV cache estimation, or, where no estimation runs (``TRTLLM_SKIP_KV_CACHE_ESTIMATION``, helix CP on KV
 cache manager v2, encoder-decoder models), when the target ``KVCacheManagerV2`` is built; that manager owns it.
 
@@ -41,8 +41,6 @@ Trust model: the directory is private to the job's user (``ensure_rendezvous_dir
 
 import contextlib
 import ctypes
-import errno
-import fcntl
 import mmap
 import os
 import re
@@ -56,12 +54,21 @@ from collections.abc import Callable, Iterator
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Optional
 
-from tensorrt_llm._torch.mmap_utils import madvise_range
 from tensorrt_llm.llmapi.llm_args import REMOTE_CACHE_CHUNK_BYTES, REMOTE_CACHE_DONOR_RESERVE_BYTES
 from tensorrt_llm.logger import logger
 
+from .host_memory import (
+    MADV_HUGEPAGE,
+    bind_to_numa_node,
+    host_numa_node_of,
+    host_numa_nodes,
+    node_compaction_lock,
+    place_chunks,
+    populate,
+)
+
 if TYPE_CHECKING:
-    from cuda.bindings.driver import CUdevice, CUmemAllocationProp, CUmemGenericAllocationHandle
+    from cuda.bindings.driver import CUmemAllocationProp, CUmemGenericAllocationHandle
 
     from tensorrt_llm.llmapi.llm_args import RemoteCacheConfig
     from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
@@ -239,44 +246,6 @@ def _withdraw_unowned(
 
 # Linux values (asm-generic, so x86_64 and aarch64 alike); Python's mmap module lacks some of them before 3.13.
 _MAP_NORESERVE = 0x4000
-_MADV_HUGEPAGE = 14
-_POPULATE_SLICE = 64 << 20
-
-
-def _populate(region: mmap.mmap, address: int, nbytes: int) -> None:
-    """Make every page of `region` (at `address`) resident: huge pages where the kernel has them (MADV_HUGEPAGE is set
-    first), 4 KiB pages elsewhere. MADV_POPULATE_WRITE does it in the kernel without holding the GIL; a kernel without
-    it gets the region zeroed slice by slice. Any other madvise error (ENOMEM, EHWPOISON) raises."""
-    try:
-        madvise_range(address, nbytes, "populate_write")
-        return
-    except OSError as error:
-        if error.errno not in (errno.EINVAL, errno.ENOSYS):
-            raise
-    zeros = bytes(_POPULATE_SLICE)
-    view = memoryview(region)
-    try:
-        for offset in range(0, nbytes, _POPULATE_SLICE):
-            end = min(offset + _POPULATE_SLICE, nbytes)
-            view[offset:end] = zeros[: end - offset]
-    finally:
-        view.release()
-
-
-def _bind_to_numa_node(address: int, nbytes: int, node: int) -> bool:
-    """Bind [address, address + nbytes) to NUMA node `node` with libnuma, before it is touched."""
-    try:
-        libnuma = ctypes.CDLL("libnuma.so.1")
-    except OSError:
-        return False
-    if libnuma.numa_available() < 0:
-        return False
-    libnuma.numa_tonode_memory.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-    libnuma.numa_tonode_memory.restype = None
-    libnuma.numa_tonode_memory(
-        ctypes.c_void_p(address), ctypes.c_size_t(nbytes), ctypes.c_int(node)
-    )
-    return True
 
 
 def _cuda_check(result: object) -> Any:
@@ -293,242 +262,6 @@ def _cuda_check(result: object) -> Any:
 
 
 _GIB = 1 << 30
-# Seconds a refused fabric chunk is retried with backoff before a pass: the driver refuses transiently while reclaiming.
-_FABRIC_RETRY_S = 2.0
-# A reclaim-and-compact pass (_compact_node) covers the donation still missing, at least this share of the node reserve
-# and at most _MAX_PASS_CHUNKS chunks, and leaves this share of the reserve free above the reserve and the chunk.
-_PASS_RESERVE_SHARE = 1 / 3
-_MAX_PASS_CHUNKS = 64
-# Pass bounds: per node, and per refused chunk; past the first bound only while each pass adds a chunk's worth of
-# >= 2 MiB blocks.
-_MAX_PASSES_PER_NODE = 64
-_MAX_PASSES_PER_REFUSAL = 3
-_MAX_PASSES_PER_REFUSAL_PROGRESSING = 16
-
-
-def _node_meminfo(node: int) -> dict:
-    """GiB per field of /sys/devices/system/node/node<node>/meminfo; empty if unreadable."""
-    out = {}
-    try:
-        with open(f"/sys/devices/system/node/node{node}/meminfo") as f:
-            for line in f:
-                parts = line.split()  # "Node 0 MemFree:  123 kB"
-                if len(parts) >= 4 and parts[3].isdigit():
-                    out[parts[2].rstrip(":")] = int(parts[3]) * 1024 / _GIB
-    except OSError:
-        return {}
-    return out
-
-
-def _numa_nodes() -> list:
-    try:
-        names = os.listdir("/sys/devices/system/node")
-    except OSError:
-        return []
-    return sorted(int(n[4:]) for n in names if n.startswith("node") and n[4:].isdigit())
-
-
-def _reclaimable_gib(info: dict) -> float:
-    """Clean file pages the kernel can drop, which cuMemCreate's host allocations reclaim (shmem sits on the
-    anonymous LRU, outside these counts)."""
-    return max(
-        0.0,
-        info.get("Active(file)", 0.0) + info.get("Inactive(file)", 0.0) - info.get("Dirty", 0.0),
-    )
-
-
-def _host_numa_nodes() -> list:
-    """The NUMA nodes that have memory (GPU memory partitions show up as nodes with MemTotal 0)."""
-    return [n for n in _numa_nodes() if _node_meminfo(n).get("MemTotal", 0.0) > 0]
-
-
-def _contiguous_free_gib(
-    node: int, min_bytes: int = 2 << 20, text: Optional[str] = None, page: Optional[int] = None
-) -> float:
-    """GiB of free memory on NUMA node `node` held in blocks of at least `min_bytes` (/proc/buddyinfo: free blocks of
-    each order, per zone); -1 when unreadable. A refusal while this is near zero points at fragmentation."""
-    try:
-        if text is None:
-            with open("/proc/buddyinfo") as f:
-                text = f.read()
-        page = page or os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError):
-        return -1.0
-    total = 0
-    for line in text.splitlines():
-        parts = line.replace(",", " ").split()  # "Node 0, zone   Normal   n0 n1 ..."
-        if len(parts) < 5 or parts[0] != "Node" or not parts[1].isdigit() or int(parts[1]) != node:
-            continue
-        for order, count in enumerate(parts[4:]):
-            if count.isdigit() and (page << order) >= min_bytes:
-                total += int(count) * (page << order)
-    return total / _GIB
-
-
-def _host_numa_node_of(drv: ModuleType, device: "CUdevice") -> int:
-    """The host NUMA node closest to CUDA device `device`; the first node with memory if the driver reports none."""
-    err, node = drv.cuDeviceGetAttribute(
-        drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, device
-    )
-    if err == drv.CUresult.CUDA_SUCCESS and node >= 0:
-        return node
-    nodes = _host_numa_nodes()
-    return nodes[0] if nodes else 0
-
-
-def _compact_node(node: int, gib: float) -> None:
-    """Reclaim and compact memory on NUMA node `node`: fault in `gib` GiB of node-bound anonymous memory with huge
-    pages (direct reclaim and compaction), then unmap it, leaving about that much free in 2 MiB blocks. Raises when
-    libnuma cannot bind the region, since unbound it would land anywhere."""
-    nbytes = int(gib * _GIB) // (2 << 20) * (2 << 20)
-    region = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-    try:
-        anchor = ctypes.c_char.from_buffer(region)
-        address = ctypes.addressof(anchor)
-        del anchor  # the buffer export must end before close()
-        if not _bind_to_numa_node(address, nbytes, node):
-            raise RuntimeError("libnuma is unavailable, so the region cannot be bound to the node")
-        try:
-            region.madvise(_MADV_HUGEPAGE)
-        except OSError:
-            pass
-        _populate(region, address, nbytes)
-    finally:
-        region.close()
-
-
-@contextlib.contextmanager
-def _node_compaction_lock(directory: str, host: str, node: int) -> Iterator[bool]:
-    """Hold the exclusive flock of NUMA node `node` of `host` in `directory`; yields False, holding nothing, when the
-    file system refuses it (no pass may then run on the node)."""
-    path = os.path.join(directory, f"compact.{host}.node{node}.lock")
-    try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-    except OSError as error:
-        _log(f"cannot open {path} ({error}); no reclaim-and-compact pass on node {node}")
-        yield False
-        return
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError as error:
-            _log(f"cannot lock {path} ({error}); no reclaim-and-compact pass on node {node}")
-            yield False
-            return
-        yield True
-    finally:
-        os.close(fd)  # drops the lock
-
-
-def _place_chunks(
-    n_chunks: int,
-    nodes: list,
-    create: Callable[[int], Optional[object]],
-    *,
-    chunk_gib: float,
-    reserve_gib: float,
-    node_lock: Callable[[int], contextlib.AbstractContextManager[bool]],
-    meminfo: Optional[Callable[[int], dict]] = None,
-    compact: Optional[Callable[[int, float], None]] = None,
-    contiguous: Optional[Callable[[int], float]] = None,
-    sleep: Callable[[float], None] = time.sleep,
-    clock: Callable[[], float] = time.monotonic,
-) -> tuple[list, dict[int, int]]:
-    """Place up to `n_chunks` chunks over `nodes`, the preferred node first; `create(node)` returns a handle, or None
-    when the driver refuses. A node takes chunks while it keeps `reserve_gib`; a refused chunk is retried, then
-    compacted for under `node_lock(node)` (see the constants), which donors sharing the node take in turn; a node
-    that still refuses is left, and swept once more when no node takes the chunk. Returns (handles, {node: placed})."""
-    meminfo = meminfo or _node_meminfo
-    compact = compact or _compact_node
-    contiguous = contiguous or _contiguous_free_gib
-    handles = []
-    placement = {n: 0 for n in nodes}
-    passes = {n: 0 for n in nodes}
-    pass_failed = set()
-    min_pass_gib = margin_gib = reserve_gib * _PASS_RESERVE_SHARE
-    max_pass_gib = _MAX_PASS_CHUNKS * chunk_gib
-
-    def room(node: int) -> float:
-        info = meminfo(node)
-        return info.get("MemFree", 0.0) + _reclaimable_gib(info) if info else float("inf")
-
-    def recover(node: int) -> Optional[object]:
-        delay, deadline = 0.05, clock() + _FABRIC_RETRY_S
-        while clock() < deadline:
-            sleep(delay)
-            delay = min(2 * delay, 0.5)
-            handle = create(node)
-            if handle is not None:
-                return handle
-        tries = 0
-        while (
-            tries < _MAX_PASSES_PER_REFUSAL_PROGRESSING
-            and passes[node] < _MAX_PASSES_PER_NODE
-            and node not in pass_failed
-        ):
-            tries += 1
-            with node_lock(node) as locked:
-                if not locked:
-                    pass_failed.add(node)
-                    return None
-                # Sized from the node's memory once the lock is held: another donor may have used it meanwhile.
-                missing = (n_chunks - len(handles)) * chunk_gib
-                size = min(
-                    max(min_pass_gib, missing),
-                    max_pass_gib,
-                    room(node) - reserve_gib - chunk_gib - margin_gib,
-                )
-                if size < chunk_gib:
-                    return None
-                before = contiguous(node)
-                try:
-                    compact(node, size)
-                except Exception as error:  # noqa: BLE001 - no pass is possible here; the chunk moves on
-                    _log(f"reclaim-and-compact pass on node {node} failed: {error!r}")
-                    pass_failed.add(node)
-                    return None
-                passes[node] += 1
-                gained = contiguous(node) - before
-                handle = create(node)
-            if handle is not None:
-                return handle
-            if tries >= _MAX_PASSES_PER_REFUSAL and gained < chunk_gib:
-                return None  # the passes stopped bringing contiguous memory
-        return None
-
-    exhausted = set()
-    swept = False
-    while len(handles) < n_chunks:
-        handle = None
-        for node in nodes:
-            if node in exhausted or room(node) - chunk_gib < reserve_gib:
-                continue  # refused for good, or the node keeps its reserve for the serving process
-            handle = create(node)
-            if handle is None:
-                handle = recover(node)
-                if handle is None:
-                    exhausted.add(node)
-            if handle is not None:
-                placement[node] += 1
-                break
-        if handle is None:
-            if swept:
-                break
-            # A node given up on can recover after the donor left it (compaction and other donors' frees go on).
-            swept = True
-            revived = {
-                n
-                for n in exhausted
-                if contiguous(n) >= chunk_gib and room(n) - chunk_gib >= reserve_gib
-            }
-            if not revived:
-                break
-            exhausted -= revived
-            continue
-        handles.append(handle)
-    if any(passes.values()):
-        _log(f"reclaim-and-compact passes per NUMA node: {passes}")
-    return handles, placement
 
 
 def _meta_fields(path: str) -> dict:
@@ -624,7 +357,9 @@ def check_remote_capacity(
         for file in malformed:
             if file not in warned:
                 warned.add(file)
-                logger.warning(f"KVCM2 remote donor file {file} in {directory} is malformed; it is not counted")
+                logger.warning(
+                    f"KVCM2 remote donor file {file} in {directory} is malformed; it is not counted"
+                )
         if transport is not None:
             published = [p for p in published if p["transport"] == transport]
             failed = [f for f in failed if f["transport"] == transport]
@@ -649,8 +384,9 @@ def check_remote_capacity(
         raise RuntimeError(
             f"KVCM2 remote level capacity check failed in {directory}: {summary}"
             + (f". {'; '.join(notes)}" if notes else "")
-            + ". Raise remote_cache_config.donate_size or the number of donating ranks (expected_num_donors), "
-            "lower cache_size (expected_claim_size), or for the fabric transport lower donor_reserve_size."
+            + ". Raise remote_cache_config.donor.size or the number of donating ranks (level.expected.num_donors), "
+            "lower level.size (level.expected.claim_size), or for the fabric transport lower "
+            "transport.donor_reserve_size."
         )
     log(f"KVCM2 remote level capacity check passed in {directory}: {summary}")
     return {"published": published, "failed": failed, "offered_bytes": offered, "need_bytes": need}
@@ -936,7 +672,7 @@ class AgentDonorTransport(DonorTransport):
 
     @classmethod
     def options_from(cls, remote_config: "RemoteCacheConfig") -> dict:
-        return {"ucx_devices": remote_config.ucx_devices}
+        return {"ucx_devices": remote_config.transport.ucx_devices}
 
     def start(self, donor: "RemoteMemDonor") -> None:
         from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
@@ -957,16 +693,16 @@ class AgentDonorTransport(DonorTransport):
         self._map = mmap.mmap(-1, donor.nbytes, flags=flags)
         self._address = ctypes.addressof(ctypes.c_char.from_buffer(self._map))
         try:
-            self._map.madvise(_MADV_HUGEPAGE)
+            self._map.madvise(MADV_HUGEPAGE)
         except OSError:
             pass
-        if donor.numa_node is not None and not _bind_to_numa_node(
+        if donor.numa_node is not None and not bind_to_numa_node(
             self._address, donor.nbytes, donor.numa_node
         ):
             _log(f"libnuma unavailable; {donor.name} relies on first touch for NUMA placement")
         # Fault every page in now: registration does not pin memory where the NIC pages on demand, and a resident
         # donation fails here rather than mid-run and never makes a remote write wait on a page fault.
-        _populate(self._map, self._address, donor.nbytes)
+        populate(self._map, self._address, donor.nbytes)
         t1 = time.monotonic()
 
         # NIXL/UCX may make CUDA calls while creating the agent and registering host memory.
@@ -1019,24 +755,36 @@ class FabricDonorTransport(DonorTransport):
     imported fabric allocation maps only whole, published as one 64-byte CUDA fabric handle per chunk in
     ``donor.<name>.fabric``. Chunks fill the donor's NUMA node (default: the node of its CUDA device) first, then the
     other nodes, leaving ``reserve_bytes`` free per node; a donation that only partly fits is published with
-    ``short_bytes``. Clients map the chunks and copy on their own streams, so no transfer agent is involved."""
+    ``short_bytes``. With ``compact_host_memory`` a refused chunk gets reclaim-and-compact passes on its node first
+    (``host_memory.place_chunks``). Clients map the chunks and copy on their own streams, so no transfer agent is
+    involved."""
 
     kind = "fabric"
     name: str = ""  # the donor's, for logs
     chunk_bytes: int = REMOTE_CACHE_CHUNK_BYTES
     reserve_bytes: int = REMOTE_CACHE_DONOR_RESERVE_BYTES
+    compact_host_memory: bool = False
     _fabric: Optional[list] = None  # the cuMemCreate handles, one per chunk
     # The CUDA device ordinal whose primary context the donation retains while it lives (None: not started).
     _device: Optional[int] = None
 
-    def __init__(self, *, reserve_bytes: int = REMOTE_CACHE_DONOR_RESERVE_BYTES) -> None:
+    def __init__(
+        self,
+        *,
+        reserve_bytes: int = REMOTE_CACHE_DONOR_RESERVE_BYTES,
+        compact_host_memory: bool = False,
+    ) -> None:
         self.reserve_bytes = reserve_bytes
+        self.compact_host_memory = compact_host_memory
         self._fabric = []
         self._device = None
 
     @classmethod
     def options_from(cls, remote_config: "RemoteCacheConfig") -> dict:
-        return {"reserve_bytes": remote_config.donor_reserve_size}
+        return {
+            "reserve_bytes": remote_config.transport.donor_reserve_size,
+            "compact_host_memory": remote_config.transport.compact_host_memory,
+        }
 
     def _release_fabric(self) -> None:
         from cuda.bindings import driver as drv
@@ -1069,7 +817,7 @@ class FabricDonorTransport(DonorTransport):
             raise
 
     def start(self, donor: "RemoteMemDonor") -> None:
-        """Allocate the donation one chunk at a time, placed by _place_chunks, and publish their fabric handles in chunk
+        """Allocate the donation one chunk at a time, placed by place_chunks, and publish their fabric handles in chunk
         order. What fits is published with short_bytes; a donor that fits nothing raises."""
         from cuda.bindings import driver as drv
 
@@ -1091,9 +839,9 @@ class FabricDonorTransport(DonorTransport):
                 numa = (
                     donor.numa_node
                     if donor.numa_node is not None
-                    else _host_numa_node_of(drv, device)
+                    else host_numa_node_of(drv, device)
                 )
-                nodes = [numa] + [n for n in _host_numa_nodes() if n != numa]
+                nodes = [numa] + [n for n in host_numa_nodes() if n != numa]
                 props = {n: self._fabric_prop(drv, n) for n in nodes}
                 gran = _cuda_check(
                     drv.cuMemGetAllocationGranularity(
@@ -1114,13 +862,14 @@ class FabricDonorTransport(DonorTransport):
                     return handle
 
                 t0 = time.monotonic()
-                placed, per_node = _place_chunks(
+                placed, per_node = place_chunks(
                     planned // self.chunk_bytes,
                     nodes,
                     create,
                     chunk_gib=chunk_gib,
                     reserve_gib=reserve_gib,
-                    node_lock=lambda node: _node_compaction_lock(donor.directory, donor.host, node),
+                    node_lock=lambda node: node_compaction_lock(donor.directory, donor.host, node),
+                    compact_passes=self.compact_host_memory,
                 )
                 for handle in placed:
                     exported = _cuda_check(
@@ -1180,7 +929,7 @@ class FabricDonorTransport(DonorTransport):
         self._fabric = []
 
 
-# The donor transport of each RemoteCacheConfig.transport.
+# The donor transport of each RemoteCacheConfig.transport.kind.
 DONOR_TRANSPORTS = {"nixl": AgentDonorTransport, "fabric": FabricDonorTransport}
 TRANSPORTS = tuple(DONOR_TRANSPORTS)
 
@@ -1197,7 +946,7 @@ def make_donor(
     **transport_options: object,
 ) -> RemoteMemDonor:
     """A donation of `nbytes` in `directory`, made reachable by `transport` (one of ``TRANSPORTS``) built with
-    `transport_options` (``ucx_devices`` for NIXL, ``reserve_bytes`` for fabric)."""
+    `transport_options` (``ucx_devices`` for NIXL, ``reserve_bytes`` and ``compact_host_memory`` for fabric)."""
     if transport not in DONOR_TRANSPORTS:
         raise ValueError(f"transport {transport!r} is not one of {TRANSPORTS}")
     return RemoteMemDonor(
@@ -1214,27 +963,29 @@ def make_donor(
 def _donor_for(remote_config: "RemoteCacheConfig", device: Optional[int]) -> RemoteMemDonor:
     return make_donor(
         resolve_rendezvous_directory(remote_config.directory),
-        remote_config.donate_size,
-        remote_config.transport,
+        remote_config.donor.size,
+        remote_config.transport.kind,
         device=device,
-        **DONOR_TRANSPORTS[remote_config.transport].options_from(remote_config),
+        **DONOR_TRANSPORTS[remote_config.transport.kind].options_from(remote_config),
     )
 
 
 def start_donation(remote_config: "RemoteCacheConfig", device: int) -> RemoteMemDonor:
-    """Start donating ``remote_config.donate_size`` bytes of host memory near CUDA device `device`, in the background.
+    """Start donating ``remote_config.donor.size`` bytes of host memory near CUDA device `device`, in the background.
     Every start error, ``{GPU}`` resolution included, surfaces as the donor's failure marker."""
     donor = _donor_for(remote_config, device)
     directory = donor.directory
     donor.start_in_background()
-    if donor.nbytes != remote_config.donate_size:
+    size = remote_config.donor.size
+    donated = size - size % REMOTE_CACHE_CHUNK_BYTES  # as RemoteMemDonor rounds it
+    if donated != size:
         logger.warning(
-            f"remote_cache_config.donate_size {remote_config.donate_size} is not a whole number of "
-            f"{donor.chunk_bytes}-byte chunks; {donor.nbytes} bytes are donated"
+            f"remote_cache_config.donor.size {size} is not a whole number of "
+            f"{REMOTE_CACHE_CHUNK_BYTES}-byte chunks; {donated} bytes are donated"
         )
     logger.info(
-        f"KV cache manager v2 donates {donor.nbytes / _GIB:.2f}GiB of host memory "
-        f"to remote cache levels via {directory} ({remote_config.transport})"
+        f"KV cache manager v2 donates {donated / _GIB:.2f}GiB of host memory "
+        f"to remote cache levels via {directory} ({remote_config.transport.kind})"
     )
     return donor
 

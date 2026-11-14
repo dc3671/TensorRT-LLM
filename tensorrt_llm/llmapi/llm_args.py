@@ -5329,19 +5329,140 @@ REMOTE_CACHE_UCX_DEVICES_PATTERN = (
     rf"^{_UCX_DEVICE_ENTRY}(,{_UCX_DEVICE_ENTRY})*$")
 
 
+class RemoteNixlTransportConfig(StrictBaseModel):
+    """Remote cache transport over one-sided NIXL RDMA."""
+
+    kind: Literal["nixl"] = Field(
+        default="nixl",
+        status="prototype",
+        description="Selects this transport. Every rank sharing `directory` "
+        "must use the same transport.")
+
+    ucx_devices: Optional[str] = Field(
+        default=None,
+        pattern=REMOTE_CACHE_UCX_DEVICES_PATTERN,
+        status="prototype",
+        description=
+        "Comma-separated UCX devices of the remote level's and the donor's NIXL "
+        "agents (for example 'mlx5_0:1'), each '<device>' or '<device>:1' "
+        "(NIXL's UCX backend uses port 1); '{GPU}' is replaced by the rank's "
+        "physical GPU index. None uses the process's UCX environment.")
+
+    transfer_timeout_s: _RemoteTimeoutSeconds = Field(
+        default=30.0,
+        status="prototype",
+        description=
+        "Seconds one batch of page transfers of a remote level may take before "
+        "the level fails, e.g. on a donor that died. At most 1e6.")
+
+
+class RemoteFabricTransportConfig(StrictBaseModel):
+    """Remote cache transport over CUDA fabric memory.
+
+    Claimants in the same multi-node NVLink domain copy it over NVLink.
+    """
+
+    kind: Literal["fabric"] = Field(
+        status="prototype",
+        description="Selects this transport. Every rank sharing `directory` "
+        "must use the same transport.")
+
+    donor_reserve_size: NonNegativeInt = Field(
+        default=REMOTE_CACHE_DONOR_RESERVE_BYTES,
+        status="prototype",
+        description=
+        "Bytes of free plus reclaimable memory each host NUMA node keeps for "
+        "the processes on it while a donation is placed. Chunks go to the GPU's "
+        "node first, then to the others; a donation that does not fit is "
+        "published short.")
+
+    compact_host_memory: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Before a node that refuses a donated chunk is left, run up to 64 "
+        "reclaim-and-compact passes on it (fault in and release node-bound "
+        "huge pages under a per-node lock that donors on one host take in "
+        "turn), so fragmented or page-cache-filled memory can still take the "
+        "donation. False publishes what fits and leaves compaction to the job "
+        "prolog.")
+
+
+RemoteTransportConfig: TypeAlias = Annotated[
+    Union[RemoteNixlTransportConfig, RemoteFabricTransportConfig],
+    Field(discriminator="kind"),
+]
+
+
+class RemoteDonorConfig(StrictBaseModel):
+    """Host memory this rank donates to remote cache levels."""
+
+    size: int = Field(
+        ge=REMOTE_CACHE_CHUNK_BYTES,
+        status="prototype",
+        description=
+        "Bytes donated for the lifetime of the process, in whole 1 GiB chunks "
+        "(a remainder below one chunk is not donated; the rank logs the size "
+        "it donates).")
+
+
+class RemoteExpectedDonorsConfig(StrictBaseModel):
+    """The job's donors and claims, which only the launcher can count."""
+
+    num_donors: PositiveInt = Field(
+        status="prototype",
+        description="Number of donating ranks the job starts.")
+
+    claim_size: PositiveInt = Field(
+        status="prototype",
+        description="Bytes all ranks of the job claim from `directory` together."
+    )
+
+
+class RemoteLevelConfig(StrictBaseModel):
+    """This rank's remote cache level, in chunks of donated memory."""
+
+    size: PositiveInt = Field(
+        status="prototype",
+        description=
+        "Bytes of the level. Pages are stored as the cold tiers store them: "
+        "byte copies, or encoded by a lossy cold-page codec "
+        "(kv_cache_compression_config) when one is set. It takes the disk "
+        "level's place, so it cannot be combined with `disk_cache_size`.")
+
+    pool_ratio: Optional[List[_PositiveFiniteFloat]] = Field(
+        default=None,
+        min_length=1,
+        status="prototype",
+        description=
+        "Split of `size` across layer groups, one positive weight per layer "
+        "group in KV cache manager v2 layer-group ID order (normalized). None "
+        "follows the hot tier's split.")
+
+    expected: Optional[RemoteExpectedDonorsConfig] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "With it, the rank waits until these donors have reported and fails "
+        "at once if they cannot cover the claims, instead of after a claim "
+        "wait.")
+
+    donor_wait_timeout_s: _RemoteTimeoutSeconds = Field(
+        default=900.0,
+        status="prototype",
+        description=
+        "Seconds the rank waits for donors, applied to each wait on its own: "
+        "for the expected donors to report, and for each chunk claim. Donors "
+        "publish while their own servers start, so this bounds the job's "
+        "startup skew per wait, not in total. At most 1e6.")
+
+
 class RemoteCacheConfig(StrictBaseModel):
     """KV cache manager v2 remote cache level in host memory that other ranks donate.
 
-    A rank with ``cache_size`` gets a cache level below the host tier whose slots
-    live in memory that ranks with ``donate_size`` publish in ``directory``.
+    A rank with `level` gets a cache level below the host tier whose slots live
+    in memory that ranks with `donor` publish in `directory`.
     """
-
-    # Fields only a rank with a remote cache level (cache_size > 0) reads.
-    CLAIMANT_ONLY_FIELDS: ClassVar[Tuple[str, ...]] = ("pool_ratio",
-                                                       "expected_num_donors",
-                                                       "expected_claim_size",
-                                                       "donor_wait_timeout_s",
-                                                       "transfer_timeout_s")
 
     directory: str = Field(
         min_length=1,
@@ -5349,137 +5470,32 @@ class RemoteCacheConfig(StrictBaseModel):
         description=
         "Rendezvous directory, on a file system every rank of the job sees, where "
         "donors publish their memory and remote cache levels claim chunks of it. "
-        "Environment variables are expanded; the directory is created if missing. "
-        "Use one directory per job.")
-
-    cache_size: NonNegativeInt = Field(
-        default=0,
-        status="prototype",
-        description=
-        "Bytes of this rank's remote cache level. Pages are stored as the cold "
-        "tiers store them: byte copies, or encoded by a lossy cold-page codec "
-        "(kv_cache_compression_config) when one is set. It takes the disk "
-        "level's place, so it cannot be combined with `disk_cache_size`.")
-
-    donate_size: NonNegativeInt = Field(
-        default=0,
-        status="prototype",
-        description=
-        "Bytes of host memory this rank donates to remote cache levels, in whole "
-        "1 GiB chunks, for the lifetime of the process.")
-
-    donor_reserve_size: NonNegativeInt = Field(
-        default=REMOTE_CACHE_DONOR_RESERVE_BYTES,
-        status="prototype",
-        description=
-        "Fabric transport only: bytes of free plus reclaimable memory each host "
-        "NUMA node keeps for the processes on it while the donation is placed. "
-        "Chunks go to the GPU's node first, then to the others; a donation that "
-        "does not fit is published short. Requires `donate_size`.")
-
-    transport: Literal["nixl", "fabric"] = Field(
-        default="nixl",
-        status="prototype",
-        description=
-        "How pages move: 'nixl' uses one-sided NIXL RDMA; 'fabric' donates "
-        "CUDA fabric memory that clients in the same multi-node NVLink domain "
-        "copy over NVLink. Every rank sharing `directory` must use the same value."
+        "Environment variables are expanded, and one that is not set is an "
+        "error; the directory is created if missing. Use one directory per job."
     )
 
-    ucx_devices: Optional[str] = Field(
-        default=None,
-        pattern=REMOTE_CACHE_UCX_DEVICES_PATTERN,
+    transport: RemoteTransportConfig = Field(
+        default_factory=RemoteNixlTransportConfig,
         status="prototype",
         description=
-        "NIXL transport only: comma-separated UCX devices of the remote level's "
-        "and the donor's NIXL agents (for example 'mlx5_0:1'), each '<device>' "
-        "or '<device>:1' (NIXL's UCX backend uses port 1); '{GPU}' is "
-        "replaced by the rank's physical GPU index. None uses the process's "
-        "UCX environment.")
+        "How pages move: {kind: nixl} (one-sided NIXL RDMA, the default) or "
+        "{kind: fabric} (CUDA fabric memory copied over NVLink).")
 
-    pool_ratio: Optional[List[_PositiveFiniteFloat]] = Field(
-        default=None,
-        min_length=1,
-        status="prototype",
-        description=
-        "Split of `cache_size` across layer groups, one positive weight per "
-        "layer group in KV cache manager v2 layer-group ID order (normalized). "
-        "None follows the hot tier's split.")
-
-    expected_num_donors: Optional[PositiveInt] = Field(
+    donor: Optional[RemoteDonorConfig] = Field(
         default=None,
         status="prototype",
-        description=
-        "Number of donating ranks the job starts. With `expected_claim_size`, a "
-        "rank with `cache_size` waits until these donors have reported and fails "
-        "at once if they cannot cover the claims, instead of after the claim wait."
-    )
+        description="This rank's donation; None donates nothing.")
 
-    expected_claim_size: Optional[PositiveInt] = Field(
+    level: Optional[RemoteLevelConfig] = Field(
         default=None,
         status="prototype",
-        description=
-        "Bytes all ranks of the job claim from `directory` together. Used with "
-        "`expected_num_donors`.")
-
-    donor_wait_timeout_s: _RemoteTimeoutSeconds = Field(
-        default=900.0,
-        status="prototype",
-        description=
-        "Seconds a rank with `cache_size` waits for donors, applied to each "
-        "wait on its own: for the expected donors to report, and for each "
-        "chunk claim. Donors publish while their own servers start, so this "
-        "bounds the job's startup skew per wait, not in total. At most 1e6.")
-
-    transfer_timeout_s: _RemoteTimeoutSeconds = Field(
-        default=30.0,
-        status="prototype",
-        description=
-        "NIXL transport only: seconds one batch of page transfers may take "
-        "before the remote level fails, e.g. on a donor that died. At most "
-        "1e6. The fabric transport's copies run on the CUDA stream and are not "
-        "timed.")
+        description="This rank's remote cache level; None gives it none.")
 
     @model_validator(mode="after")
     def validate_remote_cache(self) -> 'RemoteCacheConfig':
-        if self.cache_size == 0 and self.donate_size == 0:
+        if self.donor is None and self.level is None:
             raise ValueError(
-                "remote_cache_config needs a positive cache_size or donate_size"
-            )
-        if 0 < self.donate_size < REMOTE_CACHE_CHUNK_BYTES:
-            raise ValueError(
-                "remote_cache_config.donate_size must be 0 or at least one "
-                f"{REMOTE_CACHE_CHUNK_BYTES}-byte chunk, got {self.donate_size}"
-            )
-        # Fields off their defaults, so a dumped config validates again.
-        given = {
-            name
-            for name, field in type(self).model_fields.items()
-            if getattr(self, name) != field.default
-        }
-        ignored = []
-        if self.cache_size == 0:
-            # Read only by a rank with a remote cache level.
-            ignored += [
-                name for name in self.CLAIMANT_ONLY_FIELDS if name in given
-            ]
-        elif "transfer_timeout_s" in given and self.transport != "nixl":
-            ignored.append("transfer_timeout_s")
-        if "donor_reserve_size" in given and (self.donate_size == 0
-                                              or self.transport != "fabric"):
-            ignored.append("donor_reserve_size")
-        if ignored:
-            raise ValueError(
-                f"remote_cache_config sets {', '.join(ignored)}, which a rank "
-                "with this cache_size, donate_size and transport ignores")
-        if (self.expected_num_donors is None) != (self.expected_claim_size
-                                                  is None):
-            raise ValueError("remote_cache_config.expected_num_donors and "
-                             "expected_claim_size must be set together")
-        if self.ucx_devices is not None and self.transport != "nixl":
-            raise ValueError(
-                "remote_cache_config.ucx_devices applies to transport='nixl' only"
-            )
+                "remote_cache_config needs a `donor`, a `level`, or both")
         return self
 
 
@@ -6028,14 +6044,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if self.use_kv_cache_manager_v2 is False:
             raise ValueError("kv_cache_config.remote_cache_config requires "
                              "use_kv_cache_manager_v2")
-        if remote.cache_size and self.disk_cache_size:
+        if remote.level is not None and self.disk_cache_size:
             raise ValueError(
-                "kv_cache_config.remote_cache_config.cache_size and "
+                "kv_cache_config.remote_cache_config.level and "
                 "disk_cache_size cannot both be set: the remote level takes the "
                 "disk level's place")
-        if remote.cache_size and self.enable_kv_pool_rebalance:
+        if remote.level is not None and self.enable_kv_pool_rebalance:
             raise ValueError(
-                "kv_cache_config.remote_cache_config.cache_size and "
+                "kv_cache_config.remote_cache_config.level and "
                 "enable_kv_pool_rebalance cannot both be set: a rebalance "
                 "would claim donor chunks while every request waits")
         return self

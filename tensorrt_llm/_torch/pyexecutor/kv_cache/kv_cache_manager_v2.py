@@ -2056,7 +2056,7 @@ def _withdraws_remote_donation_on_error(init: _InitT) -> _InitT:
 
 class KVCacheManagerV2(BaseResourceManager):
     gen_preemption_headroom: int = 0
-    # Host memory this rank donates to remote cache levels (remote_cache_config.donate_size); closed by shutdown().
+    # Host memory this rank donates to remote cache levels (remote_cache_config.donor); closed by shutdown().
     _remote_donor: Optional["RemoteMemDonor"] = None
     # The remote config of a donation this manager owns, started or not; a failure leaves its marker.
     _planned_donation: Optional[RemoteCacheConfig] = None
@@ -2235,7 +2235,7 @@ class KVCacheManagerV2(BaseResourceManager):
         remote_config = kv_cache_config.remote_cache_config
         if not is_draft:
             self._remote_donor = remote_donor
-            if remote_config is not None and remote_config.donate_size:
+            if remote_config is not None and remote_config.donor is not None:
                 self._planned_donation = remote_config
         self.mapping = mapping
         self.gen_preemption_headroom = gen_preemption_headroom
@@ -2465,12 +2465,12 @@ class KVCacheManagerV2(BaseResourceManager):
                         "on every CP rank. Set "
                         "kv_cache_config.disk_cache_size=0."
                     )
-                if remote_config is not None and remote_config.cache_size:
+                if remote_config is not None and remote_config.level is not None:
                     raise ValueError(
                         "KVCacheManagerV2 does not support a remote cache level "
                         "with aggregated helix context parallelism, for the same "
-                        "reason as a disk tier. Set "
-                        "kv_cache_config.remote_cache_config.cache_size=0."
+                        "reason as a disk tier. Unset "
+                        "kv_cache_config.remote_cache_config.level."
                     )
                 if kv_connector_manager is not None:
                     raise ValueError(
@@ -2909,12 +2909,16 @@ class KVCacheManagerV2(BaseResourceManager):
             offload_pinned_bytes = self._host_history_budget + self._sparse_batch_staging_bytes
             mem_available = max(0.0, mem_available - local_ranks * offload_pinned_bytes)
             memlock_limit = max(0.0, memlock_limit - offload_pinned_bytes)
-            if remote_config is not None and remote_config.donate_size and not donation_started:
+            if (
+                remote_config is not None
+                and remote_config.donor is not None
+                and not donation_started
+            ):
                 # Every co-located rank donates this much more, faulted in after this sizing.
-                donated = local_ranks * remote_config.donate_size
+                donated = local_ranks * remote_config.donor.size
                 if donated >= mem_available:
                     remote_init_error = ValueError(
-                        f"remote_cache_config.donate_size x {local_ranks} rank(s) leaves none of the "
+                        f"remote_cache_config.donor.size x {local_ranks} rank(s) leaves none of the "
                         f"{mem_available / (1 << 30):.2f}GiB available host memory to the automatic "
                         "host tier; set kv_cache_config.host_cache_size."
                     )
@@ -6741,12 +6745,12 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @property
     def remote_donor(self) -> Optional["RemoteMemDonor"]:
-        """This rank's donation (remote_cache_config.donate_size) while this manager owns it, else None."""
+        """This rank's donation (remote_cache_config.donor) while this manager owns it, else None."""
         return self._remote_donor
 
     @property
     def has_remote_cache_level(self) -> bool:
-        """True when this manager has a remote cache level (remote_cache_config.cache_size)."""
+        """True when this manager has a remote cache level (remote_cache_config.level)."""
         return CacheTier.REMOTE in self.impl.cache_tier_list
 
     @property
@@ -8777,41 +8781,47 @@ class KVCacheManagerV2(BaseResourceManager):
 
         remote_dir = resolve_rendezvous_directory(remote_config.directory)
         ensure_rendezvous_directory(remote_dir)
-        agent_backend_params = nixl_ucx_backend_params(
-            resolve_ucx_devices(remote_config.ucx_devices)
+        transport = remote_config.transport
+        nixl = transport.kind == "nixl"
+        agent_backend_params = (
+            nixl_ucx_backend_params(resolve_ucx_devices(transport.ucx_devices)) if nixl else {}
         )
-        if remote_config.donate_size and self._remote_donor is None:
+        if remote_config.donor is not None and self._remote_donor is None:
             # This rank's memory joins the pool before its own cache exists: clients wait for donors.
             self._remote_donor = start_donation(remote_config, torch.cuda.current_device())
-        if remote_config.cache_size:
-            if remote_config.expected_num_donors is not None:
+        level = remote_config.level
+        if level is not None:
+            if level.expected is not None:
                 check_remote_capacity(
                     remote_dir,
-                    remote_config.expected_num_donors,
-                    remote_config.expected_claim_size,
-                    transport=remote_config.transport,
-                    timeout_s=remote_config.donor_wait_timeout_s,
+                    level.expected.num_donors,
+                    level.expected.claim_size,
+                    transport=transport.kind,
+                    timeout_s=level.donor_wait_timeout_s,
                     log=logger.info,
                 )
             # The remote level goes below the host tier.
             cache_tiers.append(
                 RemoteCacheTierConfig(
-                    quota=remote_config.cache_size,
+                    quota=level.size,
                     path=remote_dir,
-                    wait_timeout_ms=math.ceil(remote_config.donor_wait_timeout_s * 1000),
-                    expected_donors=remote_config.expected_num_donors or 0,
-                    pool_ratio=list(remote_config.pool_ratio or []),
+                    wait_timeout_ms=math.ceil(level.donor_wait_timeout_s * 1000),
+                    expected_donors=level.expected.num_donors if level.expected is not None else 0,
+                    pool_ratio=list(level.pool_ratio or []),
                     # How pages move is declared apart from the memory.
                     transfer=RemoteTransferConfig(
-                        transport=RemoteTransport[remote_config.transport.upper()],
-                        timeout_ms=math.ceil(remote_config.transfer_timeout_s * 1000),
+                        transport=RemoteTransport[transport.kind.upper()],
+                        # Fabric copies run on the stream and are not timed: the binding's default.
+                        timeout_ms=math.ceil(transport.transfer_timeout_s * 1000)
+                        if nixl
+                        else RemoteTransferConfig().timeout_ms,
                         backend_params=agent_backend_params,
                     ),
                 )
             )
             logger.info(
                 f"KV cache manager v2 remote cache quota set to "
-                f"{remote_config.cache_size / (1 << 30):.2f}GiB via {remote_dir} ({remote_config.transport})"
+                f"{level.size / (1 << 30):.2f}GiB via {remote_dir} ({transport.kind})"
             )
 
     def _report_unstarted_donation(self, error: BaseException) -> None:

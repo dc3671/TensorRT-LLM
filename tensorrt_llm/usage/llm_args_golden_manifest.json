@@ -911,51 +911,56 @@
     {
       "capture_policy": "int",
       "kind": "value",
-      "path": "kv_cache_config.remote_cache_config.cache_size"
-    },
-    {
-      "capture_policy": "int",
-      "kind": "value",
-      "path": "kv_cache_config.remote_cache_config.donate_size"
-    },
-    {
-      "capture_policy": "int",
-      "kind": "value",
-      "path": "kv_cache_config.remote_cache_config.donor_reserve_size"
+      "path": "kv_cache_config.remote_cache_config.donor.size"
     },
     {
       "capture_policy": "float",
       "kind": "value",
-      "path": "kv_cache_config.remote_cache_config.donor_wait_timeout_s"
+      "path": "kv_cache_config.remote_cache_config.level.donor_wait_timeout_s"
     },
     {
-      "capture_policy": "int|none",
+      "capture_policy": "int",
       "kind": "value",
-      "path": "kv_cache_config.remote_cache_config.expected_claim_size"
+      "path": "kv_cache_config.remote_cache_config.level.expected.claim_size"
     },
     {
-      "capture_policy": "int|none",
+      "capture_policy": "int",
       "kind": "value",
-      "path": "kv_cache_config.remote_cache_config.expected_num_donors"
+      "path": "kv_cache_config.remote_cache_config.level.expected.num_donors"
     },
     {
       "capture_policy": "list[float]|none",
       "kind": "value",
-      "path": "kv_cache_config.remote_cache_config.pool_ratio"
+      "path": "kv_cache_config.remote_cache_config.level.pool_ratio"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.level.size"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.transport.compact_host_memory"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.transport.donor_reserve_size"
+    },
+    {
+      "allowed_values": [
+        "fabric",
+        "nixl"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_config.remote_cache_config.transport.kind"
     },
     {
       "capture_policy": "float",
       "kind": "value",
-      "path": "kv_cache_config.remote_cache_config.transfer_timeout_s"
-    },
-    {
-      "allowed_values": [
-        "nixl",
-        "fabric"
-      ],
-      "capture_policy": "literal",
-      "kind": "categorical",
-      "path": "kv_cache_config.remote_cache_config.transport"
+      "path": "kv_cache_config.remote_cache_config.transport.transfer_timeout_s"
     },
     {
       "capture_policy": "int|none",

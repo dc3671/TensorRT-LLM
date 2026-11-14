@@ -1129,8 +1129,8 @@ class TestBuildManagersBudgetGates:
             host_cache_size=20 * GB,
             remote_cache_config={
                 "directory": str(tmp_path),
-                "cache_size": 4 * GB,
-                "donate_size": 4 * GB,
+                "level": {"size": 4 * GB},
+                "donor": {"size": 4 * GB},
             },
         )
 
@@ -1155,7 +1155,7 @@ class TestBuildManagersBudgetGates:
         c._kv_cache_config = KvCacheConfig(
             max_gpu_total_bytes=10 * GB,
             host_cache_size=0,
-            remote_cache_config={"directory": str(tmp_path), "donate_size": 4 * GB},
+            remote_cache_config={"directory": str(tmp_path), "donor": {"size": 4 * GB}},
         )
         c._create_kv_cache_manager.side_effect = lambda *args, **kwargs: (
             events.append(("target", kwargs["remote_donor"])) or Mock()
@@ -1245,7 +1245,7 @@ class TestBuildManagersBudgetGates:
         c._kv_cache_config = KvCacheConfig(
             max_gpu_total_bytes=10 * GB,
             host_cache_size=0,
-            remote_cache_config={"directory": directory, "donate_size": 1 << 30},
+            remote_cache_config={"directory": directory, "donor": {"size": 1 << 30}},
         )
         c._create_kv_cache_manager.side_effect = lambda estimating, **kwargs: (
             Mock()
@@ -1316,8 +1316,8 @@ class TestBuildManagersBudgetGates:
             cross_kv_cache_fraction=0.5,
             remote_cache_config={
                 "directory": str(tmp_path),
-                "cache_size": 4 * GB,
-                "donate_size": 4 * GB,
+                "level": {"size": 4 * GB},
+                "donor": {"size": 4 * GB},
             },
         )
         self_config, cross_config = c._split_kv_cache_budget_for_cross()
@@ -1331,7 +1331,7 @@ class TestBuildManagersBudgetGates:
         before the estimation takes 44 GiB of the node's host memory; started after it, it is 44 GiB short."""
         import contextlib
 
-        from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
+        from tensorrt_llm._torch.pyexecutor.kv_cache import host_memory, remote_donor
 
         node_gib = 176.0 + 176.0 + 24.0
         room = {0: node_gib - 176.0}  # the co-located rank's donation is placed already
@@ -1341,7 +1341,7 @@ class TestBuildManagersBudgetGates:
                 room[node] -= 1.0
                 return object()
 
-            handles, _ = remote_donor._place_chunks(
+            handles, _ = host_memory.place_chunks(
                 n_chunks,
                 [0],
                 create,
@@ -1367,7 +1367,7 @@ class TestBuildManagersBudgetGates:
         c._kv_cache_config = KvCacheConfig(
             max_gpu_total_bytes=10 * GB,
             host_cache_size=0,
-            remote_cache_config={"directory": str(tmp_path), "donate_size": 176 * GB},
+            remote_cache_config={"directory": str(tmp_path), "donor": {"size": 176 * GB}},
         )
 
         def manager(*args, **kwargs):
@@ -1459,7 +1459,10 @@ class TestRemoteLevelOwnership:
         monkeypatch.setattr(kv_cache_manager_v2.torch.cuda, "current_device", lambda: 0)
         manager = SimpleNamespace(is_draft=is_draft, _remote_donor=None)
         config = RemoteCacheConfig(
-            directory=str(tmp_path), cache_size=4 * GB, donate_size=4 * GB, transport=transport
+            directory=str(tmp_path),
+            level={"size": 4 * GB},
+            donor={"size": 4 * GB},
+            transport={"kind": transport},
         )
         tiers = []
         KVCacheManagerV2._add_remote_level(manager, config, tiers)
@@ -1473,7 +1476,10 @@ class TestRemoteLevelOwnership:
 
     @pytest.mark.parametrize(
         "transport, options",
-        [("nixl", {"ucx_devices": None}), ("fabric", {"reserve_bytes": 24 * GB})],
+        [
+            ("nixl", {"ucx_devices": None}),
+            ("fabric", {"reserve_bytes": 24 * GB, "compact_host_memory": False}),
+        ],
     )
     def test_each_donor_gets_its_transport_options(self, transport, options, tmp_path, monkeypatch):
         _, _, donor_cls = self._add_remote_level(False, tmp_path, monkeypatch, transport)
@@ -1489,7 +1495,9 @@ class TestRemoteLevelOwnership:
         monkeypatch.setattr(kv_cache_manager_v2, "RemoteCacheTierConfig", Mock())
         early = Mock()
         manager = SimpleNamespace(is_draft=False, _remote_donor=early)
-        config = RemoteCacheConfig(directory=str(tmp_path), cache_size=4 * GB, donate_size=4 * GB)
+        config = RemoteCacheConfig(
+            directory=str(tmp_path), level={"size": 4 * GB}, donor={"size": 4 * GB}
+        )
         tiers = []
         KVCacheManagerV2._add_remote_level(manager, config, tiers)
         start_donation.assert_not_called()

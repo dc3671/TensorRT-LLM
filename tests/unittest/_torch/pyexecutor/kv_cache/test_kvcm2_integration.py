@@ -1935,7 +1935,7 @@ class TestRemoteTierInitStatus:
             pytest.raises(RuntimeError, match="capacity check failed"),
         ):
             _make_manager_for_cache_tier_test(
-                self._config(tmp_path, cache_size=1 << 30, donate_size=1 << 30), [Mock()]
+                self._config(tmp_path, level={"size": 1 << 30}, donor={"size": 1 << 30}), [Mock()]
             )
         assert sync.call_args.args[0] == _KVCacheManagerInitStatus.ABORT
         # Closed with the error, which leaves the donation's failure marker for the peers.
@@ -1954,7 +1954,7 @@ class TestRemoteTierInitStatus:
             pytest.raises(RuntimeError, match="failed on another rank"),
         ):
             _make_manager_for_cache_tier_test(
-                self._config(tmp_path, donate_size=1 << 30), [local_impl]
+                self._config(tmp_path, donor={"size": 1 << 30}), [local_impl]
             )
         assert sync.call_args.args[0] == _KVCacheManagerInitStatus.OK
         local_impl.shutdown.assert_called_once_with()
@@ -1965,7 +1965,7 @@ class TestRemoteTierInitStatus:
     def test_donation_without_host_memory_left_aborts_through_the_sync(self, tmp_path) -> None:
         config = KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
-            remote_cache_config={"directory": str(tmp_path), "donate_size": 1 << 50},
+            remote_cache_config={"directory": str(tmp_path), "donor": {"size": 1 << 50}},
         )
         add_remote_level = Mock()
         with (
@@ -1988,7 +1988,7 @@ class TestRemoteTierInitStatus:
         init-status collective, which waits for them."""
         config = KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
-            remote_cache_config={"directory": str(tmp_path), "donate_size": 1 << 50},
+            remote_cache_config={"directory": str(tmp_path), "donor": {"size": 1 << 50}},
         )
         markers_at_sync = []
 
@@ -2026,7 +2026,7 @@ class TestRemoteTierInitStatus:
             pytest.raises(ValueError, match="unknown token"),
         ):
             _make_manager_for_cache_tier_test(
-                self._config(tmp_path, cache_size=1 << 30, donate_size=1 << 30), [Mock()]
+                self._config(tmp_path, level={"size": 1 << 30}, donor={"size": 1 << 30}), [Mock()]
             )
         assert markers_at_sync == [[".failed"]]
         assert "unknown token" in (next(tmp_path.iterdir())).read_text()
@@ -2045,7 +2045,9 @@ class TestRemoteTierInitStatus:
             ),
             pytest.raises(RuntimeError, match="late failure"),
         ):
-            _make_manager_for_cache_tier_test(self._config(tmp_path, donate_size=1 << 30), [Mock()])
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, donor={"size": 1 << 30}), [Mock()]
+            )
         assert str(donor.close.call_args.args[0]) == "late failure"
 
     @pytest.mark.cpu_only
@@ -2073,7 +2075,7 @@ class TestRemoteTierInitStatus:
             pytest.raises(ValueError, match="state pool too small"),
         ):
             _make_manager_for_cache_tier_test(
-                self._config(tmp_path, donate_size=1 << 30),
+                self._config(tmp_path, donor={"size": 1 << 30}),
                 [Mock()],
                 manager_cls=FinalizesAfterTheBaseInit,
             )
@@ -2101,7 +2103,7 @@ class TestRemoteTierInitStatus:
             pytest.raises(ValueError, match="indexer cache too small"),
         ):
             _make_manager_for_cache_tier_test(
-                self._config(tmp_path, donate_size=1 << 30),
+                self._config(tmp_path, donor={"size": 1 << 30}),
                 [Mock()],
                 manager_cls=RaisesAfterTheBaseInit,
             )
@@ -2134,7 +2136,7 @@ class TestRemoteTierInitStatus:
             pytest.raises(ValueError, match="late failure"),
         ):
             _make_manager_for_cache_tier_test(
-                self._config(tmp_path, donate_size=1 << 30),
+                self._config(tmp_path, donor={"size": 1 << 30}),
                 [impl],
                 manager_cls=OpensACacheThenFails,
             )
@@ -2160,7 +2162,7 @@ class TestRemoteTierInitStatus:
             ),
         ):
             manager, _ = _make_manager_for_cache_tier_test(
-                self._config(tmp_path, donate_size=1 << 30), [Mock()]
+                self._config(tmp_path, donor={"size": 1 << 30}), [Mock()]
             )
         with (
             patch.object(manager, "flush_deferred_closes", side_effect=RuntimeError("close")),
@@ -2177,7 +2179,7 @@ class TestRemoteTierInitStatus:
         draft's automatic host tier nothing (here: a donation larger than the host)."""
         config = KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
-            remote_cache_config={"directory": str(tmp_path), "donate_size": 1 << 50},
+            remote_cache_config={"directory": str(tmp_path), "donor": {"size": 1 << 50}},
         )
         target_donor = Mock()
         with patch(
@@ -6372,7 +6374,9 @@ def test_sparse_offload_admits_by_current_need_with_a_cold_tier() -> None:
 
 
 @pytest.mark.cpu_only
-def test_a_remote_level_alone_below_the_gpu_reserves_history_and_stops_counting_once_failed() -> None:
+def test_a_remote_level_alone_below_the_gpu_reserves_history_and_stops_counting_once_failed() -> (
+    None
+):
     # A remote level retires when its donor dies and then takes no more pages: as the only level
     # below the GPU, admission reserves history as without one, and the eviction flags turn off.
     manager = _offload_setup_manager([12, 10])

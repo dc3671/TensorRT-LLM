@@ -28,7 +28,7 @@ from unittest import mock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache import remote_donor
+from tensorrt_llm._torch.pyexecutor.kv_cache import host_memory, remote_donor
 
 _SIZE = 96 << 20
 
@@ -64,7 +64,7 @@ class TestPopulate(unittest.TestCase):
     def test_every_page_is_resident(self):
         region, address = self._region()
         self.assertEqual(_resident_bytes(address, _SIZE), 0)
-        remote_donor._populate(region, address, _SIZE)
+        host_memory.populate(region, address, _SIZE)
         self.assertEqual(_resident_bytes(address, _SIZE), _SIZE)
 
     def test_fallback_without_madv_populate_write(self):
@@ -74,7 +74,7 @@ class TestPopulate(unittest.TestCase):
         with mock.patch.object(
             remote_donor, "madvise_range", side_effect=OSError(errno.EINVAL, "EINVAL")
         ):
-            remote_donor._populate(region, address, _SIZE)
+            host_memory.populate(region, address, _SIZE)
         self.assertEqual(_resident_bytes(address, _SIZE), _SIZE)
 
 

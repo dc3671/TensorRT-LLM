@@ -131,16 +131,17 @@ def save_mooncake_worker_config(worker_config, log_dir, role, instance_id):
 REMOTE_CACHE_DIR_NAME = 'kvcm2_remote'
 
 
-def resolve_remote_cache(worker_config: Dict[str, Any], num_ranks: Dict[str, int],
-                         directory: str) -> None:
+def resolve_remote_cache(worker_config: Dict[str, Any],
+                         num_ranks: Dict[str, int], directory: str) -> None:
     """Fill the job-wide fields of the KV cache remote level from the layout.
 
     Each role's kv_cache_config.remote_cache_config gets the job's rendezvous
-    directory; a role with a cache_size also gets the number of donating ranks
-    and the bytes all caching ranks claim, which only the launcher can count.
-    The claim is the sum of cache_size: ranks round each layer group up to
-    whole chunks, which the launcher cannot see, so a claim that runs out stops
-    once every expected donor has reported. Explicit values are left alone.
+    directory; a role with a `level` also gets `level.expected`: the number of
+    donating ranks and the bytes all ranks with a level claim, which only the
+    launcher can count. The claim is the sum of level.size: ranks round each
+    layer group up to whole chunks, which the launcher cannot see, so a claim
+    that runs out stops once every expected donor has reported. An explicit
+    `level.expected` is left alone.
 
     Args:
         worker_config: {'ctx': ..., 'gen': ...} worker configs, edited in place.
@@ -163,7 +164,7 @@ def resolve_remote_cache(worker_config: Dict[str, Any], num_ranks: Dict[str, int
         by_directory.setdefault(config['directory'], []).append(role)
     for shared, roles in by_directory.items():
         transports = {
-            role: remote[role].get('transport', 'nixl')
+            role: (remote[role].get('transport') or {}).get('kind', 'nixl')
             for role in roles
         }
         if len(set(transports.values())) > 1:
@@ -172,16 +173,16 @@ def resolve_remote_cache(worker_config: Dict[str, Any], num_ranks: Dict[str, int
                 f"directory {shared!r} with different transports {transports}; "
                 "use one transport, or a directory per role")
         num_donors = sum(num_ranks[role] for role in roles
-                         if remote[role].get('donate_size'))
-        claim_size = sum(num_ranks[role] * remote[role].get('cache_size', 0)
-                         for role in roles)
+                         if remote[role].get('donor'))
+        claim_size = sum(num_ranks[role] * remote[role]['level']['size']
+                         for role in roles if remote[role].get('level'))
         for role in roles:
-            config = remote[role]
-            explicit = ('expected_num_donors' in config
-                        or 'expected_claim_size' in config)
-            if config.get('cache_size') and num_donors and not explicit:
-                config['expected_num_donors'] = num_donors
-                config['expected_claim_size'] = claim_size
+            level = remote[role].get('level')
+            if level and num_donors and 'expected' not in level:
+                level['expected'] = {
+                    'num_donors': num_donors,
+                    'claim_size': claim_size
+                }
 
 
 def calculate_nodes(world_size, num_servers, gpus_per_node):

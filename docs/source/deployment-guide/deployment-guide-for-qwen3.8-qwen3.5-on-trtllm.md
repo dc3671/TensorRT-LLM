@@ -212,11 +212,11 @@ budget before increasing worker count or cache size.
 
 These profiles do not use the
 [remote KV cache level](../features/kvcache.md#remote-cache-level-in-donated-host-memory-prototype).
-If you add it, every rank with `remote_cache_config.donate_size` also holds that
+If you add it, every rank with `remote_cache_config.donor.size` also holds that
 many bytes of host memory for the life of its process, on top of its
 `host_cache_size`. For example, decode ranks that donate 100 GiB each on a full
 four-rank node with 128 GiB host caches use 912 GiB, which exceeds the 840 GiB of
-the source system. Lower `host_cache_size` or `donate_size` on the donating ranks
+the source system. Lower `host_cache_size` or `donor.size` on the donating ranks
 so that host cache plus donation fits each node's budget.
 
 Use a GB300 NVL72 system with working GPU peer access and NIXL/UCX transport.

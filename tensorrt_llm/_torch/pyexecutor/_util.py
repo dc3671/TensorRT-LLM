@@ -1024,7 +1024,7 @@ class KvCacheCreator:
     _joint_kv_cache_reuse = False
     _gen_preemption_headroom: int = 0
 
-    # This rank's donation (remote_cache_config.donate_size), started before the
+    # This rank's donation (remote_cache_config.donor), started before the
     # estimation so that clients do not wait out the warmup; the final target
     # manager takes it over.
     _remote_donor: Optional["RemoteMemDonor"] = None
@@ -3862,7 +3862,7 @@ class KvCacheCreator:
     def _start_remote_donation(self) -> None:
         """Start this rank's donation for the final target manager, once, and wait until it is placed or failed."""
         remote_config = self._kv_cache_config.remote_cache_config
-        if (remote_config is None or not remote_config.donate_size
+        if (remote_config is None or remote_config.donor is None
                 or self._remote_donor is not None):
             return
         from .kv_cache.remote_donor import start_donation

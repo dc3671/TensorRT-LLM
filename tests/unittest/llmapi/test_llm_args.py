@@ -2075,78 +2075,131 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
     config = KvCacheConfig(
         remote_cache_config={
             "directory": str(tmp_path),
-            "cache_size": 200 << 30,
-            "transport": "fabric",
-            "pool_ratio": [0.02, 0.98],
-            "expected_num_donors": 8,
-            "expected_claim_size": 406 << 30,
+            "transport": {
+                "kind": "fabric"
+            },
+            "level": {
+                "size": 200 << 30,
+                "pool_ratio": [0.02, 0.98],
+                "expected": {
+                    "num_donors": 8,
+                    "claim_size": 406 << 30
+                },
+            },
         })
-    assert config.remote_cache_config.cache_size == 200 << 30
-    assert config.remote_cache_config.donor_wait_timeout_s == 900.0
-    assert config.remote_cache_config.transfer_timeout_s == 30.0
+    level = config.remote_cache_config.level
+    assert level.size == 200 << 30
+    assert level.donor_wait_timeout_s == 900.0
+    assert isinstance(config.remote_cache_config.transport,
+                      llm_args_mod.RemoteFabricTransportConfig)
+    assert config.remote_cache_config.donor is None
+    # The default transport is NIXL with its defaults.
+    nixl = remote(directory=str(tmp_path), donor={"size": 1 << 30}).transport
+    assert (nixl.kind, nixl.transfer_timeout_s,
+            nixl.ucx_devices) == ("nixl", 30.0, None)
     assert KvCacheConfig().remote_cache_config is None
 
     for bad in (
-        {},  # neither cache_size nor donate_size
+        {},  # neither a donor nor a level
         {
-            "cache_size": 1,
-            "expected_num_donors": 8
+            "level": {
+                "size": 1,
+                "expected": {
+                    "num_donors": 8
+                }
+            }
+        },
+            # Each transport's fields only on that transport.
+        {
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "fabric",
+                "ucx_devices": "mlx5_0:1"
+            }
         },
         {
-            "donate_size": 1 << 30,
-            "transport": "fabric",
-            "ucx_devices": "mlx5_0:1"
+            "level": {
+                "size": 1
+            },
+            "transport": {
+                "kind": "fabric",
+                "transfer_timeout_s": 10.0
+            }
         },
         {
-            "cache_size": 1,
-            "pool_ratio": [0.5, 0.0]
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "nixl",
+                "donor_reserve_size": 8 << 30
+            }
         },
         {
-            "donate_size": 1 << 30,
-            "ucx_devices": "mlx5_0:2"  # NIXL's UCX backend uses port 1
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "rdma"
+            }
         },
         {
-            "donate_size": 1 << 30,
-            "ucx_devices": "mlx5_0:1,,mlx5_1:1"
+            "level": {
+                "size": 1,
+                "pool_ratio": [0.5, 0.0]
+            }
         },
         {
-            "donate_size": (1 << 30) - 1  # below the donor's 1 GiB chunk
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "nixl",
+                "ucx_devices": "mlx5_0:2"  # NIXL's UCX backend uses port 1
+            }
         },
         {
-            "cache_size": 1,
-            "donor_wait_timeout_s": 0
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "nixl",
+                "ucx_devices": "mlx5_0:1,,mlx5_1:1"
+            }
         },
         {
-            "cache_size": 1,
-            "transfer_timeout_s": float("inf")
-        },
-            # Fields a donation-only rank, or a NIXL donor, would ignore.
-        {
-            "donate_size": 1 << 30,
-            "pool_ratio": [1.0]
+            "donor": {
+                "size": (1 << 30) - 1  # below the donor's 1 GiB chunk
+            }
         },
         {
-            "donate_size": 1 << 30,
-            "expected_num_donors": 8,
-            "expected_claim_size": 1 << 30
+            "level": {
+                "size": 0
+            }
         },
         {
-            "donate_size": 1 << 30,
-            "transfer_timeout_s": 10.0
+            "level": {
+                "size": 1,
+                "donor_wait_timeout_s": 0
+            }
         },
         {
-            "donate_size": 1 << 30,
-            "donor_reserve_size": 8 << 30
+            "level": {
+                "size": 1
+            },
+            "transport": {
+                "kind": "nixl",
+                "transfer_timeout_s": float("inf")
+            }
+        },
+            # The old flat fields are gone.
+        {
+            "cache_size": 1
         },
         {
-            "cache_size": 1,
-            "transport": "fabric",
-            "donor_reserve_size": 8 << 30
-        },
-        {
-            "cache_size": 1,
-            "transport": "fabric",
-            "transfer_timeout_s": 10.0
+            "donate_size": 1 << 30
         },
     ):
         with pytest.raises(ValidationError):
@@ -2154,35 +2207,45 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
     # A dumped config, defaults included, validates again.
     for good in (
             config.remote_cache_config,
-            remote(directory=str(tmp_path), donate_size=1 << 30),
+            remote(directory=str(tmp_path), donor={"size": 1 << 30}),
             remote(directory=str(tmp_path),
-                   donate_size=1 << 30,
-                   transport="fabric",
-                   donor_reserve_size=8 << 30),
+                   donor={"size": 1 << 30},
+                   transport={
+                       "kind": "fabric",
+                       "donor_reserve_size": 8 << 30
+                   }),
     ):
         assert remote(**good.model_dump()) == good
     assert remote(directory=str(tmp_path),
-                  donate_size=1 << 30).donate_size == 1 << 30
+                  donor={
+                      "size": 1 << 30
+                  },
+                  transport={
+                      "kind": "fabric",
+                      "donor_reserve_size": 8 << 30
+                  }).transport.donor_reserve_size == 8 << 30
     assert remote(directory=str(tmp_path),
-                  donate_size=1 << 30,
-                  transport="fabric",
-                  donor_reserve_size=8 << 30).donor_reserve_size == 8 << 30
-    assert remote(directory=str(tmp_path),
-                  donate_size=1 << 30,
-                  ucx_devices="mlx5_0:1").ucx_devices == "mlx5_0:1"
-    assert remote(directory=str(tmp_path),
-                  donate_size=1 << 30,
-                  ucx_devices="rdma_vf_rail{GPU}:1, mlx5_1").ucx_devices
+                  donor={
+                      "size": 1 << 30
+                  },
+                  transport={
+                      "kind": "nixl",
+                      "ucx_devices": "rdma_vf_rail{GPU}:1, mlx5_1"
+                  }).transport.ucx_devices
     with pytest.raises(ValidationError):
         KvCacheConfig(remote_cache_config={
             "directory": str(tmp_path),
-            "donate_size": 1 << 30
+            "donor": {
+                "size": 1 << 30
+            }
         },
                       use_kv_cache_manager_v2=False)
     with pytest.raises(ValidationError):
         KvCacheConfig(remote_cache_config={
             "directory": str(tmp_path),
-            "cache_size": 1
+            "level": {
+                "size": 1
+            }
         },
                       disk_cache_size=1,
                       disk_cache_path=str(tmp_path))
@@ -2190,12 +2253,16 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
     with pytest.raises(ValidationError, match="enable_kv_pool_rebalance"):
         KvCacheConfig(remote_cache_config={
             "directory": str(tmp_path),
-            "cache_size": 1
+            "level": {
+                "size": 1
+            }
         },
                       enable_kv_pool_rebalance=True)
     assert KvCacheConfig(remote_cache_config={
         "directory": str(tmp_path),
-        "donate_size": 1 << 30
+        "donor": {
+            "size": 1 << 30
+        }
     },
                          enable_kv_pool_rebalance=True).enable_kv_pool_rebalance
 
@@ -2206,17 +2273,29 @@ def test_KvCacheConfig_remote_cache_validation(tmp_path):
     [
         # CTX style: a remote level and a donation.
         {
-            "cache_size": 200 << 30,
-            "donate_size": 8 << 30,
-            "transport": "fabric",
-            "pool_ratio": [0.02, 0.98],
-            "expected_num_donors": 8,
-            "expected_claim_size": 406 << 30,
+            "transport": {
+                "kind": "fabric"
+            },
+            "donor": {
+                "size": 8 << 30
+            },
+            "level": {
+                "size": 200 << 30,
+                "pool_ratio": [0.02, 0.98],
+                "expected": {
+                    "num_donors": 8,
+                    "claim_size": 406 << 30
+                },
+            },
         },
         # GEN style: donation only.
         {
-            "donate_size": 160 << 30,
-            "transport": "fabric",
+            "transport": {
+                "kind": "fabric"
+            },
+            "donor": {
+                "size": 160 << 30
+            },
         },
     ],
     ids=["ctx", "gen"])

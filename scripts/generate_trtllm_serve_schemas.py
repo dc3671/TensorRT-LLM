@@ -223,12 +223,7 @@ def _cross_field_rules(definitions: dict) -> None:
 
     They hold only for values the YAML sets; defaults are taken from the models.
     """
-    from tensorrt_llm.llmapi.llm_args import (
-        REMOTE_CACHE_CHUNK_BYTES,
-        RemoteCacheConfig,
-        SchedulerConfig,
-        WaitingQueuePolicy,
-    )
+    from tensorrt_llm.llmapi.llm_args import SchedulerConfig, WaitingQueuePolicy
 
     def default(model: type, name: str) -> dict:
         return {"const": model.model_fields[name].default}
@@ -236,59 +231,11 @@ def _cross_field_rules(definitions: dict) -> None:
     def when(condition: dict, then: dict) -> dict:
         return {"if": condition, "then": then}
 
-    unset_or_zero = {"not": _is_set_to("cache_size", {"minimum": 1})}
     # RemoteCacheConfig.validate_remote_cache().
-    remote_unread = {
-        name: default(RemoteCacheConfig, name) for name in RemoteCacheConfig.CLAIMANT_ONLY_FIELDS
-    }
-    definitions["RemoteCacheConfig"].setdefault("allOf", []).extend(
-        [
-            {
-                "anyOf": [
-                    _is_set_to("cache_size", {"minimum": 1}),
-                    _is_set_to("donate_size", {"minimum": 1}),
-                ]
-            },
-            when(
-                _is_set_to("donate_size", {"exclusiveMinimum": 0}),
-                {"properties": {"donate_size": {"minimum": REMOTE_CACHE_CHUNK_BYTES}}},
-            ),
-            when(unset_or_zero, {"properties": remote_unread}),
-            when(
-                _is_set_to("transport", {"const": "fabric"}),
-                {
-                    "properties": {
-                        "transfer_timeout_s": default(RemoteCacheConfig, "transfer_timeout_s")
-                    }
-                },
-            ),
-            when(
-                {
-                    "anyOf": [
-                        {"not": _is_set_to("donate_size", {"minimum": 1})},
-                        {"not": _is_set_to("transport", {"const": "fabric"})},
-                    ]
-                },
-                {
-                    "properties": {
-                        "donor_reserve_size": default(RemoteCacheConfig, "donor_reserve_size")
-                    }
-                },
-            ),
-            when(
-                _is_set_to("expected_num_donors", {"type": "integer"}),
-                _is_set_to("expected_claim_size", {"type": "integer"}),
-            ),
-            when(
-                _is_set_to("expected_claim_size", {"type": "integer"}),
-                _is_set_to("expected_num_donors", {"type": "integer"}),
-            ),
-            when(
-                _is_set_to("ucx_devices", {"type": "string"}),
-                {"properties": {"transport": {"const": "nixl"}}},
-            ),
-        ]
-    )
+    definitions["RemoteCacheConfig"]["anyOf"] = [
+        {"required": ["donor"], "properties": {"donor": {"type": "object"}}},
+        {"required": ["level"], "properties": {"level": {"type": "object"}}},
+    ]
     # KvCacheConfig.validate_remote_cache_config() and validate_defer_generation_only_release().
     kv_v2 = {"properties": {"use_kv_cache_manager_v2": {"not": {"const": False}}}}
     definitions["KvCacheConfig"].setdefault("allOf", []).extend(
@@ -296,7 +243,7 @@ def _cross_field_rules(definitions: dict) -> None:
             when(_is_set_to("remote_cache_config", {"type": "object"}), kv_v2),
             when(_is_set_to("defer_generation_only_release", {"const": True}), kv_v2),
             when(
-                _is_set_to("remote_cache_config", _is_set_to("cache_size", {"minimum": 1})),
+                _is_set_to("remote_cache_config", _is_set_to("level", {"type": "object"})),
                 {
                     "properties": {
                         "disk_cache_size": {"enum": [0, None]},

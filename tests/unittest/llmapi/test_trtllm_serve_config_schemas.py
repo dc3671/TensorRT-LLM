@@ -725,90 +725,54 @@ _GIB = 1 << 30
     ("section", "config", "valid"),
     [
         # RemoteCacheConfig
-        ("kv_cache_config", {"remote_cache_config": {"directory": "d", "cache_size": _GIB}}, True),
-        ("kv_cache_config", {"remote_cache_config": {"directory": "d", "donate_size": _GIB}}, True),
-        ("kv_cache_config", {"remote_cache_config": {"directory": "d"}}, False),
-        ("kv_cache_config", {"remote_cache_config": {"directory": "d", "donate_size": 1}}, False),
-        (
-            "kv_cache_config",
-            {
-                "remote_cache_config": {
-                    "directory": "d",
-                    "donate_size": _GIB,
-                    "transfer_timeout_s": 5,
-                }
-            },
-            False,
-        ),
-        (
-            "kv_cache_config",
-            {"remote_cache_config": {"directory": "d", "cache_size": 1, "expected_num_donors": 2}},
-            False,
-        ),
-        (
-            "kv_cache_config",
-            {
-                "remote_cache_config": {
-                    "directory": "d",
-                    "cache_size": 1,
-                    "expected_num_donors": 2,
-                    "expected_claim_size": _GIB,
-                }
-            },
-            True,
-        ),
-        (
-            "kv_cache_config",
-            {
-                "remote_cache_config": {
-                    "directory": "d",
-                    "cache_size": 1,
-                    "transport": "fabric",
-                    "ucx_devices": "mlx5_0:1",
-                }
-            },
-            False,
-        ),
-        (
-            "kv_cache_config",
-            {
-                "remote_cache_config": {
-                    "directory": "d",
-                    "cache_size": 1,
-                    "transport": "fabric",
-                    "transfer_timeout_s": 5,
-                }
-            },
-            False,
-        ),
-        (
-            "kv_cache_config",
-            {
-                "remote_cache_config": {
-                    "directory": "d",
-                    "donate_size": _GIB,
-                    "donor_reserve_size": 0,
-                }
-            },
-            False,
-        ),
-        (
-            "kv_cache_config",
-            {
-                "remote_cache_config": {
-                    "directory": "d",
-                    "donate_size": _GIB,
-                    "transport": "fabric",
-                    "donor_reserve_size": 0,
-                }
-            },
-            True,
+        *(
+            ("kv_cache_config", {"remote_cache_config": {"directory": "d", **remote}}, valid)
+            for remote, valid in (
+                ({"level": {"size": _GIB}}, True),
+                ({"donor": {"size": _GIB}}, True),
+                ({}, False),
+                ({"donor": {"size": 1}}, False),
+                ({"level": {"size": 0}}, False),
+                ({"cache_size": _GIB}, False),
+                ({"level": {"size": 1, "expected": {"num_donors": 2}}}, False),
+                ({"level": {"size": 1, "expected": {"num_donors": 2, "claim_size": _GIB}}}, True),
+                (
+                    {"level": {"size": 1}, "transport": {"kind": "nixl", "transfer_timeout_s": 5}},
+                    True,
+                ),
+                (
+                    {
+                        "level": {"size": 1},
+                        "transport": {"kind": "fabric", "transfer_timeout_s": 5},
+                    },
+                    False,
+                ),
+                (
+                    {"level": {"size": 1}, "transport": {"kind": "fabric", "ucx_devices": "m:1"}},
+                    False,
+                ),
+                (
+                    {
+                        "donor": {"size": _GIB},
+                        "transport": {"kind": "nixl", "donor_reserve_size": 0},
+                    },
+                    False,
+                ),
+                (
+                    {
+                        "donor": {"size": _GIB},
+                        "transport": {"kind": "fabric", "donor_reserve_size": 0},
+                    },
+                    True,
+                ),
+                ({"donor": {"size": _GIB}, "transport": {"kind": "rdma"}}, False),
+            )
         ),
         # KvCacheConfig
         (
             "kv_cache_config",
             {
-                "remote_cache_config": {"directory": "d", "cache_size": 1},
+                "remote_cache_config": {"directory": "d", "level": {"size": 1}},
                 "disk_cache_size": 1,
                 "disk_cache_path": str(_REPO_ROOT),
             },
@@ -817,7 +781,7 @@ _GIB = 1 << 30
         (
             "kv_cache_config",
             {
-                "remote_cache_config": {"directory": "d", "donate_size": _GIB},
+                "remote_cache_config": {"directory": "d", "donor": {"size": _GIB}},
                 "disk_cache_size": 1,
                 "disk_cache_path": str(_REPO_ROOT),
             },
@@ -826,7 +790,7 @@ _GIB = 1 << 30
         (
             "kv_cache_config",
             {
-                "remote_cache_config": {"directory": "d", "cache_size": 1},
+                "remote_cache_config": {"directory": "d", "level": {"size": 1}},
                 "use_kv_cache_manager_v2": False,
             },
             False,
@@ -834,7 +798,7 @@ _GIB = 1 << 30
         (
             "kv_cache_config",
             {
-                "remote_cache_config": {"directory": "d", "cache_size": 1},
+                "remote_cache_config": {"directory": "d", "level": {"size": 1}},
                 "enable_kv_pool_rebalance": True,
             },
             False,
@@ -842,7 +806,7 @@ _GIB = 1 << 30
         (
             "kv_cache_config",
             {
-                "remote_cache_config": {"directory": "d", "donate_size": _GIB},
+                "remote_cache_config": {"directory": "d", "donor": {"size": _GIB}},
                 "enable_kv_pool_rebalance": True,
             },
             True,
@@ -853,8 +817,8 @@ _GIB = 1 << 30
                 {
                     "remote_cache_config": {
                         "directory": "d",
-                        "cache_size": 1,
-                        "ucx_devices": devices,
+                        "level": {"size": 1},
+                        "transport": {"kind": "nixl", "ucx_devices": devices},
                     }
                 },
                 valid,

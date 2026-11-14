@@ -3166,12 +3166,12 @@
             "properties": {
               "remote_cache_config": {
                 "properties": {
-                  "cache_size": {
-                    "minimum": 1
+                  "level": {
+                    "type": "object"
                   }
                 },
                 "required": [
-                  "cache_size"
+                  "level"
                 ]
               }
             },
@@ -5782,274 +5782,198 @@
     },
     "RemoteCacheConfig": {
       "additionalProperties": false,
-      "allOf": [
+      "anyOf": [
         {
-          "anyOf": [
-            {
-              "properties": {
-                "cache_size": {
-                  "minimum": 1
-                }
-              },
-              "required": [
-                "cache_size"
-              ]
-            },
-            {
-              "properties": {
-                "donate_size": {
-                  "minimum": 1
-                }
-              },
-              "required": [
-                "donate_size"
-              ]
+          "properties": {
+            "donor": {
+              "type": "object"
             }
+          },
+          "required": [
+            "donor"
           ]
         },
         {
-          "if": {
-            "properties": {
-              "donate_size": {
-                "exclusiveMinimum": 0
-              }
-            },
-            "required": [
-              "donate_size"
-            ]
-          },
-          "then": {
-            "properties": {
-              "donate_size": {
-                "minimum": 1073741824
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "not": {
-              "properties": {
-                "cache_size": {
-                  "minimum": 1
-                }
-              },
-              "required": [
-                "cache_size"
-              ]
+          "properties": {
+            "level": {
+              "type": "object"
             }
           },
-          "then": {
-            "properties": {
-              "donor_wait_timeout_s": {
-                "const": 900.0
-              },
-              "expected_claim_size": {
-                "const": null
-              },
-              "expected_num_donors": {
-                "const": null
-              },
-              "pool_ratio": {
-                "const": null
-              },
-              "transfer_timeout_s": {
-                "const": 30.0
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "transport": {
-                "const": "fabric"
-              }
-            },
-            "required": [
-              "transport"
-            ]
-          },
-          "then": {
-            "properties": {
-              "transfer_timeout_s": {
-                "const": 30.0
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "anyOf": [
-              {
-                "not": {
-                  "properties": {
-                    "donate_size": {
-                      "minimum": 1
-                    }
-                  },
-                  "required": [
-                    "donate_size"
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "properties": {
-                    "transport": {
-                      "const": "fabric"
-                    }
-                  },
-                  "required": [
-                    "transport"
-                  ]
-                }
-              }
-            ]
-          },
-          "then": {
-            "properties": {
-              "donor_reserve_size": {
-                "const": 25769803776
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "expected_num_donors": {
-                "type": "integer"
-              }
-            },
-            "required": [
-              "expected_num_donors"
-            ]
-          },
-          "then": {
-            "properties": {
-              "expected_claim_size": {
-                "type": "integer"
-              }
-            },
-            "required": [
-              "expected_claim_size"
-            ]
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "expected_claim_size": {
-                "type": "integer"
-              }
-            },
-            "required": [
-              "expected_claim_size"
-            ]
-          },
-          "then": {
-            "properties": {
-              "expected_num_donors": {
-                "type": "integer"
-              }
-            },
-            "required": [
-              "expected_num_donors"
-            ]
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "ucx_devices": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "ucx_devices"
-            ]
-          },
-          "then": {
-            "properties": {
-              "transport": {
-                "const": "nixl"
-              }
-            }
-          }
+          "required": [
+            "level"
+          ]
         }
       ],
-      "description": "KV cache manager v2 remote cache level in host memory that other ranks donate.\n\nA rank with ``cache_size`` gets a cache level below the host tier whose slots\nlive in memory that ranks with ``donate_size`` publish in ``directory``.",
+      "description": "KV cache manager v2 remote cache level in host memory that other ranks donate.\n\nA rank with `level` gets a cache level below the host tier whose slots live\nin memory that ranks with `donor` publish in `directory`.",
       "properties": {
-        "cache_size": {
-          "default": 0,
-          "description": "Bytes of this rank's remote cache level. Pages are stored as the cold tiers store them: byte copies, or encoded by a lossy cold-page codec (kv_cache_compression_config) when one is set. It takes the disk level's place, so it cannot be combined with `disk_cache_size`.",
-          "minimum": 0,
-          "status": "prototype",
-          "title": "Cache Size",
-          "type": "integer"
-        },
         "directory": {
-          "description": "Rendezvous directory, on a file system every rank of the job sees, where donors publish their memory and remote cache levels claim chunks of it. Environment variables are expanded; the directory is created if missing. Use one directory per job.",
+          "description": "Rendezvous directory, on a file system every rank of the job sees, where donors publish their memory and remote cache levels claim chunks of it. Environment variables are expanded, and one that is not set is an error; the directory is created if missing. Use one directory per job.",
           "minLength": 1,
           "status": "prototype",
           "title": "Directory",
           "type": "string"
         },
-        "donate_size": {
-          "default": 0,
-          "description": "Bytes of host memory this rank donates to remote cache levels, in whole 1 GiB chunks, for the lifetime of the process.",
-          "minimum": 0,
+        "donor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteDonorConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "This rank's donation; None donates nothing.",
+          "status": "prototype"
+        },
+        "level": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteLevelConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "This rank's remote cache level; None gives it none.",
+          "status": "prototype"
+        },
+        "transport": {
+          "description": "How pages move: {kind: nixl} (one-sided NIXL RDMA, the default) or {kind: fabric} (CUDA fabric memory copied over NVLink).",
+          "discriminator": {
+            "mapping": {
+              "fabric": "#/$defs/RemoteFabricTransportConfig",
+              "nixl": "#/$defs/RemoteNixlTransportConfig"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RemoteNixlTransportConfig",
+              "required": [
+                "kind"
+              ]
+            },
+            {
+              "$ref": "#/$defs/RemoteFabricTransportConfig",
+              "required": [
+                "kind"
+              ]
+            }
+          ],
           "status": "prototype",
-          "title": "Donate Size",
+          "title": "Transport"
+        }
+      },
+      "required": [
+        "directory"
+      ],
+      "title": "RemoteCacheConfig",
+      "type": "object"
+    },
+    "RemoteDonorConfig": {
+      "additionalProperties": false,
+      "description": "Host memory this rank donates to remote cache levels.",
+      "properties": {
+        "size": {
+          "description": "Bytes donated for the lifetime of the process, in whole 1 GiB chunks (a remainder below one chunk is not donated; the rank logs the size it donates).",
+          "minimum": 1073741824,
+          "status": "prototype",
+          "title": "Size",
           "type": "integer"
+        }
+      },
+      "required": [
+        "size"
+      ],
+      "title": "RemoteDonorConfig",
+      "type": "object"
+    },
+    "RemoteExpectedDonorsConfig": {
+      "additionalProperties": false,
+      "description": "The job's donors and claims, which only the launcher can count.",
+      "properties": {
+        "claim_size": {
+          "description": "Bytes all ranks of the job claim from `directory` together.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Claim Size",
+          "type": "integer"
+        },
+        "num_donors": {
+          "description": "Number of donating ranks the job starts.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Num Donors",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "num_donors",
+        "claim_size"
+      ],
+      "title": "RemoteExpectedDonorsConfig",
+      "type": "object"
+    },
+    "RemoteFabricTransportConfig": {
+      "additionalProperties": false,
+      "description": "Remote cache transport over CUDA fabric memory.\n\nClaimants in the same multi-node NVLink domain copy it over NVLink.",
+      "properties": {
+        "compact_host_memory": {
+          "default": false,
+          "description": "Before a node that refuses a donated chunk is left, run up to 64 reclaim-and-compact passes on it (fault in and release node-bound huge pages under a per-node lock that donors on one host take in turn), so fragmented or page-cache-filled memory can still take the donation. False publishes what fits and leaves compaction to the job prolog.",
+          "status": "prototype",
+          "title": "Compact Host Memory",
+          "type": "boolean"
         },
         "donor_reserve_size": {
           "default": 25769803776,
-          "description": "Fabric transport only: bytes of free plus reclaimable memory each host NUMA node keeps for the processes on it while the donation is placed. Chunks go to the GPU's node first, then to the others; a donation that does not fit is published short. Requires `donate_size`.",
+          "description": "Bytes of free plus reclaimable memory each host NUMA node keeps for the processes on it while a donation is placed. Chunks go to the GPU's node first, then to the others; a donation that does not fit is published short.",
           "minimum": 0,
           "status": "prototype",
           "title": "Donor Reserve Size",
           "type": "integer"
         },
+        "kind": {
+          "const": "fabric",
+          "description": "Selects this transport. Every rank sharing `directory` must use the same transport.",
+          "status": "prototype",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "RemoteFabricTransportConfig",
+      "type": "object"
+    },
+    "RemoteLevelConfig": {
+      "additionalProperties": false,
+      "description": "This rank's remote cache level, in chunks of donated memory.",
+      "properties": {
         "donor_wait_timeout_s": {
           "default": 900.0,
-          "description": "Seconds a rank with `cache_size` waits for donors, applied to each wait on its own: for the expected donors to report, and for each chunk claim. Donors publish while their own servers start, so this bounds the job's startup skew per wait, not in total. At most 1e6.",
+          "description": "Seconds the rank waits for donors, applied to each wait on its own: for the expected donors to report, and for each chunk claim. Donors publish while their own servers start, so this bounds the job's startup skew per wait, not in total. At most 1e6.",
           "exclusiveMinimum": 0,
           "maximum": 1000000.0,
           "status": "prototype",
           "title": "Donor Wait Timeout S",
           "type": "number"
         },
-        "expected_claim_size": {
+        "expected": {
           "anyOf": [
             {
-              "exclusiveMinimum": 0,
-              "type": "integer"
+              "$ref": "#/$defs/RemoteExpectedDonorsConfig"
             },
             {
               "type": "null"
             }
           ],
           "default": null,
-          "description": "Bytes all ranks of the job claim from `directory` together. Used with `expected_num_donors`.",
-          "status": "prototype",
-          "title": "Expected Claim Size"
-        },
-        "expected_num_donors": {
-          "anyOf": [
-            {
-              "exclusiveMinimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Number of donating ranks the job starts. With `expected_claim_size`, a rank with `cache_size` waits until these donors have reported and fails at once if they cannot cover the claims, instead of after the claim wait.",
-          "status": "prototype",
-          "title": "Expected Num Donors"
+          "description": "With it, the rank waits until these donors have reported and fails at once if they cannot cover the claims, instead of after a claim wait.",
+          "status": "prototype"
         },
         "pool_ratio": {
           "anyOf": [
@@ -6066,29 +5990,44 @@
             }
           ],
           "default": null,
-          "description": "Split of `cache_size` across layer groups, one positive weight per layer group in KV cache manager v2 layer-group ID order (normalized). None follows the hot tier's split.",
+          "description": "Split of `size` across layer groups, one positive weight per layer group in KV cache manager v2 layer-group ID order (normalized). None follows the hot tier's split.",
           "status": "prototype",
           "title": "Pool Ratio"
         },
+        "size": {
+          "description": "Bytes of the level. Pages are stored as the cold tiers store them: byte copies, or encoded by a lossy cold-page codec (kv_cache_compression_config) when one is set. It takes the disk level's place, so it cannot be combined with `disk_cache_size`.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "size"
+      ],
+      "title": "RemoteLevelConfig",
+      "type": "object"
+    },
+    "RemoteNixlTransportConfig": {
+      "additionalProperties": false,
+      "description": "Remote cache transport over one-sided NIXL RDMA.",
+      "properties": {
+        "kind": {
+          "const": "nixl",
+          "default": "nixl",
+          "description": "Selects this transport. Every rank sharing `directory` must use the same transport.",
+          "status": "prototype",
+          "title": "Kind",
+          "type": "string"
+        },
         "transfer_timeout_s": {
           "default": 30.0,
-          "description": "NIXL transport only: seconds one batch of page transfers may take before the remote level fails, e.g. on a donor that died. At most 1e6. The fabric transport's copies run on the CUDA stream and are not timed.",
+          "description": "Seconds one batch of page transfers of a remote level may take before the level fails, e.g. on a donor that died. At most 1e6.",
           "exclusiveMinimum": 0,
           "maximum": 1000000.0,
           "status": "prototype",
           "title": "Transfer Timeout S",
           "type": "number"
-        },
-        "transport": {
-          "default": "nixl",
-          "description": "How pages move: 'nixl' uses one-sided NIXL RDMA; 'fabric' donates CUDA fabric memory that clients in the same multi-node NVLink domain copy over NVLink. Every rank sharing `directory` must use the same value.",
-          "enum": [
-            "nixl",
-            "fabric"
-          ],
-          "status": "prototype",
-          "title": "Transport",
-          "type": "string"
         },
         "ucx_devices": {
           "anyOf": [
@@ -6101,15 +6040,12 @@
             }
           ],
           "default": null,
-          "description": "NIXL transport only: comma-separated UCX devices of the remote level's and the donor's NIXL agents (for example 'mlx5_0:1'), each '<device>' or '<device>:1' (NIXL's UCX backend uses port 1); '{GPU}' is replaced by the rank's physical GPU index. None uses the process's UCX environment.",
+          "description": "Comma-separated UCX devices of the remote level's and the donor's NIXL agents (for example 'mlx5_0:1'), each '<device>' or '<device>:1' (NIXL's UCX backend uses port 1); '{GPU}' is replaced by the rank's physical GPU index. None uses the process's UCX environment.",
           "status": "prototype",
           "title": "Ucx Devices"
         }
       },
-      "required": [
-        "directory"
-      ],
-      "title": "RemoteCacheConfig",
+      "title": "RemoteNixlTransportConfig",
       "type": "object"
     },
     "ReorderRequestPolicyConfig": {
