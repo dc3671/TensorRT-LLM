@@ -632,6 +632,18 @@ class _GdnPrefillScratch:
             self._views[("packed",) + key[1:]] = _PackedPostConv(t.squeeze(0) for t in views)
         return views
 
+    def log_gate(self, num_tokens: int, num_v_heads: int, device) -> torch.Tensor:
+        """``[1, num_tokens, num_v_heads]`` FP32 for a log-space gate nobody reads: gdn_prefill_conv_post's g when
+        its linear-space alpha goes into ``post_conv``'s g (the buffer FlashInfer's packed views read)."""
+        key = ("glog", num_tokens, num_v_heads, device)
+        view = self._views.get(key)
+        if view is None:
+            n = num_tokens * num_v_heads
+            buf = self._flat(("glog", device), n, torch.float32, device)
+            view = buf[:n].view(1, num_tokens, num_v_heads)
+            self._views[key] = view
+        return view
+
     def post_conv_packed(
         self,
         num_tokens: int,
@@ -848,7 +860,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     # Token-major prefill conv, shared with main's Mamba2 switch (default 1).
     _token_major_conv = os.environ.get("TRTLLM_MAMBA_TOKEN_MAJOR_CONV", "1") == "1"
     # Context-only prefill runs gdn_prefill_conv_post (conv1d + post-conv in one pass over the token-major in_proj
-    # output); not bitwise to the stock kernels in the FP32 order of the q / k L2 norms.
+    # output); not bitwise to the stock kernels in q / k / v (SiLU form, FP32 order of the q / k L2 norms) and alpha
+    # (libdevice expf vs tl.exp), see gdn_prefill_conv.py.
     fused_prefill_conv: bool = False
     # The in-forward snapshot split runs its state / token copies as bit-identical Triton launches.
     fused_split_copies: bool = False
@@ -1078,8 +1091,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             tokens = model_config.spec_config.tokens_per_gen_step
             hv, hk = self.num_v_heads_per_tp, self.num_k_heads_per_tp
             if tcgen05.gdn_verify_tcgen05_supported(tokens, hv, hk, fp8_out=True):
-                # Compiled here: never inside a warm-up step or a CUDA-graph capture.
-                tcgen05.compile_gdn_verify_tcgen05(tokens, hv, hk)
+                # Compiled by cache_derived_state, once the out_proj quantization is known.
                 self.verify_tcgen05_min_rows = verify_tcgen05_min_rows
                 self.verify_tcgen05_tokens = tokens
         self.fused_split_copies = fused_prefill
@@ -1113,6 +1125,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             # does not register the derived scale into norm's state_dict; the
             # detached view still shares storage with out_proj.input_scale.
             self.norm.fp8_scale = scale.detach() if scale is not None else None
+        if self.verify_tcgen05_min_rows > 0 and self.norm.fp8_scale is not None:
+            # The tcgen05 verify runs only with an E4M3 out_proj input (_fused_verify_replay_norm): compile it here,
+            # after loading and before any warm-up step or CUDA-graph capture, for an FP8QDQ out_proj only.
+            from ...kernels.blackwell import gdn_verify_tcgen05 as tcgen05
+
+            tcgen05.compile_gdn_verify_tcgen05(
+                self.verify_tcgen05_tokens, self.num_v_heads_per_tp, self.num_k_heads_per_tp
+            )
         self._refresh_fused_in_proj()
 
     def _fused_in_proj_eligible(self) -> bool:
@@ -1482,16 +1502,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         h_fp8: Optional[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-        spec_metadata: Optional[SpecMetadata],
+        plan: FusedVerifyPlan,
     ) -> Optional[torch.Tensor]:
         """The low-M in_proj with the conv1d update in its epilogue (convolved q|k|v, intermediate windows and conv
-        state written by the GEMM), then the fused replay + gated RMSNorm: the out_proj input of a decode-only MTP
-        target-verify step, or None when the step or the in_proj does not qualify."""
+        state written by the GEMM), then the fused replay + gated RMSNorm: the out_proj input of the decode-only MTP
+        target-verify step ``plan`` describes, or None when the in_proj does not qualify."""
         if low_m_gemm_dispatcher(self.in_proj_qkvz) is None:
-            return None
-        plan = self._fused_verify_plan(attn_metadata, spec_metadata, hidden_states.shape[0])
-        if plan is None:
             return None
         layer_cache = plan.layer_cache
         res = self._lowm_in_proj(
@@ -1521,13 +1537,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         h_fp8: Optional[torch.Tensor],
-        attn_metadata: AttentionMetadata,
-        spec_metadata: Optional[SpecMetadata],
+        plan: FusedVerifyPlan,
     ) -> Optional[torch.Tensor]:
         """in_proj_qkvz on the resident-weight FP8 GEMM with the conv1d update in its epilogue (convolved q|k|v,
         intermediate windows and conv state written by the GEMM), in_proj_ba on the aux stream, then the fused replay
-        + gated RMSNorm: the out_proj input of a decode-only MTP target-verify step of at least
-        ``resident_min_rows`` rows, or None when the step, the shapes or the caches do not qualify."""
+        + gated RMSNorm: the out_proj input of the decode-only MTP target-verify step ``plan`` describes when it has
+        at least ``resident_min_rows`` rows, or None when the shapes or the caches do not qualify."""
         if (
             not self.resident_min_rows
             or h_fp8 is None
@@ -1544,9 +1559,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             or not h_fp8.is_contiguous()
             or qkvz.weight.dtype != torch.float8_e4m3fn
         ):
-            return None
-        plan = self._fused_verify_plan(attn_metadata, spec_metadata, hidden_states.shape[0])
-        if plan is None:
             return None
         from ...kernels.blackwell import resident_fp8_gemm as resident
 
@@ -1611,14 +1623,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         a: torch.Tensor,
         b: torch.Tensor,
         ba_ready: Optional[torch.cuda.Event],
-        attn_metadata: AttentionMetadata,
-        spec_metadata: Optional[SpecMetadata],
-    ) -> Optional[torch.Tensor]:
-        """The conv1d update kernel, then the fused replay + gated RMSNorm: the out_proj input of a decode-only MTP
-        target-verify step whose in_proj did not take the low-M kernel, or None (separate kernels)."""
-        plan = self._fused_verify_plan(attn_metadata, spec_metadata, mixed_qkv.shape[0])
-        if plan is None:
-            return None
+        plan: FusedVerifyPlan,
+    ) -> torch.Tensor:
+        """The conv1d update kernel, then the fused replay + gated RMSNorm: the out_proj input of the decode-only MTP
+        target-verify step ``plan`` describes, when its in_proj did not take the low-M kernel."""
         num_decodes = plan.num_decodes
         draft_token_num = plan.draft_token_num
         layer_cache = plan.layer_cache
@@ -2149,35 +2157,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     mixed_qkv_p_t, None, a[:num_prefill_tokens], b[:num_prefill_tokens], g_linear
                 )
         elif fused_conv:
-            # With g_linear the scans take alpha = exp(g), written next to g by the kernel's gates stage.
-            alpha = None
-            if g_linear:
-                alpha = torch.empty(
-                    (1, mixed_qkv.shape[0], self.num_v_heads_per_tp),
-                    dtype=torch.float32,
-                    device=mixed_qkv.device,
-                )
-            query, key, value, g, beta = gdn_prefill_conv_post(
+            query, key, value, g, beta, packed = self._fused_prefill_conv_post(
                 mixed_qkv,
-                self.conv1d.weight,
-                self.conv1d.bias,
                 conv_states_to_use,
                 query_start_loc,
                 cache_indices,
                 has_initial_states,
                 a,
                 b,
-                self.A_log,
-                self.dt_bias,
-                self.num_k_heads_per_tp,
-                self.head_k_dim,
-                self.num_v_heads_per_tp,
-                self.head_v_dim,
-                activation=self.activation,
-                alpha_out=alpha,
+                g_linear,
             )
-            if alpha is not None:
-                g = alpha
             if inforward_split is not None:
                 if inforward_window is None:
                     # One launch: stage the live states, then load the window at P straight from mixed_qkv.
@@ -2608,6 +2597,67 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
         return q, k, v, g, beta, packed
 
+    def _fused_prefill_conv_post(
+        self,
+        mixed_qkv: torch.Tensor,
+        conv_states: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        cache_indices: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        g_linear: bool,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[_PackedPostConv],
+    ]:
+        """gdn_prefill_conv_post on the scratch buffers ``_post_conv`` fills: ``(q, k, v, g, beta, packed)`` with
+        ``packed`` the ``_PackedPostConv`` of the same buffers. With ``g_linear`` the kernel writes alpha = exp(g)
+        into the scratch g (what the scans and ``packed`` read) and its log-space g into a scratch nobody reads."""
+        num_tokens = mixed_qkv.shape[0]
+        shape = (
+            num_tokens,
+            self.num_k_heads_per_tp,
+            self.head_k_dim,
+            self.num_v_heads_per_tp,
+            self.head_v_dim,
+            mixed_qkv.dtype,
+            mixed_qkv.device,
+        )
+        scratch = _prefill_scratch()
+        log_g = (
+            scratch.log_gate(num_tokens, self.num_v_heads_per_tp, mixed_qkv.device)
+            if g_linear
+            else None
+        )
+        q, k, v, g, beta = scratch.post_conv(*shape)
+        packed = scratch.post_conv_packed(*shape)
+        gdn_prefill_conv_post(
+            mixed_qkv,
+            self.conv1d.weight,
+            self.conv1d.bias,
+            conv_states,
+            query_start_loc,
+            cache_indices,
+            has_initial_states,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            self.num_k_heads_per_tp,
+            self.head_k_dim,
+            self.num_v_heads_per_tp,
+            self.head_v_dim,
+            activation=self.activation,
+            alpha_out=g if g_linear else None,
+            out=(q, k, v, log_g if g_linear else g, beta),
+        )
+        return q, k, v, g, beta, packed
+
     def _reset_prefill_states(
         self,
         attn_metadata: AttentionMetadata,
@@ -2658,15 +2708,18 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         h_fp8: Optional[torch.Tensor] = None,
     ):
-        fused = self._fused_verify_inproj(hidden_states, h_fp8, attn_metadata, spec_metadata)
-        if fused is None:
-            fused = self._resident_verify_inproj(hidden_states, h_fp8, attn_metadata, spec_metadata)
-        if fused is not None:
-            return self.out_proj(fused, all_reduce_params=all_reduce_params)
+        # Built once per layer and step; the three fused verify paths below share it.
+        plan = self._fused_verify_plan(attn_metadata, spec_metadata, hidden_states.shape[0])
+        if plan is not None:
+            fused = self._fused_verify_inproj(hidden_states, h_fp8, plan)
+            if fused is None:
+                fused = self._resident_verify_inproj(hidden_states, h_fp8, plan)
+            if fused is not None:
+                return self.out_proj(fused, all_reduce_params=all_reduce_params)
 
         mixed_qkv, z, a, b, ba_ready = self._compute_tokenwise_inputs(hidden_states, h_fp8)
-        fused = self._fused_verify(mixed_qkv, z, a, b, ba_ready, attn_metadata, spec_metadata)
-        if fused is not None:
+        if plan is not None:
+            fused = self._fused_verify(mixed_qkv, z, a, b, ba_ready, plan)
             return self.out_proj(fused, all_reduce_params=all_reduce_params)
         # Every path below reads a / b.
         if ba_ready is not None:

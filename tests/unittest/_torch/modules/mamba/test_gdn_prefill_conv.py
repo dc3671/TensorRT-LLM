@@ -4,8 +4,10 @@
 
 extract_transpose_prefill_slice + causal_conv1d_fn + fused_gdn_post_conv: g, beta and the new conv states are
 bitwise equal; q / k differ in the FP32 summation order of their L2 norms, and q / k / v in the SiLU, which the
-stock CUDA conv takes through tanh.approx above -7 (causalConv1d.cu) and the fused kernel exactly. The value-head
-counts include ones that are not powers of two (24 / 48 per rank).
+stock CUDA conv takes through tanh.approx above -7 (causalConv1d.cu) and the fused kernel exactly. The linear-space
+gate alpha = exp(g) is libdevice expf (torch.exp's bits), a few FP32 ulp from the stock kernel's tl.exp
+(fused_gdn_post_conv(g_linear=True)). The value-head counts include ones that are not powers of two (24 / 48 per
+rank).
 """
 
 import pytest
@@ -84,7 +86,37 @@ def _stock(x, num_k_heads, num_v_heads):
     return q, k, v, g, beta, conv_states
 
 
-def _fused(x, num_k_heads, num_v_heads):
+def _stock_alpha(x, num_k_heads, num_v_heads):
+    """alpha of the stock pipeline with the FlashInfer gate convention: fused_gdn_post_conv(g_linear=True)."""
+    conv_states = x["conv_states"].clone()
+    mixed = x["mixed_qkv"]
+    mixed_t = extract_transpose_prefill_slice(mixed, mixed.shape[0], 0, mixed.shape[1])
+    mixed_t = causal_conv1d_fn(
+        mixed_t,
+        x["weight"].squeeze(1),
+        None,
+        activation="silu",
+        conv_states=conv_states,
+        has_initial_state=x["has_initial_state"],
+        cache_indices=x["cache_indices"],
+        query_start_loc=x["query_start_loc"],
+    )
+    return fused_gdn_post_conv(
+        mixed_t,
+        None,
+        x["a"],
+        x["b"],
+        x["A_log"],
+        x["dt_bias"],
+        num_k_heads,
+        HEAD_DIM,
+        num_v_heads,
+        HEAD_DIM,
+        g_linear=True,
+    )[3]
+
+
+def _fused(x, num_k_heads, num_v_heads, out=None):
     conv_states = x["conv_states"].clone()
     alpha = torch.empty((1, x["mixed_qkv"].shape[0], num_v_heads), device="cuda")
     q, k, v, g, beta = gdn_prefill_conv_post(
@@ -104,6 +136,7 @@ def _fused(x, num_k_heads, num_v_heads):
         num_v_heads,
         HEAD_DIM,
         alpha_out=alpha,
+        out=out,
     )
     return q, k, v, g, beta, conv_states, alpha
 
@@ -135,8 +168,60 @@ def test_matches_stock_pipeline(num_k_heads, num_v_heads, lens, pad_seqs, extra_
     assert torch.equal(beta, beta_ref)
     assert torch.equal(cs, cs_ref)
     assert torch.equal(alpha, torch.exp(g))
+    # alpha in (0, 1]: the int32 bit patterns of two such floats differ by their ulp distance.
+    alpha_ref = _stock_alpha(x, num_k_heads, num_v_heads)
+    ulps = (alpha.view(torch.int32) - alpha_ref.view(torch.int32)).abs().max().item()
+    assert ulps <= _ALPHA_MAX_ULPS, ulps
     torch.testing.assert_close(q.float(), q_ref.float(), atol=8e-3, rtol=0)
     torch.testing.assert_close(k.float(), k_ref.float(), atol=8e-3, rtol=0)
+
+
+# libdevice expf vs the stock kernel's tl.exp (ex2.approx of g * log2(e), whose error grows with |g|) on the gates
+# of these inputs: at most 25 ulp measured on GB300, a relative difference below 3e-6.
+_ALPHA_MAX_ULPS = 32
+
+
+@pytest.mark.parametrize("lens,pad_seqs", [([700, 3, 0, 1, 1300], (2,)), ([1, 65], ())])
+def test_out_buffers_take_the_same_values(lens, pad_seqs):
+    """``out=`` (the mixer's shared scratch views) is the buffers the kernel writes and returns: the same launches
+    give bit-identical q / k / v / g / beta, alpha and conv states as freshly allocated outputs."""
+    num_k_heads, num_v_heads = 8, 32
+    x = _inputs(lens, num_k_heads, num_v_heads, pad_seqs=pad_seqs)
+    ref = _fused(x, num_k_heads, num_v_heads)
+    T = x["mixed_qkv"].shape[0]
+    # Prefix views of larger flat buffers filled with NaN, as the scratch hands them out.
+    out = (
+        torch.full((2 * T * num_k_heads * HEAD_DIM,), float("nan"), device="cuda")
+        .to(torch.bfloat16)[: T * num_k_heads * HEAD_DIM]
+        .view(1, T, num_k_heads, HEAD_DIM),
+        torch.full((T * num_k_heads * HEAD_DIM,), float("nan"), device="cuda")
+        .to(torch.bfloat16)
+        .view(1, T, num_k_heads, HEAD_DIM),
+        torch.full((T * num_v_heads * HEAD_DIM,), float("nan"), device="cuda")
+        .to(torch.bfloat16)
+        .view(1, T, num_v_heads, HEAD_DIM),
+        torch.full((3 * T * num_v_heads,), float("nan"), device="cuda")[: T * num_v_heads].view(
+            1, T, num_v_heads
+        ),
+        torch.full((T, num_v_heads), float("nan"), device="cuda").view(1, T, num_v_heads),
+    )
+    got = _fused(x, num_k_heads, num_v_heads, out=out)
+    torch.cuda.synchronize()
+    for t, o in zip(got[:5], out):
+        assert t.data_ptr() == o.data_ptr()
+    for name, a, b in zip(("q", "k", "v", "g", "beta", "conv_states", "alpha"), got, ref):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), name
+
+
+def test_out_buffers_are_checked():
+    num_k_heads, num_v_heads = 8, 32
+    x = _inputs([5], num_k_heads, num_v_heads)
+    T = x["mixed_qkv"].shape[0]
+    q = torch.empty((1, T, num_k_heads, HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    v = torch.empty((1, T, num_v_heads, HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    g = torch.empty((1, T, num_v_heads), device="cuda")
+    with pytest.raises(ValueError, match="out must be"):
+        _fused(x, num_k_heads, num_v_heads, out=(q, q.clone(), v, g, g.to(torch.bfloat16)))
 
 
 @pytest.mark.parametrize("num_k_heads,num_v_heads", [(2, 6), (4, 12)])

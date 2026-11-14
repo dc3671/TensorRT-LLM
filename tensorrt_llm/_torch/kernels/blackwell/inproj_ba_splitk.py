@@ -61,7 +61,7 @@ def _smem_bytes(k: int, n: int) -> int:
     return 2 * (nbox * n * KBOX + (MROWS - n) * KBOX + nbox * X_BOX) + 4 * SPLITS * TOK * n + 1024
 
 
-def plan(m: int, k: int, n: int):
+def plan(m: int, k: int, n: int) -> int | None:
     """Token tiles, or None outside 1..MAX_ROWS rows or the kernel's shapes: K in whole barrier groups of x boxes per
     split; N in whole 8-row swizzle atoms within the 16 accumulator rows of TMEM sub-partition 0 (MMA M 64), which
     warp 0 reads; the CTA's shared memory within one SM."""
@@ -316,7 +316,7 @@ def _compiled(*key):
     return fn
 
 
-def ba_splitk(x: torch.Tensor, w: torch.Tensor, out=None) -> torch.Tensor:
+def ba_splitk(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """y[M, N] BF16 = x[M, K] BF16 @ w[N, K].T with cuBLAS' split-K 4 arithmetic (``supports`` operands)."""
     m, k = x.shape
     n = w.shape[0]

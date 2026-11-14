@@ -3,9 +3,14 @@
 """GDN prefill causal conv1d + post-conv in one pass over the token-major in_proj output.
 
 Replaces extract_transpose_prefill_slice + causal_conv1d_fn + fused_gdn_post_conv for a context-only batch with
-two Triton launches: conv + SiLU + q / k L2 norm + gates, then the new conv states. Outputs equal the stock
-pipeline's bit for bit except the FP32 summation order of the q / k L2 norms.
+two Triton launches: conv + SiLU + q / k L2 norm + gates, then the new conv states. g, beta and the conv states equal
+the stock pipeline's bit for bit; q / k / v differ in the SiLU (the stock CUDA conv takes tanh.approx above -7, this
+kernel the exact form) and in the FP32 summation order of the q / k L2 norms; the optional linear-space gate
+alpha = exp(g) is libdevice expf (torch.exp's value), up to a few tens of FP32 ulp (relative 3e-6) from the
+stock Triton ``tl.exp`` of ``fused_gdn_post_conv(g_linear=True)``.
 """
+
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -411,7 +416,8 @@ def _gates(
     WITH_ALPHA: tl.constexpr,
 ):
     """g, beta FP32 of tokens [t0, t0 + CHUNK) x value heads [h0, h0 + HEADS) with _fused_gdn_post_conv_kernel's
-    expressions; with WITH_ALPHA also alpha = exp(g), FlashInfer's linear-space gate (bit-identical to torch.exp)."""
+    expressions; with WITH_ALPHA also alpha = exp(g), FlashInfer's linear-space gate, as libdevice expf (bit-identical
+    to torch.exp; the stock kernel's tl.exp differs by up to a few tens of ulp)."""
     t = t0 + tl.arange(0, GATE_T)
     h = h0 + tl.arange(0, HEADS)
     t64 = t.to(tl.int64)
@@ -494,7 +500,7 @@ def _gdn_conv_state_update_kernel(
 def gdn_prefill_conv_post(
     mixed_qkv: torch.Tensor,
     conv_weight: torch.Tensor,
-    conv_bias,
+    conv_bias: Optional[torch.Tensor],
     conv_states: torch.Tensor,
     query_start_loc: torch.Tensor,
     cache_indices: torch.Tensor,
@@ -511,12 +517,18 @@ def gdn_prefill_conv_post(
     l2_norm_eps: float = 1e-6,
     softplus_threshold: float = 20.0,
     pad_slot_id: int = -1,
-    alpha_out: "torch.Tensor | None" = None,
-):
+    alpha_out: Optional[torch.Tensor] = None,
+    out: Optional[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """q, k (L2-normed), v [1, T, H, D] in mixed_qkv's dtype and g, beta [1, T, HV] FP32, with conv_states updated
-    in place; equals extract_transpose_prefill_slice + causal_conv1d_fn + fused_gdn_post_conv up to the q / k L2
-    norms' FP32 summation order. mixed_qkv: [T, conv_dim] BF16 token-major (gdn_prefill_conv_eligible).
-    alpha_out: optional [1, T, HV] FP32 tensor that receives exp(g), bit-identical to torch.exp(g)."""
+    in place; g, beta and the conv states equal extract_transpose_prefill_slice + causal_conv1d_fn +
+    fused_gdn_post_conv, q / k / v up to the SiLU form and the q / k L2 norms' FP32 summation order (module
+    docstring). mixed_qkv: [T, conv_dim] BF16 token-major (gdn_prefill_conv_eligible).
+    alpha_out: optional [1, T, HV] FP32 tensor that receives exp(g), bit-identical to torch.exp(g).
+    out: optional contiguous (q, k, v, g, beta) of the shapes / dtypes above that the kernel writes and that are
+    returned (e.g. views of a scratch shared by the layers of one iteration); same launches, same values."""
     if activation not in (None, "silu", "swish"):
         raise ValueError(f"unsupported activation {activation!r}")
     T, conv_dim = mixed_qkv.shape
@@ -538,11 +550,26 @@ def gdn_prefill_conv_post(
     num_seqs = query_start_loc.shape[0] - 1
     D = head_k_dim
     dev = mixed_qkv.device
-    q = torch.empty((1, T, num_k_heads, D), dtype=mixed_qkv.dtype, device=dev)
-    k = torch.empty_like(q)
-    v = torch.empty((1, T, num_v_heads, D), dtype=mixed_qkv.dtype, device=dev)
-    g = torch.empty((1, T, num_v_heads), dtype=torch.float32, device=dev)
-    beta = torch.empty((1, T, num_v_heads), dtype=torch.float32, device=dev)
+    if out is None:
+        q = torch.empty((1, T, num_k_heads, D), dtype=mixed_qkv.dtype, device=dev)
+        k = torch.empty_like(q)
+        v = torch.empty((1, T, num_v_heads, D), dtype=mixed_qkv.dtype, device=dev)
+        g = torch.empty((1, T, num_v_heads), dtype=torch.float32, device=dev)
+        beta = torch.empty((1, T, num_v_heads), dtype=torch.float32, device=dev)
+    else:
+        q, k, v, g, beta = out
+        shapes = (
+            ((1, T, num_k_heads, D),) * 2 + ((1, T, num_v_heads, D),) + ((1, T, num_v_heads),) * 2
+        )
+        dtypes = (mixed_qkv.dtype,) * 3 + (torch.float32,) * 2
+        if any(
+            t.shape != shape or t.dtype != dtype or not t.is_contiguous()
+            for t, shape, dtype in zip(out, shapes, dtypes)
+        ):
+            raise ValueError(
+                "out must be contiguous (q, k, v, g, beta) of [1, T, Hk, D] x 2, [1, T, HV, D] in mixed_qkv's "
+                "dtype and [1, T, HV] FP32 x 2"
+            )
     if alpha_out is not None and (
         alpha_out.shape != (1, T, num_v_heads)
         or alpha_out.dtype != torch.float32
@@ -619,7 +646,7 @@ def gdn_prefill_conv_supported(
     head_k_dim: int,
     head_v_dim: int,
     conv_kernel_size: int,
-    activation,
+    activation: Optional[str],
     conv_dim: int,
     num_k_heads: int,
 ) -> bool:
