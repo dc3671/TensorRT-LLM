@@ -2149,8 +2149,12 @@ class KVCacheManagerV2(BaseResourceManager):
     # built without running __init__.
     _sparse_kv_offload: Optional[SparseKvCacheOffloadConfig] = None
     # Host history pages admitted requests hold through their last token; None
-    # unless offload runs with no cache level below the hot one.
+    # unless offload runs with no host or disk level below the hot one.
     _host_history_reservations: Optional[HostHistoryReservations] = None
+    # Whether the configured tiers have a level below the GPU, and whether all of them are remote levels, which retire
+    # at run time when a transfer or their donor fails (see can_evict).
+    _can_evict: bool = False
+    _only_remote_below_gpu: bool = False
     # Host history pages the smallest rank's pool has for requests once dummy
     # requests are set aside, the most one request can be given; None when no
     # rank offloads sparse history.
@@ -3092,11 +3096,17 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         self.kv_cache_manager_py_config = config
         self.impl = candidate
-        self.can_evict = len(config.cache_tiers) > 1
-        if self._sparse_kv_offload is not None and not self.can_evict:
+        self._can_evict = len(config.cache_tiers) > 1
+        self._only_remote_below_gpu = self._can_evict and all(
+            isinstance(tier, RemoteCacheTierConfig) for tier in config.cache_tiers[1:]
+        )
+        if self._sparse_kv_offload is not None and (
+            not self._can_evict or self._only_remote_below_gpu
+        ):
             logger.warning(
                 "Sparse KV cache offload runs without a host or disk cache tier: suspending a "
-                "request cannot free its KV cache pages, and a decode-only worker cannot "
+                "request cannot free its KV cache pages (a remote level stops taking them once "
+                "its donor fails), and a decode-only worker cannot "
                 "recompute them, so scheduling can stall once the device KV cache is full. "
                 "Admission therefore reserves each request's offloaded history through its last "
                 "token, which admits fewer requests. Set kv_cache_config.host_cache_size to give "
@@ -6705,8 +6715,22 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @property
     def has_cache_tier_below_gpu(self) -> bool:
-        """True when a suspended page has somewhere to be evicted to."""
-        return len(self.impl.cache_tier_list) > 1
+        """True when a suspended page has somewhere to be evicted to; a failed remote level takes no more pages."""
+        if len(self.impl.cache_tier_list) <= 1:
+            return False
+        return self._has_durable_tier_below_gpu or not self.impl.any_remote_level_failed
+
+    @property
+    def _has_durable_tier_below_gpu(self) -> bool:
+        """True when a level below the GPU cannot retire at run time, as a remote level does when its donor dies."""
+        return any(tier != CacheTier.REMOTE for tier in self.impl.cache_tier_list[1:])
+
+    @property
+    def can_evict(self) -> bool:
+        """True when the configured tiers have a level below the GPU that has not failed."""
+        return self._can_evict and not (
+            self._only_remote_below_gpu and self.impl.any_remote_level_failed
+        )
 
     @property
     def remote_donor(self) -> Optional["RemoteMemDonor"]:
@@ -8097,8 +8121,9 @@ class KVCacheManagerV2(BaseResourceManager):
         # decode, and the scheduler suspends one under pressure, demoting its
         # history. Without one, suspension frees nothing and a decode-only worker
         # cannot recompute, so admission reserves each request's history through
-        # its last token instead.
-        if not self.has_cache_tier_below_gpu:
+        # its last token instead. A remote level alone counts as none: it retires
+        # when its donor dies, and admitted requests could then exhaust the slots.
+        if not self._has_durable_tier_below_gpu:
             self._host_history_reservations = HostHistoryReservations(capacity_blocks)
         if not self.is_estimating_kv_cache:
             if self._host_tier_follows_history:

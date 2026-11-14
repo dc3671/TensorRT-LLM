@@ -6344,6 +6344,31 @@ def test_sparse_offload_admits_by_current_need_with_a_cold_tier() -> None:
 
 
 @pytest.mark.cpu_only
+def test_a_remote_level_alone_below_the_gpu_reserves_history_and_stops_counting_once_failed() -> None:
+    # A remote level retires when its donor dies and then takes no more pages: as the only level
+    # below the GPU, admission reserves history as without one, and the eviction flags turn off.
+    manager = _offload_setup_manager([12, 10])
+    manager.impl = SimpleNamespace(
+        cache_tier_list=[CacheTier.GPU_MEM, CacheTier.REMOTE], any_remote_level_failed=False
+    )
+    manager._can_evict = manager._only_remote_below_gpu = True
+
+    with patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"):
+        manager._setup_sparse_kv_offload(
+            KvCacheConfig(), max_seq_len=1024, num_reserved_index_slots=0
+        )
+
+    assert manager._host_history_reservations is not None
+    assert manager.has_cache_tier_below_gpu and manager.can_evict
+    manager.impl.any_remote_level_failed = True
+    assert not manager.has_cache_tier_below_gpu and not manager.can_evict
+    # A host level below keeps both whatever the remote level does.
+    manager.impl.cache_tier_list = [CacheTier.GPU_MEM, CacheTier.HOST_MEM, CacheTier.REMOTE]
+    manager._only_remote_below_gpu = False
+    assert manager.has_cache_tier_below_gpu and manager.can_evict
+
+
+@pytest.mark.cpu_only
 def test_sparse_offload_setup_warns_when_max_seq_len_outgrows_host_history() -> None:
     manager = _offload_setup_manager([8])
 
