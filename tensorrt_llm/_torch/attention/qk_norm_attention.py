@@ -349,7 +349,8 @@ class QKNormRoPEAttention(Attention):
         )
         return qkv, None, None, gate, None
 
-    def apply_output_gate(self, attention_output, gate):
+    def apply_output_gate(self, attention_output: torch.Tensor,
+                          gate: torch.Tensor) -> torch.Tensor:
         if (self._fuse_qk_norm_rope_gate and torch.version.hip is None
                 and attention_output.device.type == "cuda"
                 and attention_output.dim() == 2
@@ -367,7 +368,8 @@ class QKNormRoPEAttention(Attention):
     # E4M3 input where o_proj takes one (Linear.static_fp8_input_scale); smaller calls keep the BF16 gate.
     _OUTPUT_GATE_FP8_MIN_TOKENS = 1024
 
-    def _output_gate_fp8_scale(self, attention_output):
+    def _output_gate_fp8_scale(
+            self, attention_output: torch.Tensor) -> Optional[torch.Tensor]:
         rows = attention_output.shape[0]
         if (not self.fp8_output_gate or rows < self._OUTPUT_GATE_FP8_MIN_TOKENS
                 or attention_output.dtype != torch.bfloat16):

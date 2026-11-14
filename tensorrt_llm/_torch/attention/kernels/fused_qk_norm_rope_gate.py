@@ -1273,48 +1273,6 @@ def _fused_sigmoid_mul_kernel(
     output_ptr,
     attention_ptr,
     gate_ptr,
-    output_stride_token,
-    attention_stride_token,
-    gate_stride_token,
-    gate_stride_head,
-    hidden_size: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_size: tl.constexpr,
-    LAUNCH_WITH_PDL: tl.constexpr = False,
-) -> None:
-    if LAUNCH_WITH_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-    token = tl.program_id(0).to(tl.int64)
-    block = tl.program_id(1)
-    offsets = block * block_size + tl.arange(0, block_size)
-    mask = offsets < hidden_size
-    head = offsets // head_dim
-    dim = offsets - head * head_dim
-    if LAUNCH_WITH_PDL:
-        gdc_wait_with_memory_clobber()
-
-    attention = tl.load(
-        attention_ptr + token * attention_stride_token + offsets,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    gate = tl.load(
-        gate_ptr + token * gate_stride_token + head * gate_stride_head + dim,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    tl.store(
-        output_ptr + token * output_stride_token + offsets,
-        attention * tl.sigmoid(gate),
-        mask=mask,
-    )
-
-
-@triton.jit
-def _fused_sigmoid_mul_fp8_kernel(
-    output_ptr,
-    attention_ptr,
-    gate_ptr,
     scale_ptr,
     output_stride_token,
     attention_stride_token,
@@ -1323,10 +1281,12 @@ def _fused_sigmoid_mul_fp8_kernel(
     hidden_size: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
+    OUT_FP8: tl.constexpr = False,
     LAUNCH_WITH_PDL: tl.constexpr = False,
 ) -> None:
-    """_fused_sigmoid_mul_kernel with the E4M3 output that static_quantize_e4m3_per_tensor makes of its result: the
-    product rounded to the attention dtype, times the correctly rounded reciprocal of the scale, RN-satfinite."""
+    """output = attention * sigmoid(gate). With OUT_FP8 the output is the E4M3 that static_quantize_e4m3_per_tensor
+    makes of that product: rounded to the attention dtype, times the correctly rounded reciprocal of the scale
+    (scale_ptr; unread otherwise), RN-satfinite."""
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_launch_dependents()
     token = tl.program_id(0).to(tl.int64)
@@ -1348,29 +1308,73 @@ def _fused_sigmoid_mul_fp8_kernel(
         mask=mask,
         other=0.0,
     ).to(tl.float32)
-    y = (attention * tl.sigmoid(gate)).to(attention_ptr.dtype.element_ty).to(tl.float32)
-    y *= tldevice.rcp_rn(tl.load(scale_ptr).to(tl.float32))
-    tl.store(
-        output_ptr + token * output_stride_token + offsets,
-        y.to(output_ptr.dtype.element_ty),
-        mask=mask,
-    )
+    if OUT_FP8:
+        y = (attention * tl.sigmoid(gate)).to(attention_ptr.dtype.element_ty).to(tl.float32)
+        y *= tldevice.rcp_rn(tl.load(scale_ptr).to(tl.float32))
+        tl.store(
+            output_ptr + token * output_stride_token + offsets,
+            y.to(output_ptr.dtype.element_ty),
+            mask=mask,
+        )
+    else:
+        tl.store(
+            output_ptr + token * output_stride_token + offsets,
+            attention * tl.sigmoid(gate),
+            mask=mask,
+        )
 
 
-def _sigmoid_mul_launch_args(
-    attention_output: torch.Tensor, gate: torch.Tensor
-) -> Tuple[int, int, int, int, int]:
-    """(num_tokens, hidden_size, head_dim, gate token stride, gate head stride) of an output-gate call."""
+def _sigmoid_mul_launch(
+    output: torch.Tensor,
+    attention_output: torch.Tensor,
+    gate: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+) -> None:
+    """Launch _fused_sigmoid_mul_kernel for an output-gate call: output = attention_output * sigmoid(gate), as the
+    E4M3 static quant at input_scale when given. One program per (token, block of hidden_size), 4 warps, PDL where
+    _sigmoid_mul_pdl allows it."""
     assert attention_output.dim() == 2 and attention_output.stride(-1) == 1
     num_tokens, hidden_size = attention_output.shape
     if gate.dim() == 3:
         assert gate.shape[0] == num_tokens
         assert gate.shape[1] * gate.shape[2] == hidden_size
         assert gate.stride(-1) == 1
-        return num_tokens, hidden_size, gate.shape[2], gate.stride(0), gate.stride(1)
-    assert gate.dim() == 2 and gate.shape == attention_output.shape
-    assert gate.stride(-1) == 1
-    return num_tokens, hidden_size, hidden_size, gate.stride(0), hidden_size
+        head_dim, gate_stride_token, gate_stride_head = (
+            gate.shape[2],
+            gate.stride(0),
+            gate.stride(1),
+        )
+    else:
+        assert gate.dim() == 2 and gate.shape == attention_output.shape
+        assert gate.stride(-1) == 1
+        head_dim, gate_stride_token, gate_stride_head = hidden_size, gate.stride(0), hidden_size
+    if num_tokens == 0:
+        return
+    max_block_size = 1024 if num_tokens < 1024 else 2048
+    block_size = min(triton.next_power_of_2(hidden_size), max_block_size)
+    grid = (num_tokens, triton.cdiv(hidden_size, block_size))
+    pdl_kwargs = (
+        dict(LAUNCH_WITH_PDL=True, launch_pdl=True)
+        if _sigmoid_mul_pdl(attention_output.device.index)
+        else {}
+    )
+    out_fp8 = input_scale is not None
+    _fused_sigmoid_mul_kernel[grid](
+        output,
+        attention_output,
+        gate,
+        input_scale if out_fp8 else attention_output,
+        output.stride(0),
+        attention_output.stride(0),
+        gate_stride_token,
+        gate_stride_head,
+        hidden_size=hidden_size,
+        head_dim=head_dim,
+        block_size=block_size,
+        OUT_FP8=out_fp8,
+        num_warps=4,
+        **pdl_kwargs,
+    )
 
 
 @torch.library.custom_op("trtllm::fused_sigmoid_mul_fp8", mutates_args=())
@@ -1381,35 +1385,8 @@ def fused_sigmoid_mul_fp8(
 ) -> torch.Tensor:
     """``static_quantize_e4m3_per_tensor(attention_output * sigmoid(gate), input_scale)`` in one kernel: the E4M3
     input of an FP8 per-tensor o_proj, bit for bit the in-place gate kernel followed by that quantization."""
-    (num_tokens, hidden_size, head_dim, gate_stride_token, gate_stride_head) = (
-        _sigmoid_mul_launch_args(attention_output, gate)
-    )
     out = torch.empty_like(attention_output, dtype=torch.float8_e4m3fn)
-    if num_tokens == 0:
-        return out
-    max_block_size = 1024 if num_tokens < 1024 else 2048
-    block_size = min(triton.next_power_of_2(hidden_size), max_block_size)
-    grid = (num_tokens, triton.cdiv(hidden_size, block_size))
-    pdl_kwargs = (
-        dict(LAUNCH_WITH_PDL=True, launch_pdl=True)
-        if _sigmoid_mul_pdl(attention_output.device.index)
-        else {}
-    )
-    _fused_sigmoid_mul_fp8_kernel[grid](
-        out,
-        attention_output,
-        gate,
-        input_scale,
-        out.stride(0),
-        attention_output.stride(0),
-        gate_stride_token,
-        gate_stride_head,
-        hidden_size=hidden_size,
-        head_dim=head_dim,
-        block_size=block_size,
-        num_warps=4,
-        **pdl_kwargs,
-    )
+    _sigmoid_mul_launch(out, attention_output, gate, input_scale)
     return out
 
 
@@ -1429,44 +1406,4 @@ def fused_sigmoid_mul_inplace(
     gate: torch.Tensor,
 ) -> None:
     """Apply ``attention_output *= sigmoid(gate)`` with a Triton kernel."""
-    assert attention_output.dim() == 2 and attention_output.stride(-1) == 1
-    num_tokens, hidden_size = attention_output.shape
-    if gate.dim() == 3:
-        assert gate.shape[0] == num_tokens
-        assert gate.shape[1] * gate.shape[2] == hidden_size
-        assert gate.stride(-1) == 1
-        head_dim = gate.shape[2]
-        gate_stride_token = gate.stride(0)
-        gate_stride_head = gate.stride(1)
-    else:
-        assert gate.dim() == 2 and gate.shape == attention_output.shape
-        assert gate.stride(-1) == 1
-        head_dim = hidden_size
-        gate_stride_token = gate.stride(0)
-        gate_stride_head = hidden_size
-
-    if num_tokens == 0:
-        return
-
-    max_block_size = 1024 if num_tokens < 1024 else 2048
-    block_size = min(triton.next_power_of_2(hidden_size), max_block_size)
-    grid = (num_tokens, triton.cdiv(hidden_size, block_size))
-    pdl_kwargs = (
-        dict(LAUNCH_WITH_PDL=True, launch_pdl=True)
-        if _sigmoid_mul_pdl(attention_output.device.index)
-        else {}
-    )
-    _fused_sigmoid_mul_kernel[grid](
-        attention_output,
-        attention_output,
-        gate,
-        attention_output.stride(0),
-        attention_output.stride(0),
-        gate_stride_token,
-        gate_stride_head,
-        hidden_size=hidden_size,
-        head_dim=head_dim,
-        block_size=block_size,
-        num_warps=4,
-        **pdl_kwargs,
-    )
+    _sigmoid_mul_launch(attention_output, attention_output, gate)
