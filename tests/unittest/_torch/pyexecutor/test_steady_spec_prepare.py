@@ -204,7 +204,12 @@ def test_populate_before_stage_matches_the_upload(uniform):
     the staging kernel writes the Philox buffers from the deferred values: over consecutive steps of seeded and
     unseeded requests, the same buffers and window counters as the uploads of the full pass. A batch whose requests'
     rows differ is uploaded."""
-    from tensorrt_llm._torch.speculative.interface import _RNG_SLOT_SPAN, SpecMetadata
+    from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import request_random_seed
+    from tensorrt_llm._torch.speculative.interface import (
+        _RNG_SLOT_SPAN,
+        OneModelSamplingParams,
+        SpecMetadata,
+    )
 
     t = 4
     seeds = [None, 123, None, (1 << 63) + 5]
@@ -216,6 +221,16 @@ def test_populate_before_stage_matches_the_upload(uniform):
         )
         for slot, seed in zip((5, 2, 7, 0), seeds)
     ]
+    for request in requests:
+        # The sampling parameters LlmRequest caches; only the seed is read here.
+        request.py_spec_sampling_params = OneModelSamplingParams(
+            temperature=1.0,
+            top_k=torch.iinfo(torch.int32).max,
+            top_p=1.0,
+            min_p=0.0,
+            is_greedy=False,
+            seed=request_random_seed(request),
+        )
     b = len(requests)
     rows = [t] * b if uniform else [t, 1, t, t]
     normalized = [(1.0, 0, 1.0, 0.0, n) for n in rows]

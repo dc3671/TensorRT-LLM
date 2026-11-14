@@ -2557,7 +2557,8 @@ class AttentionDpConfig(StrictBaseModel):
         "requests of the same admission group (priority) may pass a waiting "
         "one on any rank; later groups may pass it on other ranks only, not "
         "into its home rank. None overflows at once. Requires "
-        "kv_cache_routing_conversation_affinity=True.",
+        "kv_cache_routing_conversation_affinity=True; not combinable with "
+        "kv_cache_routing_strict_conversation_affinity.",
         status="prototype")
     kv_cache_routing_strict_conversation_affinity: bool = Field(
         default=False,

@@ -127,7 +127,8 @@ stays bound to the home rank. While it waits, later requests can be admitted
 ahead of it. With `scheduler_config.waiting_queue_policy: priority`, later
 requests of the same priority can take any rank, and lower-priority requests
 can take other ranks but not the held request's home rank, so each rank still
-admits in priority order.
+admits in priority order. It cannot be combined with
+`kv_cache_routing_strict_conversation_affinity`.
 
 ## Gateway trust boundary
 
