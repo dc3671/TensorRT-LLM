@@ -543,9 +543,12 @@ def _meta_fields(path: str) -> dict:
     return fields
 
 
-def scan_donors(directory: str) -> tuple[list[dict], list[dict]]:
+def scan_donors(
+    directory: str, malformed: Optional[list[str]] = None
+) -> tuple[list[dict], list[dict]]:
     """The donors of a rendezvous directory that have reported: (published, failed). A published donor offers the
-    whole chunks of its segments; a failed one left donor.<name>.failed (RemoteMemDonor.publish_failure)."""
+    whole chunks of its segments; a failed one left donor.<name>.failed (RemoteMemDonor.publish_failure). Files that
+    name no transport count as neither; their names are appended to `malformed`."""
     published, failed = [], []
     try:
         files = sorted(os.listdir(directory))
@@ -559,7 +562,10 @@ def scan_donors(directory: str) -> tuple[list[dict], list[dict]]:
             if file.endswith(".ready"):
                 fields = _meta_fields(os.path.join(directory, f"donor.{name}.meta"))
                 if "transport" not in fields:
-                    continue  # malformed: every donor names its transport, as clients require
+                    # Malformed: every donor names its transport, as clients require.
+                    if malformed is not None:
+                        malformed.append(f"donor.{name}.meta")
+                    continue
                 chunk = int(fields.get("chunk_bytes", 0))
                 offered = sum(b - b % chunk for _, b in fields["segments"]) if chunk else 0
                 published.append(
@@ -575,7 +581,9 @@ def scan_donors(directory: str) -> tuple[list[dict], list[dict]]:
             elif file.endswith(".failed"):
                 fields = _meta_fields(os.path.join(directory, file))
                 if "transport" not in fields:
-                    continue  # malformed, as for .meta
+                    if malformed is not None:
+                        malformed.append(file)
+                    continue
                 failed.append(
                     {
                         "name": name,
@@ -610,7 +618,12 @@ def check_remote_capacity(
     expected = num_donors
     deadline = time.monotonic() + timeout_s
     while True:
-        published, failed = scan_donors(directory)
+        malformed: list[str] = []
+        published, failed = scan_donors(directory, malformed)
+        for file in malformed:
+            if file not in warned:
+                warned.add(file)
+                logger.warning(f"KVCM2 remote donor file {file} in {directory} is malformed; it is not counted")
         if transport is not None:
             published = [p for p in published if p["transport"] == transport]
             failed = [f for f in failed if f["transport"] == transport]
@@ -622,6 +635,7 @@ def check_remote_capacity(
     summary = (
         f"{len(published)} of {expected} planned donors published {offered / _GIB:.0f} GiB, {len(failed)} failed, "
         f"{max(0, expected - reported)} not reported; the plan's clients claim {need / _GIB:.0f} GiB"
+        + (f"; malformed (not counted): {', '.join(malformed)}" if malformed else "")
     )
     if offered < need:
         notes = [f"{f['name']} ({f['host']}) failed: {f['error']}" for f in failed]

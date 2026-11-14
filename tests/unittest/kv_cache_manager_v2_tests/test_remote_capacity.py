@@ -115,6 +115,13 @@ class TestCapacityCheck(unittest.TestCase):
         published, failed = scan_donors(self.dir)
         self.assertEqual([p["name"] for p in published], ["ok"])
         self.assertEqual(failed, [])
+        # The capacity check warns once per malformed file and names them, instead of blaming a missing donor.
+        with mock.patch.object(remote_donor.logger, "warning") as warning:
+            with self.assertRaisesRegex(RuntimeError, "malformed.*donor.bare.meta, donor.lost.failed"):
+                check_remote_capacity(
+                    self.dir, 3, 20 * _GIB, timeout_s=0.3, poll_s=0.05, log=lambda _: None
+                )
+        self.assertEqual(sorted(c.args[0].split()[4] for c in warning.call_args_list), ["donor.bare.meta", "donor.lost.failed"])
 
     def test_every_donor_names_its_transport(self):
         for kind in remote_donor.TRANSPORTS:
