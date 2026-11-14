@@ -132,18 +132,10 @@ def test_a_wide_draft_pick_reaches_the_shard_argmax(monkeypatch) -> None:
     assert torch.equal(tokens, torch.arange(rows, dtype=torch.int32) + 7)
 
 
-def test_the_greedy_draft_override_takes_the_base_signature() -> None:
+def test_the_greedy_draft_override_fills_out() -> None:
     """SpecWorkerBase.sample_draft_tokens passes ``tokens_out`` to greedy_sample_draft_with_tp_gather; the M3 override
-    must accept it and hand it on, and the step's ``out`` row must hold the tokens on every path."""
-    import inspect
-
-    from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
-
-    base = inspect.signature(SpecWorkerBase.greedy_sample_draft_with_tp_gather).parameters
-    assert list(
-        inspect.signature(M3Eagle3Worker.greedy_sample_draft_with_tp_gather).parameters
-    ) == list(base)
-
+    hands it on, and the step's ``out`` row holds the tokens on every path. (Its signature is checked with every
+    other override's in hw_agnostic/test_draft_sampler_overrides.py.)"""
     w = _worker()
     w.mapping.tp_size = 1  # replicated logits: the base sampler's plain argmax
     w._d2t = None

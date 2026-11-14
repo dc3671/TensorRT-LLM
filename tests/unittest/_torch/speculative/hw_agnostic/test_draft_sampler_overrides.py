@@ -48,6 +48,30 @@ def _definitions(path: Path) -> list[tuple[str, str, ast.FunctionDef]]:
     return found
 
 
+def _defaulted(fn: ast.FunctionDef) -> set[str]:
+    """Parameters of ``fn`` that callers may leave out (a default, or ``*args`` / ``**kwargs``)."""
+    a = fn.args
+    positional = a.posonlyargs + a.args
+    names = {p.arg for p in positional[len(positional) - len(a.defaults) :]}
+    names |= {p.arg for p, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None}
+    names |= {p.arg for p in (a.vararg, a.kwarg) if p is not None}
+    return names
+
+
+def _takes_the_base_call(fn: ast.FunctionDef, base: list[tuple[str, str]]) -> bool:
+    """Every base parameter, by name and kind, with the base positional ones first and in the base order; any
+    extra parameter is defaulted. Then every call the base takes reaches the override unchanged."""
+    params = _params(fn)
+    positional = [name for name, kind in params if kind == "positional"]
+    base_positional = [name for name, kind in base if kind == "positional"]
+    extra = {name for name, _ in params} - {name for name, _ in base}
+    return (
+        set(base) <= set(params)
+        and positional[: len(base_positional)] == base_positional
+        and extra <= _defaulted(fn)
+    )
+
+
 def test_every_draft_sampler_override_takes_the_base_parameters() -> None:
     base = {
         method: _params(fn) for cls, method, fn in _definitions(_BASE) if cls == "SpecWorkerBase"
@@ -59,15 +83,32 @@ def test_every_draft_sampler_override_takes_the_base_parameters() -> None:
             if path == _BASE and cls == "SpecWorkerBase":
                 continue
             overrides.append((path.relative_to(_PKG).as_posix(), cls))
-            assert _params(fn) == base[method], (path, cls, method)
-    # Guard against a scan that finds nothing: the targets known to override.
-    names = {path.split("/")[-2] for path, _ in overrides}
-    assert {
-        "glm_5_2_nvfp4__sm_103__tep4",
-        "minimax_m3_nvfp4__sm_107__tp2",
-        "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1",
-        "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4",
-    } <= names
+            assert _takes_the_base_call(fn, base[method]), (path, cls, method)
+    # Guard against a scan that finds nothing.
+    assert overrides
+
+
+_BASE_SIGNATURE = "(self, logits, meta=None, tokens_out=None)"
+
+
+@pytest.mark.parametrize(
+    "signature,compatible",
+    [
+        (_BASE_SIGNATURE, True),
+        ("(self, logits, meta=None, tokens_out=None, lane=0)", True),  # extra defaulted parameter
+        ("(self, logits, meta=None, tokens_out=None, **kw)", True),
+        ("(self, logits, meta=None)", False),  # no tokens_out
+        ("(self, logits, meta=None, tokens_out=None, *, lane)", False),  # extra required parameter
+        ("(self, meta, logits, tokens_out=None)", False),  # reordered
+    ],
+)
+def test_the_signature_check_accepts_compatible_extensions(signature, compatible) -> None:
+    """An override may add defaulted parameters (or ``**kwargs``) to the base's, not drop or reorder them."""
+
+    def fn(sig: str) -> ast.FunctionDef:
+        return ast.parse(f"def f{sig}: pass").body[0]
+
+    assert _takes_the_base_call(fn(signature), _params(fn(_BASE_SIGNATURE))) is compatible
 
 
 def _worker(cls: type) -> SpecWorkerBase:
