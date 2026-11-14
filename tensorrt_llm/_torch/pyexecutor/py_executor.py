@@ -1992,8 +1992,9 @@ class PyExecutor:
                 f"cache tiers below GPU (found: {names}). Pages evicted to "
                 "another tier have their GPU slot reassigned, which would "
                 "invalidate the addresses registered with the connector. Set "
-                "KvCacheConfig.host_cache_size=0 and "
-                "KvCacheConfig.disk_cache_size=0 to run GPU-only.")
+                "KvCacheConfig.host_cache_size=0, "
+                "KvCacheConfig.disk_cache_size=0 and "
+                "remote_cache_config.cache_size=0 to run GPU-only.")
 
     def _release_transfer(self, request: LlmRequest) -> None:
         """Release one transfer claim held by the KV connector or transceiver.
