@@ -412,3 +412,58 @@ async def test_generation_first_stream_releases_the_context_server_without_a_sea
         await service._send_disagg_request_gen_first(request)
     assert ctx_router._get_server_load("ctx:1") == 0 and ctx_router._req_routing_table == {}
     service._ctx_client.send_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fleet", [False, True], ids=["in_process", "fleet"])
+async def test_responses_request_waits_for_a_seat_at_the_prior(fleet):
+    """/v1/responses is not predicted: a pooled seat queue ranks it at the prior, not by a client value."""
+    from tensorrt_llm.llmapi.disagg_utils import CtxGenServerConfig, RouterConfig, ServerRole
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+    from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, PooledLoadBalancingRouter
+
+    config = _config()
+    config.server_configs = [CtxGenServerConfig(type="gen", hostname="g", port=1)]
+    config.ctx_router_config = RouterConfig(type="round_robin", server_role=ServerRole.CONTEXT)
+    config.gen_router_config = RouterConfig(
+        type="load_balancing",
+        server_role=ServerRole.GENERATION,
+        args={"max_requests_per_server": 1},
+    )
+    coordinator = DisaggCoordinatorService(config, client_factory=_client_factory)
+    if fleet:
+        coordinator._gen_router = CoordinatorDelegatingRouter(
+            "http://c:1", coordinator.gen_router, "generation", 5.0
+        )
+    service = OpenAIDisaggregatedService(config, coordinator, client_factory=_client_factory)
+    gen_router = service._gen_router
+    local = gen_router._local if fleet else gen_router
+    assert isinstance(local, PooledLoadBalancingRouter)
+    prior = olp.priority_of(olp.PRIOR_TOKENS)
+    for client_priority in (0.0, 1.0):
+        # ResponsesRequest keeps unknown fields: a client "priority" is an extra, not a priority.
+        request = ResponsesRequest(model="m", input="hi", priority=client_priority)
+        assert local.routing_key(request)["priority"] == pytest.approx(prior)
+    # A request model with a priority field keeps its (orchestrator-set) value.
+    assert local.routing_key(CompletionRequest(model="m", prompt="x", priority=0.9))[
+        "priority"
+    ] == pytest.approx(0.9)
+    if not fleet:
+        # The in-process placement orders by the same priority.
+        first = CompletionRequest(model="m", prompt="x", priority=0.5)
+        assert (await local.get_next_server(first))[0] == "g:1"
+        responses = asyncio.create_task(
+            local.get_next_server(ResponsesRequest(model="m", input="hi", priority=0.0))
+        )
+        completion = asyncio.create_task(
+            local.get_next_server(CompletionRequest(model="m", prompt="x", priority=0.6))
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await local.finish_request(first)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert responses.done() and not completion.done()
+        completion.cancel()
+        await asyncio.gather(completion, return_exceptions=True)
+    await coordinator.stop()

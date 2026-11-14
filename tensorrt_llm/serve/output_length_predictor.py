@@ -912,7 +912,9 @@ class OutputLengthPriority:
             f"learned online in the coordinator{', predicted in /select' if self.via_select else ''}): "
             f"priority = 1 / (1 + tokens / {PRIORITY_SCALE_TOKENS:g}); "
             f"without a prediction, {PRIOR_TOKENS:g} tokens (priority {self.prior_priority:.4f}); max_tokens "
-            f"is never read; /v1/responses requests are not predicted"
+            f"is never read; /v1/responses requests are not predicted (they wait for a pooled "
+            f"generation seat at the prior's priority, and get the default priority on the "
+            f"generation server)"
         )
 
     async def assign(

@@ -536,6 +536,10 @@ class Router(ABC):
         del reason
         return 0
 
+    def set_unpredicted_priority(self, priority: float) -> None:
+        """The priority of requests whose model has no ``priority`` field (``pooled`` routers)."""
+        del priority
+
     async def renew_request(self,
                             request: OpenAIRequest,
                             req_id: Optional[int] = None) -> None:
@@ -954,6 +958,8 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
         self._finished_ids: OrderedDict[int, float] = OrderedDict()
         # Set by fail_waiters: why new requests are refused.
         self._stopping_reason: Optional[str] = None
+        # The priority of a request whose model has no priority field (set_unpredicted_priority).
+        self._unpredicted_priority: Optional[float] = None
         logger.info(f"PooledLoadBalancingRouter: "
                     f"{self._pool.describe(len(self._servers))}")
         self._warn_if_cap_exceeds_kv_timeout(kv_transfer_timeout_ms)
@@ -1018,6 +1024,24 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
                                             1000.0)
         self._warn_if_cap_exceeds_kv_timeout(value)
 
+    def set_unpredicted_priority(self, priority: float) -> None:
+        """Give requests whose model has no ``priority`` field (``/v1/responses``) this priority.
+
+        ``output_length_prediction`` sets the prior's priority here; without it they rank at
+        the default priority.
+        """
+        self._unpredicted_priority = priority
+
+    def _request_priority(self, request: OpenAIRequest) -> Optional[float]:
+        """The request's ``priority`` field, else the unpredicted priority.
+
+        A ``priority`` a client sent to a request model that allows extra fields
+        (``ResponsesRequest``) is not a priority field and is ignored.
+        """
+        if "priority" in getattr(type(request), "model_fields", {}):
+            return request.priority
+        return self._unpredicted_priority
+
     @staticmethod
     def _orig_elapsed_s(request: OpenAIRequest) -> Optional[float]:
         params = getattr(request, "disaggregated_params", None)
@@ -1026,8 +1050,7 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
     def routing_key(self, request: OpenAIRequest) -> dict:
         """The parent's key plus the priority and, past the context phase, ``orig_elapsed_s``."""
         key = super().routing_key(request)
-        key["priority"] = priority_or_default(getattr(request, "priority",
-                                                      None))
+        key["priority"] = priority_or_default(self._request_priority(request))
         orig_elapsed_s = self._orig_elapsed_s(request)
         if orig_elapsed_s is not None:
             key["orig_elapsed_s"] = orig_elapsed_s
@@ -1185,7 +1208,7 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
         del req_id
         self._validate_servers_available()
         server = await self._acquire(id(request),
-                                     getattr(request, "priority", None),
+                                     self._request_priority(request),
                                      exclude_server,
                                      self._orig_elapsed_s(request))
         return server, {"server_info": self._server_info.get(server, {})}
@@ -2399,6 +2422,10 @@ class CoordinatorDelegatingRouter(Router):
                 for server, info in self._local._server_info.items()
                 if server in servers
             }
+
+    def set_unpredicted_priority(self, priority: float) -> None:
+        # The local router computes the routing key's priority.
+        self._local.set_unpredicted_priority(priority)
 
     def enable_output_length_prediction(self) -> bool:
         """Have the coordinator predict a generation request's output length in ``/select``.

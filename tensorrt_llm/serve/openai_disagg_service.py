@@ -185,6 +185,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                 via_select=remote and coordinator.enable_output_length_prediction_in_select(),
                 record_flush_s=RECORD_FLUSH_S if remote else 0.0,
             )
+            # Requests without a priority field (/v1/responses) are not predicted: a pooled
+            # generation router seats them at the prior's priority.
+            self._gen_router.set_unpredicted_priority(self._output_length_priority.prior_priority)
             logger.info(self._output_length_priority.startup_line())
 
         self._ctx_client = None
