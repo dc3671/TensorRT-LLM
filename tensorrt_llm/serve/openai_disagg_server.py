@@ -55,6 +55,7 @@ from tensorrt_llm.serve.cluster_storage import (
     validate_http_cluster_storage_scope)
 from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
                                                 resolve_request_conversation_id)
+from tensorrt_llm.serve.coordinator_server import SHUTDOWN_POLL_S
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
 from tensorrt_llm.serve.kv_hints import KvHintsRoute
@@ -653,7 +654,29 @@ class OpenAIDisaggServer:
                                 port=port,
                                 log_level=logger.level,
                                 timeout_keep_alive=keep_alive_timeout)
-        await create_uvicorn_server(config).serve(sockets=sockets)
+        server = create_uvicorn_server(config)
+        if not isinstance(self._coordinator, DisaggCoordinatorService):
+            await server.serve(sockets=sockets)
+            return
+        watcher = asyncio.create_task(
+            self._fail_seat_waiters_at_shutdown(server))
+        try:
+            await server.serve(sockets=sockets)
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    async def _fail_seat_waiters_at_shutdown(self,
+                                             server: uvicorn.Server) -> None:
+        """Fail the requests waiting for a generation seat once shutdown begins.
+
+        uvicorn's graceful shutdown waits for every request in flight, so the
+        lifespan teardown that also fails them would run only after they got a
+        seat or their KV transfer deadline (as in ``CoordinatorServer``).
+        """
+        while not server.should_exit:
+            await asyncio.sleep(SHUTDOWN_POLL_S)
+        await self._coordinator.fail_seat_waiters()
 
     async def _sync_server_clock(self, server: str):
         """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running).
