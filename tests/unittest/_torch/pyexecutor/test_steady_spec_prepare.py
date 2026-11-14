@@ -33,7 +33,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 SLOTS, MAX_TOKENS, MAX_DRAFT, BATCH = 8, 64, 8, 4
 
 
-def _buffers():
+def _buffers(batch: int = BATCH) -> dict:
+    """The staging kernel's destination buffers, the per-request ones sized for ``batch`` requests."""
     i32 = dict(dtype=torch.int32, device="cuda")
     return dict(
         input_ids=torch.full((MAX_TOKENS,), -1, **i32),
@@ -41,11 +42,11 @@ def _buffers():
         prev_batch_idx=torch.full((MAX_TOKENS,), -1, **i32),
         prev_pos_idx=torch.full((MAX_TOKENS,), -1, **i32),
         prev_pos_offsets=torch.zeros((MAX_TOKENS,), **i32),
-        prev_kv_offsets=torch.zeros((BATCH,), **i32),
+        prev_kv_offsets=torch.zeros((batch,), **i32),
         positions=torch.full((MAX_TOKENS,), -1, **i32),
         mrope_positions=torch.full((3, 1, MAX_TOKENS), -1, **i32),
         gather_ids=torch.full((MAX_TOKENS,), -1, **i32),
-        kv_lens_cuda=torch.full((BATCH,), -1, **i32),
+        kv_lens_cuda=torch.full((batch,), -1, **i32),
     )
 
 
@@ -156,7 +157,12 @@ def test_staged_rng_matches_uploaded_rng(b, t, host_slab):
         b,
         t,
         dev,
-        **{k: v for k, v in _buffers().items() if k not in ("mrope_positions", "kv_lens_cuda")},
+        # Sized for this case's requests (5 > BATCH).
+        **{
+            k: v
+            for k, v in _buffers(batch=b).items()
+            if k not in ("mrope_positions", "kv_lens_cuda")
+        },
         mrope_positions=None,
         rng_slab=rng_slab if host_slab else rng_slab.cuda(),
         rng_buffers=rng_buffers,
