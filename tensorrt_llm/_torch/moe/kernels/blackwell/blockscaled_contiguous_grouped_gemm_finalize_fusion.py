@@ -1470,39 +1470,26 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     )
                     tBgB_slice = tBgB_0[(None, mma_tile_coord_mnl[1], None, expert_idx)]
                     tBgSFB_slice = tBgSFB_0[(None, slice_n, None, expert_idx)]
+                    # cute.copy treats cache_policy=None as no policy.
+                    b_policy = None
                     if cutlass.const_expr(self.weights_evict_first):
                         b_policy = _l2_evict_first_policy()
-                        cute.copy(
-                            tma_atoms_b[0],
-                            tBgB_slice[(None, ab_producer_state.count)],
-                            tBsB_pipe,
-                            tma_bar_ptr=tma_bar,
-                            mcast_mask=b_full_mcast_mask,
-                            cache_policy=b_policy,
-                        )
-                        cute.copy(
-                            tma_atoms_sfb[0],
-                            tBgSFB_slice[(None, ab_producer_state.count)],
-                            tBsSFB_pipe,
-                            tma_bar_ptr=tma_bar,
-                            mcast_mask=sfb_full_mcast_mask,
-                            cache_policy=b_policy,
-                        )
-                    else:
-                        cute.copy(
-                            tma_atoms_b[0],
-                            tBgB_slice[(None, ab_producer_state.count)],
-                            tBsB_pipe,
-                            tma_bar_ptr=tma_bar,
-                            mcast_mask=b_full_mcast_mask,
-                        )
-                        cute.copy(
-                            tma_atoms_sfb[0],
-                            tBgSFB_slice[(None, ab_producer_state.count)],
-                            tBsSFB_pipe,
-                            tma_bar_ptr=tma_bar,
-                            mcast_mask=sfb_full_mcast_mask,
-                        )
+                    cute.copy(
+                        tma_atoms_b[0],
+                        tBgB_slice[(None, ab_producer_state.count)],
+                        tBsB_pipe,
+                        tma_bar_ptr=tma_bar,
+                        mcast_mask=b_full_mcast_mask,
+                        cache_policy=b_policy,
+                    )
+                    cute.copy(
+                        tma_atoms_sfb[0],
+                        tBgSFB_slice[(None, ab_producer_state.count)],
+                        tBsSFB_pipe,
+                        tma_bar_ptr=tma_bar,
+                        mcast_mask=sfb_full_mcast_mask,
+                        cache_policy=b_policy,
+                    )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     ab_producer_state.advance()
