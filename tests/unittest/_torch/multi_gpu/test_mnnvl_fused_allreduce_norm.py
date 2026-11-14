@@ -725,10 +725,13 @@ def _tp2_cases(tp, max_tokens=4096):
 
 
 def _tp2_hidden_cases(tp, rank, mapping, hidden, max_tokens):
+    from tensorrt_llm._torch.distributed.ll_exchange import _PeerBuffers
     from tensorrt_llm._torch.distributed.tp2_allreduce import Tp2AllReduceNorm
 
     assert Tp2AllReduceNorm.is_supported(mapping, hidden, max_tokens)
     ar = Tp2AllReduceNorm(mapping, hidden, max_tokens)
+    # Peer memory without a multicast object (the kernel reads only the two unicast mappings): IPC inside a node.
+    assert isinstance(ar._bufs, _PeerBuffers) and ar._bufs.transport == "IPC"
     norm_weight = _rand((hidden,), 6, 0.1) + 1
     scale = torch.tensor([0.05], dtype=torch.float32, device="cuda")
     for m in (Tp2AllReduceNorm.MIN_TOKENS, 3001, max_tokens):
@@ -846,29 +849,25 @@ def test_mnnvl_fused_allreduce_norm(case, mpi_pool_executor):
 
 
 def _tp2_setup_failure(tp, error_type=RuntimeError):
-    """A failure past the multicast buffer's collective handle exchange on one rank (its pointer-table init is not
-    collective) fails Tp2AllReduceNorm's construction on every rank with RuntimeError, naming the failed rank's
-    cause, whatever ``error_type`` that rank raised. Returns this rank's outcome as text (exceptions stay in the
-    worker)."""
-    import importlib
-
+    """A failure past the peer buffers' collective setup on one rank (the pointer-table init is not collective) fails
+    Tp2AllReduceNorm's construction on every rank with RuntimeError, naming the failed rank's cause, whatever
+    ``error_type`` that rank raised. Returns this rank's outcome as text (exceptions stay in the worker)."""
+    from tensorrt_llm._torch.distributed.ll_exchange import _PeerBuffers
     from tensorrt_llm._torch.distributed.tp2_allreduce import Tp2AllReduceNorm
-
-    # By name: a bare ``ops`` in this function would make cloudpickle ship the torch.ops module with it.
-    allreduce_ops = importlib.import_module("tensorrt_llm._torch.distributed.ops")
 
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
-    real = allreduce_ops._make_mnnvl_mcast_buffer
+    real = _PeerBuffers.__dict__["create"]
 
-    def make(*args, **kwargs):
-        handle = real(*args, **kwargs)
+    @classmethod
+    def create(cls, *args, **kwargs):
+        bufs = real.__func__(cls, *args, **kwargs)
         if rank == 1:
             raise error_type("injected pointer-table failure")
-        return handle
+        return bufs
 
-    allreduce_ops._make_mnnvl_mcast_buffer = make
+    _PeerBuffers.create = create
     try:
         Tp2AllReduceNorm(mapping, H, 4096)
         outcome = "constructed"
@@ -877,7 +876,7 @@ def _tp2_setup_failure(tp, error_type=RuntimeError):
     except BaseException as e:  # noqa: BLE001 - reported to the parent as text
         outcome = f"unexpected {type(e).__name__}: {e}"
     finally:
-        allreduce_ops._make_mnnvl_mcast_buffer = real
+        _PeerBuffers.create = real
     MPI.COMM_WORLD.barrier()
     return outcome
 

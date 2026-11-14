@@ -40,13 +40,14 @@ nodes of one NVLink domain. Without either, ``create`` returns None and callers 
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from ..modules.fla.op import gdc_wait_with_memory_clobber
 
@@ -541,7 +542,7 @@ class _PeerBuffers:
         del keep
 
     @classmethod
-    def create(cls, mapping, nbytes: int, fill: int = 0) -> Optional["_PeerBuffers"]:
+    def create(cls, mapping: Mapping, nbytes: int, fill: int = 0) -> Optional["_PeerBuffers"]:
         """Collective over the TP group (every rank must call it in step); None without peer memory."""
         from tensorrt_llm._ipc_utils import IpcMemory, can_access_peer
         from tensorrt_llm._utils import mpi_disabled
@@ -600,11 +601,17 @@ class _PeerBuffers:
         return cls(peers[mapping.tp_rank], peers, nbytes, "MNNVL", mem)
 
     @staticmethod
-    def _all_filled(comm, transport: str, error: Optional[BaseException]) -> bool:
+    def failures(comm: Any, error: Optional[BaseException]) -> List[str]:
+        """Collective over ``comm`` (``TpMnnvlMemory.get_comm``): "rank r: <cause>" for every rank that passed an
+        error, the same list on every rank (empty when all succeeded)."""
+        errors = comm.allgather(None if error is None else str(error))
+        return [f"rank {r}: {e}" for r, e in enumerate(errors) if e is not None]
+
+    @staticmethod
+    def _all_filled(comm: Any, transport: str, error: Optional[BaseException]) -> bool:
         """Every rank's fill outcome, agreed over the TP group (the barrier the writes wait for); on any failure
         every rank logs each failed rank's cause and declines the buffers."""
-        errors = comm.allgather(None if error is None else str(error))
-        failed = [f"rank {r}: {e}" for r, e in enumerate(errors) if e is not None]
+        failed = _PeerBuffers.failures(comm, error)
         if failed:
             logger.warning(
                 f"[ll_exchange] {transport} peer buffer fill failed ({'; '.join(failed)})"

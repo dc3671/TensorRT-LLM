@@ -7,38 +7,28 @@
 ``allreduce_tp2_fused_norm``, the strategy is AUTO or TWOSHOT and the TP2 group has no MNNVL all-reduce;
 ``AllReduce.forward`` routes the residual RMSNorm fusions of BF16 calls of ``MIN_TOKENS`` to ``max_tokens`` tokens
 here. The workspace (each rank's two landing buffers of max_tokens / 2 rows and its flags: max_tokens x hidden x 2
-bytes, e.g. 128 MiB for 16384 tokens at hidden 4096) is a McastGPUBuffer allocated when the first AllReduce of the
-mapping is built, before the KV cache is sized and any CUDA graph is captured.
+bytes, e.g. 128 MiB for 16384 tokens at hidden 4096) is peer memory without a multicast object
+(``ll_exchange._PeerBuffers``: IPC inside a node, unicast MNNVL memory across nodes; the kernel reads only the two
+unicast mappings), allocated when the first AllReduce of the mapping is built, before the KV cache is sized and any
+CUDA graph is captured. Built only under MPI (``AllReduce`` skips it with MPI disabled).
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
-from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceFusionOp
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from . import ops
+from .ll_exchange import _PeerBuffers
+from .mnnvl_memory import TpMnnvlMemory
 from .ops import MNNVLAllReduce
 
 # Fusion op -> (quantized output, normalized output): the fusions of the CuTe DSL norm kernels.
 _OUTPUTS = MNNVLAllReduce._FUSED_NORM_OUTPUTS
-
-
-def _setup_failures(comm: Any, rank: int, error: Optional[BaseException]) -> str:
-    """Agree on a setup step over the TP pair's communicator (``_get_mnnvl_workspace_comm``: an MPI communicator, or
-    the TP ProcessGroup under Ray): "" when every rank succeeded, else "rank r: <cause>"
-    for each failed rank (this rank's own cause only where the communicator is a ProcessGroup)."""
-    if mpi_disabled():
-        if ops._mnnvl_workspace_all_succeeded(comm, error is None):
-            return ""
-        return f"rank {rank}: {error}" if error is not None else "on a peer rank"
-    errors = comm.allgather(None if error is None else str(error))
-    return "; ".join(f"rank {r}: {e}" for r, e in enumerate(errors) if e is not None)
 
 
 class Tp2AllReduceNorm:
@@ -66,25 +56,23 @@ class Tp2AllReduceNorm:
         dev = torch.device("cuda", torch.cuda.current_device())
         self.sms = torch.cuda.get_device_properties(dev).multi_processor_count
         self.warps = 8
-        # The TP pair's communicator (a split of the session communicator; the buffer only borrows it). Not
-        # get_or_scale_allreduce_mnnvl_workspace: that would also allocate an MNNVL workspace nothing here uses.
-        comm = self._comm = ops._get_mnnvl_workspace_comm(mapping)
         half = (max_tokens + 1) // 2
         lbytes = half * hidden * 2
         flag_bytes = 2 * self.sms * self.warps * 4
         size = 2 * lbytes + flag_bytes + 4096
+        # The TP pair's communicator, ordered by TP rank (the one the buffers agree over).
+        comm = TpMnnvlMemory.get_comm(mapping)
+        bufs = None
         error = None
         try:
-            # Collective up to the handle exchange; its pointer-table tail is not, so it is agreed on below.
-            self.handle = ops._make_mnnvl_mcast_buffer(
-                comm, size, mapping, ops.use_mnnvl_fabric_handle(mapping)
-            )
-            r, p = mapping.tp_rank, 1 - mapping.tp_rank
-            own = self.handle.get_uc_buffer(r, (size // 4,), torch.int32, 0)
-            own.zero_()
-            peer = self.handle.get_uc_buffer(p, (size // 4,), torch.int32, 0)
+            # Collective: every rank's buffer is zero (the flags too) before any rank returns; None on every rank
+            # when the pair has no peer memory or the fill failed on a rank.
+            bufs = _PeerBuffers.create(mapping, size)
+            if bufs is None:
+                raise RuntimeError("no peer memory")
+            # The rest is not collective, so it is agreed on below.
             self.ctl = torch.zeros((4,), dtype=torch.int32, device=dev)  # epoch, arrival counter
-            o, q = own.data_ptr(), peer.data_ptr()
+            o, q = bufs.local_ptr, bufs.peer_ptrs[1 - mapping.tp_rank]
             self.table = torch.tensor(
                 [
                     o,
@@ -99,7 +87,7 @@ class Tp2AllReduceNorm:
                 dtype=torch.int64,
                 device=dev,
             )
-            self._bufs = (own, peer)
+            self._bufs = bufs
             self._fns = {}
             self._dummy_scale = torch.ones((1,), dtype=torch.float32, device=dev)
             # CuTe views of the operands fixed across calls, built at the first call: the pointer table, the
@@ -112,11 +100,14 @@ class Tp2AllReduceNorm:
         # below; an exception escaping before it would leave the peer waiting in the collective.
         except Exception as e:  # noqa: BLE001 - re-raised on every rank below as RuntimeError
             error = e
-        # Every rank's flags are zero before any rank can raise one; a failure on one rank fails all of them.
-        causes = _setup_failures(comm, mapping.tp_rank, error)
+        # A failure on one rank fails all of them.
+        causes = _PeerBuffers.failures(comm, error)
         if causes:
+            if bufs is not None:
+                bufs.close()
             raise RuntimeError(
-                f"TP2 all-reduce workspace setup failed ({causes}); the library all-reduce serves these calls"
+                f"TP2 all-reduce workspace setup failed ({'; '.join(causes)}); the library all-reduce serves these "
+                "calls"
             ) from error
         logger.info(
             f"[TP2 all-reduce] workspace {size >> 20} MiB for {max_tokens} tokens, H {hidden}"
@@ -149,7 +140,7 @@ class Tp2AllReduceNorm:
         residual: torch.Tensor,
         norm_weight: torch.Tensor,
         eps: float,
-        fusion_op,
+        fusion_op: AllReduceFusionOp,
         scale: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, ...]:
         """Outputs of the library op for ``fusion_op``: [norm, residual], [fp8, residual] or [norm, fp8, residual]."""
