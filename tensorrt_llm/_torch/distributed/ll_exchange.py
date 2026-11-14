@@ -961,6 +961,72 @@ class TPKeyExchange:
         return tokens_out
 
 
+# The Lamport protocol of the group exchanges (allgather, ll_pos_gather, alltoall_merge; the CuTe producers that push
+# into a merge slot follow it too): a sender stores its words into every member's receive slot, a word equal to the
+# empty sentinel sent as _LAMPORT_NAN; a receiver polls its slot until no word is empty, then empties it again. Each
+# position (block / row) has its own epoch, a plain counter whose parity picks one of the two slot halves, so the
+# next write to a half is two launches of the channel away.
+
+
+@triton.jit
+def _ll_word(words):
+    """``words`` as sent: the empty sentinel (only NaN data) goes out as another NaN."""
+    return tl.where(words == _LAMPORT_EMPTY, _LAMPORT_NAN, words)
+
+
+@triton.jit
+def _ll_peer(pv, ar_g, d):
+    """Member ``d``'s receive region (int32 words) from the group's peer table ``pv`` [G]."""
+    return tl.sum(tl.where(ar_g == d, pv, 0)).to(tl.uint64).to(tl.pointer_type(tl.int32))
+
+
+@triton.jit
+def _ll_half(epoch, G: tl.constexpr, SLOT_WORDS: tl.constexpr):
+    """Word offset of the slot half that ``epoch`` (its parity) selects."""
+    return (epoch & 1).to(tl.int64) * (G * SLOT_WORDS)
+
+
+@triton.jit
+def _ll_empty_words(got, mask, MASKED: tl.constexpr):
+    """How many of the polled words ``got`` (where ``mask``, if ``MASKED``) have not arrived."""
+    empty = got == _LAMPORT_EMPTY
+    if MASKED:
+        empty = empty & mask
+    return tl.sum(empty.to(tl.int32))
+
+
+@triton.jit
+def _ll_reset(ptr, offs, got, mask, MASKED: tl.constexpr):
+    """Empty the received words again (``got``'s shape, where ``mask``, if ``MASKED``)."""
+    empty = tl.full(got.shape, _LAMPORT_EMPTY, tl.int32)
+    if MASKED:
+        tl.store(ptr + offs, empty, mask=mask)
+    else:
+        tl.store(ptr + offs, empty)
+
+
+@triton.jit
+def _ll_load(ptr, offs, mask, MASKED: tl.constexpr):
+    if MASKED:
+        got = tl.load(ptr + offs, mask=mask, other=0, volatile=True)
+    else:
+        got = tl.load(ptr + offs, volatile=True)
+    return got
+
+
+@triton.jit
+def _ll_poll(ptr, offs, mask, MASKED: tl.constexpr):
+    """The words at ``ptr + offs`` (where ``mask``, if ``MASKED``) once every one arrived; their slot is emptied
+    again."""
+    got = _ll_load(ptr, offs, mask, MASKED)
+    waiting = _ll_empty_words(got, mask, MASKED)
+    while waiting > 0:
+        got = _ll_load(ptr, offs, mask, MASKED)
+        waiting = _ll_empty_words(got, mask, MASKED)
+    _ll_reset(ptr, offs, got, mask, MASKED)
+    return got
+
+
 @triton.jit
 def _ll_group_push(
     src_ptr,
@@ -975,14 +1041,12 @@ def _ll_group_push(
     SLOT_WORDS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    slot = (epoch & 1).to(tl.int64) * (G * SLOT_WORDS) + slot_base
+    slot = _ll_half(epoch, G, SLOT_WORDS) + slot_base
     w = block * BLOCK + tl.arange(0, BLOCK)
     ok = w < n_words
-    words = tl.load(src_ptr + w, mask=ok, other=0)
-    lw = tl.where(words == _LAMPORT_EMPTY, _LAMPORT_NAN, words)
+    lw = _ll_word(tl.load(src_ptr + w, mask=ok, other=0))
     for d in tl.static_range(G):
-        dst = tl.sum(tl.where(ar_g == d, pv, 0)).to(tl.uint64).to(tl.pointer_type(tl.int32))
-        tl.store(dst + slot + grank * SLOT_WORDS + w, lw, mask=ok)
+        tl.store(_ll_peer(pv, ar_g, d) + slot + grank * SLOT_WORDS + w, lw, mask=ok)
 
 
 @triton.jit
@@ -998,20 +1062,13 @@ def _ll_group_poll(
     SLOT_WORDS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    slot = (epoch & 1).to(tl.int64) * (G * SLOT_WORDS)
+    slot = _ll_half(epoch, G, SLOT_WORDS)
     src_rank = tl.arange(0, G)
     w = block * BLOCK + tl.arange(0, BLOCK)
     ok = w < n_words
     offs = slot + src_rank[:, None].to(tl.int64) * SLOT_WORDS + w[None, :]
     mask = (src_rank[:, None] < G) & ok[None, :]
-    # arrived = not empty; read, then empty again (the next write to these words is two launches of the channel
-    # away)
-    got = tl.load(mine + offs, mask=mask, other=0, volatile=True)
-    waiting = tl.sum(((got == _LAMPORT_EMPTY) & mask).to(tl.int32))
-    while waiting > 0:
-        got = tl.load(mine + offs, mask=mask, other=0, volatile=True)
-        waiting = tl.sum(((got == _LAMPORT_EMPTY) & mask).to(tl.int32))
-    tl.store(mine + offs, tl.full([G, BLOCK], _LAMPORT_EMPTY, tl.int32), mask=mask)
+    got = _ll_poll(mine, offs, mask, True)
     row = w // row_words
     col = w % row_words
     out_offs = (
@@ -1053,8 +1110,7 @@ def _ll_group_kernel(
         tl.extra.cuda.gdc_launch_dependents()
     ar_g = tl.arange(0, G)
     pv = tl.load(peers_ptr + ar_g)
-    mine = tl.sum(tl.where(ar_g == grank, pv, 0)).to(tl.uint64)
-    mine = mine.to(tl.pointer_type(tl.int32))
+    mine = _ll_peer(pv, ar_g, grank)
     if WAIT:
         gdc_wait_with_memory_clobber()
     if TRIGGER == 2:
@@ -1089,8 +1145,7 @@ def _ll_group_kernel(
             SLOT_WORDS,
             BLOCK,
         )
-        nxt = epoch + 1
-        tl.store(state_ptr + program, tl.where(nxt == 0, 2, nxt))
+        tl.store(state_ptr + program, epoch + 1)
     else:
         for block in range(program, num_blocks, stride):
             epoch = tl.load(state_ptr + block, volatile=True)
@@ -1121,8 +1176,7 @@ def _ll_group_kernel(
                 SLOT_WORDS,
                 BLOCK,
             )
-            nxt = epoch + 1
-            tl.store(state_ptr + block, tl.where(nxt == 0, 2, nxt))
+            tl.store(state_ptr + block, epoch + 1)
 
 
 @triton.jit
@@ -1144,22 +1198,16 @@ def ll_pos_gather(
     inside a producer kernel (TPGroupExchange.rope_gather_args) into ``out`` [rows, G * HQ * W] words, member-major as
     allgather. One epoch per position; the caller's grid must stay within one wave (every program polls)."""
     epoch = tl.load(state_ptr + pos, volatile=True)
-    half = (epoch & 1).to(tl.int64) * (G * SLOT_WORDS)
+    half = _ll_half(epoch, G, SLOT_WORDS)
     w = tl.arange(0, W)
     ar_g = tl.arange(0, G)
     base = half + grank * SLOT_WORDS + pos.to(tl.int64) * W
     offs = half + ar_g[:, None].to(tl.int64) * SLOT_WORDS + pos.to(tl.int64) * W + w[None, :]
-    mine = tl.sum(tl.where(ar_g == grank, pv, 0)).to(tl.uint64).to(tl.pointer_type(tl.int32))
-    lw = tl.where(words == _LAMPORT_EMPTY, _LAMPORT_NAN, words)
+    mine = _ll_peer(pv, ar_g, grank)
+    lw = _ll_word(words)
     for d in tl.static_range(G):
-        dst = tl.sum(tl.where(ar_g == d, pv, 0)).to(tl.uint64).to(tl.pointer_type(tl.int32))
-        tl.store(dst + base + w, lw)
-    got = tl.load(mine + offs, volatile=True)
-    waiting = tl.sum((got == _LAMPORT_EMPTY).to(tl.int32))
-    while waiting > 0:
-        got = tl.load(mine + offs, volatile=True)
-        waiting = tl.sum((got == _LAMPORT_EMPTY).to(tl.int32))
-    tl.store(mine + offs, tl.full([G, W], _LAMPORT_EMPTY, tl.int32))
+        tl.store(_ll_peer(pv, ar_g, d) + base + w, lw)
+    got = _ll_poll(mine, offs, 0, False)
     out_offs = (
         row.to(tl.int64) * (G * HQ * W)
         + ar_g[:, None].to(tl.int64) * (HQ * W)
@@ -1167,8 +1215,7 @@ def ll_pos_gather(
         + w[None, :]
     )
     tl.store(out_ptr + out_offs, got)
-    nxt = epoch + 1
-    tl.store(state_ptr + pos, tl.where(nxt == 0, 2, nxt))
+    tl.store(state_ptr + pos, epoch + 1)
 
 
 # alltoall_merge receive layout inside each (parity, source) slot of a channel: the O words of row position pos at
@@ -1250,8 +1297,7 @@ def _ll_merge_kernel(
         tl.extra.cuda.gdc_launch_dependents()
     ar_g = tl.arange(0, G)
     pv = tl.load(peers_ptr + ar_g)  # host-written table: ahead of the wait
-    mine = tl.sum(tl.where(ar_g == grank, pv, 0)).to(tl.uint64)
-    mine = mine.to(tl.pointer_type(tl.int32))
+    mine = _ll_peer(pv, ar_g, grank)
     if WAIT:
         gdc_wait_with_memory_clobber()
     program = tl.program_id(0)
@@ -1264,18 +1310,13 @@ def _ll_merge_kernel(
         for p in tl.static_range(P):
             pos = r * P + p
             epoch = tl.load(state_ptr + pos, volatile=True)
-            slot = (epoch & 1).to(tl.int64) * (G * SLOT_WORDS) + grank * SLOT_WORDS
+            slot = _ll_half(epoch, G, SLOT_WORDS) + grank * SLOT_WORDS
             for d in tl.static_range(G):
-                dst = tl.sum(tl.where(ar_g == d, pv, 0)).to(tl.uint64).to(tl.pointer_type(tl.int32))
+                dst = _ll_peer(pv, ar_g, d)
                 ow = tl.load(o_ptr + d * o_sd + p * o_sp + t * o_st + h * DW + w)
                 lw = tl.load(lse_ptr + d * l_sd + p * l_sp + t * l_st + h)
-                tl.store(
-                    dst + slot + pos * DW + w, tl.where(ow == _LAMPORT_EMPTY, _LAMPORT_NAN, ow)
-                )
-                tl.store(
-                    dst + slot + LSE_BASE + pos,
-                    tl.where(lw == _LAMPORT_EMPTY, _LAMPORT_NAN, lw),
-                )
+                tl.store(dst + slot + pos * DW + w, _ll_word(ow))
+                tl.store(dst + slot + LSE_BASE + pos, _ll_word(lw))
     c = tl.arange(0, P * DW)  # columns of a row's poll tile: partial c // DW, word c % DW
     cp = c // DW
     first = (c % DW) == 0
@@ -1286,7 +1327,7 @@ def _ll_merge_kernel(
         # racing volatile loads of thread-replicated data could disagree and make the loop exit non-uniform
         # (barrier deadlock in the reductions). Masked-off LSE lanes read as "arrived".
         ecol = tl.load(state_ptr + r * P + cp, volatile=True)  # epoch of each column's position
-        slotc = (ecol & 1).to(tl.int64) * (G * SLOT_WORDS)
+        slotc = _ll_half(ecol, G, SLOT_WORDS)
         src = ar_g.to(tl.int64) * SLOT_WORDS
         o_offs = slotc[None, :] + src[:, None] + r * (P * DW) + c[None, :]
         l_offs = slotc[None, :] + src[:, None] + LSE_BASE + r * P + cp[None, :]
@@ -1295,19 +1336,14 @@ def _ll_merge_kernel(
         # is two launches of the channel away, after this rank's next launch has pushed.
         got_o = tl.load(mine + o_offs, volatile=True)
         got_l = tl.load(mine + l_offs, mask=lm, other=0, volatile=True)
-        waiting = tl.sum((got_o == _LAMPORT_EMPTY).to(tl.int32)) + tl.sum(
-            (got_l == _LAMPORT_EMPTY).to(tl.int32)
-        )
+        waiting = _ll_empty_words(got_o, 0, False) + _ll_empty_words(got_l, 0, False)
         while waiting > 0:
             got_o = tl.load(mine + o_offs, volatile=True)
             got_l = tl.load(mine + l_offs, mask=lm, other=0, volatile=True)
-            waiting = tl.sum((got_o == _LAMPORT_EMPTY).to(tl.int32)) + tl.sum(
-                (got_l == _LAMPORT_EMPTY).to(tl.int32)
-            )
-        tl.store(mine + o_offs, tl.full([G, P * DW], _LAMPORT_EMPTY, tl.int32))
-        tl.store(mine + l_offs, tl.full([G, P * DW], _LAMPORT_EMPTY, tl.int32), mask=lm)
-        nxt = ecol + 1
-        tl.store(state_ptr + r * P + cp, tl.where(nxt == 0, 2, nxt), mask=first)
+            waiting = _ll_empty_words(got_o, 0, False) + _ll_empty_words(got_l, 0, False)
+        _ll_reset(mine, o_offs, got_o, 0, False)
+        _ll_reset(mine, l_offs, got_l, lm, True)
+        tl.store(state_ptr + r * P + cp, ecol + 1, mask=first)
         # every column of partial p carries that partial's LSE (column p * DW holds the word)
         lbits = tl.where(lm, got_l.to(tl.int32), 0)
         lse_full = tl.zeros([G, P * DW], dtype=tl.float32)
@@ -1417,7 +1453,7 @@ class TPGroupExchange:
             for c in range(num_channels)
         ]
         self._peers = torch.tensor(table, dtype=torch.int64, device=device)
-        # One epoch per (channel, block of 256 words); 0 = never sent, the first launch uses 1.
+        # One epoch per (channel, block of 256 words): a counter whose parity picks the slot half (starts at 1).
         self._state = torch.ones(
             (num_channels, triton.cdiv(max_words, 256)), dtype=torch.int32, device=device
         )

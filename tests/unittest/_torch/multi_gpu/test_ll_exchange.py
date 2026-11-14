@@ -451,6 +451,26 @@ def _group_allgather(tp):
             torch.cuda.synchronize()
             ref = torch.cat([x_of(r).reshape(rows, -1) for r in members], dim=-1)
             assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), ("allgather", rows)
+        # An epoch is a plain counter whose parity picks the slot half: exchanges across its int32 wrap (-1 -> 0 -> 1)
+        # deliver like any other. Every rank's previous launch has finished before any rank moves its epochs.
+        MPI.COMM_WORLD.barrier()
+        ex._state.fill_(-1)
+
+        def wrap_x(r):
+            g = torch.Generator(device="cuda").manual_seed(1000 + r)
+            return torch.randn((64, 4, 256), generator=g, device="cuda").to(torch.bfloat16)
+
+        x = wrap_x(rank)
+        ref = torch.cat([wrap_x(r).reshape(64, -1) for r in members], dim=-1)
+        blocks = 64 * 4 * 256 * 2 // 4 // 256
+        for launch in range(2):
+            out = ex.allgather(x)
+            torch.cuda.synchronize()
+            assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), (
+                "allgather across the wrap",
+                launch,
+            )
+        assert (ex._state[0, :blocks] == 1).all(), ex._state[0, :blocks]
         # Refused before any launch: an integer payload (its all-ones words would arrive rewritten), a pushed
         # merge of two partials per row (its producer pushes one), and an in-kernel gather on an exchange created
         # without its head dim.
