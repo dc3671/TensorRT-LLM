@@ -53,6 +53,7 @@ batches. Only requests with a ``priority`` field (completions and chat completio
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -114,6 +115,8 @@ RESET_MAX_PREV_ISL = 1500.0
 RESET_MIN_APPENDED = 10000.0
 SKIP_MAX_OUT = 2.0
 MAX_CONVERSATIONS = 50000
+# A longer conversation id is keyed by its digest, which bounds the table's memory.
+MAX_CONVERSATION_ID_CHARS = 128
 # Features of predicted requests whose reply has not been learned yet (the oldest are dropped).
 MAX_PENDING_ROWS = 200000
 # The median prior covers the last this many learned replies.
@@ -197,12 +200,19 @@ class _History:
         return (float(self.n), self.last_out, self.ema, self.sum_out, self.max_out, self.last_isl)
 
 
+def _table_key(conv_id: str) -> str | bytes:
+    """``conv_id``, or a 16-byte digest of it when longer than ``MAX_CONVERSATION_ID_CHARS``."""
+    if len(conv_id) <= MAX_CONVERSATION_ID_CHARS:
+        return conv_id
+    return hashlib.blake2b(conv_id.encode(errors="surrogatepass"), digest_size=16).digest()
+
+
 class ConversationLengthTable:
     """Per-conversation reply history (least recently used conversations evicted)."""
 
     def __init__(self, max_conversations: int = MAX_CONVERSATIONS) -> None:
         self.max_conversations = max_conversations
-        self._histories: OrderedDict[str, _History] = OrderedDict()
+        self._histories: OrderedDict[str | bytes, _History] = OrderedDict()
         self.resets = 0
         self.recorded = 0
         self.skipped = 0
@@ -214,40 +224,37 @@ class ConversationLengthTable:
         """The conversation's history for a new request, after the reset rule; None without one."""
         if conv_id is None:
             return None
-        history = self._histories.get(conv_id)
+        key = _table_key(conv_id)
+        history = self._histories.get(key)
         if history is None:
             return None
-        self._histories.move_to_end(conv_id)
+        self._histories.move_to_end(key)
         if (
             history.n == 1
             and history.last_isl < RESET_MAX_PREV_ISL
             and isl - history.last_isl - history.last_out > RESET_MIN_APPENDED
         ):
-            del self._histories[conv_id]
+            del self._histories[key]
             self.resets += 1
             return None
         return history.snapshot()
 
-    def record(self, conv_id: Optional[str], isl: float, out: float) -> bool:
-        """Record a finished reply of a conversation unless it has at most ``SKIP_MAX_OUT`` tokens.
+    def record(self, conv_id: str, isl: float, out: float) -> None:
+        """Add a finished reply to its conversation's history.
 
-        Returns whether it was recorded; only recorded replies are learned.
+        :meth:`OnlineLengthPredictor.record` decides which replies are learned (and counts the
+        skipped cache primers in ``skipped``).
         """
-        if conv_id is None:
-            return False
-        if out <= SKIP_MAX_OUT:
-            self.skipped += 1
-            return False
-        history = self._histories.get(conv_id)
+        key = _table_key(conv_id)
+        history = self._histories.get(key)
         if history is None:
-            history = self._histories[conv_id] = _History()
+            history = self._histories[key] = _History()
             if len(self._histories) > self.max_conversations:
                 self._histories.popitem(last=False)
         else:
-            self._histories.move_to_end(conv_id)
+            self._histories.move_to_end(key)
         history.record(float(isl), float(out))
         self.recorded += 1
-        return True
 
 
 def _log1p_nonneg(value: float) -> float:

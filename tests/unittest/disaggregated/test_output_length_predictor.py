@@ -91,17 +91,32 @@ def test_priority_is_strictly_decreasing_in_tokens():
 
 
 def test_table_reset_and_skip_rules():
-    table = olp.ConversationLengthTable()
-    assert not table.record("c", 1000, 2)  # cache primer: not learned
+    predictor = olp.OnlineLengthPredictor("ridge")
+    table = predictor.table
+    assert not predictor.record("c", 1000, 2, None, 0.0)  # cache primer: not learned
     assert table.skipped == 1 and len(table) == 0
-    assert not table.record(None, 1000, 50)  # no conversation id
-    assert table.record("c", 1000, 50)
+    assert predictor.record(None, 1000, 50, None, 0.0)  # no conversation id: global models only
+    assert len(table) == 0
+    assert predictor.record("c", 1000, 50, None, 0.0) and table.recorded == 1
     # One reply with a short prompt, then a jump of more than 10,000 appended tokens: a new prefix.
     assert table.snapshot_for("c", 1000 + 50 + 10001) is None
     assert table.resets == 1 and len(table) == 0
-    assert table.record("c", 1000, 50) and table.record("c", 1100, 70)
+    table.record("c", 1000, 50)
+    table.record("c", 1100, 70)
     snapshot = table.snapshot_for("c", 20000)  # two replies: never reset
     assert snapshot == (2.0, 70.0, 60.0, 120.0, 70.0, 1100.0)
+
+
+def test_table_keys_a_long_conversation_id_by_its_digest():
+    """A client-chosen id longer than MAX_CONVERSATION_ID_CHARS costs a fixed-size key."""
+    table = olp.ConversationLengthTable()
+    long_id = "x" * (64 * 1024)
+    table.record(long_id, 1000, 50)
+    table.record("y" * olp.MAX_CONVERSATION_ID_CHARS, 1000, 70)
+    assert table.snapshot_for(long_id, 2000)[1] == 50.0
+    assert table.snapshot_for(long_id + "z", 2000) is None
+    assert table.snapshot_for("y" * olp.MAX_CONVERSATION_ID_CHARS, 2000)[1] == 70.0
+    assert all(len(key) <= olp.MAX_CONVERSATION_ID_CHARS for key in table._histories)
 
 
 def test_table_evicts_least_recently_used():
