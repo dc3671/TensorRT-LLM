@@ -25,7 +25,9 @@ the order of the generation server's ``AgingPriorityWaitingQueue``).
 A request that comes from a finished context phase carries ``orig_elapsed_s``, its time since it
 reached the orchestrator: its wait counts from that arrival. With ``kv_transfer_timeout_s`` (the
 context servers' ``kv_transfer_timeout_ms``) every waiter fails once it has been in this queue
-that long: its context server has given up the KV cache transfer by then (with
+that long. A C++-transceiver context server counts that timeout from its KV send, so it has
+dropped the transfer by then; a Python-transceiver one holds a send its generation peer has not
+asked for up to three timeouts from the send, so there this bound is conservative (with
 ``generation_first`` the context server waits the same timeout for the generation side).
 
 Waiters sit in heaps per excluded server, so a placement costs O(E log W) for E distinct
@@ -286,8 +288,8 @@ class SeatPool:
         return (
             f"generation request {waiter.rid} found no free seat within the context servers' KV "
             f"transfer timeout ({waiter.deadline - waiter.entered:g} s after it joined the queue; "
-            f"{self._clock() - waiter.arrival:.1f} s since it arrived); the context server has "
-            f"released its KV cache"
+            f"{self._clock() - waiter.arrival:.1f} s since it arrived); a context server with the "
+            f"C++ transceiver has dropped the KV cache transfer by then"
         )
 
     def _is_aged(self, waiter: Waiter, now: float) -> bool:

@@ -529,6 +529,30 @@ async def test_seat_wait_bound_comes_from_the_context_servers():
     waiting.cancel()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("infos", "expected_s"),
+    [
+        ({"c0": {"kv_transfer_timeout_ms": None}, "c1": {"kv_transfer_timeout_ms": None}}, None),
+        ({"c0": {"kv_transfer_timeout_ms": None}, "c1": {}}, None),
+        ({"c0": {"kv_transfer_timeout_ms": None}, "c1": {"kv_transfer_timeout_ms": 30000}}, 30.0),
+        ({"c0": {}}, 60.0),
+    ],
+    ids=["all_null", "null_and_unreported", "null_and_bounded", "unreported"],
+)
+async def test_a_null_kv_transfer_timeout_leaves_the_seat_wait_unbounded(infos, expected_s):
+    """Context servers without a KV transfer timeout never drop the transfer: no 503 at 60 s."""
+    gen = _router(servers=("s0",), seats=1, kv_ms=60000)
+    gen.set_context_router(_ctx_router_with(infos))
+    await gen.get_next_server_by_key({}, req_id=1)
+    waiting = asyncio.create_task(gen.get_next_server_by_key({}, req_id=2))
+    await _settle()
+    assert gen._pool.kv_transfer_timeout_s == expected_s
+    assert (gen._pool.waiter(2).deadline is None) == (expected_s is None)
+    waiting.cancel()
+    await asyncio.gather(waiting, return_exceptions=True)
+
+
 def test_max_queue_wait_without_pooling_is_rejected():
     with pytest.raises(ValueError, match="max_requests_per_server"):
         extract_disagg_cfg(

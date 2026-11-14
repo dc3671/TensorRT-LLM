@@ -63,6 +63,8 @@ POOLED_SELECT_TIMEOUT_S = 3600.0
 POOLED_FINISHED_TTL_S = 600.0
 POOLED_FINISHED_MAX = 1 << 17
 _UNREAD = object()
+# The context servers report a null kv_transfer_timeout_ms: no seat-wait bound.
+_NO_KV_TIMEOUT = object()
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
@@ -895,9 +897,10 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
 
     A request whose context phase has finished (``disaggregated_params.orig_elapsed_s``
     set) ages from its arrival at the orchestrator. With ``kv_transfer_timeout_ms`` every
-    request fails once it has waited that long for a seat: its context server has dropped
-    the KV transfer by then. The value is the smallest one the context servers report in
-    ``/server_info`` (:meth:`set_context_router`), else the configured one.
+    request fails once it has waited that long for a seat (see :mod:`seat_pool` for what the
+    context side does by then). The value is the smallest one the context servers report in
+    ``/server_info`` (:meth:`set_context_router`), else the configured one; there is no bound
+    when they all report null.
 
     A seat is released on the server state it was taken from: a server that leaves while
     requests hold its seats keeps that state, and gets it back if it rejoins, so its seat
@@ -971,21 +974,37 @@ class PooledLoadBalancingRouter(LoadBalancingRouter):
         self._context_router = context_router
 
     def _refresh_kv_timeout(self) -> None:
-        """Use the smallest ``kv_transfer_timeout_ms`` in the context servers' ``/server_info``."""
+        """Use the smallest ``kv_transfer_timeout_ms`` in the context servers' ``/server_info``.
+
+        No bound when every context server that reports the key reports null (no timeout).
+        """
         if self._context_router is None:
             return
         reported = [
             info["kv_transfer_timeout_ms"]
             for info in self._context_router.server_infos().values()
-            if isinstance(info.get("kv_transfer_timeout_ms"), (int, float))
-            and not isinstance(info.get("kv_transfer_timeout_ms"), bool)
-            and info["kv_transfer_timeout_ms"] > 0
+            if "kv_transfer_timeout_ms" in info
         ]
-        value = min(reported) if reported else None
+        bounds = [
+            value for value in reported if isinstance(value, (int, float))
+            and not isinstance(value, bool) and value > 0
+        ]
+        if bounds:
+            value = min(bounds)
+        elif reported and all(value is None for value in reported):
+            value = _NO_KV_TIMEOUT
+        else:
+            value = None
         if value == self._reported_kv_timeout_ms:
             return
         self._reported_kv_timeout_ms = value
-        if value is None:
+        if value is _NO_KV_TIMEOUT:
+            value = None
+            logger.info(
+                "PooledLoadBalancingRouter: the context servers have no "
+                "kv_transfer_timeout_ms; generation requests wait for a "
+                "seat without a bound")
+        elif value is None:
             value = self._configured_kv_timeout_ms
             logger.warning(
                 "PooledLoadBalancingRouter: no context server reports "
