@@ -588,6 +588,31 @@ class TestPriorityWaitingQueue:
         peeked = [item.id for item in q.peek_requests(4)]
         assert peeked == [6, 13, 20, 27]
 
+    def test_peek_requests_reads_only_the_entries_it_returns_and_their_children(self):
+        """A home-wait round re-peeks a growing window: each peek walks O(k) heap entries, not the whole heap, and
+        matches the pop order for any k."""
+        import random
+
+        rng = random.Random(3)
+        q = PriorityWaitingQueue()
+        for i in range(5000):
+            q.add_request(create_priority_request_item(i, priority=rng.choice([0.1, 0.3, 0.5, 0.7])))
+        q.prepend_requests([create_priority_request_item(9000 + i, priority=0.5) for i in range(3)])
+        order = [e[2].id for e in sorted(q._heap)]
+        for k in (0, 1, 7, 256, 5003, 6000):
+            assert [item.id for item in q.peek_requests(k)] == order[:k]
+
+        class _Counting(list):
+            reads = 0
+
+            def __getitem__(self, index):
+                _Counting.reads += 1
+                return super().__getitem__(index)
+
+        q._heap = _Counting(q._heap)
+        assert [item.id for item in q.peek_requests(16)] == order[:16]
+        assert _Counting.reads <= 1 + 2 * 16
+
     def test_iter_does_not_consume_items(self):
         """Iterating over the queue does not remove items."""
         q = PriorityWaitingQueue()

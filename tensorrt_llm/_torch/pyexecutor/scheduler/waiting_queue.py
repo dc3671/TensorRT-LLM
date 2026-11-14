@@ -199,7 +199,7 @@ class PriorityWaitingQueue(WaitingQueue):
     Complexity:
         - add_request / add_requests: O(log n)
         - pop_request / peek_request: O(log n) / O(1)
-        - peek_requests(k): O(n log k), without copying or sorting the heap
+        - peek_requests(k): O(k log k), without copying or sorting the heap
         - remove_by_ids: O(n) rebuild + O(n) heapify
         - __iter__: O(n log n) over a sorted copy (priority order)
     """
@@ -251,8 +251,21 @@ class PriorityWaitingQueue(WaitingQueue):
         return self._heap[0][2]
 
     def peek_requests(self, k: int) -> list[RequestQueueItem]:
-        """Return up to ``k`` requests in priority order without removing them."""
-        return [e[2] for e in heapq.nsmallest(max(k, 0), self._heap)]
+        """Return up to ``k`` requests in priority order without removing them.
+
+        Best-first over the heap's tree: an entry's children are its only successors, so the walk reads O(k) entries
+        and the whole heap is never scanned.
+        """
+        heap = self._heap
+        frontier = [(heap[0], 0)] if heap and k > 0 else []
+        result = []
+        while frontier and len(result) < k:
+            entry, index = heapq.heappop(frontier)
+            result.append(entry[2])
+            for child in (2 * index + 1, 2 * index + 2):
+                if child < len(heap):
+                    heapq.heappush(frontier, (heap[child], child))
+        return result
 
     def admission_groups(self, requests: list[RequestQueueItem]) -> list[int]:
         """One group per priority."""
