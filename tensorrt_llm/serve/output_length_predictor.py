@@ -65,18 +65,9 @@ import time
 from array import array
 from bisect import bisect_left, insort
 from collections import OrderedDict, deque
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    AsyncIterator,
-    List,
-    Literal,
-    Optional,
-    Protocol,
-    Tuple,
-    get_args,
-)
+from typing import TYPE_CHECKING, Any, AsyncIterator, List, Optional, Protocol, Tuple, get_args
 
+from tensorrt_llm.llmapi.disagg_utils import OutputLengthPredictorName as PredictorName
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -91,13 +82,13 @@ if TYPE_CHECKING:
     # A request the orchestrator sends to a generation server.
     GenerationRequest = CompletionRequest | ChatCompletionRequest | ResponsesRequest
 
-# OutputLengthPredictionConfig.predictor.
-PredictorName = Literal["ridge", "ridge_gbm"]
 PREDICTORS = get_args(PredictorName)
 
 # priority = 1 / (1 + tokens / scale); the admission order does not depend on the scale.
 PRIORITY_SCALE_TOKENS = 1024.0
-# The prediction before any reply was learned, and for a request the coordinator could not predict.
+# The prediction before any reply was learned, and for a request the coordinator could not predict:
+# the median reply length (375.767 tokens) of the AgentX trace the Qwen3.5 reference recipes replay.
+# It is fixed; it does not follow the learned median.
 PRIOR_TOKENS = 375.77
 PREDICT_TIMEOUT_S = 1.0
 RECORD_TIMEOUT_S = 5.0

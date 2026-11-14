@@ -218,6 +218,10 @@ class DisaggClusterConfig:
                 "require an etcd:// cluster_uri")
 
 
+# The output-length predictors (serve/output_length_predictor.py implements them).
+OutputLengthPredictorName = Literal["ridge", "ridge_gbm"]
+
+
 class OutputLengthPredictionConfig(StrictBaseModel):
     """Generation priority from an online prediction of each request's output length.
 
@@ -231,7 +235,7 @@ class OutputLengthPredictionConfig(StrictBaseModel):
     phase (conditional disaggregation) gets the prior's priority.
     """
 
-    predictor: Literal["ridge", "ridge_gbm"] = Field(
+    predictor: OutputLengthPredictorName = Field(
         default="ridge",
         description=(
             "'ridge': a ridge regression on the request's history features, "
