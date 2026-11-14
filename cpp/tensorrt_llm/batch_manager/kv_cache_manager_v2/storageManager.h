@@ -524,8 +524,8 @@ private:
         CUstream stream, Submit&& submit);
     //! Encode hot pages (PageIndexPair::src) of `layerGroup` into cold pages at `dstBase` (PageIndexPair::dst), the
     //! cold level's base or a staging buffer; false if the codec rejects the batch.
-    bool encodeColdPages(LayerGroupId layerGroup, void* dstBase, PageIndexPair const* pageIndices, size_t numPages,
-        CUstream stream);
+    bool encodeColdPages(
+        LayerGroupId layerGroup, void* dstBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
     //! The reverse of encodeColdPages: cold pages at `srcBase` (src) into hot pages (dst).
     bool decodeColdPages(LayerGroupId layerGroup, void const* srcBase, PageIndexPair const* pageIndices,
         size_t numPages, CUstream stream);

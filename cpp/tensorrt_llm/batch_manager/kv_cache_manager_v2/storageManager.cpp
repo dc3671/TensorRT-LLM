@@ -978,7 +978,6 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     auto& srcPoolGroup = poolGroup(srcLevel, srcPgIdx);
     auto& dstPoolGroup = poolGroup(dstLevel, dstPgIdx);
 
-
     if (srcIsHot == dstIsHot)
     {
         if (!srcIsHot && (remoteLevel(srcLevel) != nullptr || remoteLevel(dstLevel) != nullptr))

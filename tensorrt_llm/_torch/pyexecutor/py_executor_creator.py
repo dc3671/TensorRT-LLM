@@ -1417,7 +1417,8 @@ def _create_py_executor(
                 guided_decoder=guided_decoder,
                 capturable_guided_decoder=capturable_guided_decoder,
                 lora_config=lora_config,
-                garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+                garbage_collection_gen0_threshold=
+                garbage_collection_gen0_threshold,
                 kv_connector_manager=kv_connector_manager
                 if not estimating_kv_cache else None,
                 resource_governor_queue=resource_governor_queue,
@@ -1429,7 +1430,8 @@ def _create_py_executor(
                 scheduler_config=scheduler_config,
                 cache_transceiver_config=cache_transceiver_config,
                 transfer_budget_is_explicit=transfer_budget_is_explicit,
-                virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
+                virtual_memory_pools=vm_pools
+                if not estimating_kv_cache else None,
                 execution_stream=execution_stream,
                 # Without the KV-cache estimation the executor serves from its
                 # construction: it gets the DWDP manager or the standalone dense

@@ -596,7 +596,9 @@ class TestPriorityWaitingQueue:
         rng = random.Random(3)
         q = PriorityWaitingQueue()
         for i in range(5000):
-            q.add_request(create_priority_request_item(i, priority=rng.choice([0.1, 0.3, 0.5, 0.7])))
+            q.add_request(
+                create_priority_request_item(i, priority=rng.choice([0.1, 0.3, 0.5, 0.7]))
+            )
         q.prepend_requests([create_priority_request_item(9000 + i, priority=0.5) for i in range(3)])
         order = [e[2].id for e in sorted(q._heap)]
         for k in (0, 1, 7, 256, 5003, 6000):
@@ -608,6 +610,10 @@ class TestPriorityWaitingQueue:
             def __getitem__(self, index):
                 _Counting.reads += 1
                 return super().__getitem__(index)
+
+            def __iter__(self):
+                _Counting.reads += len(self)
+                return super().__iter__()
 
         q._heap = _Counting(q._heap)
         assert [item.id for item in q.peek_requests(16)] == order[:16]

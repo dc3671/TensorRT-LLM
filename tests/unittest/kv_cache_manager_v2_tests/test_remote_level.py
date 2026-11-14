@@ -498,8 +498,11 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
         ]
 
     def test_rebase_leaves_the_remote_copies_of_stale_sliding_window_blocks_unread(self) -> None:
-        """A stale sliding-window block's page is held only to be committed: rebasing it onto the tree's remote copy
-        drops it instead of reading that copy back, which with the donor gone would fail the commit."""
+        """Rebasing a stale sliding-window block onto the tree's remote copy reads nothing.
+
+        Its page is held only to be committed: the rebase drops it instead of reading that copy back, which with the
+        donor gone would fail the commit.
+        """
         if self.transport == "fabric":
             self.skipTest(_NIXL_DEATH_ONLY)
         directory = tempfile.mkdtemp(prefix="kvcm2_swa_")
@@ -508,7 +511,9 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             cfg = self._config(with_host=True, directory=directory, transfer_timeout_ms=10_000)
             # All-reusable commits: the sliding layer's stale blocks keep their pages (held) until committed.
             self.cfg = replace(
-                cfg, layers=self._attention_layers(window=self.tokens_per_block), commit_min_snapshot=False
+                cfg,
+                layers=self._attention_layers(window=self.tokens_per_block),
+                commit_min_snapshot=False,
             )
             self.manager = KVCacheManager(self.cfg)
             self.engine = FakeEngine(self.cfg)
@@ -1080,8 +1085,11 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             shutil.rmtree(directory, ignore_errors=True)
 
     def test_a_donor_reported_twice_counts_once(self) -> None:
-        """A listing that sees a donor's .ready and its .failed (it exits between the two) counts one donor, so a
-        claim keeps waiting for the other expected donor instead of failing as if all had reported."""
+        """A donor whose .ready and .failed are both listed counts once.
+
+        A listing can see both when the donor exits between the two; a claim then keeps waiting for the other expected
+        donor instead of failing as if all had reported.
+        """
         directory = tempfile.mkdtemp(prefix="kvcm2_twice_")
         try:
             meta = f"version 1\nname x\nhost h\npid 1\nchunk_bytes {_CHUNK_BYTES}\ntransport {self.transport}\n"
@@ -1105,8 +1113,11 @@ class TestRemoteLevelRoundTrip(_Transport, unittest.TestCase):
             shutil.rmtree(directory, ignore_errors=True)
 
     def test_a_donor_found_full_earlier_is_probed_again_before_a_claim_fails(self) -> None:
-        """A donor found full while a claim was served elsewhere is probed again before a claim fails at once (every
-        expected donor reported): a peer may have returned its chunks since, e.g. an abandoned construction."""
+        """A donor found full earlier is probed again before a claim fails at once.
+
+        Every expected donor reported, but a peer may have returned its chunks since the donor was found full while a
+        claim was served elsewhere, e.g. an abandoned construction.
+        """
         directory = tempfile.mkdtemp(prefix="kvcm2_refull_")
         donors = [_Donor(directory, _CHUNK_BYTES, self.transport) for _ in range(2)]
         peer_claim = os.path.join(directory, f"claim.{donors[0].name}.0")

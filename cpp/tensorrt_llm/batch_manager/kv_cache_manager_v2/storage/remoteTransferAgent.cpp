@@ -269,6 +269,7 @@ std::unique_ptr<RemoteTransferAttempt> AgentTransferBackend::submit(bool write, 
         TLLM_CHECK_DEBUG(ios[i].donor < donors.size());
         byDonor[ios[i].donor].push_back(i);
     }
+
     // Everything that allocates is made before the first request is posted: from then on submit must return the
     // attempt that owns the requests in flight, never throw (dropping a status does not stop its request).
     struct Pending
