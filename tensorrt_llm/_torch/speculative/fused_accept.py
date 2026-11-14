@@ -34,7 +34,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ..distributed.ll_exchange import argmax_exchange_finish, fast_gumbel_key
+from ..distributed.ll_exchange import TPKeyExchange, argmax_exchange_finish, fast_gumbel_key
 from ..modules.fla.op import gdc_wait_with_memory_clobber
 
 MAX_DRAFT_LEN = 31  # columns of the accept tile (k + 1 <= 32)
@@ -299,7 +299,7 @@ def _force_mode(force: Optional[tuple], k: int, num_accepted: torch.Tensor) -> t
 
 
 def sample_and_strict_accept(
-    exchange,
+    exchange: TPKeyExchange,
     logits: torch.Tensor,
     vocab_offset: int,
     temperature: torch.Tensor,
@@ -382,6 +382,9 @@ def sample_and_strict_accept(
         COUNTER_STRIDE=int(c_stride),
         SLOT_STRIDE=int(s_stride),
         POOL_MASK=int(pool_mask),
+        # The acceptance tile follows the batch (16 / 32 / 64 rows; it loops over row blocks above 64): one compile
+        # per tile size, the first time an eager step lands in it. Not one 64-row tile for every batch: the tile
+        # sizes this one-launch kernel's registers, so its captured decode steps keep their smaller variants.
         BLOCK_B=max(16, min(64, triton.next_power_of_2(max(num_gens, num_contexts, 1)))),
         BLOCK_K=max(8, triton.next_power_of_2(k + 1)),
         num_warps=4,

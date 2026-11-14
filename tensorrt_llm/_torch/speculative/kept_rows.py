@@ -38,7 +38,8 @@ def generation_only_on_every_rank(
     return all_rank_num_gens is not None and list(all_rank_num_gens) == list(all_rank_num_seqs)
 
 
-# Batch counts and strides are not specialized: eager steps at new batch sizes reuse the compiled kernels.
+# Batch counts are not specialized: an eager step at a new batch size reuses the kernel compiled for its BLOCK (one
+# compile per power of two of the batch, from 16; one tile holds the whole batch for the cumsum).
 @triton.jit(do_not_specialize=["num_contexts", "num_gens", "num_ctx_tokens"])
 def _kept_row_ids_kernel(
     seq_lens_ptr,
